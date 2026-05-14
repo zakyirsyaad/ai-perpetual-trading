@@ -11,8 +11,7 @@ from bot.exchange.okx_client import OKXAPIError, OKXFuturesClient
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.logger import setup_logging
 from bot.risk.risk_manager import RiskManager
-from bot.storage.supabase_journal import SupabaseJournal
-from bot.storage.trade_store import TradeStore
+from bot.storage.supabase_trade_store import SupabaseTradeStore
 from bot.strategy.grok_strategy import GrokStrategy
 
 
@@ -26,6 +25,13 @@ async def run() -> None:
     )
     logger.info("AI model: xAI %s", settings.xai_model)
 
+    if not (settings.supabase_url and settings.supabase_service_role_key):
+        raise RuntimeError(
+            "Supabase primary store is required. Fill SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY; "
+            "local trade.db is disabled for this runtime."
+        )
+    logger.info("Supabase primary store enabled; local trade.db will not be used.")
+
     client = OKXFuturesClient(
         api_key=settings.okx_api_key,
         secret_key=settings.okx_secret_key,
@@ -38,7 +44,7 @@ async def run() -> None:
         insecure_ssl=settings.okx_insecure_ssl,
         debug_http=settings.okx_debug_http,
     )
-    store = TradeStore(settings.database_path)
+    store = SupabaseTradeStore(settings, logger)
     risk = RiskManager(
         store,
         max_stop_losses_per_day=settings.max_stop_loss_per_day,
@@ -48,12 +54,9 @@ async def run() -> None:
     signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
     intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)
     brain = GrokBrain(settings, logger)
-    supabase_journal = SupabaseJournal(settings, logger)
-    if supabase_journal.enabled:
-        logger.info("Supabase mirror enabled.")
-    orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal)
+    orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
     strategy = GrokStrategy(orchestrator)
-    engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal)
+    engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal=None)
 
     try:
         await engine.run_forever()
@@ -62,7 +65,9 @@ async def run() -> None:
         raise SystemExit(1) from None
     finally:
         await strategy.close()
-        await supabase_journal.close()
+        store_close = getattr(store, "close", None)
+        if store_close is not None:
+            await store_close()
         await client.close()
 
 
