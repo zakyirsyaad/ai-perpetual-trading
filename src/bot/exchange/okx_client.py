@@ -11,13 +11,28 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from bot.models import PositionDirection
 
 
 class OKXAPIError(Exception):
     """Raised when OKX returns a non-success response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        payload: dict[str, Any] | None = None,
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.payload = payload
+        self.retryable = retryable
 
 
 @dataclass(slots=True)
@@ -175,16 +190,37 @@ class OKXFuturesClient:
         return float(value) if value not in (None, "") else 0.0
 
     async def has_open_position(self, symbol: str) -> bool:
+        size, _ = await self.get_symbol_position_snapshot(symbol)
+        return size > 0
+
+    async def has_any_open_position(self, symbols: tuple[str, ...]) -> bool:
+        for symbol in symbols:
+            if await self.has_open_position(symbol):
+                return True
+        return False
+
+    async def get_symbol_position_quantity(self, symbol: str) -> float:
+        size, _ = await self.get_symbol_position_snapshot(symbol)
+        return size
+
+    async def get_symbol_position_snapshot(self, symbol: str) -> tuple[float, float | None]:
+        """Return (absolute OKX position size, average entry price) for a symbol."""
         resp = await self.get_position_info(symbol)
         data = resp.get("data") if isinstance(resp.get("data"), list) else []
+        target_inst_id = self._normalize_symbol(symbol).upper()
         for row in data:
             if not isinstance(row, dict):
                 continue
-            if str(row.get("instId", "")).upper() != self._normalize_symbol(symbol).upper():
+            if str(row.get("instId", "")).upper() != target_inst_id:
                 continue
-            if abs(self._parse_decimal(row.get("pos"))) > 0:
-                return True
-        return False
+            size = abs(self._parse_decimal(row.get("pos")))
+            if size <= 0:
+                continue
+            avg_price = self._parse_decimal(
+                row.get("avgPx") or row.get("openAvgPx") or row.get("markPx")
+            )
+            return float(size), float(avg_price) if avg_price > 0 else None
+        return 0.0, None
 
     async def calculate_order_size(self, symbol: str, base_quantity: float) -> float:
         instrument = await self._get_instrument(symbol)
@@ -222,15 +258,18 @@ class OKXFuturesClient:
         return instrument
 
     async def _public_request(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
         async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type((httpx.HTTPError, OKXAPIError)),
+            retry=retry_if_exception(self._is_retryable_exception),
             wait=wait_exponential(multiplier=0.8, min=0.8, max=8),
             stop=stop_after_attempt(5),
             reraise=True,
         ):
             with attempt:
-                response = await self._client.request(method.upper(), url, params=params or {})
+                response = await self._client.request(
+                    method.upper(),
+                    f"{self._base_url}{path}",
+                    params=params or {},
+                )
                 body = self._parse_response(response, "public")
                 if body.get("code") not in ("0", 0, None):
                     raise OKXAPIError(f"OKX public API error: {body}")
@@ -245,14 +284,14 @@ class OKXFuturesClient:
         request_path = path
 
         if method_upper == "GET" and payload:
-            query = urlencode(payload)
+            query = urlencode(payload, doseq=True)
             request_path = f"{path}?{query}"
         elif method_upper != "GET":
             request_body = json.dumps(payload, separators=(",", ":"))
 
-        url = f"{self._base_url}{path}"
+        url = f"{self._base_url}{request_path if method_upper == 'GET' else path}"
         async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type((httpx.HTTPError, OKXAPIError)),
+            retry=retry_if_exception(self._is_retryable_exception),
             wait=wait_exponential(multiplier=0.8, min=0.8, max=8),
             stop=stop_after_attempt(5),
             reraise=True,
@@ -261,7 +300,7 @@ class OKXFuturesClient:
                 timestamp = self._timestamp()
                 headers = self._signed_headers(timestamp, method_upper, request_path, request_body)
                 if method_upper == "GET":
-                    response = await self._client.get(url, params=query, headers=headers)
+                    response = await self._client.get(url, headers=headers)
                 else:
                     response = await self._client.request(
                         method_upper,
@@ -296,7 +335,6 @@ class OKXFuturesClient:
         return headers
 
     def _parse_response(self, response: httpx.Response, api_kind: str) -> dict[str, Any]:
-        response.raise_for_status()
         try:
             body = response.json()
         except ValueError:
@@ -308,6 +346,23 @@ class OKXFuturesClient:
             )
         if self._debug_http:
             print(json.dumps(body, ensure_ascii=True)[:1000])
+        if response.is_error:
+            payload = body if isinstance(body, dict) else {"body": body}
+            code = str(payload.get("code") or "") if isinstance(payload, dict) else None
+            hint = ""
+            if api_kind == "signed" and response.status_code in {401, 403}:
+                hint = (
+                    " Check OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, demo-vs-live API key, "
+                    "regional OKX_BASE_URL, IP allowlist, and system clock."
+                )
+            raise OKXAPIError(
+                f"OKX {api_kind} API HTTP {response.status_code}: "
+                f"{json.dumps(payload, ensure_ascii=True)}.{hint}",
+                status_code=response.status_code,
+                code=code,
+                payload=payload,
+                retryable=response.status_code in {408, 409, 425, 429} or response.status_code >= 500,
+            )
         return body
 
     def _normalize_symbol(self, symbol: str) -> str:
@@ -349,6 +404,12 @@ class OKXFuturesClient:
         if step <= 0:
             return value
         return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+    @staticmethod
+    def _is_retryable_exception(exc: BaseException) -> bool:
+        if isinstance(exc, OKXAPIError):
+            return exc.retryable
+        return isinstance(exc, httpx.HTTPError)
 
     @staticmethod
     def _format_decimal(value: Decimal) -> str:

@@ -77,9 +77,7 @@ class TradeStore:
             )
             await self._ensure_column(db, "closed_trades", "entry_reason", "TEXT NOT NULL DEFAULT ''")
             await self._ensure_column(db, "open_positions", "entry_reason", "TEXT NOT NULL DEFAULT ''")
-<<<<<<< HEAD
             await self._ensure_column(db, "open_positions", "exchange_size", "REAL NOT NULL DEFAULT 0")
-=======
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_closed_trades_closed_at
@@ -104,7 +102,6 @@ class TradeStore:
                 ON open_positions(opened_at)
                 """
             )
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
             await db.commit()
 
     async def _ensure_column(

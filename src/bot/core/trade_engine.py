@@ -129,39 +129,22 @@ class TradeEngine:
 
     async def _execute_single_trade(self, plan: TradePlan) -> None:
         entry_price = await self._client.get_last_price(plan.symbol)
-<<<<<<< HEAD
         base_quantity = self._calculate_quantity(plan.usdt_size, plan.leverage, entry_price)
         exchange_size = await self._client.calculate_order_size(plan.symbol, base_quantity)
         if exchange_size < self._settings.min_order_contracts:
-=======
-        target_quantity = self._calculate_quantity(plan.usdt_size, plan.leverage, entry_price)
-        if target_quantity < self._settings.min_order_quantity:
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
             self._logger.warning(
                 "Skipped trade for %s, order size %.8f below MIN_ORDER_CONTRACTS %.8f",
                 plan.symbol,
-<<<<<<< HEAD
                 exchange_size,
                 self._settings.min_order_contracts,
             )
             return
         self._logger.info(
-            "Opening %s %s | base_qty=%s | okx_size=%s | entry_price=%s | decision=%s",
+            "Opening %s %s | base_qty=%.8f | okx_size=%.8f | entry_price=%.8f | conf=%.2f | setup=%.2f | decision=%s",
             plan.symbol,
             plan.direction.value,
             base_quantity,
             exchange_size,
-=======
-                target_quantity,
-                self._settings.min_order_quantity,
-            )
-            return
-        self._logger.info(
-            "Opening %s %s | qty=%.8f | ref_price=%.8f | conf=%.2f | setup=%.2f | decision=%s",
-            plan.symbol,
-            plan.direction.value,
-            target_quantity,
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
             entry_price,
             plan.confidence,
             plan.setup_score,
@@ -171,30 +154,28 @@ class TradeEngine:
         entry_resp = await self._client.place_market_order(
             symbol=plan.symbol,
             direction=plan.direction,
-<<<<<<< HEAD
             size=exchange_size,
-=======
-            quantity=target_quantity,
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
             reduce_only=False,
         )
         entry_order_id = self._extract_order_id(entry_resp)
         await asyncio.sleep(self._settings.order_fill_wait_seconds)
         # Verify that a position actually exists and adjust to the filled quantity.
-        filled_qty, filled_entry_price = await self._client.get_symbol_position_snapshot(plan.symbol)
-        if filled_qty <= 0:
+        filled_size, filled_entry_price = await self._client.get_symbol_position_snapshot(plan.symbol)
+        if filled_size <= 0:
             raise RuntimeError(
                 f"Entry order placed but no open position detected for {plan.symbol}."
             )
-        if filled_qty < target_quantity * 0.5:
+        if filled_size < exchange_size * 0.5:
             self._logger.warning(
-                "Entry for %s appears partially filled: target_qty=%.8f, exchange_qty=%.8f. "
+                "Entry for %s appears partially filled: target_okx_size=%.8f, exchange_okx_size=%.8f. "
                 "Proceeding with smaller size.",
                 plan.symbol,
-                target_quantity,
-                filled_qty,
+                exchange_size,
+                filled_size,
             )
-        quantity = filled_qty
+        filled_base_quantity = await self._client.estimate_base_quantity(plan.symbol, filled_size)
+        if filled_base_quantity <= 0:
+            filled_base_quantity = base_quantity
         if filled_entry_price:
             entry_price = filled_entry_price
         opened_at = datetime.now(timezone.utc)
@@ -203,8 +184,8 @@ class TradeEngine:
             symbol=plan.symbol,
             direction=plan.direction,
             entry_price=entry_price,
-            quantity=base_quantity,
-            exchange_size=exchange_size,
+            quantity=filled_base_quantity,
+            exchange_size=filled_size,
             exchange_order_id=entry_order_id,
             opened_at=opened_at,
             entry_reason=plan.decision_reason,
@@ -219,9 +200,9 @@ class TradeEngine:
         # It is possible that the exchange position was already closed or resized externally
         # (manual close, liquidation, partial close, etc.). In that case we should not try to
         # send a reduce-only order for the original size.
-        exchange_qty, _ = await self._client.get_symbol_position_snapshot(open_position.symbol)
+        exchange_size_to_close, _ = await self._client.get_symbol_position_snapshot(open_position.symbol)
         realized_qty = open_position.quantity
-        if exchange_qty <= 0:
+        if exchange_size_to_close <= 0:
             self._logger.warning(
                 "No position to close on exchange for %s; treating as already closed. reason=%s",
                 open_position.symbol,
@@ -230,22 +211,20 @@ class TradeEngine:
             exit_order_id = "NO_POSITION_TO_CLOSE"
             exit_price = await self._client.get_last_price(open_position.symbol)
         else:
-            realized_qty = exchange_qty
-            if abs(realized_qty - open_position.quantity) > 1e-8:
+            realized_qty = await self._client.estimate_base_quantity(open_position.symbol, exchange_size_to_close)
+            if realized_qty <= 0:
+                realized_qty = open_position.quantity
+            if abs(exchange_size_to_close - open_position.exchange_size) > 1e-8:
                 self._logger.warning(
-                    "Exchange position size for %s changed during trade lifecycle: local_qty=%.8f, exchange_qty=%.8f.",
+                    "Exchange position size for %s changed during trade lifecycle: local_okx_size=%.8f, exchange_okx_size=%.8f.",
                     open_position.symbol,
-                    open_position.quantity,
-                    realized_qty,
+                    open_position.exchange_size,
+                    exchange_size_to_close,
                 )
             exit_resp = await self._client.place_market_order(
                 symbol=open_position.symbol,
                 direction=open_position.direction,
-<<<<<<< HEAD
-                size=open_position.exchange_size,
-=======
-                quantity=realized_qty,
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
+                size=exchange_size_to_close,
                 reduce_only=True,
             )
             exit_order_id = self._extract_order_id(exit_resp)
@@ -260,20 +239,12 @@ class TradeEngine:
             open_position.direction,
             open_position.entry_price,
             exit_price,
-<<<<<<< HEAD
-            open_position.quantity,
-=======
             realized_qty,
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
         )
         total_fee = self._estimate_total_taker_fee(
             open_position.entry_price,
             exit_price,
-<<<<<<< HEAD
-            open_position.quantity,
-=======
             realized_qty,
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
             self._settings.taker_fee_pct,
         )
         pnl = gross_pnl - total_fee
@@ -369,19 +340,6 @@ class TradeEngine:
                     "TP hit but gross %.4f < fee %.4f; holding for better exit.",
                     gross, fee,
                 )
-<<<<<<< HEAD
-            else:
-                elapsed = datetime.now(timezone.utc).timestamp() - position.opened_at.timestamp()
-                ai_exit = await self._strategy.exit_signal(position, current_price, elapsed)
-                if ai_exit.close_now:
-                    if gross >= fee:
-                        return f"strategy_exit:{ai_exit.reason}"
-                    self._logger.debug(
-                        "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
-                        gross, fee,
-                    )
-            await asyncio.sleep(self._settings.market_poll_seconds)
-=======
             if elapsed >= max_hold_seconds:
                 return "time_stop"
             ai_exit = await self._strategy.exit_signal(position, current_price, elapsed)
@@ -397,7 +355,6 @@ class TradeEngine:
     def _resolve_max_hold_seconds(self, plan: TradePlan) -> float:
         hold_minutes = plan.max_hold_minutes or self._settings.position_hold_minutes
         return max(float(hold_minutes), 1.0) * 60.0
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
 
     @staticmethod
     def _hit_take_profit(direction: PositionDirection, entry: float, current: float, pct: float) -> bool:

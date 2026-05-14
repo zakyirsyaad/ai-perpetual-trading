@@ -14,7 +14,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-<<<<<<< HEAD
     okx_api_key: str = Field(alias="OKX_API_KEY")
     okx_secret_key: str = Field(alias="OKX_SECRET_KEY")
     okx_passphrase: str = Field(alias="OKX_PASSPHRASE")
@@ -26,7 +25,9 @@ class Settings(BaseSettings):
     okx_insecure_ssl: bool = Field(default=False, alias="OKX_INSECURE_SSL")
     okx_debug_http: bool = Field(default=False, alias="OKX_DEBUG_HTTP")
     okx_require_set_leverage: bool = Field(default=False, alias="OKX_REQUIRE_SET_LEVERAGE")
-=======
+
+    # Legacy BingX/paper strategy settings are optional and are not used by the
+    # OKX demo runtime in src/main.py.
     bingx_api_key: str | None = Field(default=None, alias="BINGX_API_KEY")
     bingx_secret_key: str | None = Field(default=None, alias="BINGX_SECRET_KEY")
     bingx_base_url: str = Field(default="https://open-api.bingx.com", alias="BINGX_BASE_URL")
@@ -35,7 +36,6 @@ class Settings(BaseSettings):
     use_testnet: bool = Field(default=False, alias="USE_TESTNET")
     enable_live_trading: bool = Field(default=False, alias="ENABLE_LIVE_TRADING")
     strategy_mode: str = Field(default="rule", alias="STRATEGY_MODE")
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
 
     symbols: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("BTC/USDT", "ETH/USDT"),
@@ -77,12 +77,8 @@ class Settings(BaseSettings):
     xai_timeout_seconds: int = Field(default=90, alias="XAI_TIMEOUT_SECONDS")
     ai_kline_interval: str = Field(default="1m", alias="AI_KLINE_INTERVAL")
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
-<<<<<<< HEAD
     ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")
-=======
-    ai_min_confidence: float = Field(default=0.60, alias="AI_MIN_CONFIDENCE")
     ai_min_setup_score: float = Field(default=0.58, ge=0.0, le=1.0, alias="AI_MIN_SETUP_SCORE")
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
     ai_systemic_risk_no_trade_threshold: int = Field(
         default=4,
         ge=1,
@@ -90,9 +86,7 @@ class Settings(BaseSettings):
         alias="AI_SYSTEMIC_RISK_NO_TRADE_THRESHOLD",
     )
     ai_pre_trade_check: bool = Field(default=True, alias="AI_PRE_TRADE_CHECK")
-<<<<<<< HEAD
     external_signal_cache_seconds: int = Field(default=300, alias="EXTERNAL_SIGNAL_CACHE_SECONDS")
-=======
     ai_exit_check_interval_seconds: int = Field(
         default=30,
         ge=5,
@@ -103,7 +97,6 @@ class Settings(BaseSettings):
         ge=0.0,
         alias="AI_EXIT_PRICE_MOVE_THRESHOLD_PCT",
     )
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
 
     # Layer 3 external market signals.
     coinmarketcap_api_key: str | None = Field(default=None, alias="COINMARKETCAP_API_KEY")
@@ -135,30 +128,16 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = Field(default=20, alias="REQUEST_TIMEOUT_SECONDS")
     db_path: str = Field(default="bot_data/trades.db", alias="DB_PATH")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-<<<<<<< HEAD
-=======
-    order_fill_wait_seconds: int = Field(default=5, alias="ORDER_FILL_WAIT_SECONDS")
     position_monitor_interval_seconds: int = Field(
         default=5,
         ge=1,
         alias="POSITION_MONITOR_INTERVAL_SECONDS",
     )
-    max_daily_drawdown_usdt: float = Field(default=100.0, alias="MAX_DAILY_DRAWDOWN_USDT")
-    max_consecutive_losses: int = Field(default=3, alias="MAX_CONSECUTIVE_LOSSES")
-    prevent_new_entries_if_exchange_position_open: bool = Field(
-        default=True,
-        alias="PREVENT_NEW_ENTRIES_IF_EXCHANGE_POSITION_OPEN",
-    )
     min_order_quantity: float = Field(default=0.0001, alias="MIN_ORDER_QUANTITY")
-    # AI provider: xAI (Grok)
-    xai_api_key: str | None = Field(default=None, alias="XAI_API_KEY")
-    xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
-    xai_model: str = Field(default="grok-4-latest", alias="XAI_MODEL")
 
     # Backward compatibility (older envs). Prefer XAI_*.
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
 
     @field_validator(
         "bingx_api_key",

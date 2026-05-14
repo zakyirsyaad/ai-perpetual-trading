@@ -125,6 +125,7 @@ class AIOrchestrator:
             take_profit_pct=tp_pct,
             decision_reason=reason,
             decision_payload=decision.model_dump(),
+            confidence=decision.confidence,
         )
 
     async def exit_signal(

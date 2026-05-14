@@ -20,13 +20,10 @@ class TradePlan:
     stop_loss_pct: float
     take_profit_pct: float
     decision_reason: str = "rule"
-<<<<<<< HEAD
     decision_payload: dict[str, Any] | None = None
-=======
     confidence: float = 0.0
     setup_score: float = 0.0
     max_hold_minutes: int | None = None
->>>>>>> c78be0d66ab75cb6b8447245488aab66339bae13
 
 
 @dataclass(slots=True)

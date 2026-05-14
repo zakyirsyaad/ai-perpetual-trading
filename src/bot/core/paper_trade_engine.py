@@ -89,6 +89,7 @@ class PaperTradeEngine:
             direction=plan.direction,
             entry_price=entry_price,
             quantity=quantity,
+            exchange_size=quantity,
             exchange_order_id=order_id,
             opened_at=opened_at,
             entry_reason=plan.decision_reason,
