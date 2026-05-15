@@ -26,6 +26,13 @@ class EntryDecision(BaseModel):
     learning_note: str = Field(default="", max_length=500)
 
 
+class EntryDecisionBatch(BaseModel):
+    decisions: list[EntryDecision] = Field(
+        min_length=1,
+        description="One independent entry decision for each allowed symbol.",
+    )
+
+
 class PreTradeCheck(BaseModel):
     approved: bool
     confirmations: str = Field(min_length=1, max_length=500)
@@ -46,11 +53,16 @@ You are a disciplined quant scalper and risk manager. You evaluate only live mar
 
 Principles:
 - Protect capital and avoid chaotic/noisy markets.
-- Prefer HOLD when trend, momentum, liquidity, and external signals conflict.
+- Prefer HOLD when trend, momentum, liquidity, and external signals conflict, but do not use recent losses
+  as a blanket veto when the current setup is clearly different and passes risk controls.
 - Use OKX technicals as the execution truth; use CoinMarketCap, Dune, and TradingView-derived signals as supporting context.
 - Learn from recent executed demo-trade outcomes. Avoid repeating patterns with negative average PnL.
 - Never invent missing data. If an external provider is empty, mark that in your reason and reduce confidence.
-- High leverage can liquidate quickly. Keep stop-loss realistic and take-profit at least equal or better than stop distance.
+- High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise and take-profit
+  far enough to beat taker fees with positive fee-adjusted risk/reward.
+- For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct, take_profit_pct, and risk_reward_ratio.
+- Return one decision for every allowed symbol in decisions. Do not omit ETH/USDT.
+- Evaluate each symbol independently. Do not default to BTC/USDT when ETH/USDT has the cleaner setup.
 """
 
 
@@ -82,6 +94,17 @@ class GrokBrain:
             schema=EntryDecision,
             reasoning_effort=self._settings.xai_reasoning_effort,
         )
+
+    async def entry_decisions(self, payload: dict[str, Any]) -> list[EntryDecision] | None:
+        response = await self._ask_grok(
+            system_prompt=ENTRY_SYSTEM_PROMPT,
+            payload=payload,
+            schema=EntryDecisionBatch,
+            reasoning_effort=self._settings.xai_reasoning_effort,
+        )
+        if response is None:
+            return None
+        return response.decisions
 
     async def pre_trade_check(self, payload: dict[str, Any]) -> PreTradeCheck | None:
         system_prompt = (

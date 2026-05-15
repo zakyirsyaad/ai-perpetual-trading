@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     okx_passphrase: str = Field(alias="OKX_PASSPHRASE")
     okx_base_url: str = Field(default="https://www.okx.com", alias="OKX_BASE_URL")
     okx_demo_trading: bool = Field(default=True, alias="OKX_DEMO_TRADING")
-    okx_margin_mode: str = Field(default="cross", alias="OKX_MARGIN_MODE")
+    okx_margin_mode: str = Field(default="isolated", alias="OKX_MARGIN_MODE")
     okx_position_mode: str = Field(default="long_short_mode", alias="OKX_POSITION_MODE")
     okx_instrument_type: str = Field(default="SWAP", alias="OKX_INSTRUMENT_TYPE")
     okx_insecure_ssl: bool = Field(default=False, alias="OKX_INSECURE_SSL")
@@ -41,9 +41,13 @@ class Settings(BaseSettings):
         default=("BTC/USDT", "ETH/USDT"),
         alias="SYMBOLS",
     )
+    decision_timeframes: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("1m", "3m", "5m"),
+        alias="DECISION_TIMEFRAMES",
+    )
     trade_target_per_day: int = Field(default=20, alias="TRADE_TARGET_PER_DAY")
     max_stop_loss_per_day: int = Field(default=2, alias="MAX_STOP_LOSS_PER_DAY")
-    leverage: int = Field(default=20, alias="LEVERAGE")
+    leverage: int = Field(default=3, ge=1, le=5, alias="LEVERAGE")
     position_usdt: float = Field(default=20.0, alias="POSITION_USDT")
     min_order_contracts: float = Field(default=1.0, alias="MIN_ORDER_CONTRACTS")
 
@@ -56,7 +60,7 @@ class Settings(BaseSettings):
     order_fill_wait_seconds: int = Field(default=3, alias="ORDER_FILL_WAIT_SECONDS")
 
     # Dynamic risk management.
-    account_balance_usdt: float = Field(default=1000.0, alias="ACCOUNT_BALANCE_USDT")
+    account_balance_usdt: float = Field(default=60.0, alias="ACCOUNT_BALANCE_USDT")
     max_risk_pct_per_trade: float = Field(default=0.5, alias="MAX_RISK_PCT_PER_TRADE")
     atr_sl_multiplier: float = Field(default=1.5, alias="ATR_SL_MULTIPLIER")
     atr_tp_multiplier: float = Field(default=3.0, alias="ATR_TP_MULTIPLIER")
@@ -73,12 +77,13 @@ class Settings(BaseSettings):
     xai_api_key: str = Field(alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
     xai_model: str = Field(default="grok-4.3", alias="XAI_MODEL")
-    xai_reasoning_effort: str = Field(default="medium", alias="XAI_REASONING_EFFORT")
+    xai_reasoning_effort: str = Field(default="high", alias="XAI_REASONING_EFFORT")
     xai_timeout_seconds: int = Field(default=90, alias="XAI_TIMEOUT_SECONDS")
     ai_kline_interval: str = Field(default="1m", alias="AI_KLINE_INTERVAL")
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
     ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")
     ai_min_setup_score: float = Field(default=0.58, ge=0.0, le=1.0, alias="AI_MIN_SETUP_SCORE")
+    ai_min_fee_adjusted_rr: float = Field(default=1.35, ge=0.1, alias="AI_MIN_FEE_ADJUSTED_RR")
     ai_systemic_risk_no_trade_threshold: int = Field(
         default=4,
         ge=1,
@@ -97,6 +102,25 @@ class Settings(BaseSettings):
         ge=0.0,
         alias="AI_EXIT_PRICE_MOVE_THRESHOLD_PCT",
     )
+
+    # Exchange-agnostic perpetual futures layer defaults.
+    perp_exchange_api_name: str | None = Field(default=None, alias="PERP_EXCHANGE_API_NAME")
+    perp_daily_fee_budget_pct: float = Field(default=0.03, ge=0.0, alias="PERP_DAILY_FEE_BUDGET_PCT")
+    perp_risk_per_trade_pct: float = Field(default=0.0075, ge=0.0, alias="PERP_RISK_PER_TRADE_PCT")
+    perp_fee_round_trip: float = Field(default=0.005, gt=0.0, alias="PERP_FEE_ROUND_TRIP")
+    perp_slippage_round_trip: float = Field(default=0.0004, ge=0.0, alias="PERP_SLIPPAGE_ROUND_TRIP")
+    perp_edge_buffer_bps: float = Field(default=5.0, ge=0.0, alias="PERP_EDGE_BUFFER_BPS")
+    perp_leverage_cap: int = Field(default=3, ge=1, le=5, alias="PERP_LEVERAGE_CAP")
+    perp_hard_max_leverage: int = Field(default=5, ge=1, le=5, alias="PERP_HARD_MAX_LEVERAGE")
+    perp_venue_max_leverage: int | None = Field(default=None, ge=1, le=125, alias="PERP_VENUE_MAX_LEVERAGE")
+    perp_max_spread_bps: float = Field(default=6.0, ge=0.0, alias="PERP_MAX_SPREAD_BPS")
+    perp_funding_blackout_minutes: int = Field(default=10, ge=0, alias="PERP_FUNDING_BLACKOUT_MINUTES")
+    perp_max_daily_realized_drawdown_pct: float = Field(
+        default=0.03,
+        ge=0.0,
+        alias="PERP_MAX_DAILY_REALIZED_DRAWDOWN_PCT",
+    )
+    perp_max_rolling_drawdown_pct: float = Field(default=0.05, ge=0.0, alias="PERP_MAX_ROLLING_DRAWDOWN_PCT")
 
     # Layer 3 external market signals.
     coinmarketcap_api_key: str | None = Field(default=None, alias="COINMARKETCAP_API_KEY")
@@ -146,6 +170,7 @@ class Settings(BaseSettings):
         "xai_api_key",
         "xai_base_url",
         "xai_model",
+        "perp_exchange_api_name",
         "openai_api_key",
         "openai_model",
         mode="before",
@@ -178,6 +203,22 @@ class Settings(BaseSettings):
             return tuple(str(item).strip().upper().replace("-", "/") for item in value if str(item).strip())
         return value
 
+    @field_validator("perp_venue_max_leverage", mode="before")
+    @classmethod
+    def parse_optional_int(cls, value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    @field_validator("decision_timeframes", mode="before")
+    @classmethod
+    def parse_decision_timeframes(cls, value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return tuple(item.strip().lower() for item in value.split(",") if item.strip())
+        if isinstance(value, (list, tuple)):
+            return tuple(str(item).strip().lower() for item in value if str(item).strip())
+        return value
+
     @field_validator("dune_query_ids", mode="before")
     @classmethod
     def parse_dune_query_ids(cls, value: Any) -> tuple[str, ...]:
@@ -193,8 +234,8 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_margin_mode(cls, value: str) -> str:
         out = value.lower().strip()
-        if out not in {"cross", "isolated"}:
-            raise ValueError("OKX_MARGIN_MODE must be 'cross' or 'isolated'")
+        if out != "isolated":
+            raise ValueError("OKX_MARGIN_MODE must be 'isolated'; cross margin is not allowed.")
         return out
 
     @field_validator("okx_position_mode")
@@ -217,6 +258,22 @@ class Settings(BaseSettings):
         if out not in {"none", "low", "medium", "high"}:
             raise ValueError("XAI_REASONING_EFFORT must be none, low, medium, or high")
         return out
+
+    @field_validator("decision_timeframes")
+    @classmethod
+    def validate_decision_timeframes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = {"1m", "3m", "5m"}
+        invalid = [item for item in value if item not in allowed]
+        if invalid:
+            raise ValueError("DECISION_TIMEFRAMES may only contain 1m, 3m, and 5m")
+        return value
+
+    @field_validator("perp_leverage_cap")
+    @classmethod
+    def validate_perp_leverage_cap(cls, value: int) -> int:
+        if value > 3:
+            raise ValueError("PERP_LEVERAGE_CAP defaults to 3 and must not exceed 3 until venue tiers are known.")
+        return value
 
     @field_validator("dune_performance_tier")
     @classmethod

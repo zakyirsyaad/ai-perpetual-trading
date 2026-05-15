@@ -28,6 +28,11 @@ src/
     strategy/
       grok_strategy.py
       indicators.py
+    perps/
+      exchange_adapter.py   # Venue-neutral perpetual futures boundary
+      execution.py          # Maker-first entry and reduce-only exit state machine
+      risk.py               # Fee/slippage-aware sizing and kill-switch checks
+      backtester.py         # Conservative event-driven/hybrid backtester
 ```
 
 ## Live Signal Sources
@@ -43,7 +48,15 @@ src/
 - `OKX_DEMO_TRADING=true` is required. The bot refuses to start if this is false.
 - OKX demo requests include the `x-simulated-trading: 1` header.
 - xAI defaults to `grok-4.3`.
+- xAI reasoning defaults to `high` for the Grok 4.3 High strategy profile.
+- Perpetual futures safety defaults are isolated margin, 3x leverage cap, 5x hard max, and one net open position total.
 - The bot learns only from executed demo trades and saved AI decisions, not from fake or replayed fills.
+
+## Perpetual Futures Layer
+
+The exchange-agnostic perpetual futures layer lives in `src/bot/perps`. It keeps venue REST, WebSocket, auth, and instrument metadata behind `ExchangeAdapter`, with `MockExchangeAdapter` available for tests.
+
+See [docs/perps.md](docs/perps.md) and [config/perps.safe-defaults.json](config/perps.safe-defaults.json) for assumptions, sizing math, kill-switch defaults, backtest behavior, and venue-specific TODOs.
 
 ## Setup
 
