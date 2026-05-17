@@ -64,6 +64,44 @@ class PerpsRiskTests(unittest.TestCase):
         self.assertFalse(sizing.accepted)
         self.assertIn("expected_move_bps", sizing.rejected_reason or "")
 
+    def test_volume_sizing_uses_configured_margin_per_entry(self) -> None:
+        config = PerpsConfig(
+            starting_equity_usdt=1500,
+            target_trades_per_day=16,
+            sizing_mode="volume",
+            target_margin_per_entry_usdt=180,
+            default_leverage=100,
+            leverage_cap=100,
+            hard_max_leverage=100,
+            venue_max_leverage=100,
+            min_liquidation_distance_bps=10,
+        )
+        risk = PerpsRiskEngine(config)
+        instrument = InstrumentMetadata(
+            symbol="BTC/USDT",
+            base_asset="BTC",
+            quote_asset="USDT",
+            price_tick=Decimal("0.1"),
+            qty_step=Decimal("0.00001"),
+            min_qty=Decimal("0.00001"),
+            min_notional=Decimal("5"),
+            max_leverage=100,
+        )
+
+        sizing = risk.size_order(
+            signal=self._signal(expected_move_bps=1, stop_bps=5, take_bps=8),
+            instrument=instrument,
+            snapshot=self.snapshot,
+            equity_usdt=Decimal("1500"),
+            requested_leverage=100,
+        )
+
+        self.assertTrue(sizing.accepted, sizing.rejected_reason)
+        self.assertEqual(sizing.leverage, 100)
+        self.assertEqual(sizing.n_margin, Decimal("18000"))
+        self.assertAlmostEqual(float(sizing.margin_used), 180.0, places=2)
+        self.assertAlmostEqual(float(sizing.projected_round_trip_volume), 36_000.0, delta=2.0)
+
     def test_kill_switches_block_entries(self) -> None:
         signal = self._signal(expected_move_bps=85)
         result = self.risk.evaluate_entry(
@@ -89,7 +127,7 @@ class PerpsRiskTests(unittest.TestCase):
         self.assertIn("fee_budget_breach", result.reasons)
 
     @staticmethod
-    def _signal(expected_move_bps: float) -> NormalizedSignal:
+    def _signal(expected_move_bps: float, stop_bps: float = 50, take_bps: float = 95) -> NormalizedSignal:
         return NormalizedSignal.model_validate(
             {
                 "symbol": "BTC/USDT",
@@ -97,8 +135,8 @@ class PerpsRiskTests(unittest.TestCase):
                 "side": "long",
                 "confidence": 0.75,
                 "expected_move_bps": expected_move_bps,
-                "stop_bps": 50,
-                "take_bps": 95,
+                "stop_bps": stop_bps,
+                "take_bps": take_bps,
                 "max_hold_minutes": 12,
                 "rationale_codes": ["trend:bullish"],
                 "invalidation_reason": "breaks support",

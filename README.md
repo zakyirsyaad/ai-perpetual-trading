@@ -37,7 +37,7 @@ src/
 
 ## Live Signal Sources
 
-- OKX public/private API: execution source of truth, candles, ticker, funding rate, open interest, positions, leverage, and market orders.
+- OKX public/private API: execution source of truth, candles, ticker, order book, account fee rate, funding rate, open interest, positions, leverage, and orders.
 - CoinMarketCap: latest quotes via `/v2/cryptocurrency/quotes/latest` when `COINMARKETCAP_API_KEY` is configured.
 - Dune Analytics: runs built-in SQL signals via `/api/v1/sql/execute` when `DUNE_API_KEY` is configured. Saved query IDs in `DUNE_QUERY_IDS` are optional.
 - TradingView: uses the included local relay at `src/tradingview_relay.py`. TradingView does not provide a general public market-data API for bots, so alerts must be pushed into the relay.
@@ -50,6 +50,8 @@ src/
 - xAI defaults to `grok-4.3`.
 - xAI reasoning defaults to `high` for the Grok 4.3 High strategy profile.
 - Perpetual futures safety defaults are isolated margin, 3x leverage cap, 5x hard max, and one net open position total.
+- `STRATEGY_MODE=ai_volume` lets Grok choose timing, symbol, and direction while execution size follows the volume-builder profile. `STRATEGY_MODE=volume` keeps deterministic rotation, and `STRATEGY_MODE=grok` keeps normal AI risk-sized trading.
+- The OKX runtime refreshes exchange taker fees when `USE_EXCHANGE_FEE_RATES=true`, blocks entries when order-book spread/depth is poor, skips entries near funding, and checks liquidation distance after entry.
 - The bot learns only from executed demo trades and saved AI decisions, not from fake or replayed fills.
 
 ## Perpetual Futures Layer
@@ -57,6 +59,51 @@ src/
 The exchange-agnostic perpetual futures layer lives in `src/bot/perps`. It keeps venue REST, WebSocket, auth, and instrument metadata behind `ExchangeAdapter`, with `MockExchangeAdapter` available for tests.
 
 See [docs/perps.md](docs/perps.md) and [config/perps.safe-defaults.json](config/perps.safe-defaults.json) for assumptions, sizing math, kill-switch defaults, backtest behavior, and venue-specific TODOs.
+
+## Volume Builder Profile
+
+The included `.env.example` is set up for an AI-guided volume-builder run:
+
+```env
+STRATEGY_MODE=ai_volume
+ACCOUNT_BALANCE_USDT=1500
+POSITION_USDT=180
+VOLUME_MARGIN_PER_ENTRY_USDT=180
+LEVERAGE=100
+TRADE_TARGET_PER_DAY=16
+VOLUME_SIDES_PER_ENTRY=2
+VOLUME_TARGET_USDT=10000000
+```
+
+That profile projects `180 * 100 * 2 = 36,000 USDT` round-trip volume per
+completed entry and `36,000 * 16 = 576,000 USDT` per day, so a `10,000,000 USDT`
+target takes about `18` conservative trading days before partial fills, skipped
+entries, fees, and exchange limits. `VOLUME_NEUTRAL_EXIT_ENABLED=true` lets the
+monitor close when estimated net PnL after fee is inside the configured positive
+neutral band, for example `VOLUME_NEUTRAL_EXIT_MIN_NET_USDT=12` through `17`
+when `VOLUME_NEUTRAL_EXIT_BAND_USDT=5`. In `ai_volume` mode the xAI key is
+required because Grok chooses whether to trade; in deterministic `volume` mode
+the xAI key is not required.
+
+For high-leverage volume mode, these execution guards are intentionally separate
+from AI. Grok can say `OPEN`, but the engine can still skip the trade if the
+exchange state is too expensive:
+
+```env
+USE_EXCHANGE_FEE_RATES=true
+EXECUTION_GUARDS_ENABLED=true
+EXECUTION_ENTRY_ORDER_TYPE=market
+ORDERBOOK_DEPTH_LEVELS=20
+MIN_ORDERBOOK_DEPTH_MULTIPLIER=1.2
+MAX_ABS_FUNDING_RATE=0.001
+PERP_MAX_SPREAD_BPS=6
+PERP_FUNDING_BLACKOUT_MINUTES=10
+PERP_MIN_LIQUIDATION_DISTANCE_BPS=10
+```
+
+`EXECUTION_ENTRY_ORDER_TYPE=post_only` can be used for maker-first entry tests.
+When `EXECUTION_POST_ONLY_FALLBACK_TO_MARKET=false`, an unfilled maker entry is
+skipped instead of converted into a taker entry.
 
 ## Setup
 
@@ -142,12 +189,14 @@ python src/main.py
 The engine will:
 
 1. Validate OKX demo API access.
-2. Set account position mode and leverage where OKX allows it.
-3. Gather live OKX data plus configured CMC/Dune/TradingView signals.
-4. Ask Grok for a structured entry or hold decision.
-5. Execute only OKX demo market orders.
-6. Monitor the open position with live prices, TP/SL, AI exits, and risk guards.
-7. Save executed outcomes for future decision context.
+2. Refresh OKX account fee rates where available.
+3. Set account position mode and leverage where OKX allows it.
+4. Gather live OKX data plus configured CMC/Dune/TradingView signals.
+5. Ask Grok for a structured entry or hold decision when `STRATEGY_MODE=grok` or `STRATEGY_MODE=ai_volume`, or rotate deterministic volume-builder entries when `STRATEGY_MODE=volume`.
+6. Run execution guards for spread, depth, funding, and liquidation distance.
+7. Execute OKX demo market entries by default, or post-only entries when configured.
+8. Monitor the open position with live prices, TP/SL, AI exits, and risk guards.
+9. Save executed outcomes for future decision context.
 
 ## Reporting
 
@@ -162,4 +211,5 @@ This summarizes real executed demo trades by AI entry reason.
 
 - For OKX SWAP instruments, internal symbols such as `BTC/USDT` are mapped to OKX instrument IDs such as `BTC-USDT-SWAP`.
 - `POSITION_USDT * LEVERAGE` defines target notional. The OKX client converts base quantity into contract size using OKX instrument metadata.
+- The current runtime is OKX-first. BingX credentials can stay empty until you receive the API key; when switching later, implement the same execution surface now used by the OKX client before pointing `main.py` at BingX.
 - Trading is risky even in demo mode. Validate order sizing, contract metadata, and account position mode before leaving the bot unattended.

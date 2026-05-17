@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from bot.volume import VolumeBuildProfile
 
 
 class Settings(BaseSettings):
@@ -35,7 +37,7 @@ class Settings(BaseSettings):
     bingx_debug_http: bool = Field(default=False, alias="BINGX_DEBUG_HTTP")
     use_testnet: bool = Field(default=False, alias="USE_TESTNET")
     enable_live_trading: bool = Field(default=False, alias="ENABLE_LIVE_TRADING")
-    strategy_mode: str = Field(default="rule", alias="STRATEGY_MODE")
+    strategy_mode: str = Field(default="grok", alias="STRATEGY_MODE")
 
     symbols: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("BTC/USDT", "ETH/USDT"),
@@ -47,9 +49,16 @@ class Settings(BaseSettings):
     )
     trade_target_per_day: int = Field(default=20, alias="TRADE_TARGET_PER_DAY")
     max_stop_loss_per_day: int = Field(default=2, alias="MAX_STOP_LOSS_PER_DAY")
-    leverage: int = Field(default=3, ge=1, le=5, alias="LEVERAGE")
+    leverage: int = Field(default=3, ge=1, le=200, alias="LEVERAGE")
     position_usdt: float = Field(default=20.0, alias="POSITION_USDT")
     min_order_contracts: float = Field(default=1.0, alias="MIN_ORDER_CONTRACTS")
+    volume_margin_per_entry_usdt: float | None = Field(default=None, gt=0.0, alias="VOLUME_MARGIN_PER_ENTRY_USDT")
+    volume_sides_per_entry: int = Field(default=2, ge=1, le=4, alias="VOLUME_SIDES_PER_ENTRY")
+    volume_target_usdt: float = Field(default=10_000_000.0, ge=0.0, alias="VOLUME_TARGET_USDT")
+    volume_neutral_exit_enabled: bool = Field(default=False, alias="VOLUME_NEUTRAL_EXIT_ENABLED")
+    volume_neutral_exit_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_NEUTRAL_EXIT_MIN_SECONDS")
+    volume_neutral_exit_min_net_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_MIN_NET_USDT")
+    volume_neutral_exit_band_usdt: float = Field(default=5.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_BAND_USDT")
 
     entry_interval_minutes: int = Field(default=15, alias="ENTRY_INTERVAL_MINUTES")
     position_hold_minutes: int = Field(default=20, alias="POSITION_HOLD_MINUTES")
@@ -58,6 +67,27 @@ class Settings(BaseSettings):
     taker_fee_pct: float = Field(default=0.05, alias="TAKER_FEE_PCT")
     market_poll_seconds: int = Field(default=5, alias="MARKET_POLL_SECONDS")
     order_fill_wait_seconds: int = Field(default=3, alias="ORDER_FILL_WAIT_SECONDS")
+    use_exchange_fee_rates: bool = Field(default=True, alias="USE_EXCHANGE_FEE_RATES")
+    execution_guards_enabled: bool = Field(default=True, alias="EXECUTION_GUARDS_ENABLED")
+    execution_entry_order_type: str = Field(default="market", alias="EXECUTION_ENTRY_ORDER_TYPE")
+    execution_post_only_timeout_seconds: float = Field(
+        default=8.0,
+        ge=0.5,
+        alias="EXECUTION_POST_ONLY_TIMEOUT_SECONDS",
+    )
+    execution_post_only_max_reprices: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        alias="EXECUTION_POST_ONLY_MAX_REPRICES",
+    )
+    execution_post_only_fallback_to_market: bool = Field(
+        default=False,
+        alias="EXECUTION_POST_ONLY_FALLBACK_TO_MARKET",
+    )
+    orderbook_depth_levels: int = Field(default=20, ge=1, le=400, alias="ORDERBOOK_DEPTH_LEVELS")
+    min_orderbook_depth_multiplier: float = Field(default=1.2, ge=0.0, alias="MIN_ORDERBOOK_DEPTH_MULTIPLIER")
+    max_abs_funding_rate: float = Field(default=0.001, ge=0.0, alias="MAX_ABS_FUNDING_RATE")
 
     # Dynamic risk management.
     account_balance_usdt: float = Field(default=60.0, alias="ACCOUNT_BALANCE_USDT")
@@ -74,7 +104,7 @@ class Settings(BaseSettings):
     )
 
     # Layer 1: xAI Grok brain.
-    xai_api_key: str = Field(alias="XAI_API_KEY")
+    xai_api_key: str | None = Field(default=None, alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
     xai_model: str = Field(default="grok-4.3", alias="XAI_MODEL")
     xai_reasoning_effort: str = Field(default="high", alias="XAI_REASONING_EFFORT")
@@ -110,9 +140,25 @@ class Settings(BaseSettings):
     perp_fee_round_trip: float = Field(default=0.005, gt=0.0, alias="PERP_FEE_ROUND_TRIP")
     perp_slippage_round_trip: float = Field(default=0.0004, ge=0.0, alias="PERP_SLIPPAGE_ROUND_TRIP")
     perp_edge_buffer_bps: float = Field(default=5.0, ge=0.0, alias="PERP_EDGE_BUFFER_BPS")
-    perp_leverage_cap: int = Field(default=3, ge=1, le=5, alias="PERP_LEVERAGE_CAP")
-    perp_hard_max_leverage: int = Field(default=5, ge=1, le=5, alias="PERP_HARD_MAX_LEVERAGE")
-    perp_venue_max_leverage: int | None = Field(default=None, ge=1, le=125, alias="PERP_VENUE_MAX_LEVERAGE")
+    perp_leverage_cap: int = Field(default=3, ge=1, le=200, alias="PERP_LEVERAGE_CAP")
+    perp_hard_max_leverage: int = Field(default=5, ge=1, le=200, alias="PERP_HARD_MAX_LEVERAGE")
+    perp_venue_max_leverage: int | None = Field(default=None, ge=1, le=200, alias="PERP_VENUE_MAX_LEVERAGE")
+    perp_sizing_mode: str = Field(default="risk", alias="PERP_SIZING_MODE")
+    perp_target_margin_per_entry_usdt: float | None = Field(
+        default=None,
+        gt=0.0,
+        alias="PERP_TARGET_MARGIN_PER_ENTRY_USDT",
+    )
+    perp_maintenance_margin_fallback: float = Field(
+        default=0.005,
+        ge=0.0,
+        alias="PERP_MAINTENANCE_MARGIN_FALLBACK",
+    )
+    perp_min_liquidation_distance_bps: float = Field(
+        default=250.0,
+        ge=0.0,
+        alias="PERP_MIN_LIQUIDATION_DISTANCE_BPS",
+    )
     perp_max_spread_bps: float = Field(default=6.0, ge=0.0, alias="PERP_MAX_SPREAD_BPS")
     perp_funding_blackout_minutes: int = Field(default=10, ge=0, alias="PERP_FUNDING_BLACKOUT_MINUTES")
     perp_max_daily_realized_drawdown_pct: float = Field(
@@ -186,7 +232,7 @@ class Settings(BaseSettings):
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
 
-    @field_validator("okx_api_key", "okx_secret_key", "okx_passphrase", "xai_api_key")
+    @field_validator("okx_api_key", "okx_secret_key", "okx_passphrase")
     @classmethod
     def require_non_empty_secret(cls, value: str) -> str:
         if not value or not value.strip():
@@ -209,6 +255,41 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return None
         return int(value)
+
+    @field_validator("volume_margin_per_entry_usdt", "perp_target_margin_per_entry_usdt", mode="before")
+    @classmethod
+    def parse_optional_float(cls, value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
+
+    @field_validator("strategy_mode")
+    @classmethod
+    def normalize_strategy_mode(cls, value: str) -> str:
+        out = value.lower().strip()
+        if out in {"volume", "volume_builder", "rule"}:
+            return "volume"
+        if out in {"ai_volume", "volume_ai", "grok_volume", "ai-volume", "volume-ai"}:
+            return "ai_volume"
+        if out in {"grok", "ai"}:
+            return "grok"
+        raise ValueError("STRATEGY_MODE must be grok, ai_volume, or volume")
+
+    @field_validator("perp_sizing_mode")
+    @classmethod
+    def normalize_perp_sizing_mode(cls, value: str) -> str:
+        out = value.lower().strip()
+        if out not in {"risk", "volume"}:
+            raise ValueError("PERP_SIZING_MODE must be risk or volume")
+        return out
+
+    @field_validator("execution_entry_order_type")
+    @classmethod
+    def normalize_entry_order_type(cls, value: str) -> str:
+        out = value.lower().strip()
+        if out not in {"market", "post_only"}:
+            raise ValueError("EXECUTION_ENTRY_ORDER_TYPE must be market or post_only")
+        return out
 
     @field_validator("decision_timeframes", mode="before")
     @classmethod
@@ -268,13 +349,6 @@ class Settings(BaseSettings):
             raise ValueError("DECISION_TIMEFRAMES may only contain 1m, 3m, and 5m")
         return value
 
-    @field_validator("perp_leverage_cap")
-    @classmethod
-    def validate_perp_leverage_cap(cls, value: int) -> int:
-        if value > 3:
-            raise ValueError("PERP_LEVERAGE_CAP defaults to 3 and must not exceed 3 until venue tiers are known.")
-        return value
-
     @field_validator("dune_performance_tier")
     @classmethod
     def normalize_dune_performance_tier(cls, value: str) -> str:
@@ -283,6 +357,20 @@ class Settings(BaseSettings):
             raise ValueError("DUNE_PERFORMANCE_TIER must be small, medium, or large")
         return out
 
+    @model_validator(mode="after")
+    def validate_cross_field_settings(self) -> "Settings":
+        if self.strategy_mode in {"grok", "ai_volume"} and not (self.xai_api_key and self.xai_api_key.strip()):
+            raise ValueError("XAI_API_KEY is required when STRATEGY_MODE is grok or ai_volume.")
+        if self.leverage > self.perp_hard_max_leverage:
+            raise ValueError("LEVERAGE cannot exceed PERP_HARD_MAX_LEVERAGE.")
+        if self.perp_venue_max_leverage is not None and self.leverage > self.perp_venue_max_leverage:
+            raise ValueError("LEVERAGE cannot exceed PERP_VENUE_MAX_LEVERAGE.")
+        if self.perp_leverage_cap > self.perp_hard_max_leverage:
+            raise ValueError("PERP_LEVERAGE_CAP cannot exceed PERP_HARD_MAX_LEVERAGE.")
+        if self.perp_venue_max_leverage is not None and self.perp_leverage_cap > self.perp_venue_max_leverage:
+            raise ValueError("PERP_LEVERAGE_CAP cannot exceed PERP_VENUE_MAX_LEVERAGE.")
+        return self
+
     @property
     def bingx_is_demo_endpoint(self) -> bool:
         return "open-api-vst.bingx.com" in self.bingx_base_url.lower()
@@ -290,3 +378,7 @@ class Settings(BaseSettings):
     @property
     def database_path(self) -> Path:
         return Path(self.db_path)
+
+    @property
+    def volume_profile(self) -> VolumeBuildProfile:
+        return VolumeBuildProfile.from_settings(self)

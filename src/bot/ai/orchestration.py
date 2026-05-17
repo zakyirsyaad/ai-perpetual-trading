@@ -58,7 +58,7 @@ class AIOrchestrator:
         market_context = await self._intelligence.build_context()
         recent_performance = await self._trade_store.recent_performance_summary(limit=50)
         payload = {
-            "task": "entry_decision",
+            "task": "ai_volume_entry_decision" if self._strategy_mode == "ai_volume" else "entry_decision",
             "execution_environment": {
                 "exchange": "OKX",
                 "mode": "demo_trading",
@@ -66,6 +66,7 @@ class AIOrchestrator:
                 "margin_mode": self._settings.okx_margin_mode,
                 "symbols": list(self._settings.symbols),
             },
+            "strategy_objective": self._strategy_objective_payload(),
             "risk_constraints": {
                 "trade_target_per_day": self._settings.trade_target_per_day,
                 "closed_trades_today": daily_state.closed_trades,
@@ -91,6 +92,13 @@ class AIOrchestrator:
                 "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
                 "choose_best_symbol_not_default_symbol": True,
                 "return_one_decision_per_symbol": True,
+                "ai_volume_mode_priorities": [
+                    "Only choose trades with enough directional edge to offset taker fees.",
+                    "Prefer HOLD over forced volume when trend is mixed, choppy, or liquidity is poor.",
+                    "The execution layer handles volume sizing; the brain should choose timing and direction.",
+                ]
+                if self._strategy_mode == "ai_volume"
+                else [],
             },
         }
         decisions = await self._brain.entry_decisions(payload)
@@ -193,17 +201,28 @@ class AIOrchestrator:
         decision = candidate.decision
         direction = candidate.direction
         target = candidate.target
-        usdt_size = self._calculate_position_usdt(decision, market_context, target.stop_loss_pct)
+        if self._strategy_mode == "ai_volume":
+            usdt_size = float(self._settings.volume_profile.margin_per_entry_usdt)
+        else:
+            usdt_size = self._calculate_position_usdt(decision, market_context, target.stop_loss_pct)
         if self._settings.ai_pre_trade_check:
             approved = await self._pre_trade_approved(decision, usdt_size, target)
             if not approved:
                 return None
 
+        mode = "ai_volume" if self._strategy_mode == "ai_volume" else "grok"
+        volume_note = ""
+        if self._strategy_mode == "ai_volume":
+            profile = self._settings.volume_profile
+            volume_note = (
+                f" volume_margin={float(profile.margin_per_entry_usdt):.2f} "
+                f"entry_volume={float(profile.volume_per_entry_usdt):.2f}"
+            )
         reason = (
-            f"grok:{decision.action} conf={decision.confidence:.2f} "
+            f"{mode}:{decision.action} conf={decision.confidence:.2f} "
             f"trend={decision.market_trend} risk={decision.systemic_risk}/5 "
             f"rr={decision.risk_reward_ratio} net_rr={target.fee_adjusted_rr:.2f} "
-            f"atr={target.atr_pct:.3f}% note={decision.reason[:180]}"
+            f"atr={target.atr_pct:.3f}%{volume_note} note={decision.reason[:180]}"
         )
         return TradePlan(
             symbol=decision.symbol,
@@ -235,6 +254,28 @@ class AIOrchestrator:
             - max(decision.systemic_risk - 1, 0) * 0.1
             + secondary_symbol_bonus
         )
+
+    def _strategy_objective_payload(self) -> dict[str, Any]:
+        if self._strategy_mode != "ai_volume":
+            return {
+                "mode": "directional_ai",
+                "primary_goal": "Only open trades with clear positive expectancy after fees.",
+            }
+        profile = self._settings.volume_profile
+        return {
+            "mode": "ai_volume",
+            "primary_goal": "Build exchange volume while minimizing realized loss and avoiding low-edge forced entries.",
+            "volume_profile": profile.as_log_fields(),
+            "execution_notes": {
+                "sizing_source": "volume_profile",
+                "ai_responsibility": "select symbol, direction, and timing; return HOLD when edge is unclear",
+                "fee_warning": "Market entries/exits pay taker fees; avoid tiny moves that cannot cover round-trip fees.",
+            },
+        }
+
+    @property
+    def _strategy_mode(self) -> str:
+        return str(getattr(self._settings, "strategy_mode", "grok"))
 
     async def exit_signal(
         self,

@@ -13,6 +13,7 @@ from bot.logger import setup_logging
 from bot.risk.risk_manager import RiskManager
 from bot.storage.supabase_trade_store import SupabaseTradeStore
 from bot.strategy.grok_strategy import GrokStrategy
+from bot.strategy.volume_strategy import VolumeStrategy
 
 
 async def run() -> None:
@@ -23,7 +24,11 @@ async def run() -> None:
         settings.okx_base_url,
         "DEMO" if settings.okx_demo_trading else "LIVE",
     )
-    logger.info("AI model: xAI %s", settings.xai_model)
+    logger.info("Strategy mode: %s", settings.strategy_mode)
+    if settings.strategy_mode in {"grok", "ai_volume"}:
+        logger.info("AI model: xAI %s", settings.xai_model)
+    if settings.strategy_mode in {"volume", "ai_volume"}:
+        logger.info("Volume profile: %s", settings.volume_profile.as_log_fields())
 
     if not (settings.supabase_url and settings.supabase_service_role_key):
         raise RuntimeError(
@@ -51,11 +56,14 @@ async def run() -> None:
         max_daily_drawdown_usdt=settings.max_daily_drawdown_usdt,
         max_consecutive_losses=settings.max_consecutive_losses,
     )
-    signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
-    intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)
-    brain = GrokBrain(settings, logger)
-    orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
-    strategy = GrokStrategy(orchestrator)
+    if settings.strategy_mode == "volume":
+        strategy = VolumeStrategy(settings)
+    else:
+        signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
+        intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)
+        brain = GrokBrain(settings, logger)
+        orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
+        strategy = GrokStrategy(orchestrator)
     engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal=None)
 
     try:
@@ -64,7 +72,9 @@ async def run() -> None:
         logger.error("%s", exc)
         raise SystemExit(1) from None
     finally:
-        await strategy.close()
+        strategy_close = getattr(strategy, "close", None)
+        if strategy_close is not None:
+            await strategy_close()
         store_close = getattr(store, "close", None)
         if store_close is not None:
             await store_close()

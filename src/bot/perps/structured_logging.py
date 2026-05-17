@@ -23,6 +23,7 @@ LOG_FIELDS = (
     "notional",
     "leverage",
     "margin_used",
+    "projected_round_trip_volume",
     "projected_fee",
     "realized_fee",
     "projected_slippage_bps",

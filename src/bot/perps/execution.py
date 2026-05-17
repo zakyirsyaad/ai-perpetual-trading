@@ -442,6 +442,7 @@ class PerpExecutionManager:
             notional=sizing.notional if sizing else None,
             leverage=sizing.leverage if sizing else None,
             margin_used=sizing.margin_used if sizing else None,
+            projected_round_trip_volume=sizing.projected_round_trip_volume if sizing else None,
             projected_fee=sizing.projected_fee if sizing else None,
             realized_fee=realized_fee or (entry_status.realized_fee if entry_status else None),
             projected_slippage_bps=self._config.slippage_round_trip * 10_000.0,

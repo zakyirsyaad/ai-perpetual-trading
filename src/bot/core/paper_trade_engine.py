@@ -96,9 +96,14 @@ class PaperTradeEngine:
         )
         await self._trade_store.save_open_position(open_position)
         self._logger.info(
-            "Paper open %s %s | qty=%.8f | entry_price=%.8f | conf=%.2f | setup=%.2f | decision=%s",
+            "Paper open %s %s | margin=%.2f | leverage=%sx | target_notional=%.2f | target_round_trip_volume=%.2f | "
+            "qty=%.8f | entry_price=%.8f | conf=%.2f | setup=%.2f | decision=%s",
             plan.symbol,
             plan.direction.value,
+            plan.usdt_size,
+            plan.leverage,
+            plan.usdt_size * plan.leverage,
+            plan.usdt_size * plan.leverage * self._settings.volume_sides_per_entry,
             quantity,
             entry_price,
             plan.confidence,
@@ -166,6 +171,12 @@ class PaperTradeEngine:
             fee = self._estimate_total_taker_fee(
                 position.entry_price, current_price, position.quantity, self._settings.taker_fee_pct
             )
+            net_after_fee = gross - fee
+            if self._settings.volume_neutral_exit_enabled and elapsed >= self._settings.volume_neutral_exit_min_seconds:
+                min_net = self._settings.volume_neutral_exit_min_net_usdt
+                max_net = min_net + self._settings.volume_neutral_exit_band_usdt
+                if min_net <= net_after_fee <= max_net:
+                    return "neutral_exit"
             if self._hit_take_profit(position.direction, position.entry_price, current_price, plan.take_profit_pct):
                 if gross >= fee:
                     return "take_profit"
@@ -229,4 +240,3 @@ class PaperTradeEngine:
         entry_notional = entry_price * qty
         exit_notional = exit_price * qty
         return (entry_notional * fee_rate) + (exit_notional * fee_rate)
-

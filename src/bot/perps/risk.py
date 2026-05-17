@@ -17,11 +17,13 @@ class SizingResult:
     n_risk: Decimal
     n_liq: Decimal
     n_exchange_limits: Decimal
+    n_margin: Decimal
     n_final: Decimal
     qty: Decimal
     notional: Decimal
     leverage: int
     margin_used: Decimal
+    projected_round_trip_volume: Decimal
     projected_fee: Decimal
     projected_loss_at_stop: Decimal
     projected_net_profit_at_target: Decimal
@@ -126,7 +128,7 @@ class PerpsRiskEngine:
         slippage_round_trip = Decimal(str(self._config.slippage_round_trip))
         edge_cost_bps = self._config.round_trip_cost_bps + self._config.edge_buffer_bps
 
-        if signal.expected_move_bps <= edge_cost_bps:
+        if self._config.sizing_mode == "risk" and signal.expected_move_bps <= edge_cost_bps:
             return self._rejected(
                 reason=(
                     f"expected_move_bps {signal.expected_move_bps:.2f} <= "
@@ -153,15 +155,38 @@ class PerpsRiskEngine:
         )
         n_liq = equity_usdt * Decimal(leverage) * Decimal(str(self._config.liquidation_notional_buffer))
         n_exchange_limits = instrument.max_notional or n_liq
-        n_final = min(n_fee, n_risk, n_liq, n_exchange_limits)
+        n_margin = Decimal("0")
+        if self._config.sizing_mode == "volume":
+            n_margin = Decimal(str(self._config.volume_margin_per_entry_usdt)) * Decimal(leverage)
+            n_final = min(n_margin, n_liq, n_exchange_limits)
+        else:
+            n_final = min(n_fee, n_risk, n_liq, n_exchange_limits)
 
         raw_qty = Decimal(n_final) / Decimal(str(snapshot.mark))
         qty = instrument.round_qty(raw_qty)
         notional = qty * Decimal(str(snapshot.mark))
         if qty < instrument.min_qty:
-            return self._rejected("qty_below_exchange_min", leverage, edge_cost_bps, n_fee, n_risk, n_liq, n_exchange_limits)
+            return self._rejected(
+                "qty_below_exchange_min",
+                leverage,
+                edge_cost_bps,
+                n_fee,
+                n_risk,
+                n_liq,
+                n_exchange_limits,
+                n_margin,
+            )
         if notional < instrument.min_notional:
-            return self._rejected("notional_below_exchange_min", leverage, edge_cost_bps, n_fee, n_risk, n_liq, n_exchange_limits)
+            return self._rejected(
+                "notional_below_exchange_min",
+                leverage,
+                edge_cost_bps,
+                n_fee,
+                n_risk,
+                n_liq,
+                n_exchange_limits,
+                n_margin,
+            )
 
         mmr = instrument.maintenance_margin_rate
         if mmr is None:
@@ -169,15 +194,42 @@ class PerpsRiskEngine:
         liquidation_distance = max(Decimal("0"), (Decimal("1") / Decimal(leverage)) - mmr)
         liquidation_distance_bps = float(liquidation_distance * Decimal("10000"))
         if liquidation_distance_bps < self._config.min_liquidation_distance_bps:
-            return self._rejected("liquidation_distance_too_close", leverage, edge_cost_bps, n_fee, n_risk, n_liq, n_exchange_limits)
+            return self._rejected(
+                "liquidation_distance_too_close",
+                leverage,
+                edge_cost_bps,
+                n_fee,
+                n_risk,
+                n_liq,
+                n_exchange_limits,
+                n_margin,
+            )
         if signal.stop_bps >= liquidation_distance_bps:
-            return self._rejected("stop_beyond_liquidation_guard", leverage, edge_cost_bps, n_fee, n_risk, n_liq, n_exchange_limits)
+            return self._rejected(
+                "stop_beyond_liquidation_guard",
+                leverage,
+                edge_cost_bps,
+                n_fee,
+                n_risk,
+                n_liq,
+                n_exchange_limits,
+                n_margin,
+            )
 
         projected_fee = notional * fee_round_trip
         projected_loss = notional * (stop_distance + fee_round_trip + slippage_round_trip)
         projected_net_profit = notional * (take_distance - fee_round_trip - slippage_round_trip)
-        if projected_net_profit <= zero:
-            return self._rejected("target_not_profitable_after_costs", leverage, edge_cost_bps, n_fee, n_risk, n_liq, n_exchange_limits)
+        if self._config.sizing_mode == "risk" and projected_net_profit <= zero:
+            return self._rejected(
+                "target_not_profitable_after_costs",
+                leverage,
+                edge_cost_bps,
+                n_fee,
+                n_risk,
+                n_liq,
+                n_exchange_limits,
+                n_margin,
+            )
 
         return SizingResult(
             accepted=True,
@@ -186,11 +238,13 @@ class PerpsRiskEngine:
             n_risk=n_risk,
             n_liq=n_liq,
             n_exchange_limits=n_exchange_limits,
+            n_margin=n_margin,
             n_final=n_final,
             qty=qty,
             notional=notional,
             leverage=leverage,
             margin_used=notional / Decimal(leverage),
+            projected_round_trip_volume=notional * Decimal(self._config.volume_sides_per_entry),
             projected_fee=projected_fee,
             projected_loss_at_stop=projected_loss,
             projected_net_profit_at_target=projected_net_profit,
@@ -220,6 +274,7 @@ class PerpsRiskEngine:
         n_risk: Decimal = Decimal("0"),
         n_liq: Decimal = Decimal("0"),
         n_exchange_limits: Decimal = Decimal("0"),
+        n_margin: Decimal = Decimal("0"),
     ) -> SizingResult:
         return SizingResult(
             accepted=False,
@@ -228,11 +283,13 @@ class PerpsRiskEngine:
             n_risk=n_risk,
             n_liq=n_liq,
             n_exchange_limits=n_exchange_limits,
+            n_margin=n_margin,
             n_final=Decimal("0"),
             qty=Decimal("0"),
             notional=Decimal("0"),
             leverage=leverage,
             margin_used=Decimal("0"),
+            projected_round_trip_volume=Decimal("0"),
             projected_fee=Decimal("0"),
             projected_loss_at_stop=Decimal("0"),
             projected_net_profit_at_target=Decimal("0"),

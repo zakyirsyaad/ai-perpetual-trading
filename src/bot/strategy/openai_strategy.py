@@ -21,10 +21,10 @@ from bot.strategy.indicators import MarketFeatures, atr, ema, macd, pct_change, 
 
 # --- Analyst-style output (professional high-leverage scalper prompt) ---
 ANALYST_SYSTEM_PROMPT = """You are a professional crypto futures scalper and risk manager
-specialized in high-leverage (100x–200x) trading on low timeframes (1m–15m).
+specialized in high-leverage (up to 100x) trading on low timeframes (1m–15m).
 
 You MUST assume:
-- Leverage is VERY high (≈150x).
+- Leverage is VERY high (up to 100x).
 - Timeframe is 5m for entries, with 15m/1h as higher-timeframe context (trend filter).
 - Survival and drawdown control matter more than number of trades.
 
@@ -1202,4 +1202,3 @@ class OpenAIStrategy(BaseStrategy):
             return float(value)
         except (TypeError, ValueError):
             return default
-
