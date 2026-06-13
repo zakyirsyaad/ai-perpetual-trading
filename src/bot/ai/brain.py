@@ -45,6 +45,23 @@ class ExitDecision(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class ArenaMarketReview(BaseModel):
+    regime: str = Field(min_length=1, max_length=80)
+    summary: str = Field(min_length=1, max_length=800)
+    risk_flags: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ArenaSignalReview(BaseModel):
+    approved_triggers: list[str] = Field(default_factory=list, max_length=12)
+    blocked_triggers: list[str] = Field(default_factory=list, max_length=12)
+    reason: str = Field(min_length=1, max_length=800)
+
+
+class ArenaDiagnosis(BaseModel):
+    cards: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
+    summary: str = Field(min_length=1, max_length=800)
+
+
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
@@ -126,6 +143,30 @@ class GrokBrain:
             reasoning_effort="low",
         )
 
+    async def arena_market_review(self, payload: dict[str, Any]) -> ArenaMarketReview | None:
+        return await self._ask_grok(
+            system_prompt="You are MarketAnalyzer. Review only supplied market/factor context and return concise JSON.",
+            payload=payload,
+            schema=ArenaMarketReview,
+            reasoning_effort="low",
+        )
+
+    async def arena_signal_review(self, payload: dict[str, Any]) -> ArenaSignalReview | None:
+        return await self._ask_grok(
+            system_prompt="You are SignalDesigner. Approve only robust supplied market-flow triggers.",
+            payload=payload,
+            schema=ArenaSignalReview,
+            reasoning_effort="low",
+        )
+
+    async def arena_diagnosis(self, payload: dict[str, Any]) -> ArenaDiagnosis | None:
+        return await self._ask_grok(
+            system_prompt="You are AttributionDiagnoser. Use only supplied realized metrics.",
+            payload=payload,
+            schema=ArenaDiagnosis,
+            reasoning_effort="low",
+        )
+
     async def _ask_grok(
         self,
         *,
@@ -159,11 +200,32 @@ class GrokBrain:
             },
         }
 
+        use_chat = str(getattr(self._settings, "xai_api_style", "responses")).strip().lower() == "chat"
+        if use_chat:
+            # OpenAI-compatible /chat/completions with json_object. The provider
+            # doesn't support strict json_schema, so we embed the schema in the
+            # system prompt and rely on pydantic validation + retry to enforce it.
+            schema_hint = (
+                "Respond ONLY with a single JSON object, no markdown, matching this JSON Schema:\n"
+                + json.dumps(schema.model_json_schema(), ensure_ascii=True)
+            )
+            body = {
+                "model": self._settings.xai_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt + "\n\n" + schema_hint},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                ],
+                "response_format": {"type": "json_object"},
+            }
+            endpoint = "/chat/completions"
+        else:
+            endpoint = "/responses"
+
         last_error: Exception | None = None
         for attempt in range(2):
             try:
                 response = await self._client.post(
-                    f"{self._settings.xai_base_url.rstrip('/')}/responses",
+                    f"{self._settings.xai_base_url.rstrip('/')}{endpoint}",
                     json=body,
                 )
                 response.raise_for_status()
