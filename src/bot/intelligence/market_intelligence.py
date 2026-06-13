@@ -4,6 +4,8 @@ import logging
 from statistics import mean
 from typing import Any
 
+from bot.arena.factors import FactorRegistry
+from bot.arena.flow_signals import FactorDistributionTracker, MarketFlowSignalDetector, SignalRuleConfig
 from bot.config import Settings
 from bot.data.market_signals import ExternalMarketSignals, MarketContext, TechnicalFeatures
 from bot.data.providers import ExternalSignalAggregator
@@ -25,6 +27,13 @@ class MarketIntelligence:
         self._client = client
         self._external_signals = external_signals
         self._logger = logger
+        self._factor_registry = FactorRegistry()
+        self._factor_distribution_tracker = FactorDistributionTracker()
+        self._flow_detector = MarketFlowSignalDetector(
+            self._signal_config_from_settings(settings),
+            distribution_tracker=self._factor_distribution_tracker,
+        )
+        self._last_open_interest_by_symbol: dict[str, float] = {}
 
     async def build_context(self, symbols: tuple[str, ...] | None = None) -> MarketContext:
         pairs = symbols or self._settings.symbols
@@ -35,11 +44,24 @@ class MarketIntelligence:
                 technicals.append(features)
 
         external = await self._external_signals.fetch()
+        factor_payload: dict[str, Any] = {"snapshots": [], "top_factors": []}
+        if self._settings.arena_factors_enabled:
+            factor_payload = self._factor_registry.context_payload(technicals)
+        flow_payload: dict[str, Any] = {"active": [], "new_triggers": [], "trigger_names": []}
+        if self._settings.arena_flow_signals_enabled:
+            factors = self._factor_registry.score_many(technicals) if self._settings.arena_factors_enabled else []
+            for factor in factors:
+                self._factor_distribution_tracker.add(factor.symbol, factor.name, factor.score)
+            flow_payload = self._flow_detector.evaluate_many(technicals, factors)
         intelligence = self._summarize_market(technicals, external)
+        intelligence["factor_intelligence"] = factor_payload
+        intelligence["market_flow_signals"] = flow_payload
         return MarketContext(
             technicals=technicals,
             external_signals=external,
             intelligence=intelligence,
+            factor_snapshots=factor_payload.get("snapshots") or [],
+            active_flow_signals=flow_payload.get("active") or [],
         )
 
     async def close(self) -> None:
@@ -70,6 +92,24 @@ class MarketIntelligence:
         except Exception as exc:
             self._logger.debug("Open interest fetch failed for %s: %s", symbol, exc)
             open_interest = 0.0
+        previous_open_interest = self._last_open_interest_by_symbol.get(symbol)
+        open_interest_change_pct = 0.0
+        if previous_open_interest and previous_open_interest > 0 and open_interest > 0:
+            open_interest_change_pct = ((open_interest - previous_open_interest) / previous_open_interest) * 100.0
+        if open_interest > 0:
+            self._last_open_interest_by_symbol[symbol] = open_interest
+
+        spread_bps = None
+        bid_depth_notional = None
+        ask_depth_notional = None
+        if self._settings.arena_flow_signals_enabled or self._settings.arena_factors_enabled:
+            try:
+                order_book = await self._client.get_order_book(symbol, depth=self._settings.orderbook_depth_levels)
+                spread_bps = order_book.spread_bps
+                bid_depth_notional = order_book.bid_depth_notional
+                ask_depth_notional = order_book.ask_depth_notional
+            except Exception as exc:
+                self._logger.debug("Order book enrichment failed for %s: %s", symbol, exc)
 
         return TechnicalFeatures(
             symbol=symbol,
@@ -88,6 +128,10 @@ class MarketIntelligence:
             volume_change_pct=pct_change(volumes, 5) if len(volumes) > 5 else 0.0,
             funding_rate=funding_rate,
             open_interest=open_interest,
+            open_interest_change_pct=open_interest_change_pct,
+            spread_bps=spread_bps,
+            bid_depth_notional=bid_depth_notional,
+            ask_depth_notional=ask_depth_notional,
         )
 
     def _summarize_market(
@@ -143,3 +187,18 @@ class MarketIntelligence:
             "risk_flags": risk_flags,
             "symbol_scores": symbol_scores,
         }
+
+    @staticmethod
+    def _signal_config_from_settings(settings: Settings) -> SignalRuleConfig:
+        return SignalRuleConfig(
+            volume_spike_pct=settings.arena_volume_spike_pct,
+            volume_collapse_pct=settings.arena_volume_collapse_pct,
+            price_momentum_bps=settings.arena_price_momentum_bps,
+            open_interest_surge_pct=settings.arena_open_interest_surge_pct,
+            funding_extreme_abs=settings.arena_funding_extreme_abs,
+            factor_score_trigger=settings.arena_factor_score_trigger,
+            factor_percentile_trigger=settings.arena_factor_percentile_trigger,
+            order_flow_imbalance_pct=settings.arena_order_flow_imbalance_pct,
+            max_spread_bps=settings.okx_max_spread_bps,
+            min_depth_notional=settings.arena_min_depth_notional,
+        )

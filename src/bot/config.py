@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     min_order_contracts: float = Field(default=1.0, alias="MIN_ORDER_CONTRACTS")
     volume_margin_per_entry_usdt: float | None = Field(default=None, gt=0.0, alias="VOLUME_MARGIN_PER_ENTRY_USDT")
     volume_sides_per_entry: int = Field(default=2, ge=1, le=4, alias="VOLUME_SIDES_PER_ENTRY")
-    volume_execution_mode: str = Field(default="maker_only", alias="VOLUME_EXECUTION_MODE")
+    volume_execution_mode: str = Field(default="market", alias="VOLUME_EXECUTION_MODE")
     volume_attempt_target_per_day: int = Field(default=34, ge=1, alias="VOLUME_ATTEMPT_TARGET_PER_DAY")
     volume_min_filled_entries_per_day: int = Field(default=28, ge=1, alias="VOLUME_MIN_FILLED_ENTRIES_PER_DAY")
     volume_target_usdt: float = Field(default=30_000_000.0, ge=0.0, alias="VOLUME_TARGET_USDT")
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     volume_neutral_exit_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_NEUTRAL_EXIT_MIN_SECONDS")
     volume_neutral_exit_min_net_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_MIN_NET_USDT")
     volume_neutral_exit_band_usdt: float = Field(default=5.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_BAND_USDT")
-    volume_breakeven_exit_enabled: bool = Field(default=True, alias="VOLUME_BREAKEVEN_EXIT_ENABLED")
+    volume_breakeven_exit_enabled: bool = Field(default=False, alias="VOLUME_BREAKEVEN_EXIT_ENABLED")
     volume_breakeven_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_BREAKEVEN_MIN_SECONDS")
     volume_breakeven_max_loss_usdt: float = Field(default=1.0, ge=0.0, alias="VOLUME_BREAKEVEN_MAX_LOSS_USDT")
     volume_breakeven_min_profit_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_BREAKEVEN_MIN_PROFIT_USDT")
@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     volume_daily_fee_budget_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_DAILY_FEE_BUDGET_USDT")
 
     entry_interval_minutes: int = Field(default=15, alias="ENTRY_INTERVAL_MINUTES")
-    position_hold_minutes: int = Field(default=20, alias="POSITION_HOLD_MINUTES")
+    position_hold_minutes: int = Field(default=60, alias="POSITION_HOLD_MINUTES")
     stop_loss_pct: float = Field(default=0.35, alias="STOP_LOSS_PCT")
     take_profit_pct: float = Field(default=0.7, alias="TAKE_PROFIT_PCT")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
     confluence_min_atr_pct: float = Field(default=0.05, ge=0.0, alias="CONFLUENCE_MIN_ATR_PCT")
     confluence_min_score: float = Field(default=0.05, ge=0.0, alias="CONFLUENCE_MIN_SCORE")
-    confluence_atr_tp_mult: float = Field(default=2.5, gt=0.0, alias="CONFLUENCE_ATR_TP_MULT")
+    confluence_atr_tp_mult: float = Field(default=3.0, gt=0.0, alias="CONFLUENCE_ATR_TP_MULT")
     confluence_atr_sl_mult: float = Field(default=1.0, gt=0.0, alias="CONFLUENCE_ATR_SL_MULT")
     taker_fee_pct: float = Field(default=0.05, alias="TAKER_FEE_PCT")
     maker_fee_pct: float = Field(default=0.02, alias="MAKER_FEE_PCT")
@@ -123,15 +123,15 @@ class Settings(BaseSettings):
         alias="PREVENT_NEW_ENTRIES_IF_EXCHANGE_POSITION_OPEN",
     )
 
-    # Layer 1: xAI Grok brain.
+    # Layer 1: OpenAI-compatible AI brain.
     xai_api_key: str | None = Field(default=None, alias="XAI_API_KEY")
-    xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
-    xai_model: str = Field(default="grok-4.3", alias="XAI_MODEL")
+    xai_base_url: str = Field(default="https://api.freemodel.dev/v1", alias="XAI_BASE_URL")
+    xai_model: str = Field(default="gpt-5.4", alias="XAI_MODEL")
     xai_reasoning_effort: str = Field(default="high", alias="XAI_REASONING_EFFORT")
     xai_timeout_seconds: int = Field(default=90, alias="XAI_TIMEOUT_SECONDS")
     # "responses" = xAI /responses w/ json_schema; "chat" = OpenAI /chat/completions w/ json_object.
-    xai_api_style: str = Field(default="responses", alias="XAI_API_STYLE")
-    ai_kline_interval: str = Field(default="1m", alias="AI_KLINE_INTERVAL")
+    xai_api_style: str = Field(default="chat", alias="XAI_API_STYLE")
+    ai_kline_interval: str = Field(default="3m", alias="AI_KLINE_INTERVAL")
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
     ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")
     ai_min_setup_score: float = Field(default=0.58, ge=0.0, le=1.0, alias="AI_MIN_SETUP_SCORE")

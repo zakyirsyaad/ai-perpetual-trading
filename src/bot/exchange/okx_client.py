@@ -276,6 +276,20 @@ class OKXFuturesClient:
             raw=row,
         )
 
+    async def get_position_tiers(self, symbol: str, td_mode: str = "isolated") -> list[dict[str, Any]]:
+        inst_id = self._normalize_symbol(symbol)
+        params: dict[str, Any] = {
+            "instType": self._instrument_type,
+            "tdMode": td_mode,
+        }
+        if self._instrument_type in {"SWAP", "FUTURES", "OPTION"}:
+            params["instFamily"] = self._instrument_family(inst_id)
+        else:
+            params["instId"] = inst_id
+        resp = await self._public_request("GET", "/api/v5/public/position-tiers", params)
+        data = resp.get("data")
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+
     async def validate_api_access(self, symbol: str) -> None:
         await self.get_last_price(symbol)
         await self.get_position_info(symbol)

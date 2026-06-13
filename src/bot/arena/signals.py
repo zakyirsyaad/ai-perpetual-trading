@@ -13,7 +13,7 @@ _RATIONALE_CODE = re.compile(r"^[a-z0-9_:-]{2,48}$")
 
 
 class NormalizedSignal(BaseModel):
-    """Strict execution-facing signal contract."""
+    """Strict Program Trader signal contract for the OKX arena runtime."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -84,12 +84,6 @@ def normalize_legacy_entry_decision(
     model_latency_ms: int,
     default_max_hold_minutes: int,
 ) -> NormalizedSignal:
-    """Convert the existing EntryDecision model into the execution contract.
-
-    OPEN signals must include explicit stop/take fields. Missing directional
-    economics are rejected instead of being silently defaulted.
-    """
-
     data = decision.model_dump() if hasattr(decision, "model_dump") else dict(decision)
     action = str(data.get("action", "HOLD")).upper()
     if action == "OPEN_LONG":

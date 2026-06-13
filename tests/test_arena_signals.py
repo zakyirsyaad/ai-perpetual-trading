@@ -4,10 +4,10 @@ import unittest
 
 from pydantic import ValidationError
 
-from bot.perps.signal import NormalizedSignal, normalize_legacy_entry_decision
+from bot.arena.signals import NormalizedSignal, normalize_legacy_entry_decision
 
 
-class PerpsSignalTests(unittest.TestCase):
+class ArenaSignalTests(unittest.TestCase):
     def test_valid_signal_contract(self) -> None:
         signal = NormalizedSignal.model_validate(
             {

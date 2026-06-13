@@ -4,13 +4,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, GrokBrain
 from bot.config import Settings
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
 from bot.storage.supabase_journal import SupabaseJournal
-from bot.storage.trade_store import TradeStore
+from bot.storage.interfaces import TradeStoreProtocol
 from bot.strategy.base import ExitSignal
 
 
@@ -39,7 +40,7 @@ class AIOrchestrator:
         settings: Settings,
         brain: GrokBrain,
         intelligence: MarketIntelligence,
-        trade_store: TradeStore,
+        trade_store: TradeStoreProtocol,
         logger: logging.Logger,
         supabase_journal: SupabaseJournal | None = None,
     ) -> None:
@@ -49,6 +50,8 @@ class AIOrchestrator:
         self._trade_store = trade_store
         self._logger = logger
         self._supabase_journal = supabase_journal
+        self._market_analyzer = MarketAnalyzer()
+        self._signal_designer = SignalDesigner()
 
     async def close(self) -> None:
         await self._brain.close()
@@ -57,6 +60,7 @@ class AIOrchestrator:
     async def next_trade_plan(self, daily_state: DailyRiskState) -> TradePlan | None:
         market_context = await self._intelligence.build_context()
         recent_performance = await self._trade_store.recent_performance_summary(limit=50)
+        context_dict = market_context.to_dict()
         payload = {
             "task": "ai_volume_entry_decision" if self._strategy_mode == "ai_volume" else "entry_decision",
             "execution_environment": {
@@ -82,7 +86,11 @@ class AIOrchestrator:
                 "min_fee_adjusted_risk_reward": self._settings.ai_min_fee_adjusted_rr,
                 "round_trip_taker_fee_pct": self._round_trip_fee_pct,
             },
-            "market_context": market_context.to_dict(),
+            "market_context": context_dict,
+            "arena_reviews": [
+                self._market_analyzer.review(context_dict).to_dict(),
+                self._signal_designer.review(context_dict).to_dict(),
+            ],
             "recent_executed_trade_performance": recent_performance,
             "output_rules": {
                 "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
@@ -112,7 +120,6 @@ class AIOrchestrator:
             self._logger.warning("Grok did not return decisions for symbols: %s", ", ".join(missing_symbols))
 
         candidates: list[EntryCandidate] = []
-        context_dict = market_context.to_dict()
         for decision in decisions:
             await self._record_ai_decision(decision, payload)
             candidate = self._build_entry_candidate(decision, context_dict)
@@ -234,6 +241,8 @@ class AIOrchestrator:
             decision_reason=reason,
             decision_payload=decision.model_dump(),
             confidence=decision.confidence,
+            factor_metadata=self._factor_metadata_for_symbol(market_context, decision.symbol),
+            trigger_metadata=self._trigger_metadata_for_symbol(market_context, decision.symbol),
         )
 
     def _candidate_score(
@@ -547,3 +556,28 @@ class AIOrchestrator:
             if features.get("symbol") == symbol:
                 return features
         return None
+
+    @staticmethod
+    def _factor_metadata_for_symbol(market_context: dict[str, Any], symbol: str) -> dict[str, Any]:
+        snapshots = [
+            item
+            for item in market_context.get("factor_snapshots", [])
+            if isinstance(item, dict) and item.get("symbol") == symbol
+        ]
+        top = sorted(snapshots, key=lambda item: abs(float(item.get("score") or 0.0)), reverse=True)[:5]
+        return {
+            "top_factors": [str(item.get("name")) for item in top if item.get("name")],
+            "snapshots": top,
+        }
+
+    @staticmethod
+    def _trigger_metadata_for_symbol(market_context: dict[str, Any], symbol: str) -> dict[str, Any]:
+        triggers = [
+            item
+            for item in market_context.get("active_flow_signals", [])
+            if isinstance(item, dict) and item.get("symbol") == symbol
+        ]
+        return {
+            "trigger_names": [str(item.get("name")) for item in triggers if item.get("name")],
+            "signals": triggers,
+        }
