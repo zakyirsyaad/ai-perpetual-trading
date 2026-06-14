@@ -34,6 +34,7 @@ class MarketIntelligence:
             distribution_tracker=self._factor_distribution_tracker,
         )
         self._last_open_interest_by_symbol: dict[str, float] = {}
+        self._tradingview_ever_available = False
 
     async def build_context(self, symbols: tuple[str, ...] | None = None) -> MarketContext:
         pairs = symbols or self._settings.symbols
@@ -179,7 +180,16 @@ class MarketIntelligence:
             risk_flags.append("coinmarketcap_unavailable")
         if self._settings.dune_query_ids and not external.dune:
             risk_flags.append("dune_unavailable")
-        if self._settings.tradingview_signal_url and not external.tradingview:
+        if external.tradingview:
+            self._tradingview_ever_available = True
+        # Only flag TradingView as unavailable if the feed has worked before (a real
+        # transient outage). A feed that has never responded is treated as not
+        # configured, so a structurally dead relay does not poison every decision.
+        if (
+            self._settings.tradingview_signal_url
+            and self._tradingview_ever_available
+            and not external.tradingview
+        ):
             risk_flags.append("tradingview_signal_unavailable")
 
         return {

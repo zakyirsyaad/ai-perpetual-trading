@@ -6,7 +6,7 @@ import time
 from typing import Any, Literal, TypeVar
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
 
 from bot.config import Settings
 
@@ -37,6 +37,17 @@ class PreTradeCheck(BaseModel):
     approved: bool
     confirmations: str = Field(min_length=1, max_length=500)
     invalidation_trigger: str = Field(min_length=1, max_length=300)
+
+    @field_validator("confirmations", "invalidation_trigger", mode="before")
+    @classmethod
+    def _clamp_length(cls, value: Any, info: ValidationInfo) -> Any:
+        # The chat-mode provider cannot enforce maxLength server-side, so a verbose
+        # but otherwise valid approval must not be discarded on a length technicality
+        # (which previously turned guard-passed entries into "no response" rejections).
+        if not isinstance(value, str):
+            return value
+        limit = 500 if info.field_name == "confirmations" else 300
+        return value[:limit]
 
 
 class ExitDecision(BaseModel):
@@ -70,11 +81,13 @@ You are a disciplined quant scalper and risk manager. You evaluate only live mar
 
 Principles:
 - Protect capital and avoid chaotic/noisy markets.
-- Prefer HOLD when trend, momentum, liquidity, and external signals conflict, but do not use recent losses
-  as a blanket veto when the current setup is clearly different and passes risk controls.
-- Use OKX technicals as the execution truth; use CoinMarketCap, Dune, and TradingView-derived signals as supporting context.
+- Prefer HOLD when the OKX trend, momentum, and liquidity genuinely conflict or the market is chaotic.
+  Do not use recent losses, or the mere absence of an optional external signal, as a blanket veto when the
+  OKX setup is clean and passes risk controls.
+- Use OKX technicals as the execution truth; CoinMarketCap, Dune, and TradingView are OPTIONAL supporting context.
 - Learn from recent executed demo-trade outcomes. Avoid repeating patterns with negative average PnL.
-- Never invent missing data. If an external provider is empty, mark that in your reason and reduce confidence.
+- Never invent missing data. If an optional external provider is empty, note it in your reason, but do not
+  reduce confidence or HOLD on that basis alone — the OKX live technicals are sufficient to act.
 - High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise and take-profit
   far enough to beat taker fees with positive fee-adjusted risk/reward.
 - For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct, take_profit_pct, and risk_reward_ratio.

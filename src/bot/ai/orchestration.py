@@ -82,7 +82,9 @@ class AIOrchestrator:
                 "max_daily_drawdown_usdt": self._settings.max_daily_drawdown_usdt,
                 "configured_leverage": self._settings.leverage,
                 "configured_position_usdt": self._settings.position_usdt,
-                "min_confidence": self._settings.ai_min_confidence,
+                # Deliberately NOT exposing min_confidence to the model: showing it the
+                # exact gate made it self-censor at that number every tick. The code gate
+                # in _build_entry_candidate still enforces ai_min_confidence after the fact.
                 "min_fee_adjusted_risk_reward": self._settings.ai_min_fee_adjusted_rr,
                 "round_trip_taker_fee_pct": self._round_trip_fee_pct,
             },
@@ -95,7 +97,8 @@ class AIOrchestrator:
             "output_rules": {
                 "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
                 "use_only_allowed_symbols": True,
-                "never_trade_if_data_is_missing_or_unclear": True,
+                "never_trade_if_okx_execution_data_is_missing": True,
+                "optional_external_signal_absence_alone_is_not_a_hold_reason": True,
                 "only_demo_trades_are_executed": True,
                 "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
                 "choose_best_symbol_not_default_symbol": True,
@@ -343,11 +346,22 @@ class AIOrchestrator:
             },
         }
         check = await self._brain.pre_trade_check(payload)
-        if check is None or not check.approved:
-            self._logger.info(
-                "Pre-trade check rejected %s: %s",
+        if check is None:
+            # No/invalid AI response is an infrastructure failure (timeout, 503,
+            # unparseable output) — NOT a risk veto. The candidate already cleared the
+            # entry guard and code gates, so fail open rather than silently dropping a
+            # valid setup whenever the secondary AI call flakes.
+            self._logger.warning(
+                "Pre-trade check unavailable for %s (no/invalid AI response); "
+                "passing on prior entry-guard approval.",
                 decision.symbol,
-                getattr(check, "invalidation_trigger", "no response"),
+            )
+            return True
+        if not check.approved:
+            self._logger.info(
+                "Pre-trade check vetoed %s: %s",
+                decision.symbol,
+                check.invalidation_trigger,
             )
             return False
         self._logger.info(
