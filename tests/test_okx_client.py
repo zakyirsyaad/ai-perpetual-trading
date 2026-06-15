@@ -199,6 +199,71 @@ class OKXFuturesClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["data"][0]["ordId"], "abc")
 
+    async def test_flatten_position_closes_short_with_reduce_only_buy(self) -> None:
+        client = OKXFuturesClient(
+            api_key="key",
+            secret_key="secret",
+            passphrase="passphrase",
+            base_url="https://www.okx.com",
+            instrument_type="SWAP",
+        )
+        captured: dict[str, object] = {}
+
+        async def fake_details(symbol):
+            from bot.exchange.okx_client import OKXPositionDetails
+
+            return OKXPositionDetails(
+                symbol=symbol,
+                exchange_size=104.78,
+                base_quantity=10.478,
+                avg_price=1717.82,
+                mark_price=1716.0,
+                liquidation_price=1727.0,
+                pos_side="short",
+                raw={},
+            )
+
+        async def fake_signed_request(method, path, body=None):
+            captured["path"] = path
+            captured["body"] = body
+            return {"code": "0", "data": [{"ordId": "close-1", "sCode": "0"}]}
+
+        client.get_symbol_position_details = fake_details
+        client._signed_request = fake_signed_request
+
+        resp = await client.flatten_position("ETH/USDT")
+        self.assertEqual(resp["data"][0]["ordId"], "close-1")
+        self.assertEqual(captured["path"], "/api/v5/trade/order")
+        # Closing a SHORT must be a reduce-only BUY on posSide short.
+        self.assertEqual(captured["body"]["side"], "buy")
+        self.assertEqual(captured["body"]["posSide"], "short")
+        self.assertEqual(captured["body"]["reduceOnly"], "true")
+
+    async def test_flatten_position_noops_when_flat(self) -> None:
+        client = OKXFuturesClient(
+            api_key="key",
+            secret_key="secret",
+            passphrase="passphrase",
+            base_url="https://www.okx.com",
+        )
+
+        async def fake_details(symbol):
+            from bot.exchange.okx_client import OKXPositionDetails
+
+            return OKXPositionDetails(
+                symbol=symbol,
+                exchange_size=0.0,
+                base_quantity=0.0,
+                avg_price=None,
+                mark_price=None,
+                liquidation_price=None,
+                pos_side=None,
+                raw={},
+            )
+
+        client.get_symbol_position_details = fake_details
+        self.assertIsNone(await client.flatten_position("ETH/USDT"))
+
 
 if __name__ == "__main__":
     unittest.main()

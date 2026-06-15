@@ -183,6 +183,29 @@ class OKXFuturesClient:
             payload["reduceOnly"] = "true"
         return await self._signed_request("POST", "/api/v5/trade/order", payload)
 
+    async def flatten_position(self, symbol: str) -> dict[str, Any] | None:
+        """Market-close any open position for symbol via a reduce-only order.
+
+        Returns the order response, or None if there was nothing to close. Used to
+        auto-flat an orphan exchange position found at startup (no local record, so
+        its original SL/TP cannot be reconstructed)."""
+        details = await self.get_symbol_position_details(symbol)
+        if details.exchange_size <= 0:
+            return None
+        # In long_short (hedge) mode posSide tells us the side; default to LONG only
+        # when it is genuinely absent (net mode), which still resolves to a valid close.
+        direction = (
+            PositionDirection.SHORT
+            if str(details.pos_side or "").lower() == "short"
+            else PositionDirection.LONG
+        )
+        return await self.place_market_order(
+            symbol=symbol,
+            direction=direction,
+            size=details.exchange_size,
+            reduce_only=True,
+        )
+
     async def place_limit_order(
         self,
         symbol: str,

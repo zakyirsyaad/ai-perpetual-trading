@@ -401,11 +401,35 @@ class TradeEngine:
             if symbol in local_symbols:
                 continue
             if await self._client.has_open_position(symbol):
+                # Orphan exchange position with no local record (e.g. the bot was
+                # stopped mid-trade). Open positions are not persisted and the original
+                # SL/TP cannot be reconstructed, so leaving it would be an unmonitored
+                # 100x position. Auto-flat it at startup so the bot resumes from a clean,
+                # fully-monitored state instead of blocking all new entries indefinitely.
                 self._logger.warning(
-                    "Exchange already has an open position for %s but no local record was found. "
-                    "New entries will remain blocked until that position is closed.",
+                    "Exchange has an unrecorded open position for %s; auto-flattening it "
+                    "at startup (original SL/TP unknown).",
                     symbol,
                 )
+                try:
+                    resp = await self._client.flatten_position(symbol)
+                    if resp is None:
+                        self._logger.info("Nothing to flatten for %s (already closed).", symbol)
+                    elif await self._client.has_open_position(symbol):
+                        self._logger.error(
+                            "Auto-flatten for %s did not fully close the position; "
+                            "new entries remain blocked until it is closed manually.",
+                            symbol,
+                        )
+                    else:
+                        self._logger.info("Auto-flattened orphan position for %s.", symbol)
+                except Exception as exc:
+                    self._logger.error(
+                        "Failed to auto-flatten orphan position for %s: %s. "
+                        "New entries remain blocked until it is closed manually.",
+                        symbol,
+                        exc,
+                    )
 
     async def _monitor_position(self, position: OpenPosition, plan: TradePlan) -> str:
         max_hold_seconds = self._resolve_max_hold_seconds(plan)

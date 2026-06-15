@@ -55,6 +55,16 @@ class ExitDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = Field(min_length=1, max_length=500)
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _clamp_reason(cls, value: Any) -> Any:
+        # Same chat-mode length guard as PreTradeCheck: a verbose-but-valid exit
+        # decision must not raise ValidationError -> None and strand an open position
+        # on the time-stop fallback.
+        if not isinstance(value, str):
+            return value
+        return value[:500]
+
 
 class ArenaMarketReview(BaseModel):
     regime: str = Field(min_length=1, max_length=80)
