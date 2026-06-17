@@ -114,6 +114,8 @@ class Settings(BaseSettings):
     max_risk_pct_per_trade: float = Field(default=0.5, alias="MAX_RISK_PCT_PER_TRADE")
     atr_sl_multiplier: float = Field(default=1.5, alias="ATR_SL_MULTIPLIER")
     atr_tp_multiplier: float = Field(default=3.0, alias="ATR_TP_MULTIPLIER")
+    entry_guard_long_rsi_max: float = Field(default=76.0, ge=0.0, le=100.0, alias="ENTRY_GUARD_LONG_RSI_MAX")
+    entry_guard_short_rsi_min: float = Field(default=24.0, ge=0.0, le=100.0, alias="ENTRY_GUARD_SHORT_RSI_MIN")
     cooldown_minutes_after_entry: int = Field(default=10, alias="COOLDOWN_MINUTES_AFTER_ENTRY")
     cooldown_minutes_after_stop: int = Field(default=20, alias="COOLDOWN_MINUTES_AFTER_STOP")
     max_daily_drawdown_usdt: float = Field(default=100.0, alias="MAX_DAILY_DRAWDOWN_USDT")

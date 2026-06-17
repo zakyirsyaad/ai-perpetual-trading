@@ -454,7 +454,7 @@ class AIOrchestrator:
                 (macd_hist <= 0, "macd_hist_not_positive"),
                 (trend_bias != "bullish", f"trend_bias={trend_bias}"),
                 (composite < 0.9, f"composite_too_low={composite:.2f}"),
-                (rsi_14 >= 76, f"rsi_overheated={rsi_14:.1f}"),
+                (rsi_14 >= self._settings.entry_guard_long_rsi_max, f"rsi_overheated={rsi_14:.1f}"),
                 (change_pct_1 < -0.05 and change_pct_5 < 0, "short_term_reversal_down"),
                 (volume_change_pct <= -85, f"volume_collapse={volume_change_pct:.1f}%"),
             ]
@@ -465,7 +465,7 @@ class AIOrchestrator:
                 (macd_hist >= 0, "macd_hist_not_negative"),
                 (trend_bias != "bearish", f"trend_bias={trend_bias}"),
                 (composite > -0.9, f"composite_not_bearish_enough={composite:.2f}"),
-                (rsi_14 <= 24, f"rsi_oversold={rsi_14:.1f}"),
+                (rsi_14 <= self._settings.entry_guard_short_rsi_min, f"rsi_oversold={rsi_14:.1f}"),
                 (change_pct_1 > 0.05 and change_pct_5 > 0, "short_term_reversal_up"),
                 (volume_change_pct <= -85, f"volume_collapse={volume_change_pct:.1f}%"),
             ]
