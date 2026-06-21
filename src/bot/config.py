@@ -131,8 +131,11 @@ class Settings(BaseSettings):
     xai_model: str = Field(default="gpt-5.4", alias="XAI_MODEL")
     xai_reasoning_effort: str = Field(default="high", alias="XAI_REASONING_EFFORT")
     xai_timeout_seconds: int = Field(default=90, alias="XAI_TIMEOUT_SECONDS")
-    # "responses" = xAI /responses w/ json_schema; "chat" = OpenAI /chat/completions w/ json_object.
+    # "responses" = xAI /responses w/ json_schema; "chat" = OpenAI /chat/completions w/ json_object;
+    # "messages" = Anthropic-style /messages (e.g. deepseek-v4-flash on openmodel.ai), schema in prompt.
     xai_api_style: str = Field(default="chat", alias="XAI_API_STYLE")
+    # Required by the Anthropic /messages dialect; reasoning models also spend it on thinking.
+    xai_max_tokens: int = Field(default=4096, alias="XAI_MAX_TOKENS")
     ai_kline_interval: str = Field(default="3m", alias="AI_KLINE_INTERVAL")
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
     ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")

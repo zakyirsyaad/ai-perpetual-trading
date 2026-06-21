@@ -115,12 +115,19 @@ class GrokBrain:
     def __init__(self, settings: Settings, logger: logging.Logger) -> None:
         self._settings = settings
         self._logger = logger
+        # The Anthropic-style /messages dialect authenticates with x-api-key +
+        # anthropic-version instead of a Bearer token. Send both so a single client
+        # works across "responses"/"chat" (Bearer) and "messages" (x-api-key) providers.
+        _headers = {
+            "Authorization": f"Bearer {settings.xai_api_key}",
+            "Content-Type": "application/json",
+        }
+        if str(getattr(settings, "xai_api_style", "")).strip().lower() == "messages":
+            _headers["x-api-key"] = settings.xai_api_key or ""
+            _headers["anthropic-version"] = "2023-06-01"
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.xai_timeout_seconds),
-            headers={
-                "Authorization": f"Bearer {settings.xai_api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_headers,
         )
         self._rate_limited_until: float | None = None
 
@@ -223,24 +230,39 @@ class GrokBrain:
             },
         }
 
-        use_chat = str(getattr(self._settings, "xai_api_style", "responses")).strip().lower() == "chat"
-        if use_chat:
-            # OpenAI-compatible /chat/completions with json_object. The provider
-            # doesn't support strict json_schema, so we embed the schema in the
+        style = str(getattr(self._settings, "xai_api_style", "responses")).strip().lower()
+        if style in {"chat", "messages"}:
+            # Neither dialect supports strict json_schema, so embed the schema in the
             # system prompt and rely on pydantic validation + retry to enforce it.
             schema_hint = (
                 "Respond ONLY with a single JSON object, no markdown, matching this JSON Schema:\n"
                 + json.dumps(schema.model_json_schema(), ensure_ascii=True)
             )
-            body = {
-                "model": self._settings.xai_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt + "\n\n" + schema_hint},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
-                ],
-                "response_format": {"type": "json_object"},
-            }
-            endpoint = "/chat/completions"
+            system_full = system_prompt + "\n\n" + schema_hint
+            if style == "messages":
+                # Anthropic-style /messages: top-level `system`, mandatory `max_tokens`.
+                # Reasoning models (e.g. deepseek-v4-flash) also spend max_tokens on a
+                # thinking block, which _extract_response_text skips.
+                body = {
+                    "model": self._settings.xai_model,
+                    "max_tokens": int(getattr(self._settings, "xai_max_tokens", 4096)),
+                    "system": system_full,
+                    "messages": [
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                    ],
+                }
+                endpoint = "/messages"
+            else:
+                # OpenAI-compatible /chat/completions with json_object.
+                body = {
+                    "model": self._settings.xai_model,
+                    "messages": [
+                        {"role": "system", "content": system_full},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                    ],
+                    "response_format": {"type": "json_object"},
+                }
+                endpoint = "/chat/completions"
         else:
             endpoint = "/responses"
 
@@ -314,4 +336,13 @@ class GrokBrain:
             message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
             if isinstance(message.get("content"), str):
                 return str(message["content"])
+        # Anthropic-style /messages: top-level content[] with text/thinking blocks.
+        # Reasoning models emit a "thinking" block first; take the first "text" block.
+        top_content = payload.get("content")
+        if isinstance(top_content, list):
+            for content in top_content:
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") == "text" and isinstance(content.get("text"), str):
+                    return str(content["text"])
         raise KeyError("No text output found in xAI response")
