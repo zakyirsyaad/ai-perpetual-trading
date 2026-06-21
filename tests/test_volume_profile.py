@@ -4,6 +4,8 @@ import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 
+from pydantic import ValidationError
+
 from bot.config import Settings
 from bot.strategy.volume_strategy import VolumeStrategy
 from bot.volume import VolumeBuildProfile
@@ -66,8 +68,8 @@ class VolumeProfileTests(unittest.TestCase):
             POSITION_USDT=20,
             VOLUME_MARGIN_PER_ENTRY_USDT=180,
             LEVERAGE=100,
-            PERP_HARD_MAX_LEVERAGE=100,
-            PERP_VENUE_MAX_LEVERAGE=100,
+            OKX_HARD_MAX_LEVERAGE=100,
+            OKX_VENUE_MAX_LEVERAGE=100,
             TRADE_TARGET_PER_DAY=16,
         )
 
@@ -86,13 +88,32 @@ class VolumeProfileTests(unittest.TestCase):
             ACCOUNT_BALANCE_USDT=1500,
             VOLUME_MARGIN_PER_ENTRY_USDT=180,
             LEVERAGE=100,
-            PERP_HARD_MAX_LEVERAGE=100,
-            PERP_VENUE_MAX_LEVERAGE=100,
+            OKX_HARD_MAX_LEVERAGE=100,
+            OKX_VENUE_MAX_LEVERAGE=100,
             TRADE_TARGET_PER_DAY=16,
         )
 
         self.assertEqual(settings.strategy_mode, "ai_volume")
         self.assertEqual(settings.volume_profile.volume_per_entry_usdt, Decimal("36000"))
+
+    def test_settings_rejects_removed_regression_modes(self) -> None:
+        base = {
+            "_env_file": None,
+            "OKX_API_KEY": "demo-key",
+            "OKX_SECRET_KEY": "demo-secret",
+            "OKX_PASSPHRASE": "demo-passphrase",
+            "XAI_API_KEY": "xai-key",
+            "ACCOUNT_BALANCE_USDT": 1500,
+            "VOLUME_MARGIN_PER_ENTRY_USDT": 180,
+            "LEVERAGE": 100,
+            "OKX_HARD_MAX_LEVERAGE": 100,
+            "OKX_VENUE_MAX_LEVERAGE": 100,
+        }
+
+        for mode in ("regression_alpha", "regression_alpha_ai"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValidationError):
+                    Settings(**base, STRATEGY_MODE=mode)
 
 
 if __name__ == "__main__":

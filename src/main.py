@@ -8,6 +8,7 @@ from bot.config import Settings
 from bot.core.trade_engine import TradeEngine
 from bot.data.providers import ExternalSignalAggregator
 from bot.exchange.okx_client import OKXAPIError, OKXFuturesClient
+from bot.exchange.leverage import resolve_okx_venue_leverage
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.logger import setup_logging
 from bot.risk.risk_manager import RiskManager
@@ -27,9 +28,6 @@ async def run() -> None:
     logger.info("Strategy mode: %s", settings.strategy_mode)
     if settings.strategy_mode in {"grok", "ai_volume"}:
         logger.info("AI model: xAI %s", settings.xai_model)
-    if settings.strategy_mode in {"volume", "ai_volume"}:
-        logger.info("Volume profile: %s", settings.volume_profile.as_log_fields())
-
     if not (settings.supabase_url and settings.supabase_service_role_key):
         raise RuntimeError(
             "Supabase primary store is required. Fill SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY; "
@@ -49,6 +47,32 @@ async def run() -> None:
         insecure_ssl=settings.okx_insecure_ssl,
         debug_http=settings.okx_debug_http,
     )
+    resolution = await resolve_okx_venue_leverage(
+        client,
+        symbols=settings.symbols,
+        configured_leverage=settings.leverage,
+        margin_mode=settings.okx_margin_mode,
+    )
+    settings.okx_venue_max_leverage = resolution.effective_max_leverage
+    if resolution.was_capped:
+        logger.warning(
+            "Configured leverage %sx capped to %sx by OKX venue max %sx. source=%s",
+            resolution.configured_leverage,
+            resolution.resolved_leverage,
+            resolution.effective_max_leverage,
+            resolution.source,
+        )
+        settings.leverage = resolution.resolved_leverage
+    else:
+        logger.info(
+            "OKX leverage cap resolved: configured=%sx venue_max=%sx source=%s",
+            resolution.configured_leverage,
+            resolution.effective_max_leverage,
+            resolution.source,
+        )
+    if settings.strategy_mode in {"volume", "ai_volume"}:
+        logger.info("Volume profile: %s", settings.volume_profile.as_log_fields())
+
     store = SupabaseTradeStore(settings, logger)
     risk = RiskManager(
         store,
@@ -56,11 +80,11 @@ async def run() -> None:
         max_daily_drawdown_usdt=settings.max_daily_drawdown_usdt,
         max_consecutive_losses=settings.max_consecutive_losses,
     )
+    signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
+    intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)
     if settings.strategy_mode == "volume":
-        strategy = VolumeStrategy(settings)
+        strategy = VolumeStrategy(settings, intelligence)
     else:
-        signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
-        intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)
         brain = GrokBrain(settings, logger)
         orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
         strategy = GrokStrategy(orchestrator)

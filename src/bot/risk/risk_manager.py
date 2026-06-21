@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
-from bot.storage.trade_store import TradeStore
+from bot.storage.interfaces import TradeStoreProtocol
 
 
 @dataclass(slots=True)
@@ -19,7 +19,7 @@ class DailyRiskState:
 class RiskManager:
     def __init__(
         self,
-        trade_store: TradeStore,
+        trade_store: TradeStoreProtocol,
         max_stop_losses_per_day: int,
         max_daily_drawdown_usdt: float,
         max_consecutive_losses: int,
@@ -54,4 +54,3 @@ class RiskManager:
     async def can_open_new_position(self) -> bool:
         state = await self.get_daily_state()
         return state.allowed_to_trade
-

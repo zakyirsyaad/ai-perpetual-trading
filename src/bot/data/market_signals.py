@@ -23,6 +23,10 @@ class TechnicalFeatures:
     volume_change_pct: float
     funding_rate: float
     open_interest: float
+    open_interest_change_pct: float = 0.0
+    spread_bps: float | None = None
+    bid_depth_notional: float | None = None
+    ask_depth_notional: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -49,10 +53,14 @@ class MarketContext:
     technicals: list[TechnicalFeatures]
     external_signals: ExternalMarketSignals
     intelligence: dict[str, Any]
+    factor_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    active_flow_signals: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "technicals": [item.to_dict() for item in self.technicals],
             "external_signals": self.external_signals.to_dict(),
             "intelligence": self.intelligence,
+            "factor_snapshots": self.factor_snapshots,
+            "active_flow_signals": self.active_flow_signals,
         }

@@ -24,6 +24,8 @@ class TradePlan:
     confidence: float = 0.0
     setup_score: float = 0.0
     max_hold_minutes: int | None = None
+    factor_metadata: dict[str, Any] | None = None
+    trigger_metadata: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -52,4 +54,6 @@ class ClosedTrade:
     closed_at: datetime
     exchange_entry_order_id: str
     exchange_exit_order_id: str
-
+    confidence: float = 0.0
+    factor_metadata: dict[str, Any] | None = None
+    trigger_metadata: dict[str, Any] | None = None

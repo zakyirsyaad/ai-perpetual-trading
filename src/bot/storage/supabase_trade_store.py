@@ -14,7 +14,7 @@ from bot.models import ClosedTrade, OpenPosition
 class SupabaseTradeStore:
     """Primary trade store backed by Supabase REST.
 
-    This intentionally does not keep local SQLite state. Open positions are
+    This intentionally does not keep local file state. Open positions are
     reconciled from OKX on startup by the trade engine.
     """
 
@@ -58,6 +58,8 @@ class SupabaseTradeStore:
         payload["direction"] = trade.direction.value
         payload["opened_at"] = trade.opened_at.isoformat()
         payload["closed_at"] = trade.closed_at.isoformat()
+        payload["factor_metadata"] = trade.factor_metadata or {}
+        payload["trigger_metadata"] = trade.trigger_metadata or {}
         await self._insert(self._trades_table, payload)
 
     async def save_ai_decision(
@@ -135,6 +137,21 @@ class SupabaseTradeStore:
                 continue
             break
         return streak
+
+    async def recent_closed_trade_records(self, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._get_rows(
+            self._trades_table,
+            [
+                (
+                    "select",
+                    "symbol,direction,entry_price,exit_price,quantity,pnl_usdt,reason,entry_reason,"
+                    "opened_at,closed_at,exchange_entry_order_id,exchange_exit_order_id,confidence,"
+                    "factor_metadata,trigger_metadata",
+                ),
+                ("order", "closed_at.desc"),
+                ("limit", str(limit)),
+            ],
+        )
 
     async def _closed_trade_rows_for_day(self, day: date | None, select: str) -> list[dict[str, Any]]:
         target_day = day or datetime.now(timezone.utc).date()

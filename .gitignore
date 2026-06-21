@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
-.env
+# Ignore every .env variant (secrets) but keep the public template.
+# Covers .env, .env.backup.*, .env.bak.*, .env.save, .env.local, etc.
+.env*
+!.env.example
 logs/
 bot_data/

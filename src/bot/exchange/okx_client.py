@@ -183,6 +183,29 @@ class OKXFuturesClient:
             payload["reduceOnly"] = "true"
         return await self._signed_request("POST", "/api/v5/trade/order", payload)
 
+    async def flatten_position(self, symbol: str) -> dict[str, Any] | None:
+        """Market-close any open position for symbol via a reduce-only order.
+
+        Returns the order response, or None if there was nothing to close. Used to
+        auto-flat an orphan exchange position found at startup (no local record, so
+        its original SL/TP cannot be reconstructed)."""
+        details = await self.get_symbol_position_details(symbol)
+        if details.exchange_size <= 0:
+            return None
+        # In long_short (hedge) mode posSide tells us the side; default to LONG only
+        # when it is genuinely absent (net mode), which still resolves to a valid close.
+        direction = (
+            PositionDirection.SHORT
+            if str(details.pos_side or "").lower() == "short"
+            else PositionDirection.LONG
+        )
+        return await self.place_market_order(
+            symbol=symbol,
+            direction=direction,
+            size=details.exchange_size,
+            reduce_only=True,
+        )
+
     async def place_limit_order(
         self,
         symbol: str,
@@ -275,6 +298,20 @@ class OKXFuturesClient:
             taker_fee_pct=float(abs(taker) * Decimal("100")),
             raw=row,
         )
+
+    async def get_position_tiers(self, symbol: str, td_mode: str = "isolated") -> list[dict[str, Any]]:
+        inst_id = self._normalize_symbol(symbol)
+        params: dict[str, Any] = {
+            "instType": self._instrument_type,
+            "tdMode": td_mode,
+        }
+        if self._instrument_type in {"SWAP", "FUTURES", "OPTION"}:
+            params["instFamily"] = self._instrument_family(inst_id)
+        else:
+            params["instId"] = inst_id
+        resp = await self._public_request("GET", "/api/v5/public/position-tiers", params)
+        data = resp.get("data")
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
     async def validate_api_access(self, symbol: str) -> None:
         await self.get_last_price(symbol)

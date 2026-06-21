@@ -6,7 +6,7 @@ import time
 from typing import Any, Literal, TypeVar
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
 
 from bot.config import Settings
 
@@ -38,28 +38,65 @@ class PreTradeCheck(BaseModel):
     confirmations: str = Field(min_length=1, max_length=500)
     invalidation_trigger: str = Field(min_length=1, max_length=300)
 
+    @field_validator("confirmations", "invalidation_trigger", mode="before")
+    @classmethod
+    def _clamp_length(cls, value: Any, info: ValidationInfo) -> Any:
+        # The chat-mode provider cannot enforce maxLength server-side, so a verbose
+        # but otherwise valid approval must not be discarded on a length technicality
+        # (which previously turned guard-passed entries into "no response" rejections).
+        if not isinstance(value, str):
+            return value
+        limit = 500 if info.field_name == "confirmations" else 300
+        return value[:limit]
+
 
 class ExitDecision(BaseModel):
     action: Literal["CLOSE", "HOLD"]
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = Field(min_length=1, max_length=500)
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _clamp_reason(cls, value: Any) -> Any:
+        # Same chat-mode length guard as PreTradeCheck: a verbose-but-valid exit
+        # decision must not raise ValidationError -> None and strand an open position
+        # on the time-stop fallback.
+        if not isinstance(value, str):
+            return value
+        return value[:500]
+
+
+class ArenaMarketReview(BaseModel):
+    regime: str = Field(min_length=1, max_length=80)
+    summary: str = Field(min_length=1, max_length=800)
+    risk_flags: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ArenaSignalReview(BaseModel):
+    approved_triggers: list[str] = Field(default_factory=list, max_length=12)
+    blocked_triggers: list[str] = Field(default_factory=list, max_length=12)
+    reason: str = Field(min_length=1, max_length=800)
+
+
+class ArenaDiagnosis(BaseModel):
+    cards: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
+    summary: str = Field(min_length=1, max_length=800)
+
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
 ENTRY_SYSTEM_PROMPT = """You are Layer 1 Brain for an OKX demo crypto futures trading system.
-You are a disciplined quant scalper and risk manager. You evaluate only live market data and live external signals.
+You are a decisive quant scalper running a volume-building mandate. You evaluate only live market data and live external signals.
 
 Principles:
-- Protect capital and avoid chaotic/noisy markets.
-- Prefer HOLD when trend, momentum, liquidity, and external signals conflict, but do not use recent losses
-  as a blanket veto when the current setup is clearly different and passes risk controls.
-- Use OKX technicals as the execution truth; use CoinMarketCap, Dune, and TradingView-derived signals as supporting context.
-- Learn from recent executed demo-trade outcomes. Avoid repeating patterns with negative average PnL.
-- Never invent missing data. If an external provider is empty, mark that in your reason and reduce confidence.
+- This is a volume-building run on OKX demo. Your job is to choose the best directional trade every tick,
+  not to sit out. Always pick OPEN_LONG or OPEN_SHORT — whichever direction the OKX technicals lean toward.
+- Use OKX technicals as the execution truth; CoinMarketCap, Dune, and TradingView are OPTIONAL supporting context.
+- Never invent missing data. If an optional external provider is empty, note it in your reason, but do not
+  reduce confidence on that basis — the OKX live technicals are sufficient to act.
 - High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise and take-profit
-  far enough to beat taker fees with positive fee-adjusted risk/reward.
+  far enough to beat taker fees.
 - For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct, take_profit_pct, and risk_reward_ratio.
 - Return one decision for every allowed symbol in decisions. Do not omit ETH/USDT.
 - Evaluate each symbol independently. Do not default to BTC/USDT when ETH/USDT has the cleaner setup.
@@ -75,12 +112,19 @@ class GrokBrain:
     def __init__(self, settings: Settings, logger: logging.Logger) -> None:
         self._settings = settings
         self._logger = logger
+        # The Anthropic-style /messages dialect authenticates with x-api-key +
+        # anthropic-version instead of a Bearer token. Send both so a single client
+        # works across "responses"/"chat" (Bearer) and "messages" (x-api-key) providers.
+        _headers = {
+            "Authorization": f"Bearer {settings.xai_api_key}",
+            "Content-Type": "application/json",
+        }
+        if str(getattr(settings, "xai_api_style", "")).strip().lower() == "messages":
+            _headers["x-api-key"] = settings.xai_api_key or ""
+            _headers["anthropic-version"] = "2023-06-01"
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.xai_timeout_seconds),
-            headers={
-                "Authorization": f"Bearer {settings.xai_api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_headers,
         )
         self._rate_limited_until: float | None = None
 
@@ -126,6 +170,30 @@ class GrokBrain:
             reasoning_effort="low",
         )
 
+    async def arena_market_review(self, payload: dict[str, Any]) -> ArenaMarketReview | None:
+        return await self._ask_grok(
+            system_prompt="You are MarketAnalyzer. Review only supplied market/factor context and return concise JSON.",
+            payload=payload,
+            schema=ArenaMarketReview,
+            reasoning_effort="low",
+        )
+
+    async def arena_signal_review(self, payload: dict[str, Any]) -> ArenaSignalReview | None:
+        return await self._ask_grok(
+            system_prompt="You are SignalDesigner. Approve only robust supplied market-flow triggers.",
+            payload=payload,
+            schema=ArenaSignalReview,
+            reasoning_effort="low",
+        )
+
+    async def arena_diagnosis(self, payload: dict[str, Any]) -> ArenaDiagnosis | None:
+        return await self._ask_grok(
+            system_prompt="You are AttributionDiagnoser. Use only supplied realized metrics.",
+            payload=payload,
+            schema=ArenaDiagnosis,
+            reasoning_effort="low",
+        )
+
     async def _ask_grok(
         self,
         *,
@@ -159,11 +227,47 @@ class GrokBrain:
             },
         }
 
+        style = str(getattr(self._settings, "xai_api_style", "responses")).strip().lower()
+        if style in {"chat", "messages"}:
+            # Neither dialect supports strict json_schema, so embed the schema in the
+            # system prompt and rely on pydantic validation + retry to enforce it.
+            schema_hint = (
+                "Respond ONLY with a single JSON object, no markdown, matching this JSON Schema:\n"
+                + json.dumps(schema.model_json_schema(), ensure_ascii=True)
+            )
+            system_full = system_prompt + "\n\n" + schema_hint
+            if style == "messages":
+                # Anthropic-style /messages: top-level `system`, mandatory `max_tokens`.
+                # Reasoning models (e.g. deepseek-v4-flash) also spend max_tokens on a
+                # thinking block, which _extract_response_text skips.
+                body = {
+                    "model": self._settings.xai_model,
+                    "max_tokens": int(getattr(self._settings, "xai_max_tokens", 4096)),
+                    "system": system_full,
+                    "messages": [
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                    ],
+                }
+                endpoint = "/messages"
+            else:
+                # OpenAI-compatible /chat/completions with json_object.
+                body = {
+                    "model": self._settings.xai_model,
+                    "messages": [
+                        {"role": "system", "content": system_full},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                    ],
+                    "response_format": {"type": "json_object"},
+                }
+                endpoint = "/chat/completions"
+        else:
+            endpoint = "/responses"
+
         last_error: Exception | None = None
         for attempt in range(2):
             try:
                 response = await self._client.post(
-                    f"{self._settings.xai_base_url.rstrip('/')}/responses",
+                    f"{self._settings.xai_base_url.rstrip('/')}{endpoint}",
                     json=body,
                 )
                 response.raise_for_status()
@@ -229,4 +333,13 @@ class GrokBrain:
             message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
             if isinstance(message.get("content"), str):
                 return str(message["content"])
+        # Anthropic-style /messages: top-level content[] with text/thinking blocks.
+        # Reasoning models emit a "thinking" block first; take the first "text" block.
+        top_content = payload.get("content")
+        if isinstance(top_content, list):
+            for content in top_content:
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") == "text" and isinstance(content.get("text"), str):
+                    return str(content["text"])
         raise KeyError("No text output found in xAI response")

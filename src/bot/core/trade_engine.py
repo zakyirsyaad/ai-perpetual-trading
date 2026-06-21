@@ -8,8 +8,8 @@ from bot.config import Settings
 from bot.exchange.okx_client import OKXFuturesClient, OKXOrderBook
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import RiskManager
+from bot.storage.interfaces import TradeStoreProtocol
 from bot.storage.supabase_journal import SupabaseJournal
-from bot.storage.trade_store import TradeStore
 from bot.strategy.base import BaseStrategy
 from bot.strategy.grok_strategy import GrokStrategy
 
@@ -22,7 +22,7 @@ class TradeEngine:
         client: OKXFuturesClient,
         strategy: BaseStrategy,
         risk_manager: RiskManager,
-        trade_store: TradeStore,
+        trade_store: TradeStoreProtocol,
         supabase_journal: SupabaseJournal | None = None,
     ) -> None:
         self._settings = settings
@@ -93,6 +93,10 @@ class TradeEngine:
                 state.closed_trades,
                 self._settings.trade_target_per_day,
             )
+            return
+        volume_pause_reason = await self._volume_runtime_pause_reason()
+        if volume_pause_reason is not None:
+            self._logger.info("Volume runtime guard active: %s. Entries paused.", volume_pause_reason)
             return
 
         plan = await self._strategy.next_trade_plan()
@@ -213,25 +217,27 @@ class TradeEngine:
         # Record last entry timestamp for cooldown logic.
         self._last_entry_ts = opened_at.timestamp()
 
-        exit_reason = await self._post_entry_position_guard(open_position, plan)
-        if exit_reason is None:
-            exit_reason = await self._monitor_position(open_position, plan)
-
-        # It is possible that the exchange position was already closed or resized externally
-        # (manual close, liquidation, partial close, etc.). In that case we should not try to
-        # send a reduce-only order for the original size.
-        exchange_size_to_close, _ = await self._client.get_symbol_position_snapshot(open_position.symbol)
         realized_qty = open_position.quantity
         exit_fill = None
-        if exchange_size_to_close <= 0:
-            self._logger.warning(
-                "No position to close on exchange for %s; treating as already closed. reason=%s",
-                open_position.symbol,
-                exit_reason,
-            )
-            exit_order_id = "NO_POSITION_TO_CLOSE"
-            exit_price = await self._client.get_last_price(open_position.symbol)
-        else:
+        exit_reason = await self._post_entry_position_guard(open_position, plan)
+        while True:
+            if exit_reason is None:
+                exit_reason = await self._monitor_position(open_position, plan)
+
+            # It is possible that the exchange position was already closed or resized externally
+            # (manual close, liquidation, partial close, etc.). In that case we should not try to
+            # send a reduce-only order for the original size.
+            exchange_size_to_close, _ = await self._client.get_symbol_position_snapshot(open_position.symbol)
+            if exchange_size_to_close <= 0:
+                self._logger.warning(
+                    "No position to close on exchange for %s; treating as already closed. reason=%s",
+                    open_position.symbol,
+                    exit_reason,
+                )
+                exit_order_id = "NO_POSITION_TO_CLOSE"
+                exit_price = await self._client.get_last_price(open_position.symbol)
+                break
+
             realized_qty = await self._client.estimate_base_quantity(open_position.symbol, exchange_size_to_close)
             if realized_qty <= 0:
                 realized_qty = open_position.quantity
@@ -242,18 +248,37 @@ class TradeEngine:
                     open_position.exchange_size,
                     exchange_size_to_close,
                 )
-            exit_resp = await self._client.place_market_order(
-                symbol=open_position.symbol,
-                direction=open_position.direction,
-                size=exchange_size_to_close,
-                reduce_only=True,
-            )
-            exit_order_id = self._extract_order_id(exit_resp)
+            if self._exit_allows_taker(exit_reason):
+                exit_resp = await self._client.place_market_order(
+                    symbol=open_position.symbol,
+                    direction=open_position.direction,
+                    size=exchange_size_to_close,
+                    reduce_only=True,
+                )
+                exit_order_id = self._extract_order_id(exit_resp)
+            else:
+                exit_order_id = await self._place_post_only_exit(open_position, exchange_size_to_close)
+                if exit_order_id is None:
+                    self._logger.warning(
+                        "Maker-only exit for %s did not fill for non-risk reason=%s; "
+                        "resuming position monitor.",
+                        open_position.symbol,
+                        exit_reason,
+                    )
+                    exit_reason = None
+                    continue
             await asyncio.sleep(self._settings.order_fill_wait_seconds)
             exit_fill = await self._client.get_order_fill(open_position.symbol, exit_order_id)
             if exit_fill is not None and exit_fill.base_quantity > 0:
                 realized_qty = exit_fill.base_quantity
             if await self._client.has_open_position(open_position.symbol):
+                if not self._exit_allows_taker(exit_reason):
+                    self._logger.warning(
+                        "Maker-only exit order for %s did not fully close the position; resuming monitor.",
+                        open_position.symbol,
+                    )
+                    exit_reason = None
+                    continue
                 raise RuntimeError(
                     f"Exit order placed but position still open for {open_position.symbol}."
                 )
@@ -261,6 +286,7 @@ class TradeEngine:
                 exit_price = exit_fill.avg_price
             else:
                 exit_price = await self._client.get_last_price(open_position.symbol)
+            break
         closed_at = datetime.now(timezone.utc)
         gross_pnl = self._estimate_gross_pnl(
             open_position.direction,
@@ -293,6 +319,9 @@ class TradeEngine:
             closed_at=closed_at,
             exchange_entry_order_id=entry_order_id,
             exchange_exit_order_id=exit_order_id,
+            confidence=plan.confidence,
+            factor_metadata=plan.factor_metadata,
+            trigger_metadata=plan.trigger_metadata,
         )
         await self._trade_store.save_closed_trade(closed_trade)
         if self._supabase_journal is not None:
@@ -328,6 +357,30 @@ class TradeEngine:
         self._logger.info("OKX demo API connectivity and auth check passed.")
         await self._reconcile_local_open_positions()
 
+    async def _volume_runtime_pause_reason(self) -> str | None:
+        if self._settings.strategy_mode not in {"volume", "ai_volume"}:
+            return None
+        daily_volume = await self._trade_store.total_volume_for_day()
+        daily_target = float(getattr(self._settings, "volume_daily_target_usdt", 0.0) or 0.0)
+        if (
+            getattr(self._settings, "volume_stop_at_target_enabled", True)
+            and daily_target > 0
+            and daily_volume >= daily_target
+        ):
+            return "daily_volume_target_reached"
+        target = float(getattr(self._settings, "volume_target_usdt", 0.0) or 0.0)
+        if (
+            getattr(self._settings, "volume_stop_at_target_enabled", True)
+            and target > 0
+            and daily_volume >= target
+        ):
+            return "volume_target_reached"
+        fee_budget = float(getattr(self._settings, "volume_daily_fee_budget_usdt", 0.0) or 0.0)
+        estimated_fee = daily_volume * (float(getattr(self._settings, "taker_fee_pct", 0.0) or 0.0) / 100.0)
+        if fee_budget > 0 and estimated_fee >= fee_budget:
+            return "volume_fee_budget_reached"
+        return None
+
     async def _reconcile_local_open_positions(self) -> None:
         local_positions = await self._trade_store.list_open_positions()
         local_symbols: set[str] = set()
@@ -348,11 +401,35 @@ class TradeEngine:
             if symbol in local_symbols:
                 continue
             if await self._client.has_open_position(symbol):
+                # Orphan exchange position with no local record (e.g. the bot was
+                # stopped mid-trade). Open positions are not persisted and the original
+                # SL/TP cannot be reconstructed, so leaving it would be an unmonitored
+                # 100x position. Auto-flat it at startup so the bot resumes from a clean,
+                # fully-monitored state instead of blocking all new entries indefinitely.
                 self._logger.warning(
-                    "Exchange already has an open position for %s but no local record was found. "
-                    "New entries will remain blocked until that position is closed.",
+                    "Exchange has an unrecorded open position for %s; auto-flattening it "
+                    "at startup (original SL/TP unknown).",
                     symbol,
                 )
+                try:
+                    resp = await self._client.flatten_position(symbol)
+                    if resp is None:
+                        self._logger.info("Nothing to flatten for %s (already closed).", symbol)
+                    elif await self._client.has_open_position(symbol):
+                        self._logger.error(
+                            "Auto-flatten for %s did not fully close the position; "
+                            "new entries remain blocked until it is closed manually.",
+                            symbol,
+                        )
+                    else:
+                        self._logger.info("Auto-flattened orphan position for %s.", symbol)
+                except Exception as exc:
+                    self._logger.error(
+                        "Failed to auto-flatten orphan position for %s: %s. "
+                        "New entries remain blocked until it is closed manually.",
+                        symbol,
+                        exc,
+                    )
 
     async def _monitor_position(self, position: OpenPosition, plan: TradePlan) -> str:
         max_hold_seconds = self._resolve_max_hold_seconds(plan)
@@ -373,6 +450,20 @@ class TradeEngine:
                 max_net = min_net + self._settings.volume_neutral_exit_band_usdt
                 if min_net <= net_after_fee <= max_net:
                     return "neutral_exit"
+            if (
+                getattr(self._settings, "volume_breakeven_exit_enabled", False)
+                and elapsed >= getattr(self._settings, "volume_breakeven_min_seconds", 0)
+            ):
+                min_profit = float(getattr(self._settings, "volume_breakeven_min_profit_usdt", 0.0) or 0.0)
+                max_loss = float(getattr(self._settings, "volume_breakeven_max_loss_usdt", 0.0) or 0.0)
+                if net_after_fee >= min_profit:
+                    return "breakeven_exit"
+                if max_loss > 0 and -max_loss <= net_after_fee < min_profit:
+                    self._logger.debug(
+                        "Breakeven guard waiting: net_after_fee %.4f is within allowed drift %.4f.",
+                        net_after_fee,
+                        max_loss,
+                    )
             if self._hit_take_profit(position.direction, position.entry_price, current_price, plan.take_profit_pct):
                 if gross >= fee:
                     return "take_profit"
@@ -438,12 +529,12 @@ class TradeEngine:
             self._logger.warning("Skipped %s entry: order book guard failed. error=%s", plan.symbol, exc)
             return False, None
 
-        if order_book.spread_bps > self._settings.perp_max_spread_bps:
+        if order_book.spread_bps > self._settings.okx_max_spread_bps:
             self._logger.warning(
                 "Skipped %s entry: spread %.2fbps > max %.2fbps.",
                 plan.symbol,
                 order_book.spread_bps,
-                self._settings.perp_max_spread_bps,
+                self._settings.okx_max_spread_bps,
             )
             return False, order_book
 
@@ -479,9 +570,9 @@ class TradeEngine:
             )
             return False, order_book
 
-        if funding.next_funding_time is not None and self._settings.perp_funding_blackout_minutes > 0:
+        if funding.next_funding_time is not None and self._settings.okx_funding_blackout_minutes > 0:
             seconds_to_funding = (funding.next_funding_time - datetime.now(timezone.utc)).total_seconds()
-            blackout_seconds = self._settings.perp_funding_blackout_minutes * 60
+            blackout_seconds = self._settings.okx_funding_blackout_minutes * 60
             if 0 <= seconds_to_funding <= blackout_seconds:
                 self._logger.warning(
                     "Skipped %s entry: funding blackout active (%.0fs to funding, rate=%.6f).",
@@ -507,11 +598,11 @@ class TradeEngine:
         exchange_size: float,
         order_book: OKXOrderBook | None,
     ) -> str | None:
-        if self._settings.execution_entry_order_type == "post_only":
+        if self._uses_post_only_entry():
             order_id = await self._place_post_only_entry(plan, exchange_size, order_book)
             if order_id is not None:
                 return order_id
-            if not self._settings.execution_post_only_fallback_to_market:
+            if not self._allow_taker_entry_fallback():
                 self._logger.info("Skipped %s entry: post-only order did not fill.", plan.symbol)
                 return None
             self._logger.warning("Post-only entry for %s did not fill; falling back to market order.", plan.symbol)
@@ -530,7 +621,8 @@ class TradeEngine:
         exchange_size: float,
         order_book: OKXOrderBook | None,
     ) -> str | None:
-        attempts = max(1, self._settings.execution_post_only_max_reprices + 1)
+        ttl_seconds = self._maker_entry_ttl_seconds()
+        attempts = max(1, self._maker_max_reprices() + 1)
         terminal_states = {"filled", "canceled", "mmp_canceled"}
         for attempt in range(attempts):
             book = order_book if attempt == 0 and order_book is not None else await self._client.get_order_book(
@@ -547,9 +639,9 @@ class TradeEngine:
                 post_only=True,
             )
             order_id = self._extract_order_id(response)
-            deadline = datetime.now(timezone.utc).timestamp() + self._settings.execution_post_only_timeout_seconds
+            deadline = datetime.now(timezone.utc).timestamp() + ttl_seconds
             while datetime.now(timezone.utc).timestamp() < deadline:
-                await asyncio.sleep(min(1.0, self._settings.execution_post_only_timeout_seconds))
+                await asyncio.sleep(min(1.0, ttl_seconds))
                 fill = await self._client.get_order_fill(plan.symbol, order_id)
                 if fill is not None and fill.filled_size > 0:
                     if fill.state not in {"filled", None}:
@@ -560,6 +652,38 @@ class TradeEngine:
             await self._cancel_order_best_effort(plan.symbol, order_id)
         return None
 
+    async def _place_post_only_exit(self, position: OpenPosition, exchange_size: float) -> str | None:
+        ttl_seconds = self._maker_exit_ttl_seconds()
+        attempts = max(1, self._maker_max_reprices() + 1)
+        terminal_states = {"filled", "canceled", "mmp_canceled"}
+        for _attempt in range(attempts):
+            book = await self._client.get_order_book(
+                position.symbol,
+                depth=self._settings.orderbook_depth_levels,
+            )
+            price = book.best_ask if position.direction == PositionDirection.LONG else book.best_bid
+            response = await self._client.place_limit_order(
+                symbol=position.symbol,
+                direction=position.direction,
+                size=exchange_size,
+                price=price,
+                reduce_only=True,
+                post_only=True,
+            )
+            order_id = self._extract_order_id(response)
+            deadline = datetime.now(timezone.utc).timestamp() + ttl_seconds
+            while datetime.now(timezone.utc).timestamp() < deadline:
+                await asyncio.sleep(min(1.0, ttl_seconds))
+                fill = await self._client.get_order_fill(position.symbol, order_id)
+                if fill is not None and fill.filled_size > 0:
+                    if fill.state not in {"filled", None}:
+                        await self._cancel_order_best_effort(position.symbol, order_id)
+                    return order_id
+                if fill is not None and fill.state in terminal_states:
+                    break
+            await self._cancel_order_best_effort(position.symbol, order_id)
+        return None
+
     async def _cancel_order_best_effort(self, symbol: str, order_id: str) -> None:
         try:
             await self._client.cancel_order(symbol, order_id)
@@ -567,7 +691,7 @@ class TradeEngine:
             self._logger.debug("Could not cancel order %s for %s: %s", order_id, symbol, exc)
 
     async def _post_entry_position_guard(self, position: OpenPosition, plan: TradePlan) -> str | None:
-        if self._settings.perp_min_liquidation_distance_bps <= 0:
+        if self._settings.okx_min_liquidation_distance_bps <= 0:
             return None
         try:
             details = await self._client.get_symbol_position_details(position.symbol)
@@ -589,14 +713,14 @@ class TradeEngine:
             position.direction == PositionDirection.SHORT
             and stop_price >= details.liquidation_price
         )
-        if distance_bps < self._settings.perp_min_liquidation_distance_bps or stop_beyond_liq:
+        if distance_bps < self._settings.okx_min_liquidation_distance_bps or stop_beyond_liq:
             self._logger.warning(
                 "Liquidation guard closing %s: liq=%.4f ref=%.4f distance=%.2fbps min=%.2fbps stop=%.4f.",
                 position.symbol,
                 details.liquidation_price,
                 reference_price,
                 distance_bps,
-                self._settings.perp_min_liquidation_distance_bps,
+                self._settings.okx_min_liquidation_distance_bps,
                 stop_price,
             )
             return "liquidation_guard"
@@ -604,6 +728,37 @@ class TradeEngine:
 
     def _taker_fee_pct(self, symbol: str) -> float:
         return self._taker_fee_pct_by_symbol.get(symbol, self._settings.taker_fee_pct)
+
+    def _maker_only_mode(self) -> bool:
+        return str(getattr(self._settings, "volume_execution_mode", "")).lower() == "maker_only"
+
+    def _uses_post_only_entry(self) -> bool:
+        return self._maker_only_mode() or self._settings.execution_entry_order_type == "post_only"
+
+    def _allow_taker_entry_fallback(self) -> bool:
+        return (not self._maker_only_mode()) and bool(self._settings.execution_post_only_fallback_to_market)
+
+    def _exit_allows_taker(self, exit_reason: str) -> bool:
+        if not self._maker_only_mode():
+            return True
+        if not bool(getattr(self._settings, "maker_allow_taker_emergency_exit", True)):
+            return False
+        return exit_reason in {"stop_loss", "liquidation_guard", "liquidation_guard_unverified"}
+
+    def _maker_entry_ttl_seconds(self) -> float:
+        if self._maker_only_mode():
+            return float(getattr(self._settings, "maker_entry_ttl_seconds", 3.0))
+        return float(self._settings.execution_post_only_timeout_seconds)
+
+    def _maker_exit_ttl_seconds(self) -> float:
+        if self._maker_only_mode():
+            return float(getattr(self._settings, "maker_exit_ttl_seconds", 3.0))
+        return float(getattr(self._settings, "execution_post_only_timeout_seconds", 3.0))
+
+    def _maker_max_reprices(self) -> int:
+        if self._maker_only_mode():
+            return int(getattr(self._settings, "maker_max_reprices", 5))
+        return int(self._settings.execution_post_only_max_reprices)
 
     def _resolve_max_hold_seconds(self, plan: TradePlan) -> float:
         hold_minutes = plan.max_hold_minutes or self._settings.position_hold_minutes
@@ -649,6 +804,21 @@ class TradeEngine:
         entry_notional = entry_price * qty
         exit_notional = exit_price * qty
         return (entry_notional * fee_rate) + (exit_notional * fee_rate)
+
+    @staticmethod
+    def _breakeven_exit_price(
+        direction: PositionDirection,
+        entry_price: float,
+        quantity: float,
+        taker_fee_pct: float,
+        target_net_usdt: float = 0.0,
+    ) -> float:
+        fee_rate = taker_fee_pct / 100.0
+        qty = max(quantity, 1e-12)
+        entry_notional = entry_price * qty
+        if direction == PositionDirection.LONG:
+            return (entry_notional * (1.0 + fee_rate) + target_net_usdt) / (qty * (1.0 - fee_rate))
+        return (entry_notional * (1.0 - fee_rate) - target_net_usdt) / (qty * (1.0 + fee_rate))
 
     @staticmethod
     def _extract_order_id(response: dict) -> str:
