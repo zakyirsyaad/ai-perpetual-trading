@@ -2,6 +2,8 @@
 
 Async Python trading bot for OKX demo futures. The runtime is intentionally live-data only for execution: it does not place simulated live orders outside OKX demo trading.
 
+> **Shell note:** command blocks below use PowerShell (`$env:PYTHONPATH="src"; python ...`). The dev machine is macOS/zsh and the VPS is Linux, so use the POSIX form instead — prefix the var inline: `PYTHONPATH=src python src/main.py`.
+
 ## Architecture
 
 ```text
@@ -44,8 +46,8 @@ src/
 
 - `OKX_DEMO_TRADING=true` is required. The bot refuses to start if this is false.
 - OKX demo requests include the `x-simulated-trading: 1` header.
-- xAI defaults to `grok-4.3`.
-- xAI reasoning defaults to `high` for the Grok 4.3 High strategy profile.
+- AI provider is pluggable via `XAI_API_STYLE` (`responses` / `chat` / `messages`). `config.py` defaults to the `chat` profile (`XAI_MODEL=gpt-5.4`, freemodel.dev); the live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai. The `xai_*` names and "Grok" log lines are historical — the brain is provider-agnostic.
+- xAI reasoning effort defaults to `high` (`XAI_REASONING_EFFORT`); ignored by providers that don't accept a reasoning field.
 - OKX safety defaults are isolated margin, explicit leverage caps, and one net open position total.
 - `STRATEGY_MODE=ai_volume` lets Grok choose timing, symbol, and direction while execution size follows the volume-builder profile. `STRATEGY_MODE=volume` keeps deterministic rotation, and `STRATEGY_MODE=grok` keeps normal AI risk-sized trading.
 - The OKX runtime refreshes exchange taker fees when `USE_EXCHANGE_FEE_RATES=true`, blocks entries when order-book spread/depth is poor, skips entries near funding, and checks liquidation distance after entry.

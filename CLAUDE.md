@@ -53,7 +53,11 @@ All config is environment-driven via `pydantic-settings` in `src/bot/config.py`,
 
 **The AI decision pipeline (the "layers")** — understanding this requires reading `intelligence/market_intelligence.py`, `ai/brain.py`, and `ai/orchestration.py` together:
 1. `MarketIntelligence` synthesizes OKX truth (candles/orderbook/funding/OI/fees) + external signals (CMC, Dune, TradingView) + `arena` reviews into one context dict.
-2. `GrokBrain` (`ai/brain.py`) makes the LLM calls. Despite the name "Grok", the provider was migrated to an OpenAI-compatible endpoint (`XAI_API_STYLE=chat`, e.g. freemodel.dev); logs still say "Grok". Pydantic models (`EntryDecision`, `PreTradeCheck`, `ExitDecision`) validate the structured output.
+2. `GrokBrain` (`ai/brain.py`) makes the LLM calls. Despite the name "Grok" (and the `xai_*` config aliases), the provider is pluggable via `XAI_API_STYLE`, which selects one of three wire dialects — they differ in endpoint, auth, and how the JSON schema is enforced:
+   - `responses` — xAI-native `/responses` with strict server-side `json_schema`, Bearer auth.
+   - `chat` — OpenAI-compatible `/chat/completions` with `json_object`; schema is embedded in the system prompt and enforced only by pydantic + one retry.
+   - `messages` — Anthropic-style `/messages`: top-level `system`, mandatory `max_tokens` (`XAI_MAX_TOKENS`), `x-api-key` + `anthropic-version` headers. Same prompt-embedded schema as `chat`.
+   `config.py` *defaults* still point at the `chat` profile (freemodel.dev / `gpt-5.4`), but the **live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai** — a reasoning model that emits a `thinking` content block before the `text` block, so `_extract_response_text` skips to the first `text` block and `XAI_MAX_TOKENS` must leave headroom for the thinking spend. Pydantic models (`EntryDecision`, `PreTradeCheck`, `ExitDecision`) validate the structured output; only `responses` validates schema server-side, so `chat`/`messages` lean on the retry. Logs still say "Grok" regardless of provider.
 3. `AIOrchestrator` (`ai/orchestration.py`) runs the AI **twice per tick**: first `entry_decisions` (one decision per symbol), then a separate skeptical `pre_trade_check` on the selected candidate. Between them it applies hard gates: `ai_min_confidence`, `ai_systemic_risk_no_trade_threshold`, RR ratio, fee-adjusted RR.
 4. `GrokStrategy.next_trade_plan()` returns a `TradePlan` or `None`.
 
