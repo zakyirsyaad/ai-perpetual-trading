@@ -247,6 +247,9 @@ class GrokBrain:
                     "messages": [
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
                     ],
+                    # Some gateways default to SSE streaming; force a single JSON body
+                    # so response.json() can parse it.
+                    "stream": False,
                 }
                 endpoint = "/messages"
             else:
@@ -258,6 +261,9 @@ class GrokBrain:
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
                     ],
                     "response_format": {"type": "json_object"},
+                    # Some gateways default to SSE streaming; force a single JSON body
+                    # so response.json() can parse it.
+                    "stream": False,
                 }
                 endpoint = "/chat/completions"
         else:
