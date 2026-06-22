@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import unittest
 
 from bot.arena.program_trader import ProgramStrategyRunner, validate_strategy_code
@@ -55,6 +56,22 @@ def build_signal(context):
         self.assertIn("Import", unsafe.errors[0])
         self.assertFalse(missing_risk.success)
         self.assertIn("Directional signals require positive", missing_risk.error or "")
+
+    def test_runner_terminates_strategy_after_timeout(self) -> None:
+        started = time.perf_counter()
+        result = ProgramStrategyRunner(timeout_seconds=0.1).run_signal(
+            """
+def build_signal(context):
+    while True:
+        pass
+""",
+            {},
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.error or "")
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":

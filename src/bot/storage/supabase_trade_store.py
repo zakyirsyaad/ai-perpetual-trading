@@ -118,6 +118,14 @@ class SupabaseTradeStore:
 
     async def total_volume_for_day(self, day: date | None = None) -> float:
         rows = await self._closed_trade_rows_for_day(day, "entry_price,exit_price,quantity")
+        return self._sum_trade_volume(rows)
+
+    async def total_volume_all_time(self) -> float:
+        rows = await self._all_closed_trade_rows("entry_price,exit_price,quantity")
+        return self._sum_trade_volume(rows)
+
+    @staticmethod
+    def _sum_trade_volume(rows: list[dict[str, Any]]) -> float:
         return sum(
             (float(row.get("entry_price") or 0.0) * float(row.get("quantity") or 0.0))
             + (float(row.get("exit_price") or 0.0) * float(row.get("quantity") or 0.0))
@@ -167,6 +175,25 @@ class SupabaseTradeStore:
                 ("limit", "1000"),
             ],
         )
+
+    async def _all_closed_trade_rows(self, select: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_size = 1000
+        offset = 0
+        while True:
+            page = await self._get_rows(
+                self._trades_table,
+                [
+                    ("select", select),
+                    ("order", "closed_at.asc"),
+                    ("limit", str(page_size)),
+                    ("offset", str(offset)),
+                ],
+            )
+            rows.extend(page)
+            if len(page) < page_size:
+                return rows
+            offset += page_size
 
     async def _insert(self, table: str, payload: dict[str, Any]) -> None:
         response = await self._client.post(

@@ -9,11 +9,15 @@ from bot.volume import VolumeBuildProfile
 
 
 class _Store:
-    def __init__(self, volume: float) -> None:
+    def __init__(self, volume: float, total_volume: float | None = None) -> None:
         self.volume = volume
+        self.total_volume = volume if total_volume is None else total_volume
 
     async def total_volume_for_day(self) -> float:
         return self.volume
+
+    async def total_volume_all_time(self) -> float:
+        return self.total_volume
 
 
 class ArenaVolumeRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -77,15 +81,32 @@ class ArenaVolumeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         engine._settings = SimpleNamespace(
             strategy_mode="ai_volume",
             volume_stop_at_target_enabled=True,
+            volume_daily_target_usdt=0,
             volume_target_usdt=10_000,
             volume_daily_fee_budget_usdt=0,
             taker_fee_pct=0.05,
         )
-        engine._trade_store = _Store(volume=10_500)
+        engine._trade_store = _Store(volume=1_000, total_volume=10_500)
 
         reason = await engine._volume_runtime_pause_reason()
 
         self.assertEqual(reason, "volume_target_reached")
+
+    async def test_total_volume_target_does_not_use_only_today_volume(self) -> None:
+        engine = object.__new__(TradeEngine)
+        engine._settings = SimpleNamespace(
+            strategy_mode="ai_volume",
+            volume_stop_at_target_enabled=True,
+            volume_daily_target_usdt=0,
+            volume_target_usdt=10_000,
+            volume_daily_fee_budget_usdt=0,
+            taker_fee_pct=0.05,
+        )
+        engine._trade_store = _Store(volume=9_999, total_volume=9_999)
+
+        reason = await engine._volume_runtime_pause_reason()
+
+        self.assertIsNone(reason)
 
     async def test_volume_fee_budget_blocks_entries_when_estimated_fee_spent(self) -> None:
         engine = object.__new__(TradeEngine)

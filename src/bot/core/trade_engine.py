@@ -372,7 +372,7 @@ class TradeEngine:
         if (
             getattr(self._settings, "volume_stop_at_target_enabled", True)
             and target > 0
-            and daily_volume >= target
+            and await self._trade_store.total_volume_all_time() >= target
         ):
             return "volume_target_reached"
         fee_budget = float(getattr(self._settings, "volume_daily_fee_budget_usdt", 0.0) or 0.0)

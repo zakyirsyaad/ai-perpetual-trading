@@ -160,11 +160,15 @@ class ArenaAdvancedFeatureTests(unittest.TestCase):
 
 
 class _Store:
-    def __init__(self, volume: float) -> None:
+    def __init__(self, volume: float, total_volume: float | None = None) -> None:
         self.volume = volume
+        self.total_volume = volume if total_volume is None else total_volume
 
     async def total_volume_for_day(self) -> float:
         return self.volume
+
+    async def total_volume_all_time(self) -> float:
+        return self.total_volume
 
 
 if __name__ == "__main__":

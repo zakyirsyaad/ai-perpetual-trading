@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import ast
+import multiprocessing
+import queue
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,20 @@ _SAFE_BUILTINS = {
 }
 
 
+def _execute_strategy_in_child(code: str, context: dict[str, Any], result_queue: multiprocessing.Queue) -> None:
+    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+    try:
+        compiled = compile(code, "<program_trader>", "exec")
+        exec(compiled, namespace, namespace)
+        build_signal = namespace.get("build_signal")
+        if not callable(build_signal):
+            result_queue.put({"success": False, "error": "build_signal(context) is not callable"})
+            return
+        result_queue.put({"success": True, "raw": build_signal(dict(context))})
+    except Exception as exc:
+        result_queue.put({"success": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 def validate_strategy_code(code: str) -> ValidationResult:
     errors: list[str] = []
     try:
@@ -105,21 +120,28 @@ class ProgramStrategyRunner:
             return ProgramExecutionResult(False, error="Validation failed: " + "; ".join(validation.errors))
 
         started = time.perf_counter()
-        namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
-        try:
-            compiled = compile(code, "<program_trader>", "exec")
-            exec(compiled, namespace, namespace)
-            build_signal = namespace.get("build_signal")
-            if not callable(build_signal):
-                return ProgramExecutionResult(False, error="build_signal(context) is not callable")
-
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(build_signal, dict(context))
-                raw = future.result(timeout=self._timeout_seconds)
-        except TimeoutError:
+        process_context = multiprocessing.get_context("spawn")
+        result_queue = process_context.Queue(maxsize=1)
+        process = process_context.Process(
+            target=_execute_strategy_in_child,
+            args=(code, dict(context), result_queue),
+        )
+        process.start()
+        process.join(timeout=self._timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=0.2)
             return ProgramExecutionResult(False, error=f"Strategy timed out after {self._timeout_seconds:.2f}s")
-        except Exception as exc:
-            return ProgramExecutionResult(False, error=f"{type(exc).__name__}: {exc}")
+        try:
+            child_result = result_queue.get_nowait()
+        except queue.Empty:
+            return ProgramExecutionResult(False, error="Strategy exited without returning a result")
+        if not child_result.get("success"):
+            return ProgramExecutionResult(False, error=str(child_result.get("error") or "Strategy failed"))
+        raw = child_result.get("raw")
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         try:
