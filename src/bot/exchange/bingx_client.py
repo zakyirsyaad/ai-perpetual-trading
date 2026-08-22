@@ -129,10 +129,11 @@ class BingXFuturesClient:
         if normalized_env != "vst":
             raise ValueError("BINGX_ENV must be 'vst'; live BingX trading is not enabled for this runtime.")
         normalized_url = str(base_url).strip().rstrip("/")
-        if not self._is_vst_host(normalized_url):
+        if not self._is_vst_primary_host(normalized_url):
             raise ValueError(
-                "BINGX_BASE_URL must point at the BingX VST host "
-                f"({BINGX_VST_BASE_URL} or {BINGX_VST_FALLBACK_BASE_URL}); live endpoints fail closed."
+                f"BINGX_BASE_URL must be exactly {BINGX_VST_BASE_URL} — `.com` is the mandatory "
+                f"primary host. {BINGX_VST_FALLBACK_BASE_URL} is an internal fallback used only "
+                "after a network error or timeout, and live endpoints fail closed."
             )
 
         self._api_key = api_key
@@ -1100,8 +1101,9 @@ class BingXFuturesClient:
     # internals: parsing helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _is_vst_host(url: str) -> bool:
-        return url in {BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL}
+    def _is_vst_primary_host(url: str) -> bool:
+        """`.com` only. `.pro` is reachable exclusively as an internal fallback."""
+        return url == BINGX_VST_BASE_URL
 
     @staticmethod
     def _now_ms() -> int:

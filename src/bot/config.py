@@ -13,7 +13,10 @@ from bot.exchange.bingx_client import (
 )
 from bot.volume import VolumeBuildProfile
 
-BINGX_VST_HOSTS = frozenset({BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL})
+# `.com` is the mandatory primary host. `.pro` is deliberately NOT configurable:
+# the documented policy allows it only as an internal fallback after a network
+# error or timeout, so accepting it here would let config skip the primary.
+BINGX_VST_PRIMARY_HOST = BINGX_VST_BASE_URL
 
 
 class Settings(BaseSettings):
@@ -419,10 +422,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_bingx_vst_only(cls, value: str) -> str:
         out = value.strip().rstrip("/")
-        if out not in BINGX_VST_HOSTS:
+        if out != BINGX_VST_PRIMARY_HOST:
             raise ValueError(
-                "BINGX_BASE_URL must be a BingX VST host "
-                f"({' or '.join(sorted(BINGX_VST_HOSTS))}); live endpoints fail closed."
+                f"BINGX_BASE_URL must be exactly {BINGX_VST_PRIMARY_HOST} — `.com` is the mandatory "
+                f"primary host. {BINGX_VST_FALLBACK_BASE_URL} is an internal fallback used only after "
+                "a network error or timeout, and live endpoints fail closed."
             )
         return out
 

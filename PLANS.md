@@ -73,6 +73,12 @@ Review round 4 (PR #2) — all three follow-ups fixed:
 - [x] P1 Multiple nonzero position rows for one symbol raise instead of silently
       returning the first, so hedge dual exposure cannot hide from reconciliation.
 
+Review round 5 (PR #2) — fixed:
+
+- [x] P1 `.pro` can no longer be configured as the primary host. `BINGX_BASE_URL` accepts
+      only `https://open-api-vst.bingx.com`; `.pro` remains an internal fallback reachable
+      only after a network error or timeout.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

@@ -126,6 +126,18 @@ class EnvironmentIsolationTests(unittest.TestCase):
         client = _client()
         self.assertEqual(client.fallback_base_url, "https://open-api-vst.bingx.pro")
 
+    def test_pro_host_cannot_be_configured_as_primary(self) -> None:
+        # `.com` is the mandatory primary; `.pro` is an internal fallback only.
+        # Accepting it here would let configuration skip the primary entirely.
+        with self.assertRaises(ValueError) as ctx:
+            BingXFuturesClient(
+                api_key="k",
+                secret_key="s",
+                base_url="https://open-api-vst.bingx.pro",
+                env="vst",
+            )
+        self.assertIn("primary host", str(ctx.exception))
+
 
 class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
     def test_symbol_conversion(self) -> None:
@@ -180,6 +192,11 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
             await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
         self.assertFalse(ctx.exception.retryable)
         self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+    async def test_normal_requests_always_start_on_the_com_primary(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {"price": "1"}})])
+        await client.get_last_price("BTC/USDT")
+        self.assertTrue(client._client.requests[0]["url"].startswith(BINGX_VST_BASE_URL))  # type: ignore[attr-defined]
 
     async def test_network_error_falls_back_to_pro_domain(self) -> None:
         client = _client(

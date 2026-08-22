@@ -1,6 +1,6 @@
 # BingX VST AI Futures Bot
 
-Async Python trading bot for **BingX Perpetual Futures VST**. The runtime is intentionally live-data only for execution: it does not simulate fills outside BingX VST. Live BingX endpoints fail closed — `BINGX_ENV` must be `vst` and `BINGX_BASE_URL` must be a VST host.
+Async Python trading bot for **BingX Perpetual Futures VST**. The runtime is intentionally live-data only for execution: it does not simulate fills outside BingX VST. Live BingX endpoints fail closed — `BINGX_ENV` must be `vst` and `BINGX_BASE_URL` must be exactly `https://open-api-vst.bingx.com`.
 
 > **Shell note:** command blocks below use PowerShell (`$env:PYTHONPATH="src"; python ...`). The dev machine is macOS/zsh and the VPS is Linux, so use the POSIX form instead — prefix the var inline: `PYTHONPATH=src python src/main.py`.
 
@@ -50,7 +50,7 @@ src/
 
 ## Safety Defaults
 
-- `BINGX_ENV=vst` is required and `BINGX_BASE_URL` must be a VST host. Both the client constructor and the trade engine refuse to start otherwise, so live endpoints fail closed.
+- `BINGX_ENV=vst` is required and `BINGX_BASE_URL` must be exactly `https://open-api-vst.bingx.com`, the mandatory primary host. Both the client constructor and the trade engine refuse to start otherwise, so live endpoints fail closed. `https://open-api-vst.bingx.pro` is **not** configurable: it exists only as an internal fallback after a network error or timeout, so configuration can never skip the primary host.
 - Every order intent carries a unique `clientOrderId`. The order POST itself is **single-attempt** — the transport never retries it, because a 5xx or timeout can still mean the order reached the exchange. On an uncertain outcome the client **never issues a second POST**: it reconciles by `clientOrderId` with a bounded number of lookups, and anything short of a confirmed hit raises for operator intervention. BingX documents `109421` as "may have been filled, cancelled, or order ID is incorrect", so even that code does not prove the intent never landed. A missed entry is recoverable; a duplicate leveraged position is not. Automatic resubmission can be reconsidered once the VST contract is validated against the live venue.
 - Margin mode, position mode, and leverage are applied and then **verified** against the venue's effective state at startup. A mismatch, or a value that cannot be read, aborts startup rather than trading with the wrong configuration.
 - The `.pro` VST domain is used only after a network error or timeout, never after a valid business/API error.

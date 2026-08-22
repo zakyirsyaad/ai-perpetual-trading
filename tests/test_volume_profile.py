@@ -132,6 +132,30 @@ class VolumeProfileTests(unittest.TestCase):
         self.assertEqual(settings.strategy_mode, "ai_volume")
         self.assertEqual(settings.volume_profile.volume_per_entry_usdt, Decimal("36000"))
 
+    def test_settings_rejects_pro_host_as_primary(self) -> None:
+        # `.pro` is an internal fallback only; configuring it as the base URL
+        # would bypass the mandatory `.com` primary on every request.
+        with self.assertRaises(ValidationError):
+            Settings(
+                _env_file=None,
+                BINGX_API_KEY="vst-key",
+                BINGX_SECRET_KEY="vst-secret",
+                XAI_API_KEY="xai-key",
+                STRATEGY_MODE="ai_volume",
+                BINGX_BASE_URL="https://open-api-vst.bingx.pro",
+            )
+
+    def test_settings_accepts_the_com_primary_host(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            BINGX_API_KEY="vst-key",
+            BINGX_SECRET_KEY="vst-secret",
+            XAI_API_KEY="xai-key",
+            STRATEGY_MODE="ai_volume",
+            BINGX_BASE_URL="https://open-api-vst.bingx.com",
+        )
+        self.assertEqual(settings.bingx_base_url, "https://open-api-vst.bingx.com")
+
     def test_settings_rejects_removed_regression_modes(self) -> None:
         base = {
             "_env_file": None,
