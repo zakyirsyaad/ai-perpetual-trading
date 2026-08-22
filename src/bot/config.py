@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -58,6 +59,7 @@ class Settings(BaseSettings):
     volume_breakeven_min_profit_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_BREAKEVEN_MIN_PROFIT_USDT")
     volume_stop_at_target_enabled: bool = Field(default=True, alias="VOLUME_STOP_AT_TARGET_ENABLED")
     volume_daily_fee_budget_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_DAILY_FEE_BUDGET_USDT")
+    trading_timezone: str = Field(default="Asia/Jakarta", alias="TRADING_TIMEZONE")
 
     entry_interval_minutes: int = Field(default=15, alias="ENTRY_INTERVAL_MINUTES")
     position_hold_minutes: int = Field(default=60, alias="POSITION_HOLD_MINUTES")
@@ -138,6 +140,8 @@ class Settings(BaseSettings):
     xai_max_tokens: int = Field(default=4096, alias="XAI_MAX_TOKENS")
     ai_kline_interval: str = Field(default="3m", alias="AI_KLINE_INTERVAL")
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
+    ai_recent_performance_limit: int = Field(default=20, ge=1, le=100, alias="AI_RECENT_PERFORMANCE_LIMIT")
+    ai_trade_memory_limit: int = Field(default=40, ge=1, le=200, alias="AI_TRADE_MEMORY_LIMIT")
     ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")
     ai_min_setup_score: float = Field(default=0.58, ge=0.0, le=1.0, alias="AI_MIN_SETUP_SCORE")
     ai_min_fee_adjusted_rr: float = Field(default=1.35, ge=0.1, alias="AI_MIN_FEE_ADJUSTED_RR")
@@ -291,6 +295,16 @@ class Settings(BaseSettings):
         out = value.lower().strip().replace("-", "_")
         if out not in {"maker_only", "hybrid", "market"}:
             raise ValueError("VOLUME_EXECUTION_MODE must be maker_only, hybrid, or market")
+        return out
+
+    @field_validator("trading_timezone")
+    @classmethod
+    def validate_trading_timezone(cls, value: str) -> str:
+        out = value.strip()
+        try:
+            ZoneInfo(out)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown TRADING_TIMEZONE: {out}") from exc
         return out
 
     @field_validator("decision_timeframes", mode="before")

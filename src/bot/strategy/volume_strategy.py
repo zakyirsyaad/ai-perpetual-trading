@@ -31,7 +31,7 @@ class VolumeStrategy(BaseStrategy):
     def next_trade(self) -> TradePlan:
         return self._build_plan(context=None)
 
-    async def next_trade_plan(self) -> TradePlan:
+    async def next_trade_plan(self) -> TradePlan | None:
         context = None
         if self._intelligence is not None:
             context = (await self._intelligence.build_context()).to_dict()
@@ -41,7 +41,7 @@ class VolumeStrategy(BaseStrategy):
         if self._intelligence is not None:
             await self._intelligence.close()
 
-    def _build_plan(self, context: dict | None) -> TradePlan:
+    def _build_plan(self, context: dict | None) -> TradePlan | None:
         profile_fields = self._profile.as_log_fields()
         symbol = next(self._symbol_cycle)
         factor_metadata = self._factor_metadata_for_symbol(context, symbol)
@@ -72,6 +72,8 @@ class VolumeStrategy(BaseStrategy):
                 tp_floor_pct=float(self._settings.take_profit_pct),
                 sl_floor_pct=float(self._settings.stop_loss_pct),
             )
+            if not decision.enter:
+                return None
             direction = decision.direction
             stop_loss_pct = decision.stop_loss_pct
             take_profit_pct = decision.take_profit_pct

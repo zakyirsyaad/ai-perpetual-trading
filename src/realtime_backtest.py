@@ -115,7 +115,9 @@ def simulate_realtime_backtest(
     skipped_entries = 0
     symbol_index = 0
     direction_index = 0
-    use_confluence = strategy == "ai_volume" and bool(getattr(settings, "confluence_enabled", True))
+    use_confluence = strategy in {"volume", "ai_volume"} and bool(
+        getattr(settings, "confluence_enabled", True)
+    )
     registry = FactorRegistry() if use_confluence else None
     for entry_index in range(0, max_entry_index + 1, entry_bars):
         if len(trades) >= int(getattr(settings, "trade_target_per_day", 0) or 0):

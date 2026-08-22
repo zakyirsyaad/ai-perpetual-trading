@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from bot.storage.interfaces import TradeStoreProtocol
 
@@ -23,14 +24,16 @@ class RiskManager:
         max_stop_losses_per_day: int,
         max_daily_drawdown_usdt: float,
         max_consecutive_losses: int,
+        trading_timezone: str = "Asia/Jakarta",
     ) -> None:
         self._trade_store = trade_store
         self._max_stop_losses_per_day = max_stop_losses_per_day
         self._max_daily_drawdown_usdt = max_daily_drawdown_usdt
         self._max_consecutive_losses = max_consecutive_losses
+        self._trading_tz = ZoneInfo(trading_timezone)
 
     async def get_daily_state(self) -> DailyRiskState:
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(self._trading_tz).date()
         stop_losses = await self._trade_store.count_stop_losses_for_day(today)
         closed_trades = await self._trade_store.count_closed_trades_for_day(today)
         total_pnl_usdt = await self._trade_store.total_pnl_for_day(today)

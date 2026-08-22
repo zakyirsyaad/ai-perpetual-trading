@@ -87,16 +87,18 @@ class TradeEngine:
                 )
                 return
 
-        if state.closed_trades >= self._settings.trade_target_per_day:
-            self._logger.info(
-                "Daily target reached (%s/%s trades). Waiting for next day.",
-                state.closed_trades,
-                self._settings.trade_target_per_day,
-            )
-            return
         volume_pause_reason = await self._volume_runtime_pause_reason()
         if volume_pause_reason is not None:
             self._logger.info("Volume runtime guard active: %s. Entries paused.", volume_pause_reason)
+            return
+
+        daily_entry_limit = self._daily_entry_limit()
+        if state.closed_trades >= daily_entry_limit:
+            self._logger.info(
+                "Daily target reached (%s/%s trades). Waiting for next day.",
+                state.closed_trades,
+                daily_entry_limit,
+            )
             return
 
         plan = await self._strategy.next_trade_plan()
@@ -380,6 +382,14 @@ class TradeEngine:
         if fee_budget > 0 and estimated_fee >= fee_budget:
             return "volume_fee_budget_reached"
         return None
+
+    def _daily_entry_limit(self) -> int:
+        if (
+            self._settings.strategy_mode in {"volume", "ai_volume"}
+            and float(getattr(self._settings, "volume_daily_target_usdt", 0.0) or 0.0) > 0
+        ):
+            return int(getattr(self._settings, "volume_attempt_target_per_day", self._settings.trade_target_per_day))
+        return int(self._settings.trade_target_per_day)
 
     async def _reconcile_local_open_positions(self) -> None:
         local_positions = await self._trade_store.list_open_positions()

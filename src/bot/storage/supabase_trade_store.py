@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -26,6 +27,7 @@ class SupabaseTradeStore:
         self._ai_decisions_table = settings.supabase_ai_decisions_table
         self._logger = logger
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+        self._trading_tz = ZoneInfo(settings.trading_timezone)
 
     @property
     def enabled(self) -> bool:
@@ -162,15 +164,17 @@ class SupabaseTradeStore:
         )
 
     async def _closed_trade_rows_for_day(self, day: date | None, select: str) -> list[dict[str, Any]]:
-        target_day = day or datetime.now(timezone.utc).date()
-        start = datetime.combine(target_day, datetime.min.time(), tzinfo=timezone.utc).isoformat()
-        end = datetime.combine(target_day, datetime.max.time(), tzinfo=timezone.utc).isoformat()
+        target_day = day or datetime.now(self._trading_tz).date()
+        start_local = datetime.combine(target_day, datetime.min.time(), tzinfo=self._trading_tz)
+        end_local = start_local + timedelta(days=1)
+        start = start_local.astimezone(timezone.utc).isoformat()
+        end = end_local.astimezone(timezone.utc).isoformat()
         return await self._get_rows(
             self._trades_table,
             [
                 ("select", select),
                 ("closed_at", f"gte.{start}"),
-                ("closed_at", f"lte.{end}"),
+                ("closed_at", f"lt.{end}"),
                 ("order", "closed_at.desc"),
                 ("limit", "1000"),
             ],

@@ -57,6 +57,44 @@ class VolumeProfileTests(unittest.TestCase):
         self.assertEqual(second.symbol, "ETH/USDT")
         self.assertNotEqual(first.direction, second.direction)
 
+    def test_volume_strategy_holds_when_confluence_rejects_entry(self) -> None:
+        strategy = VolumeStrategy(
+            SimpleNamespace(
+                account_balance_usdt=1500.0,
+                position_usdt=180.0,
+                volume_margin_per_entry_usdt=180.0,
+                leverage=100,
+                volume_sides_per_entry=2,
+                volume_target_usdt=10_000_000.0,
+                trade_target_per_day=28,
+                symbols=("BTC/USDT", "ETH/USDT"),
+                stop_loss_pct=0.08,
+                take_profit_pct=0.12,
+                position_hold_minutes=60,
+                confluence_enabled=True,
+                confluence_min_agreement=0.55,
+                confluence_min_atr_pct=0.05,
+                confluence_min_score=0.05,
+                confluence_atr_tp_mult=3.0,
+                confluence_atr_sl_mult=1.0,
+            )
+        )
+        context = {
+            "factor_snapshots": [],
+            "technicals": [
+                {
+                    "symbol": "BTC/USDT",
+                    "last_price": 100_000.0,
+                    "atr_14": 20.0,
+                }
+            ],
+            "active_flow_signals": [],
+        }
+
+        plan = strategy._build_plan(context)
+
+        self.assertIsNone(plan)
+
     def test_settings_volume_mode_does_not_require_xai_key(self) -> None:
         settings = Settings(
             _env_file=None,

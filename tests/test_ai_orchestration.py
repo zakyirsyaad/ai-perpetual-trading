@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import unittest
+from datetime import date
 from types import SimpleNamespace
 
 from bot.ai.brain import EntryDecision
 from bot.ai.orchestration import AIOrchestrator, EntryCandidate, ResolvedTradeTargets
 from bot.models import PositionDirection
+from bot.risk.risk_manager import DailyRiskState
 
 
 def _volume_run_settings() -> SimpleNamespace:
@@ -70,6 +72,75 @@ class EntryGateRemovalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_entry_payload_uses_configured_history_limits(self) -> None:
+        class FakeTradeStore:
+            def __init__(self) -> None:
+                self.performance_limit: int | None = None
+                self.memory_limit: int | None = None
+
+            async def recent_performance_summary(self, limit: int = 50) -> dict:
+                self.performance_limit = limit
+                return {"sample_size": limit}
+
+            async def recent_closed_trade_records(self, limit: int = 100) -> list[dict]:
+                self.memory_limit = limit
+                return []
+
+        class FakeBrain:
+            async def entry_decisions(self, payload: dict) -> None:
+                return None
+
+        class FakeIntelligence:
+            async def build_context(self) -> SimpleNamespace:
+                return SimpleNamespace(
+                    to_dict=lambda: {
+                        "technicals": [],
+                        "external_signals": {},
+                        "intelligence": {},
+                        "factor_snapshots": [],
+                        "active_flow_signals": [],
+                    }
+                )
+
+        store = FakeTradeStore()
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._settings = SimpleNamespace(
+            strategy_mode="grok",
+            okx_instrument_type="SWAP",
+            okx_margin_mode="isolated",
+            symbols=["BTC/USDT", "ETH/USDT"],
+            trade_target_per_day=28,
+            max_stop_loss_per_day=2,
+            max_consecutive_losses=3,
+            max_daily_drawdown_usdt=100.0,
+            leverage=100,
+            position_usdt=180.0,
+            ai_min_fee_adjusted_rr=0.1,
+            taker_fee_pct=0.05,
+            ai_recent_performance_limit=12,
+            ai_trade_memory_limit=24,
+        )
+        orchestrator._brain = FakeBrain()
+        orchestrator._trade_store = store
+        orchestrator._intelligence = FakeIntelligence()
+        orchestrator._market_analyzer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._signal_designer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
+
+        plan = await orchestrator.next_trade_plan(
+            DailyRiskState(
+                day=date(2026, 6, 27),
+                stop_losses=0,
+                closed_trades=0,
+                total_pnl_usdt=0.0,
+                consecutive_losses=0,
+                allowed_to_trade=True,
+            )
+        )
+
+        self.assertIsNone(plan)
+        self.assertEqual(store.performance_limit, 12)
+        self.assertEqual(store.memory_limit, 24)
+
     async def test_candidate_to_trade_plan_uses_candidate_direction(self) -> None:
         orchestrator = object.__new__(AIOrchestrator)
         orchestrator._settings = SimpleNamespace(

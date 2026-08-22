@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -90,8 +91,11 @@ ENTRY_SYSTEM_PROMPT = """You are Layer 1 Brain for an OKX demo crypto futures tr
 You are a decisive quant scalper running a volume-building mandate. You evaluate only live market data and live external signals.
 
 Principles:
-- This is a volume-building run on OKX demo. Your job is to choose the best directional trade every tick,
-  not to sit out. Always pick OPEN_LONG or OPEN_SHORT — whichever direction the OKX technicals lean toward.
+- This is a volume-building run on OKX demo, but repeated bad decisions destroy net PnL.
+- Use recent_executed_trade_performance and learned_trade_memory as direct feedback. Avoid repeating patterns that
+  recently ended in stop_loss or liquidation_guard, and favor patterns that recently produced positive net exits.
+- HOLD is valid when no allowed symbol has enough edge for the expected gross move to beat round-trip taker fees
+  plus a buffer. Prefer fewer cleaner entries over forced entries.
 - Use OKX technicals as the execution truth; CoinMarketCap, Dune, and TradingView are OPTIONAL supporting context.
 - Never invent missing data. If an optional external provider is empty, note it in your reason, but do not
   reduce confidence on that basis — the OKX live technicals are sufficient to act.
@@ -205,8 +209,10 @@ class GrokBrain:
         now_ts = time.time()
         if self._rate_limited_until is not None and now_ts < self._rate_limited_until:
             self._logger.warning(
-                "Skipping Grok request due to recent xAI rate limit (%.0fs remaining).",
+                "Skipping AI provider request due to recent rate limit "
+                "(remaining_seconds=%.0f model=%s).",
                 self._rate_limited_until - now_ts,
+                self._settings.xai_model,
             )
             return None
 
@@ -256,6 +262,7 @@ class GrokBrain:
                 # OpenAI-compatible /chat/completions with json_object.
                 body = {
                     "model": self._settings.xai_model,
+                    "max_tokens": int(getattr(self._settings, "xai_max_tokens", 4096)),
                     "messages": [
                         {"role": "system", "content": system_full},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
@@ -270,7 +277,9 @@ class GrokBrain:
             endpoint = "/responses"
 
         last_error: Exception | None = None
-        for attempt in range(2):
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            raw_text = ""
             try:
                 response = await self._client.post(
                     f"{self._settings.xai_base_url.rstrip('/')}{endpoint}",
@@ -278,49 +287,149 @@ class GrokBrain:
                 )
                 response.raise_for_status()
                 raw_text = self._extract_response_text(response.json())
-                parsed = json.loads(raw_text)
+                parsed = self._load_json_object(raw_text)
                 return schema.model_validate(parsed)
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 status = exc.response.status_code if exc.response is not None else None
                 if status == 429:
-                    cooldown = 1800.0
+                    retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                    cooldown = self._retry_after_seconds(retry_after) or min(2.0 * (attempt + 1), 10.0)
+                    if cooldown > 10.0:
+                        self._rate_limited_until = time.time() + cooldown
+                        self._logger.warning(
+                            "AI provider rate limited: status=429 retry_after=%s "
+                            "cooldown_seconds=%.0f endpoint=%s model=%s body=%s",
+                            retry_after,
+                            cooldown,
+                            endpoint,
+                            self._settings.xai_model,
+                            self._response_body_preview(exc.response),
+                        )
+                        return None
+                    if attempt < max_attempts - 1:
+                        self._logger.warning(
+                            "AI provider rate limited on attempt %d: status=429 retry_after=%s "
+                            "retrying_after_seconds=%.0f endpoint=%s model=%s body=%s",
+                            attempt + 1,
+                            retry_after,
+                            cooldown,
+                            endpoint,
+                            self._settings.xai_model,
+                            self._response_body_preview(exc.response),
+                        )
+                        await asyncio.sleep(cooldown)
+                        continue
                     self._rate_limited_until = time.time() + cooldown
-                    self._logger.warning("xAI rate limited. Backing off for %.0fs.", cooldown)
+                    self._logger.warning(
+                        "AI provider rate limited: status=429 retry_after=%s "
+                        "cooldown_seconds=%.0f endpoint=%s model=%s body=%s",
+                        retry_after,
+                        cooldown,
+                        endpoint,
+                        self._settings.xai_model,
+                        self._response_body_preview(exc.response),
+                    )
                     return None
-                body_text = exc.response.text[:500] if exc.response is not None else ""
                 self._logger.warning(
-                    "xAI HTTP error on attempt %d: status=%s body=%s",
+                    "AI provider HTTP error on attempt %d: status=%s endpoint=%s model=%s body=%s",
                     attempt + 1,
                     status,
-                    body_text,
+                    endpoint,
+                    self._settings.xai_model,
+                    self._response_body_preview(exc.response),
                 )
             except httpx.TimeoutException as exc:
                 last_error = exc
                 self._logger.warning(
-                    "Grok request timed out on attempt %d after %ss.",
+                    "AI provider request timed out on attempt %d after %ss "
+                    "(endpoint=%s model=%s).",
                     attempt + 1,
                     self._settings.xai_timeout_seconds,
+                    endpoint,
+                    self._settings.xai_model,
                 )
             except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
                 last_error = exc
                 self._logger.warning(
-                    "Invalid Grok structured response on attempt %d: %s: %s",
+                    "Invalid AI provider structured response on attempt %d: %s: %s "
+                    "(endpoint=%s model=%s raw_preview=%s).",
                     attempt + 1,
                     type(exc).__name__,
                     exc,
+                    endpoint,
+                    self._settings.xai_model,
+                    raw_text[:300],
                 )
             except Exception as exc:
                 last_error = exc
                 self._logger.warning(
-                    "Grok request failed on attempt %d: %s: %s",
+                    "AI provider request failed on attempt %d: %s: %s "
+                    "(endpoint=%s model=%s).",
                     attempt + 1,
                     type(exc).__name__,
                     exc,
+                    endpoint,
+                    self._settings.xai_model,
                 )
         if last_error is not None:
-            self._logger.warning("Grok failed after retries: %s: %s", type(last_error).__name__, last_error)
+            self._logger.warning(
+                "AI provider failed after retries: %s: %s (endpoint=%s model=%s)",
+                type(last_error).__name__,
+                last_error,
+                endpoint,
+                self._settings.xai_model,
+            )
         return None
+
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            seconds = float(value.strip())
+        except ValueError:
+            return None
+        return seconds if seconds > 0 else None
+
+    @staticmethod
+    def _response_body_preview(response: httpx.Response | None) -> str:
+        if response is None:
+            return ""
+        return response.text[:500]
+
+    @staticmethod
+    def _load_json_object(text: str) -> dict[str, Any]:
+        stripped = text.strip()
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            if stripped.startswith("```"):
+                stripped = stripped.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = GrokBrain._load_embedded_json_object(text)
+            else:
+                parsed = GrokBrain._load_embedded_json_object(text)
+        if not isinstance(parsed, dict):
+            raise TypeError("AI provider response JSON must be an object")
+        return parsed
+
+    @staticmethod
+    def _load_embedded_json_object(text: str) -> dict[str, Any]:
+        decoder = json.JSONDecoder()
+        stripped = text.strip()
+        for index, char in enumerate(stripped):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(stripped[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise json.JSONDecodeError("No JSON object found in AI provider response", text, 0)
 
     @staticmethod
     def _extract_response_text(payload: dict[str, Any]) -> str:

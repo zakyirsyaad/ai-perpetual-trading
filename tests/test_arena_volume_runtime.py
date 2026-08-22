@@ -123,6 +123,28 @@ class ArenaVolumeRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reason, "volume_fee_budget_reached")
 
+    def test_ai_volume_uses_attempt_limit_instead_of_fixed_trade_target(self) -> None:
+        engine = object.__new__(TradeEngine)
+        engine._settings = SimpleNamespace(
+            strategy_mode="ai_volume",
+            volume_daily_target_usdt=1_000_000,
+            volume_attempt_target_per_day=34,
+            trade_target_per_day=28,
+        )
+
+        self.assertEqual(engine._daily_entry_limit(), 34)
+
+    def test_non_volume_mode_uses_trade_target_limit(self) -> None:
+        engine = object.__new__(TradeEngine)
+        engine._settings = SimpleNamespace(
+            strategy_mode="grok",
+            volume_daily_target_usdt=1_000_000,
+            volume_attempt_target_per_day=34,
+            trade_target_per_day=28,
+        )
+
+        self.assertEqual(engine._daily_entry_limit(), 28)
+
 
 if __name__ == "__main__":
     unittest.main()
