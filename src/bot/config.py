@@ -6,7 +6,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from bot.exchange.bingx_client import BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL
 from bot.volume import VolumeBuildProfile
+
+BINGX_VST_HOSTS = frozenset({BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL})
 
 
 class Settings(BaseSettings):
@@ -16,17 +19,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    okx_api_key: str = Field(alias="OKX_API_KEY")
-    okx_secret_key: str = Field(alias="OKX_SECRET_KEY")
-    okx_passphrase: str = Field(alias="OKX_PASSPHRASE")
-    okx_base_url: str = Field(default="https://www.okx.com", alias="OKX_BASE_URL")
-    okx_demo_trading: bool = Field(default=True, alias="OKX_DEMO_TRADING")
-    okx_margin_mode: str = Field(default="isolated", alias="OKX_MARGIN_MODE")
-    okx_position_mode: str = Field(default="long_short_mode", alias="OKX_POSITION_MODE")
-    okx_instrument_type: str = Field(default="SWAP", alias="OKX_INSTRUMENT_TYPE")
-    okx_insecure_ssl: bool = Field(default=False, alias="OKX_INSECURE_SSL")
-    okx_debug_http: bool = Field(default=False, alias="OKX_DEBUG_HTTP")
-    okx_require_set_leverage: bool = Field(default=False, alias="OKX_REQUIRE_SET_LEVERAGE")
+    # BingX Perpetual Futures VST is the only enabled execution environment.
+    # Live endpoints fail closed (see `validate_bingx_vst_only`).
+    bingx_api_key: str = Field(alias="BINGX_API_KEY")
+    bingx_secret_key: str = Field(alias="BINGX_SECRET_KEY")
+    bingx_env: str = Field(default="vst", alias="BINGX_ENV")
+    bingx_base_url: str = Field(default=BINGX_VST_BASE_URL, alias="BINGX_BASE_URL")
+    bingx_margin_mode: str = Field(default="isolated", alias="BINGX_MARGIN_MODE")
+    bingx_position_mode: str = Field(default="hedge", alias="BINGX_POSITION_MODE")
+    bingx_recv_window_ms: int = Field(default=5000, ge=1000, le=60000, alias="BINGX_RECV_WINDOW_MS")
+    bingx_source_key: str = Field(default="ai-perpetual-trading", alias="BINGX_SOURCE_KEY")
+    bingx_route_min_interval_seconds: float = Field(
+        default=0.2,
+        ge=0.0,
+        alias="BINGX_ROUTE_MIN_INTERVAL_SECONDS",
+    )
+    bingx_market_cache_seconds: float = Field(default=1.0, ge=0.0, alias="BINGX_MARKET_CACHE_SECONDS")
+    bingx_insecure_ssl: bool = Field(default=False, alias="BINGX_INSECURE_SSL")
+    bingx_debug_http: bool = Field(default=False, alias="BINGX_DEBUG_HTTP")
+    bingx_require_set_leverage: bool = Field(default=False, alias="BINGX_REQUIRE_SET_LEVERAGE")
     strategy_mode: str = Field(default="grok", alias="STRATEGY_MODE")
 
     symbols: Annotated[tuple[str, ...], NoDecode] = Field(
@@ -101,15 +112,15 @@ class Settings(BaseSettings):
     orderbook_depth_levels: int = Field(default=20, ge=1, le=400, alias="ORDERBOOK_DEPTH_LEVELS")
     min_orderbook_depth_multiplier: float = Field(default=1.2, ge=0.0, alias="MIN_ORDERBOOK_DEPTH_MULTIPLIER")
     max_abs_funding_rate: float = Field(default=0.001, ge=0.0, alias="MAX_ABS_FUNDING_RATE")
-    okx_max_spread_bps: float = Field(default=6.0, ge=0.0, alias="OKX_MAX_SPREAD_BPS")
-    okx_funding_blackout_minutes: int = Field(default=10, ge=0, alias="OKX_FUNDING_BLACKOUT_MINUTES")
-    okx_min_liquidation_distance_bps: float = Field(
+    max_spread_bps: float = Field(default=6.0, ge=0.0, alias="MAX_SPREAD_BPS")
+    funding_blackout_minutes: int = Field(default=10, ge=0, alias="FUNDING_BLACKOUT_MINUTES")
+    min_liquidation_distance_bps: float = Field(
         default=250.0,
         ge=0.0,
-        alias="OKX_MIN_LIQUIDATION_DISTANCE_BPS",
+        alias="MIN_LIQUIDATION_DISTANCE_BPS",
     )
-    okx_hard_max_leverage: int = Field(default=100, ge=1, le=200, alias="OKX_HARD_MAX_LEVERAGE")
-    okx_venue_max_leverage: int | None = Field(default=100, ge=1, le=200, alias="OKX_VENUE_MAX_LEVERAGE")
+    hard_max_leverage: int = Field(default=100, ge=1, le=200, alias="HARD_MAX_LEVERAGE")
+    venue_max_leverage: int | None = Field(default=100, ge=1, le=200, alias="VENUE_MAX_LEVERAGE")
 
     # Dynamic risk management.
     account_balance_usdt: float = Field(default=60.0, alias="ACCOUNT_BALANCE_USDT")
@@ -151,7 +162,6 @@ class Settings(BaseSettings):
         le=5,
         alias="AI_SYSTEMIC_RISK_NO_TRADE_THRESHOLD",
     )
-    ai_pre_trade_check: bool = Field(default=True, alias="AI_PRE_TRADE_CHECK")
     external_signal_cache_seconds: int = Field(default=300, alias="EXTERNAL_SIGNAL_CACHE_SECONDS")
     ai_exit_check_interval_seconds: int = Field(
         default=30,
@@ -162,6 +172,32 @@ class Settings(BaseSettings):
         default=0.08,
         ge=0.0,
         alias="AI_EXIT_PRICE_MOVE_THRESHOLD_PCT",
+    )
+    ai_exit_max_calls_per_trade: int = Field(
+        default=12,
+        ge=0,
+        le=200,
+        alias="AI_EXIT_MAX_CALLS_PER_TRADE",
+    )
+    # Compact AI payload shaping (see bot/ai/compact_context.py).
+    ai_compact_max_factors_per_symbol: int = Field(
+        default=6,
+        ge=1,
+        le=30,
+        alias="AI_COMPACT_MAX_FACTORS_PER_SYMBOL",
+    )
+    ai_compact_max_flow_signals: int = Field(default=5, ge=0, le=20, alias="AI_COMPACT_MAX_FLOW_SIGNALS")
+    ai_compact_max_memory_lessons: int = Field(default=3, ge=0, le=20, alias="AI_COMPACT_MAX_MEMORY_LESSONS")
+    # Optional pricing so AI call telemetry can report an estimated cost.
+    ai_input_cost_per_million_tokens: float | None = Field(
+        default=None,
+        ge=0.0,
+        alias="AI_INPUT_COST_PER_MILLION_TOKENS",
+    )
+    ai_output_cost_per_million_tokens: float | None = Field(
+        default=None,
+        ge=0.0,
+        alias="AI_OUTPUT_COST_PER_MILLION_TOKENS",
     )
 
     # Backend-only arena features inspired by Hyper-Alpha-Arena.
@@ -211,6 +247,14 @@ class Settings(BaseSettings):
         default="ai_decisions",
         alias="SUPABASE_AI_DECISIONS_TABLE",
     )
+    supabase_ai_call_metrics_table: str = Field(
+        default="ai_call_metrics",
+        alias="SUPABASE_AI_CALL_METRICS_TABLE",
+    )
+    supabase_open_positions_table: str = Field(
+        default="open_position_state",
+        alias="SUPABASE_OPEN_POSITIONS_TABLE",
+    )
 
     request_timeout_seconds: int = Field(default=20, alias="REQUEST_TIMEOUT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -238,7 +282,7 @@ class Settings(BaseSettings):
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
 
-    @field_validator("okx_api_key", "okx_secret_key", "okx_passphrase")
+    @field_validator("bingx_api_key", "bingx_secret_key")
     @classmethod
     def require_non_empty_secret(cls, value: str) -> str:
         if not value or not value.strip():
@@ -255,14 +299,19 @@ class Settings(BaseSettings):
             return tuple(str(item).strip().upper().replace("-", "/") for item in value if str(item).strip())
         return value
 
-    @field_validator("okx_venue_max_leverage", mode="before")
+    @field_validator("venue_max_leverage", mode="before")
     @classmethod
     def parse_optional_int(cls, value: Any) -> int | None:
         if value is None or value == "":
             return None
         return int(value)
 
-    @field_validator("volume_margin_per_entry_usdt", mode="before")
+    @field_validator(
+        "volume_margin_per_entry_usdt",
+        "ai_input_cost_per_million_tokens",
+        "ai_output_cost_per_million_tokens",
+        mode="before",
+    )
     @classmethod
     def parse_optional_float(cls, value: Any) -> float | None:
         if value is None or value == "":
@@ -327,26 +376,40 @@ class Settings(BaseSettings):
             return tuple(str(item).strip() for item in value if str(item).strip())
         return value
 
-    @field_validator("okx_margin_mode")
+    @field_validator("bingx_margin_mode")
     @classmethod
     def normalize_margin_mode(cls, value: str) -> str:
         out = value.lower().strip()
         if out != "isolated":
-            raise ValueError("OKX_MARGIN_MODE must be 'isolated'; cross margin is not allowed.")
+            raise ValueError("BINGX_MARGIN_MODE must be 'isolated'; cross margin is not allowed.")
         return out
 
-    @field_validator("okx_position_mode")
+    @field_validator("bingx_position_mode")
     @classmethod
     def normalize_position_mode(cls, value: str) -> str:
         out = value.lower().strip()
-        if out not in {"long_short_mode", "net_mode"}:
-            raise ValueError("OKX_POSITION_MODE must be 'long_short_mode' or 'net_mode'")
+        if out not in {"hedge", "one_way"}:
+            raise ValueError("BINGX_POSITION_MODE must be 'hedge' or 'one_way'")
         return out
 
-    @field_validator("okx_instrument_type")
+    @field_validator("bingx_env")
     @classmethod
-    def normalize_instrument_type(cls, value: str) -> str:
-        return value.upper().strip()
+    def normalize_bingx_env(cls, value: str) -> str:
+        out = value.lower().strip()
+        if out != "vst":
+            raise ValueError("BINGX_ENV must be 'vst'; live BingX trading is not enabled for this runtime.")
+        return out
+
+    @field_validator("bingx_base_url")
+    @classmethod
+    def validate_bingx_vst_only(cls, value: str) -> str:
+        out = value.strip().rstrip("/")
+        if out not in BINGX_VST_HOSTS:
+            raise ValueError(
+                "BINGX_BASE_URL must be a BingX VST host "
+                f"({' or '.join(sorted(BINGX_VST_HOSTS))}); live endpoints fail closed."
+            )
+        return out
 
     @field_validator("xai_reasoning_effort")
     @classmethod
@@ -377,13 +440,26 @@ class Settings(BaseSettings):
     def validate_cross_field_settings(self) -> "Settings":
         if self.strategy_mode in {"grok", "ai_volume"} and not (self.xai_api_key and self.xai_api_key.strip()):
             raise ValueError("XAI_API_KEY is required when STRATEGY_MODE is grok or ai_volume.")
-        if self.leverage > self.okx_hard_max_leverage:
-            raise ValueError("LEVERAGE cannot exceed OKX_HARD_MAX_LEVERAGE.")
-        if self.okx_venue_max_leverage is not None and self.leverage > self.okx_venue_max_leverage:
-            raise ValueError("LEVERAGE cannot exceed OKX_VENUE_MAX_LEVERAGE.")
+        if self.leverage > self.hard_max_leverage:
+            raise ValueError("LEVERAGE cannot exceed HARD_MAX_LEVERAGE.")
+        if self.venue_max_leverage is not None and self.leverage > self.venue_max_leverage:
+            raise ValueError("LEVERAGE cannot exceed VENUE_MAX_LEVERAGE.")
         if self.volume_execution_mode == "maker_only" and self.execution_post_only_fallback_to_market:
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
         return self
+
+    @property
+    def exchange_name(self) -> str:
+        """Venue label written to storage, logs, and AI payloads."""
+        return "bingx"
+
+    @property
+    def margin_mode(self) -> str:
+        return self.bingx_margin_mode
+
+    @property
+    def position_mode(self) -> str:
+        return self.bingx_position_mode
 
     @property
     def volume_profile(self) -> VolumeBuildProfile:

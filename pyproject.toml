@@ -9,3 +9,25 @@ dependencies = [
   "python-dotenv>=1.0.1",
   "tenacity>=8.3.0",
 ]
+
+[project.optional-dependencies]
+dev = ["coverage>=7.5.0"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = false
+omit = [
+  "src/tradingview_relay.py",
+]
+
+[tool.coverage.report]
+# Merge gate: the suite must keep at least 80% line coverage.
+fail_under = 80
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "\\.\\.\\.",
+]

@@ -39,7 +39,6 @@ class SupabaseOnlyTests(unittest.TestCase):
 
     def test_legacy_runtime_modules_are_removed(self) -> None:
         removed_paths = [
-            ROOT / "src" / "bot" / "exchange" / "bingx_client.py",
             ROOT / "src" / "bot" / "core" / "paper_trade_engine.py",
             ROOT / "src" / "bot" / "strategy" / "openai_strategy.py",
             ROOT / "src" / "bot" / "perps",
@@ -47,10 +46,21 @@ class SupabaseOnlyTests(unittest.TestCase):
             ROOT / "config" / "perps.safe-defaults.json",
             ROOT / "docs" / "perps.md",
         ]
+        # BINGX_* is no longer legacy: BingX VST is the runtime venue. The OKX
+        # runtime configuration is what must be gone from Settings.
         legacy_fields = {
-            "bingx_api_key",
-            "bingx_secret_key",
-            "bingx_base_url",
+            "okx_api_key",
+            "okx_secret_key",
+            "okx_passphrase",
+            "okx_base_url",
+            "okx_demo_trading",
+            "okx_margin_mode",
+            "okx_position_mode",
+            "okx_instrument_type",
+            "okx_max_spread_bps",
+            "okx_hard_max_leverage",
+            "okx_venue_max_leverage",
+            "ai_pre_trade_check",
             "openai_api_key",
             "openai_model",
             "perp_exchange_api_name",
@@ -60,6 +70,9 @@ class SupabaseOnlyTests(unittest.TestCase):
 
         self.assertEqual([path for path in removed_paths if path.exists()], [])
         self.assertTrue(legacy_fields.isdisjoint(Settings.model_fields))
+        self.assertIn("bingx_api_key", Settings.model_fields)
+        self.assertIn("max_spread_bps", Settings.model_fields)
+        self.assertIn("hard_max_leverage", Settings.model_fields)
 
     def test_arena_report_uses_supabase_arguments_not_db(self) -> None:
         parser = build_parser()

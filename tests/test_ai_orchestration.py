@@ -5,10 +5,19 @@ import unittest
 from datetime import date
 from types import SimpleNamespace
 
-from bot.ai.brain import EntryDecision
+from bot.ai.brain import EntryDecision, RiskReview
+from bot.ai.compact_context import CompactDecisionContextBuilder
 from bot.ai.orchestration import AIOrchestrator, EntryCandidate, ResolvedTradeTargets
 from bot.models import PositionDirection
 from bot.risk.risk_manager import DailyRiskState
+
+
+def _approved_review() -> RiskReview:
+    return RiskReview(
+        approved=True,
+        confirmations="live confirmations present",
+        invalidation_trigger="trend structure breaks",
+    )
 
 
 def _volume_run_settings() -> SimpleNamespace:
@@ -22,7 +31,12 @@ def _volume_run_settings() -> SimpleNamespace:
         atr_sl_multiplier=1.5,
         atr_tp_multiplier=3.0,
         taker_fee_pct=0.05,
+        maker_fee_pct=-0.02,
+        leverage=100,
         ai_min_fee_adjusted_rr=0.1,
+        ai_compact_max_factors_per_symbol=6,
+        ai_compact_max_flow_signals=5,
+        ai_compact_max_memory_lessons=3,
     )
 
 
@@ -47,6 +61,7 @@ class EntryGateRemovalTests(unittest.IsolatedAsyncioTestCase):
             risk_reward_ratio=0.5,
             systemic_risk=5,
             reason="weak/choppy setup that the old guards would reject",
+            risk_review=_approved_review(),
         )
 
         candidate = orchestrator._build_entry_candidate(decision, {"technicals": []})
@@ -119,12 +134,20 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
             taker_fee_pct=0.05,
             ai_recent_performance_limit=12,
             ai_trade_memory_limit=24,
+            maker_fee_pct=-0.02,
+            exchange_name="bingx",
+            margin_mode="isolated",
+            position_mode="hedge",
+            ai_compact_max_factors_per_symbol=6,
+            ai_compact_max_flow_signals=5,
+            ai_compact_max_memory_lessons=3,
         )
         orchestrator._brain = FakeBrain()
         orchestrator._trade_store = store
         orchestrator._intelligence = FakeIntelligence()
         orchestrator._market_analyzer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
         orchestrator._signal_designer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._compact_context = CompactDecisionContextBuilder(orchestrator._settings)
 
         plan = await orchestrator.next_trade_plan(
             DailyRiskState(
@@ -150,7 +173,6 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
             leverage=3,
             position_usdt=20.0,
             taker_fee_pct=0.05,
-            ai_pre_trade_check=False,
         )
 
         candidate = EntryCandidate(
@@ -164,6 +186,7 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
                 risk_reward_ratio=2.0,
                 systemic_risk=2,
                 reason="bearish continuation setup",
+                risk_review=_approved_review(),
             ),
             direction=PositionDirection.SHORT,
             target=ResolvedTradeTargets(
@@ -193,7 +216,6 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
             leverage=100,
             position_usdt=20.0,
             taker_fee_pct=0.05,
-            ai_pre_trade_check=False,
             volume_profile=SimpleNamespace(
                 margin_per_entry_usdt=180.0,
                 volume_per_entry_usdt=36_000.0,
@@ -211,6 +233,7 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
                 risk_reward_ratio=2.4,
                 systemic_risk=2,
                 reason="bullish continuation with clean liquidity",
+                risk_review=_approved_review(),
             ),
             direction=PositionDirection.LONG,
             target=ResolvedTradeTargets(
@@ -234,3 +257,60 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergedRiskReviewGateTests(unittest.TestCase):
+    def _orchestrator(self) -> AIOrchestrator:
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._settings = _volume_run_settings()
+        orchestrator._logger = logging.getLogger("test.risk_review")
+        return orchestrator
+
+    def _decision(self, **overrides) -> EntryDecision:
+        base = dict(
+            symbol="BTC/USDT",
+            action="OPEN_LONG",
+            confidence=0.8,
+            market_trend="Bullish",
+            stop_loss_pct=0.08,
+            take_profit_pct=0.12,
+            systemic_risk=2,
+            reason="clean breakout",
+            risk_review=_approved_review(),
+        )
+        base.update(overrides)
+        return EntryDecision(**base)
+
+    def test_approved_review_allows_candidate(self) -> None:
+        candidate = self._orchestrator()._build_entry_candidate(self._decision(), {"technicals": []})
+        self.assertIsNotNone(candidate)
+
+    def test_vetoed_review_blocks_candidate(self) -> None:
+        decision = self._decision(
+            risk_review=RiskReview(
+                approved=False,
+                confirmations="thin confirmations",
+                invalidation_trigger="no real level to lean on",
+            )
+        )
+        self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, {"technicals": []}))
+
+    def test_missing_review_blocks_candidate_instead_of_failing_open(self) -> None:
+        decision = self._decision(risk_review=None)
+        self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, {"technicals": []}))
+
+    def test_structurally_invalid_review_blocks_candidate(self) -> None:
+        decision = EntryDecision.model_validate(
+            {
+                "symbol": "BTC/USDT",
+                "action": "OPEN_SHORT",
+                "confidence": 0.7,
+                "market_trend": "Bearish",
+                "stop_loss_pct": 0.08,
+                "take_profit_pct": 0.12,
+                "systemic_risk": 2,
+                "reason": "breakdown",
+                "risk_review": {"approved": True},
+            }
+        )
+        self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, {"technicals": []}))

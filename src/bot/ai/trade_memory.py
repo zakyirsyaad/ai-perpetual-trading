@@ -18,7 +18,7 @@ def build_trade_decision_memory(records: list[dict[str, Any]]) -> dict[str, Any]
             "gross_pnl_usdt": 0.0,
             "fee_impact_usdt": 0.0,
             "lessons": [
-                "No realized trade memory yet; rely on current live OKX technicals and fee-aware setup quality.",
+                "No realized trade memory yet; rely on current live exchange technicals and fee-aware setup quality.",
             ],
             "winning_patterns": [],
             "losing_patterns": [],

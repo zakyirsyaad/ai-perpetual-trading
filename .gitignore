@@ -7,3 +7,8 @@ __pycache__/
 !.env.example
 logs/
 bot_data/
+
+# coverage
+.coverage
+.coverage.*
+htmlcov/

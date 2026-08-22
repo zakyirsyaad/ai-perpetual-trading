@@ -1,6 +1,6 @@
-# OKX Demo AI Futures Bot
+# BingX VST AI Futures Bot
 
-Async Python trading bot for OKX demo futures. The runtime is intentionally live-data only for execution: it does not place simulated live orders outside OKX demo trading.
+Async Python trading bot for **BingX Perpetual Futures VST**. The runtime is intentionally live-data only for execution: it does not simulate fills outside BingX VST. Live BingX endpoints fail closed — `BINGX_ENV` must be `vst` and `BINGX_BASE_URL` must be a VST host.
 
 > **Shell note:** command blocks below use PowerShell (`$env:PYTHONPATH="src"; python ...`). The dev machine is macOS/zsh and the VPS is Linux, so use the POSIX form instead — prefix the var inline: `PYTHONPATH=src python src/main.py`.
 
@@ -11,16 +11,22 @@ src/
   main.py
   bot/
     ai/
-      brain.py              # Layer 1: Grok decision brain
+      brain.py              # Layer 1: decision brain (merged entry + risk review)
+      compact_context.py    # Compact AI payload builder
+      exit_policy.py        # Event-driven AI exit gating
+      usage.py              # AI call telemetry + retry classification
       orchestration.py      # Layer 2: risk, learning, and execution orchestration
     data/
-      providers.py          # Layer 3: OKX-adjacent external signals
+      providers.py          # Layer 3: external market signals
       market_signals.py
     intelligence/
       market_intelligence.py # Layer 4: market intelligence synthesis
     arena/                 # Backend-only arena factors, flow signals, attribution, and program runner
     exchange/
-      okx_client.py
+      contracts.py          # Venue-neutral models + FuturesExchangeProtocol
+      bingx_client.py       # BingX VST adapter (runtime venue)
+      okx_client.py         # Legacy; unwired, removed after VST validation
+      leverage.py
     core/
       trade_engine.py
     risk/
@@ -36,7 +42,7 @@ src/
 
 ## Live Signal Sources
 
-- OKX public/private API: execution source of truth, candles, ticker, order book, account fee rate, funding rate, open interest, positions, leverage, and orders.
+- BingX VST public/private API: execution source of truth — candles (v3, closed candles only), ticker, depth, commission rate, premium index/funding, open interest, positions, leverage, and orders.
 - CoinMarketCap: latest quotes via `/v2/cryptocurrency/quotes/latest` when `COINMARKETCAP_API_KEY` is configured.
 - Dune Analytics: runs built-in SQL signals via `/api/v1/sql/execute` when `DUNE_API_KEY` is configured. Saved query IDs in `DUNE_QUERY_IDS` are optional.
 - TradingView: uses the included local relay at `src/tradingview_relay.py`. TradingView does not provide a general public market-data API for bots, so alerts must be pushed into the relay.
@@ -44,16 +50,92 @@ src/
 
 ## Safety Defaults
 
-- `OKX_DEMO_TRADING=true` is required. The bot refuses to start if this is false.
-- OKX demo requests include the `x-simulated-trading: 1` header.
+- `BINGX_ENV=vst` is required and `BINGX_BASE_URL` must be a VST host. Both the client constructor and the trade engine refuse to start otherwise, so live endpoints fail closed.
+- Every order intent carries a unique `clientOrderId`. After a timeout or uncertain POST the client queries the order by `clientOrderId` before any resubmission or `.pro` failover, so an order is never blindly retried.
+- The `.pro` VST domain is used only after a network error or timeout, never after a valid business/API error.
 - AI provider is pluggable via `XAI_API_STYLE` (`responses` / `chat` / `messages`). `config.py` defaults to the `chat` profile (`XAI_MODEL=gpt-5.4`, freemodel.dev); the live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai. The `xai_*` names and "Grok" log lines are historical — the brain is provider-agnostic.
 - xAI reasoning effort defaults to `high` (`XAI_REASONING_EFFORT`); ignored by providers that don't accept a reasoning field.
 - Keep AI requests compact with `XAI_MAX_TOKENS`, `AI_RECENT_PERFORMANCE_LIMIT`, and `AI_TRADE_MEMORY_LIMIT`. This reduces model TPM rate-limit risk without changing the decision strategy.
-- OKX safety defaults are isolated margin, explicit leverage caps, and one net open position total.
+- Venue safety defaults are isolated margin, hedge position mode, explicit leverage caps, and one open position total.
 - `STRATEGY_MODE=ai_volume` lets Grok choose timing, symbol, and direction while execution size follows the volume-builder profile. `STRATEGY_MODE=volume` keeps deterministic rotation, and `STRATEGY_MODE=grok` keeps normal AI risk-sized trading.
-- The OKX runtime refreshes exchange taker fees when `USE_EXCHANGE_FEE_RATES=true`, blocks entries when order-book spread/depth is poor, skips entries near funding, and checks liquidation distance after entry.
+- The runtime refreshes exchange taker fees when `USE_EXCHANGE_FEE_RATES=true`, blocks entries when order-book spread/depth is poor, skips entries near funding, and checks liquidation distance after entry. These deterministic guards are independent of the AI and run last.
 - The bot learns only from executed demo trades and saved AI decisions, not from fake or replayed fills.
 - Backend-only arena features add factor snapshots, edge-triggered market-flow signals, attribution diagnostics, and a local Program Trader dry-run runner without adding UI, accounts, or extra exchanges.
+
+## Token Optimization
+
+The AI pipeline is optimized for token cost without weakening the model, removing
+market signals, changing the trading objective, or relaxing any deterministic guard.
+
+- **Compact decision context** (`bot/ai/compact_context.py`). The full market context
+  still feeds deterministic execution, factor attribution, reporting, and audit
+  storage; only the *AI representation* is compacted. The 86 factors per symbol are
+  collapsed into aggregates (category scores, directional agreement, strongest
+  positive/negative) plus one small ranked list per symbol, instead of being repeated
+  across `factor_snapshots`, `factor_intelligence.snapshots`, `.by_symbol`, and
+  `top_factor_details`. Flow signals are capped, external provider responses become
+  one-line summaries, and absent providers are omitted rather than sent empty.
+  Engineering budgets: two-symbol entry at or below ~4,000 estimated tokens,
+  one-symbol exit at or below ~1,500.
+- **Merged risk review** (`bot/ai/brain.py`). The separate `PreTradeCheck` provider
+  call is gone. Each entry decision now carries a nested `risk_review`
+  (`approved`, `confirmations`, `invalidation_trigger`). `approved=false` vetoes that
+  candidate; a missing or structurally invalid review makes the candidate **unusable**
+  rather than silently approved — the old fail-open path is removed. Risk/reward is
+  still computed deterministically from the resolved SL, TP, and fee values.
+- **Event-driven AI exits** (`bot/ai/exit_policy.py`). Deterministic price, SL, TP,
+  fee, liquidation, and time-stop checks still run on every five-second monitor
+  iteration. The AI exit evaluator is only called when a new configured candle has
+  closed, price has moved adversely by at least `AI_EXIT_PRICE_MOVE_THRESHOLD_PCT`, or
+  a materially new regime/flow trigger appears — subject to a minimum
+  `AI_EXIT_CHECK_INTERVAL_SECONDS` gap, a cap of `AI_EXIT_MAX_CALLS_PER_TRADE` calls per
+  trade, and a request-hash skip for identical payloads. When the budget is exhausted or
+  the provider is unavailable, deterministic protection stays fully active.
+- **Retry policy** (`bot/ai/usage.py`). Only connection failures, timeouts, short
+  `429`s, and retryable `5xx` are retried. Authentication, authorization, validation,
+  and other permanent `4xx` errors fail immediately. A structurally invalid response
+  gets at most **one** repair request containing only the validation problem and the
+  compact contract — the same large payload is never resent three times.
+- **Usage telemetry.** One `ai_call_metrics` record per provider request: call id,
+  request hash, purpose, provider/model/api-style/prompt-version, provider-reported or
+  explicitly-estimated tokens, sizes, latency, attempts, error category, dedupe and
+  repair flags, and optional estimated cost.
+
+```bash
+PYTHONPATH=src python src/report_ai_usage.py --days 1
+PYTHONPATH=src python src/replay_ai_decisions.py --limit 500
+```
+
+Reporting is observability-only. Reaching any daily token or cost amount is reported,
+never enforced — it will not stop or throttle trading.
+
+## Exchange-Neutral Runtime
+
+`bot/exchange/contracts.py` defines `FuturesExchangeProtocol` and immutable
+venue-neutral models (`Instrument`, `OrderBookSnapshot`, `FundingRateInfo`,
+`PositionDetails`, `OrderAck`, `OrderFill`, `TradeFeeRates`, `ExchangeAPIError`).
+`TradeEngine`, `MarketIntelligence`, leverage resolution, and the realtime backtest
+depend on that contract, never on a venue client.
+
+BingX specifics handled by `bot/exchange/bingx_client.py`:
+
+- ASCII-key-ordered canonical parameter string, HMAC-SHA256 lowercase-hex signature,
+  millisecond `timestamp` + `recvWindow`, `X-BX-APIKEY` and source headers. Clock-drift
+  responses are reported with an explicit "synchronize the system clock" hint.
+- Klines are filtered so only candles whose close time has passed are used.
+- Hedge mode: closing uses the **opposite order side with the same `positionSide`**, and
+  `reduceOnly` is omitted because BingX rejects it for dual-side positions.
+- Per-route throttling and short-lived market-data caching for rate limits.
+
+## Restart Behavior
+
+Open-position lifecycle state is persisted to Supabase (`open_position_state`). On
+restart the engine matches persisted state against the exchange:
+
+- A persisted position the exchange confirms is **resumed** and fully monitored.
+- Exchange exposure that cannot be matched to persisted state is **never auto-flattened**.
+  New entries are blocked and the operator is alerted, because flattening unknown
+  exposure could close a position this process did not open.
 
 ## Volume Builder Profile
 
@@ -100,16 +182,16 @@ EXECUTION_ENTRY_ORDER_TYPE=market
 ORDERBOOK_DEPTH_LEVELS=20
 MIN_ORDERBOOK_DEPTH_MULTIPLIER=1.2
 MAX_ABS_FUNDING_RATE=0.001
-OKX_MAX_SPREAD_BPS=6
-OKX_FUNDING_BLACKOUT_MINUTES=10
-OKX_MIN_LIQUIDATION_DISTANCE_BPS=10
+MAX_SPREAD_BPS=6
+FUNDING_BLACKOUT_MINUTES=10
+MIN_LIQUIDATION_DISTANCE_BPS=10
 ```
 
 ## Backend Arena Core
 
-The `src/bot/arena` package ports the useful backend ideas from Hyper-Alpha-Arena into this smaller OKX demo bot:
+The `src/bot/arena` package ports the useful backend ideas from Hyper-Alpha-Arena into this bot:
 
-- Factor intelligence exposes 86 built-in factor definitions across momentum, trend, volatility, volume, and microstructure categories from existing OKX candles, order book, funding, and OI data.
+- Factor intelligence exposes 86 built-in factor definitions across momentum, trend, volatility, volume, and microstructure categories from existing exchange candles, order book, funding, and OI data.
 - Factor effectiveness scoring includes win rate, average PnL, total PnL, forward-return correlation, IC, ICIR, and a trade-count decay half-life estimate.
 - The safe `FactorExpressionEngine` exposes 69 whitelisted functions for custom local factor expressions.
 - Market-flow signal detection is edge-triggered for volume, price momentum, OI, funding, liquidity, order-flow imbalance, factor score breakouts, and factor percentile breakouts.
@@ -143,13 +225,12 @@ Copy-Item .env.example .env
 
 Fill `.env` with:
 
-- `OKX_API_KEY`
-- `OKX_SECRET_KEY`
-- `OKX_PASSPHRASE`
+- `BINGX_API_KEY`
+- `BINGX_SECRET_KEY`
 - `XAI_API_KEY`
 - optional `COINMARKETCAP_API_KEY` and `DUNE_API_KEY`
 
-OKX demo keys must be created from OKX Demo Trading, not production trading. Keep `.env` out of git.
+BingX keys must be VST (virtual) API keys, not live-trading keys. BingX does not use an OKX-style passphrase. Keep `.env` out of git.
 
 ## Dune Signals
 
@@ -215,13 +296,13 @@ python src/main.py
 
 The engine will:
 
-1. Validate OKX demo API access.
-2. Refresh OKX account fee rates where available.
-3. Set account position mode and leverage where OKX allows it.
-4. Gather live OKX data plus configured CMC/Dune/TradingView signals.
+1. Validate BingX VST API access.
+2. Refresh BingX commission rates where available.
+3. Set margin mode, position mode, and leverage where BingX allows it.
+4. Gather live BingX data plus configured CMC/Dune/TradingView signals.
 5. Produce an entry or hold decision through Grok (`grok`/`ai_volume`) or deterministic rotation (`volume`).
 6. Run execution guards for spread, depth, funding, and liquidation distance.
-7. Execute OKX demo market entries by default, or post-only entries when configured.
+7. Execute BingX VST market entries by default, or post-only (`LIMIT` + `timeInForce=PostOnly`) entries when configured.
 8. Monitor the open position with live prices, TP/SL, AI exits, and risk guards.
 9. Save executed outcomes for future decision context.
 
@@ -233,6 +314,9 @@ python src/report_ai_decisions.py --limit 1000
 ```
 
 This summarizes Supabase trades by AI entry reason. For arena attribution, use `src/report_arena.py`.
+For AI token spend by purpose, retry/error rates, and dedupe savings, use
+`src/report_ai_usage.py`; for deduplicated historical decision replay, use
+`src/replay_ai_decisions.py`.
 
 Realtime dry-run backtest without placing orders:
 
@@ -241,13 +325,13 @@ $env:PYTHONPATH="src"
 python src/realtime_backtest.py --source auto --no-trades
 ```
 
-`--source auto` tries OKX public candles/orderbook/funding first and falls back
-to CoinGecko price candles if OKX is unreachable from the local machine. Fallback
-results are useful for rough PnL/volume math, but they do not include real OKX
+`--source auto` tries BingX public candles/orderbook/funding first and falls back
+to CoinGecko price candles if BingX is unreachable from the local machine. Fallback
+results are useful for rough PnL/volume math, but they do not include real venue
 book depth, funding, or fill behavior.
 
 ## Notes
 
-- For OKX SWAP instruments, internal symbols such as `BTC/USDT` are mapped to OKX instrument IDs such as `BTC-USDT-SWAP`.
-- `POSITION_USDT * LEVERAGE` defines target notional. The OKX client converts base quantity into contract size using OKX instrument metadata.
+- Internal symbols such as `BTC/USDT` are mapped to BingX symbols such as `BTC-USDT`.
+- `POSITION_USDT * LEVERAGE` defines target notional. BingX perpetual order quantity is **base-asset quantity**, not a contract count; the client rounds it with `quantityPrecision` and validates `tradeMinQuantity` / `tradeMinUSDT` before placing an order.
 - Trading is risky even in demo mode. Validate order sizing, contract metadata, and account position mode before leaving the bot unattended.

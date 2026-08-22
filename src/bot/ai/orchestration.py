@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, GrokBrain
+from bot.ai.compact_context import CompactDecisionContextBuilder, payload_hash
+from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.config import Settings
 from bot.intelligence.market_intelligence import MarketIntelligence
@@ -53,6 +56,9 @@ class AIOrchestrator:
         self._supabase_journal = supabase_journal
         self._market_analyzer = MarketAnalyzer()
         self._signal_designer = SignalDesigner()
+        self._compact_context = CompactDecisionContextBuilder(settings)
+        self._exit_policy = AIExitPolicy(settings)
+        self._active_exit_symbol: str | None = None
 
     async def close(self) -> None:
         await self._brain.close()
@@ -68,57 +74,15 @@ class AIOrchestrator:
         )
         learned_trade_memory = build_trade_decision_memory(recent_trade_records)
         context_dict = market_context.to_dict()
-        payload = {
-            "task": "ai_volume_entry_decision" if self._strategy_mode == "ai_volume" else "entry_decision",
-            "execution_environment": {
-                "exchange": "OKX",
-                "mode": "demo_trading",
-                "instrument_type": self._settings.okx_instrument_type,
-                "margin_mode": self._settings.okx_margin_mode,
-                "symbols": list(self._settings.symbols),
-            },
-            "strategy_objective": self._strategy_objective_payload(),
-            "risk_constraints": {
-                "trade_target_per_day": self._settings.trade_target_per_day,
-                "closed_trades_today": daily_state.closed_trades,
-                "stop_losses_today": daily_state.stop_losses,
-                "max_stop_losses_per_day": self._settings.max_stop_loss_per_day,
-                "consecutive_losses_today": daily_state.consecutive_losses,
-                "max_consecutive_losses": self._settings.max_consecutive_losses,
-                "day_pnl_usdt": daily_state.total_pnl_usdt,
-                "max_daily_drawdown_usdt": self._settings.max_daily_drawdown_usdt,
-                "configured_leverage": self._settings.leverage,
-                "configured_position_usdt": self._settings.position_usdt,
-                # Deliberately NOT exposing min_confidence to the model: showing it the
-                # exact gate made it self-censor at that number every tick. The code gate
-                # in _build_entry_candidate still enforces ai_min_confidence after the fact.
-                "min_fee_adjusted_risk_reward": self._settings.ai_min_fee_adjusted_rr,
-                "round_trip_taker_fee_pct": self._round_trip_fee_pct,
-            },
-            "market_context": context_dict,
-            "arena_reviews": [
-                self._market_analyzer.review(context_dict).to_dict(),
-                self._signal_designer.review(context_dict).to_dict(),
-            ],
-            "recent_executed_trade_performance": recent_performance,
-            "learned_trade_memory": learned_trade_memory,
-            "output_rules": {
-                "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
-                "use_only_allowed_symbols": True,
-                "only_demo_trades_are_executed": True,
-                "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
-                "choose_best_symbol_not_default_symbol": True,
-                "return_one_decision_per_symbol": True,
-                "ai_volume_mode_priorities": [
-                    "This is a volume-building run, but realized net PnL matters more than forced entries.",
-                    "Use learned_trade_memory to avoid entry patterns that recently ended in stop_loss or liquidation_guard.",
-                    "HOLD is valid when no symbol has enough expected gross move to beat round-trip taker fees plus a buffer.",
-                    "Prefer fewer cleaner trades over repeating recent losing decision patterns.",
-                ]
-                if self._strategy_mode == "ai_volume"
-                else [],
-            },
-        }
+        # The full context still feeds deterministic execution, attribution, and the
+        # audit record below; only the AI representation is compacted.
+        payload = self._compact_context.build_entry_payload(
+            market_context=context_dict,
+            daily_state=daily_state,
+            recent_performance=recent_performance,
+            trade_memory=learned_trade_memory,
+            strategy_objective=self._strategy_objective_payload(),
+        )
         decisions = await self._brain.entry_decisions(payload)
         if decisions is None:
             return None
@@ -176,6 +140,29 @@ class AIOrchestrator:
             self._logger.warning("Grok returned unsupported symbol %s.", decision.symbol)
             return None
 
+        # Merged risk review (replaces the separate PreTradeCheck call). A missing or
+        # structurally invalid review makes the candidate unusable — never approved.
+        review = decision.risk_review
+        if review is None:
+            self._logger.warning(
+                "Entry candidate %s has no usable risk_review; treating as unusable rather than approved.",
+                decision.symbol,
+            )
+            return None
+        if not review.approved:
+            self._logger.info(
+                "Risk review vetoed %s: %s",
+                decision.symbol,
+                review.invalidation_trigger,
+            )
+            return None
+        self._logger.info(
+            "Risk review approved %s. confirmations=%s invalidation=%s",
+            decision.symbol,
+            review.confirmations,
+            review.invalidation_trigger,
+        )
+
         direction = PositionDirection.LONG if decision.action == "OPEN_LONG" else PositionDirection.SHORT
         target = self._resolve_trade_targets(decision, market_context)
         if target is None:
@@ -199,11 +186,6 @@ class AIOrchestrator:
             usdt_size = float(self._settings.volume_profile.margin_per_entry_usdt)
         else:
             usdt_size = self._calculate_position_usdt(decision, market_context, target.stop_loss_pct)
-        if self._settings.ai_pre_trade_check:
-            approved = await self._pre_trade_approved(decision, usdt_size, target)
-            if not approved:
-                return None
-
         mode = "ai_volume" if self._strategy_mode == "ai_volume" else "grok"
         volume_note = ""
         if self._strategy_mode == "ai_volume":
@@ -279,30 +261,79 @@ class AIOrchestrator:
         current_price: float,
         elapsed_seconds: float,
     ) -> ExitSignal:
+        """Event-driven AI exit evaluation.
+
+        Deterministic price/SL/TP/fee/liquidation/time-stop checks keep running on
+        every five-second monitor iteration in `TradeEngine._monitor_position`.
+        This method only decides whether an *AI* call is worth making, so a
+        one-hour position costs a handful of calls instead of up to 720.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        self._ensure_exit_trade_started(position, now)
+
+        gate = self._exit_policy.evaluate(
+            now=now,
+            price=current_price,
+            last_closed_candle_ms=AIExitPolicy.last_closed_candle_ms(
+                int(now * 1000),
+                str(getattr(self._settings, "ai_kline_interval", "3m")),
+            ),
+        )
+        if not gate.allowed:
+            self._logger.debug(
+                "AI exit evaluation skipped for %s (%s); deterministic protection stays active.",
+                position.symbol,
+                gate.reason,
+            )
+            return self._deterministic_exit_fallback(elapsed_seconds, ai_called=False)
+
         market_context = await self._intelligence.build_context(symbols=(position.symbol,))
-        payload = {
-            "task": "exit_decision",
-            "position": {
+        context_dict = market_context.to_dict()
+        flow_signature = AIExitPolicy.flow_signature(context_dict, position.symbol)
+        payload = self._compact_context.build_exit_payload(
+            position={
                 "symbol": position.symbol,
                 "direction": position.direction.value,
                 "entry_price": position.entry_price,
                 "current_price": current_price,
                 "quantity_base": position.quantity,
-                "exchange_size": position.exchange_size,
-                "elapsed_seconds": elapsed_seconds,
+                "elapsed_seconds": round(elapsed_seconds, 1),
             },
-            "constraints": {
-                "min_confidence": self._settings.ai_min_confidence,
-                "position_hold_minutes": self._settings.position_hold_minutes,
-                "consider_taker_fee_pct": self._settings.taker_fee_pct,
-            },
-            "market_context": market_context.to_dict(),
-        }
+            market_context=context_dict,
+        )
+        request_hash = payload_hash(payload)
+        if self._exit_policy.is_duplicate_request(request_hash):
+            # Identical compact request: the model already answered this exact
+            # state, so skip the provider call and keep the budget intact.
+            self._exit_policy.note_deduplicated()
+            self._logger.debug(
+                "Skipped duplicate AI exit request for %s (hash=%s).",
+                position.symbol,
+                request_hash[:12],
+            )
+            return self._deterministic_exit_fallback(elapsed_seconds, ai_called=False)
+
+        self._exit_policy.mark_called(
+            now=now,
+            price=current_price,
+            last_closed_candle_ms=AIExitPolicy.last_closed_candle_ms(
+                int(now * 1000),
+                str(getattr(self._settings, "ai_kline_interval", "3m")),
+            ),
+            flow_signature=flow_signature,
+            request_hash=request_hash,
+        )
+        self._logger.info(
+            "AI exit evaluation for %s triggered by %s (call %s/%s).",
+            position.symbol,
+            gate.reason,
+            self._exit_policy.calls_made,
+            self._exit_policy.state()["max_calls"],
+        )
+
         decision = await self._brain.exit_decision(payload)
         if decision is None:
-            if elapsed_seconds >= self._settings.position_hold_minutes * 60:
-                return ExitSignal(close_now=True, reason="time_stop_no_grok")
-            return ExitSignal(close_now=False, reason="hold")
+            return self._deterministic_exit_fallback(elapsed_seconds, ai_called=True)
         min_confidence = self._settings.ai_min_confidence
         if elapsed_seconds >= self._settings.position_hold_minutes * 60:
             min_confidence = max(0.4, min_confidence - 0.2)
@@ -310,51 +341,25 @@ class AIOrchestrator:
             return ExitSignal(close_now=False, reason="hold")
         return ExitSignal(close_now=decision.action == "CLOSE", reason=decision.reason)
 
-    async def _pre_trade_approved(
-        self,
-        decision: EntryDecision,
-        usdt_size: float,
-        target: ResolvedTradeTargets,
-    ) -> bool:
-        payload = {
-            "planned_trade": decision.model_dump(),
-            "position_sizing": {
-                "usdt_size": usdt_size,
-                "leverage": self._settings.leverage,
-                "stop_loss_pct": target.stop_loss_pct,
-                "take_profit_pct": target.take_profit_pct,
-                "atr_pct": target.atr_pct,
-                "round_trip_taker_fee_pct": target.round_trip_fee_pct,
-                "fee_adjusted_risk_reward": target.fee_adjusted_rr,
-                "min_fee_adjusted_risk_reward": self._settings.ai_min_fee_adjusted_rr,
-            },
-        }
-        check = await self._brain.pre_trade_check(payload)
-        if check is None:
-            # No/invalid AI response is an infrastructure failure (timeout, 503,
-            # unparseable output) — NOT a risk veto. The candidate already cleared the
-            # entry guard and code gates, so fail open rather than silently dropping a
-            # valid setup whenever the secondary AI call flakes.
-            self._logger.warning(
-                "Pre-trade check unavailable for %s (no/invalid AI response); "
-                "passing on prior entry-guard approval.",
-                decision.symbol,
-            )
-            return True
-        if not check.approved:
-            self._logger.info(
-                "Pre-trade check vetoed %s: %s",
-                decision.symbol,
-                check.invalidation_trigger,
-            )
-            return False
-        self._logger.info(
-            "Pre-trade approved for %s. confirmations=%s invalidation=%s",
-            decision.symbol,
-            check.confirmations,
-            check.invalidation_trigger,
+    def _ensure_exit_trade_started(self, position: OpenPosition, now: float) -> None:
+        trade_key = f"{position.symbol}:{position.exchange_order_id}"
+        if self._active_exit_symbol == trade_key:
+            return
+        self._active_exit_symbol = trade_key
+        self._exit_policy.start_trade(
+            entry_price=position.entry_price,
+            direction=position.direction,
+            now=now,
         )
-        return True
+
+    def _deterministic_exit_fallback(self, elapsed_seconds: float, *, ai_called: bool) -> ExitSignal:
+        """No AI verdict: deterministic time-stop protection still applies."""
+        if elapsed_seconds >= self._settings.position_hold_minutes * 60:
+            return ExitSignal(close_now=True, reason="time_stop_no_grok" if ai_called else "time_stop")
+        return ExitSignal(close_now=False, reason="hold")
+
+    def exit_policy_state(self) -> dict[str, Any]:
+        return self._exit_policy.state()
 
     def _resolve_trade_targets(
         self,
@@ -393,9 +398,14 @@ class AIOrchestrator:
         )
 
     async def _record_ai_decision(self, decision: EntryDecision, request_payload: dict[str, Any]) -> None:
+        # Link the stored decision to the provider call that produced it so token
+        # spend can be attributed to individual decisions.
+        call_metrics = getattr(self._brain, "last_call_metrics", None)
+        ai_call_id = getattr(call_metrics, "call_id", None)
         payload_json = {
             "decision": decision.model_dump(),
             "request": request_payload,
+            "ai_call_id": ai_call_id,
         }
         await self._trade_store.save_ai_decision(
             symbol=decision.symbol,
@@ -404,6 +414,7 @@ class AIOrchestrator:
             systemic_risk=decision.systemic_risk,
             reason=decision.reason,
             payload=payload_json,
+            ai_call_id=ai_call_id,
         )
         if self._supabase_journal is not None:
             await self._supabase_journal.record_ai_decision(
@@ -414,6 +425,8 @@ class AIOrchestrator:
                     "systemic_risk": decision.systemic_risk,
                     "reason": decision.reason,
                     "payload_json": payload_json,
+                    "exchange": str(getattr(self._settings, "exchange_name", "")) or None,
+                    "ai_call_id": ai_call_id,
                 }
             )
         if decision.learning_note:

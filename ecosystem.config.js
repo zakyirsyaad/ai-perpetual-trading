@@ -1,6 +1,8 @@
 module.exports = {
   apps: [
     {
+      // BingX VST runtime. Never start a second live instance:
+      // duplicate BingX orders and duplicate Supabase writes.
       name: "ai-perp-volume",
       cwd: "/home/0xkayz/ai-perpetual-trading",
       script: "src/main.py",

@@ -13,7 +13,7 @@ _RATIONALE_CODE = re.compile(r"^[a-z0-9_:-]{2,48}$")
 
 
 class NormalizedSignal(BaseModel):
-    """Strict Program Trader signal contract for the OKX arena runtime."""
+    """Strict Program Trader signal contract for the arena runtime."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
