@@ -38,6 +38,14 @@ class OpenPosition:
     exchange_order_id: str
     opened_at: datetime
     entry_reason: str = "unknown"
+    # Venue position identifier, captured at entry so a restart can verify it is
+    # the same position rather than merely the same symbol.
+    position_id: str | None = None
+    # The risk envelope this position was actually opened under. Persisted so a
+    # restart resumes the trade on its own SL/TP rather than on whatever the
+    # configuration happens to say after a redeploy.
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
 
 
 @dataclass(slots=True)

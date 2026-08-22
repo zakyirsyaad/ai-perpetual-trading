@@ -12,7 +12,8 @@ from typing import Any
 import httpx
 
 from bot.config import Settings
-from bot.exchange.okx_client import OKXFuturesClient, OKXFundingRateInfo, OKXOrderBook
+from bot.exchange.bingx_client import BingXFuturesClient
+from bot.exchange.contracts import FundingRateInfo, OrderBookSnapshot
 from bot.models import PositionDirection
 from bot.volume import VolumeBuildProfile
 from bot.arena.factors import FactorRegistry
@@ -87,8 +88,8 @@ def simulate_realtime_backtest(
     settings: Any,
     candles_by_symbol: dict[str, list[BacktestCandle]],
     *,
-    order_books: dict[str, OKXOrderBook | None],
-    funding: dict[str, OKXFundingRateInfo | None],
+    order_books: dict[str, OrderBookSnapshot | None],
+    funding: dict[str, FundingRateInfo | None],
     interval_minutes: int,
     data_source: str = "provided",
     include_trades: bool = True,
@@ -307,15 +308,15 @@ def _simulate_trade(
 def _guard_status(
     settings: Any,
     symbol: str,
-    order_book: OKXOrderBook | None,
-    funding: OKXFundingRateInfo | None,
+    order_book: OrderBookSnapshot | None,
+    funding: FundingRateInfo | None,
     target_notional: float,
 ) -> dict[str, Any]:
     if not bool(getattr(settings, "execution_guards_enabled", True)):
         return {"ok": True, "reason": "guards_disabled"}
     if order_book is None:
         return {"ok": False, "reason": "missing_orderbook"}
-    if order_book.spread_bps > float(getattr(settings, "okx_max_spread_bps", 0.0) or 0.0):
+    if order_book.spread_bps > float(getattr(settings, "max_spread_bps", 0.0) or 0.0):
         return {"ok": False, "reason": "spread_too_wide", "spread_bps": order_book.spread_bps}
     required_depth = target_notional * float(getattr(settings, "min_orderbook_depth_multiplier", 0.0) or 0.0)
     executable_depth = min(order_book.bid_depth_notional, order_book.ask_depth_notional)
@@ -411,9 +412,8 @@ def _build_settings(use_env: bool) -> Settings:
     if not use_env:
         return Settings(
             _env_file=None,
-            OKX_API_KEY="backtest-only",
-            OKX_SECRET_KEY="backtest-only",
-            OKX_PASSPHRASE="backtest-only",
+            BINGX_API_KEY="backtest-only",
+            BINGX_SECRET_KEY="backtest-only",
             STRATEGY_MODE="volume",
         )
     env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -425,35 +425,37 @@ async def _run(args: argparse.Namespace) -> RealtimeBacktestSummary:
     interval = args.interval or settings.ai_kline_interval
     interval_minutes = _parse_interval_minutes(interval)
     source = args.source.lower()
-    if source not in {"auto", "okx", "coingecko"}:
-        raise ValueError("--source must be auto, okx, or coingecko")
+    if source not in {"auto", "bingx", "coingecko"}:
+        raise ValueError("--source must be auto, bingx, or coingecko")
     if source == "coingecko":
         return await _run_coingecko(settings, interval_minutes, include_trades=not args.no_trades, strategy=args.strategy)
     try:
-        return await _run_okx(settings, interval, interval_minutes, args)
+        return await _run_bingx(settings, interval, interval_minutes, args)
     except Exception:
         if source != "auto":
             raise
         return await _run_coingecko(settings, interval_minutes, include_trades=not args.no_trades, strategy=args.strategy)
 
 
-async def _run_okx(settings: Settings, interval: str, interval_minutes: int, args: argparse.Namespace) -> RealtimeBacktestSummary:
-    client = OKXFuturesClient(
-        api_key=settings.okx_api_key,
-        secret_key=settings.okx_secret_key,
-        passphrase=settings.okx_passphrase,
-        base_url=settings.okx_base_url,
-        demo_trading=settings.okx_demo_trading,
-        margin_mode=settings.okx_margin_mode,
-        instrument_type=settings.okx_instrument_type,
+async def _run_bingx(settings: Settings, interval: str, interval_minutes: int, args: argparse.Namespace) -> RealtimeBacktestSummary:
+    client = BingXFuturesClient(
+        api_key=settings.bingx_api_key,
+        secret_key=settings.bingx_secret_key,
+        base_url=settings.bingx_base_url,
+        env=settings.bingx_env,
+        margin_mode=settings.bingx_margin_mode,
+        position_mode=settings.bingx_position_mode,
         timeout_seconds=settings.request_timeout_seconds,
-        insecure_ssl=settings.okx_insecure_ssl,
+        recv_window_ms=settings.bingx_recv_window_ms,
+        source_key=settings.bingx_source_key,
+        route_min_interval_seconds=settings.bingx_route_min_interval_seconds,
+        insecure_ssl=settings.bingx_insecure_ssl,
         debug_http=False,
     )
     try:
         candles_by_symbol: dict[str, list[BacktestCandle]] = {}
-        order_books: dict[str, OKXOrderBook | None] = {}
-        funding: dict[str, OKXFundingRateInfo | None] = {}
+        order_books: dict[str, OrderBookSnapshot | None] = {}
+        funding: dict[str, FundingRateInfo | None] = {}
         for symbol in settings.symbols:
             rows = await client.get_klines(symbol, interval=interval, limit=args.limit)
             candles_by_symbol[symbol] = [
@@ -481,7 +483,7 @@ async def _run_okx(settings: Settings, interval: str, interval_minutes: int, arg
             order_books=order_books,
             funding=funding,
             interval_minutes=interval_minutes,
-            data_source="okx",
+            data_source="bingx",
             include_trades=not args.no_trades,
             strategy=args.strategy,
         )
@@ -514,7 +516,7 @@ async def _run_coingecko(
 
     now = datetime.now(timezone.utc)
     synthetic_books = {
-        symbol: OKXOrderBook(
+        symbol: OrderBookSnapshot(
             symbol=symbol,
             best_bid=(candles[-1].close * 0.9999) if candles else 0.0,
             best_ask=(candles[-1].close * 1.0001) if candles else 0.0,
@@ -528,7 +530,7 @@ async def _run_coingecko(
         for symbol, candles in candles_by_symbol.items()
     }
     synthetic_funding = {
-        symbol: OKXFundingRateInfo(symbol=symbol, funding_rate=0.0, next_funding_time=None, raw={"source": "coingecko"})
+        symbol: FundingRateInfo(symbol=symbol, funding_rate=0.0, next_funding_time=None, raw={"source": "coingecko"})
         for symbol in settings.symbols
     }
     inferred_interval = _infer_interval_minutes(candles_by_symbol) or interval_minutes
@@ -608,10 +610,14 @@ def _infer_interval_minutes(candles_by_symbol: dict[str, list[BacktestCandle]]) 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Realtime OKX candle dry-run backtest. No orders are placed.")
-    parser.add_argument("--source", default="auto", help="auto, okx, or coingecko. auto falls back when OKX is blocked.")
+    parser = argparse.ArgumentParser(description="Realtime BingX VST candle dry-run backtest. No orders are placed.")
+    parser.add_argument(
+        "--source",
+        default="auto",
+        help="auto, bingx, or coingecko. auto falls back when BingX is blocked.",
+    )
     parser.add_argument("--strategy", default="volume", choices=("volume", "ai_volume"), help="Backtest strategy.")
-    parser.add_argument("--interval", default=None, help="OKX candle interval, default AI_KLINE_INTERVAL.")
+    parser.add_argument("--interval", default=None, help="Exchange candle interval, default AI_KLINE_INTERVAL.")
     parser.add_argument("--limit", type=int, default=300, help="Candles per symbol to fetch.")
     parser.add_argument("--no-trades", action="store_true", help="Omit per-trade rows from JSON output.")
     parser.add_argument(

@@ -13,10 +13,18 @@ from urllib.parse import urlencode
 import httpx
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
+from bot.exchange.contracts import (
+    ExchangeAPIError,
+    FundingRateInfo,
+    OrderBookSnapshot,
+    OrderFill,
+    PositionDetails,
+    TradeFeeRates,
+)
 from bot.models import PositionDirection
 
 
-class OKXAPIError(Exception):
+class OKXAPIError(ExchangeAPIError):
     """Raised when OKX returns a non-success response."""
 
     def __init__(
@@ -28,11 +36,14 @@ class OKXAPIError(Exception):
         payload: dict[str, Any] | None = None,
         retryable: bool = True,
     ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.code = code
-        self.payload = payload
-        self.retryable = retryable
+        super().__init__(
+            message,
+            status_code=status_code,
+            code=code,
+            payload=payload,
+            retryable=retryable,
+            venue="okx",
+        )
 
 
 @dataclass(slots=True)
@@ -44,59 +55,29 @@ class OKXInstrument:
     tick_size: Decimal
 
 
-@dataclass(slots=True)
-class OKXOrderFill:
-    order_id: str
-    avg_price: float | None
-    filled_size: float
-    base_quantity: float
-    fee_usdt: float
-    pnl_usdt: float | None
-    state: str | None
-    raw: dict[str, Any]
+# Legacy alias: OKX now returns the venue-neutral contract model.
+OKXOrderFill = OrderFill
 
 
-@dataclass(slots=True)
-class OKXTradeFeeRates:
-    maker_fee_pct: float | None
-    taker_fee_pct: float
-    raw: dict[str, Any]
+# Legacy alias: OKX now returns the venue-neutral contract model.
+OKXTradeFeeRates = TradeFeeRates
 
 
-@dataclass(slots=True)
-class OKXOrderBook:
-    symbol: str
-    best_bid: float
-    best_ask: float
-    mid_price: float
-    spread_bps: float
-    bid_depth_notional: float
-    ask_depth_notional: float
-    timestamp: datetime | None
-    raw: dict[str, Any]
+# Legacy alias: OKX now returns the venue-neutral contract model.
+OKXOrderBook = OrderBookSnapshot
 
 
-@dataclass(slots=True)
-class OKXFundingRateInfo:
-    symbol: str
-    funding_rate: float
-    next_funding_time: datetime | None
-    raw: dict[str, Any]
+# Legacy alias: OKX now returns the venue-neutral contract model.
+OKXFundingRateInfo = FundingRateInfo
 
 
-@dataclass(slots=True)
-class OKXPositionDetails:
-    symbol: str
-    exchange_size: float
-    base_quantity: float
-    avg_price: float | None
-    mark_price: float | None
-    liquidation_price: float | None
-    pos_side: str | None
-    raw: dict[str, Any]
+# Legacy alias: OKX now returns the venue-neutral contract model.
+OKXPositionDetails = PositionDetails
 
 
 class OKXFuturesClient:
+    venue = "okx"
+
     def __init__(
         self,
         api_key: str,

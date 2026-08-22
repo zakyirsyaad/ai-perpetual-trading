@@ -9,17 +9,20 @@ from bot.arena.flow_signals import FactorDistributionTracker, MarketFlowSignalDe
 from bot.config import Settings
 from bot.data.market_signals import ExternalMarketSignals, MarketContext, TechnicalFeatures
 from bot.data.providers import ExternalSignalAggregator
-from bot.exchange.okx_client import OKXFuturesClient
+from bot.exchange.contracts import FuturesExchangeProtocol
 from bot.strategy.indicators import atr, ema, macd, pct_change, rsi
 
 
 class MarketIntelligence:
-    """Layer 4: convert raw market data and external signals into AI-ready context."""
+    """Layer 4: convert raw market data and external signals into AI-ready context.
+
+    Depends on `FuturesExchangeProtocol`, never on a specific venue client.
+    """
 
     def __init__(
         self,
         settings: Settings,
-        client: OKXFuturesClient,
+        client: FuturesExchangeProtocol,
         external_signals: ExternalSignalAggregator,
         logger: logging.Logger,
     ) -> None:
@@ -79,7 +82,7 @@ class MarketIntelligence:
         lows = [float(row["low"]) for row in klines]
         volumes = [float(row.get("volume", 0.0)) for row in klines]
         if not closes:
-            self._logger.warning("No OKX candles returned for %s.", symbol)
+            self._logger.warning("No exchange candles returned for %s.", symbol)
             return None
 
         macd_line, macd_signal, macd_hist = macd(closes, 12, 26, 9)
@@ -143,7 +146,7 @@ class MarketIntelligence:
         if not technicals:
             return {
                 "regime": "unknown",
-                "risk_flags": ["missing_okx_market_data"],
+                "risk_flags": ["missing_exchange_market_data"],
                 "symbol_scores": {},
             }
 
@@ -209,6 +212,6 @@ class MarketIntelligence:
             factor_score_trigger=settings.arena_factor_score_trigger,
             factor_percentile_trigger=settings.arena_factor_percentile_trigger,
             order_flow_imbalance_pct=settings.arena_order_flow_imbalance_pct,
-            max_spread_bps=settings.okx_max_spread_bps,
+            max_spread_bps=settings.max_spread_bps,
             min_depth_notional=settings.arena_min_depth_notional,
         )

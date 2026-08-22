@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 
 from bot.config import Settings
-from bot.exchange.okx_client import OKXFuturesClient, OKXOrderBook
+from bot.exchange.contracts import FuturesExchangeProtocol, OrderBookSnapshot, OrderFill
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import RiskManager
 from bot.storage.interfaces import TradeStoreProtocol
@@ -15,11 +16,17 @@ from bot.strategy.grok_strategy import GrokStrategy
 
 
 class TradeEngine:
+    # Restart matching tolerances: partial fills and mark-price rounding produce
+    # small legitimate drift, but anything larger means the exchange position is
+    # not the one this bot persisted.
+    _POSITION_MATCH_TOLERANCE = 0.02
+    _POSITION_PRICE_TOLERANCE = 0.01
+
     def __init__(
         self,
         settings: Settings,
         logger: logging.Logger,
-        client: OKXFuturesClient,
+        client: FuturesExchangeProtocol,
         strategy: BaseStrategy,
         risk_manager: RiskManager,
         trade_store: TradeStoreProtocol,
@@ -36,13 +43,16 @@ class TradeEngine:
         self._last_stop_loss_ts: float | None = None
         self._taker_fee_pct_by_symbol: dict[str, float] = {}
         self._maker_fee_pct_by_symbol: dict[str, float | None] = {}
+        self._entries_blocked_reason: str | None = None
+        self._resumable_positions: list[OpenPosition] = []
 
     async def run_forever(self) -> None:
         await self._trade_store.initialize()
         await self._startup_safety_checks()
         await self._refresh_exchange_fee_rates()
         await self._initialize_leverage()
-        self._logger.info("OKX demo trade engine started.")
+        self._logger.info("%s VST trade engine started.", self._venue_label.upper())
+        await self._resume_persisted_positions()
 
         while True:
             try:
@@ -52,6 +62,9 @@ class TradeEngine:
             await asyncio.sleep(self._settings.entry_interval_minutes * 60)
 
     async def _tick(self) -> None:
+        if self._entries_blocked_reason is not None:
+            self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
+            return
         state = await self._risk_manager.get_daily_state()
         if isinstance(self._strategy, GrokStrategy):
             self._strategy.set_daily_state(state)
@@ -114,13 +127,32 @@ class TradeEngine:
         await self._execute_single_trade(plan)
 
     async def _initialize_leverage(self) -> None:
+        """Apply margin mode, position mode, and leverage, then VERIFY them.
+
+        Applying is best-effort (the venue may already be configured, which some
+        endpoints report as an error), but verification is mandatory: if the
+        effective account state does not match the configuration, startup fails
+        closed rather than trading with the wrong margin mode or leverage.
+        """
+        set_margin_mode = getattr(self._client, "set_margin_mode", None)
+        if set_margin_mode is not None:
+            for symbol in self._settings.symbols:
+                try:
+                    await set_margin_mode(symbol, self._settings.margin_mode)
+                except Exception as exc:
+                    self._logger.warning(
+                        "set_margin_mode(%s, %s) failed; will verify the effective mode. error=%s",
+                        symbol,
+                        self._settings.margin_mode,
+                        exc,
+                    )
         try:
-            resp = await self._client.set_position_mode(self._settings.okx_position_mode)
-            self._logger.info("Set OKX position mode: %s", resp.get("msg", "ok"))
+            resp = await self._client.set_position_mode(self._settings.position_mode)
+            self._logger.info("Set exchange position mode: %s", resp.get("msg", "ok"))
         except Exception as exc:
             self._logger.warning(
-                "Could not set OKX position mode to %s. Continuing with current account mode. error=%s",
-                self._settings.okx_position_mode,
+                "set_position_mode(%s) failed; will verify the effective mode. error=%s",
+                self._settings.position_mode,
                 exc,
             )
         for symbol in self._settings.symbols:
@@ -128,13 +160,72 @@ class TradeEngine:
                 resp = await self._client.set_leverage(symbol=symbol, leverage=self._settings.leverage)
                 self._logger.info("Set leverage for %s: %s", symbol, resp.get("msg", "ok"))
             except Exception as exc:
-                message = (
-                    f"Could not set OKX leverage for {symbol} to {self._settings.leverage}x. "
-                    f"Continuing with the leverage currently configured on OKX. error={exc}"
+                self._logger.warning(
+                    "set_leverage(%s, %sx) failed; will verify the effective leverage. error=%s",
+                    symbol,
+                    self._settings.leverage,
+                    exc,
                 )
-                if self._settings.okx_require_set_leverage:
-                    raise RuntimeError(message) from exc
-                self._logger.warning(message)
+
+        await self._verify_account_configuration()
+
+    async def _verify_account_configuration(self) -> None:
+        """Fail closed when the venue's effective account state is not what we configured."""
+        mismatches: list[str] = []
+
+        get_position_mode = getattr(self._client, "get_position_mode", None)
+        if get_position_mode is not None:
+            effective = await self._checked(get_position_mode(), "position mode", mismatches)
+            if effective is not None and str(effective).lower() != self._settings.position_mode:
+                mismatches.append(
+                    f"position mode is {effective!r}, expected {self._settings.position_mode!r}"
+                )
+
+        get_margin_mode = getattr(self._client, "get_margin_mode", None)
+        get_effective_leverage = getattr(self._client, "get_effective_leverage", None)
+        for symbol in self._settings.symbols:
+            if get_margin_mode is not None:
+                effective = await self._checked(get_margin_mode(symbol), f"margin mode for {symbol}", mismatches)
+                if effective is not None and not self._margin_modes_match(str(effective)):
+                    mismatches.append(
+                        f"{symbol} margin mode is {effective!r}, expected {self._settings.margin_mode!r}"
+                    )
+            if get_effective_leverage is not None:
+                effective = await self._checked(
+                    get_effective_leverage(symbol), f"leverage for {symbol}", mismatches
+                )
+                if effective is not None:
+                    long_leverage, short_leverage = effective
+                    configured = int(self._settings.leverage)
+                    if long_leverage != configured or short_leverage != configured:
+                        mismatches.append(
+                            f"{symbol} leverage is long={long_leverage}x short={short_leverage}x, "
+                            f"expected {configured}x on both sides"
+                        )
+
+        if mismatches:
+            raise RuntimeError(
+                "Exchange account configuration does not match this runtime's settings: "
+                + "; ".join(mismatches)
+                + ". Fix the account on the venue (or the configuration) before trading."
+            )
+        self._logger.info("Verified effective margin mode, position mode, and leverage on the venue.")
+
+    async def _checked(self, awaitable, label: str, mismatches: list[str]):
+        """Await a verification query; an unreadable value is itself a mismatch."""
+        try:
+            return await awaitable
+        except Exception as exc:
+            mismatches.append(f"could not read {label} ({type(exc).__name__}: {exc})")
+            return None
+
+    def _margin_modes_match(self, effective: str) -> bool:
+        configured = str(self._settings.margin_mode).strip().lower()
+        normalized = effective.strip().lower()
+        # BingX reports isolated margin as "isolated"; cross appears as "crossed"/"cross".
+        if configured == "isolated":
+            return normalized == "isolated"
+        return normalized in {configured, f"{configured}ed"}
 
     async def _execute_single_trade(self, plan: TradePlan) -> None:
         target_notional = plan.usdt_size * plan.leverage
@@ -144,18 +235,22 @@ class TradeEngine:
 
         entry_price = order_book.mid_price if order_book is not None else await self._client.get_last_price(plan.symbol)
         base_quantity = self._calculate_quantity(plan.usdt_size, plan.leverage, entry_price)
+        # `calculate_order_size` returns 0 when the venue's own tradeMinQuantity /
+        # tradeMinUSDT metadata rejects the size. That metadata is the only
+        # authority here: the old MIN_ORDER_CONTRACTS floor was an OKX
+        # contract-count concept and, applied to BingX base-asset quantity, it
+        # silently blocked every BTC entry (18,000 USDT notional is ~0.3 BTC < 1).
         exchange_size = await self._client.calculate_order_size(plan.symbol, base_quantity)
-        if exchange_size < self._settings.min_order_contracts:
+        if exchange_size <= 0:
             self._logger.warning(
-                "Skipped trade for %s, order size %.8f below MIN_ORDER_CONTRACTS %.8f",
+                "Skipped trade for %s: base quantity %.8f is below the venue minimum quantity/notional.",
                 plan.symbol,
-                exchange_size,
-                self._settings.min_order_contracts,
+                base_quantity,
             )
             return
         self._logger.info(
             "Opening %s %s | margin=%.2f | leverage=%sx | target_notional=%.2f | target_round_trip_volume=%.2f | "
-            "base_qty=%.8f | okx_size=%.8f | entry_price=%.8f | spread_bps=%.2f | taker_fee_pct=%.4f | "
+            "base_qty=%.8f | venue_size=%.8f | entry_price=%.8f | spread_bps=%.2f | taker_fee_pct=%.4f | "
             "conf=%.2f | setup=%.2f | decision=%s",
             plan.symbol,
             plan.direction.value,
@@ -179,14 +274,18 @@ class TradeEngine:
         await asyncio.sleep(self._settings.order_fill_wait_seconds)
         entry_fill = await self._client.get_order_fill(plan.symbol, entry_order_id)
         # Verify that a position actually exists and adjust to the filled quantity.
-        filled_size, filled_entry_price = await self._client.get_symbol_position_snapshot(plan.symbol)
+        # Read full details (not just the snapshot) so the venue position id is
+        # captured for restart identity matching.
+        position_details = await self._client.get_symbol_position_details(plan.symbol)
+        filled_size = position_details.exchange_size
+        filled_entry_price = position_details.avg_price
         if filled_size <= 0:
             raise RuntimeError(
                 f"Entry order placed but no open position detected for {plan.symbol}."
             )
         if filled_size < exchange_size * 0.5:
             self._logger.warning(
-                "Entry for %s appears partially filled: target_okx_size=%.8f, exchange_okx_size=%.8f. "
+                "Entry for %s appears partially filled: target_venue_size=%.8f, exchange_venue_size=%.8f. "
                 "Proceeding with smaller size.",
                 plan.symbol,
                 exchange_size,
@@ -213,11 +312,39 @@ class TradeEngine:
             exchange_order_id=entry_order_id,
             opened_at=opened_at,
             entry_reason=plan.decision_reason,
+            position_id=getattr(position_details, "position_id", None),
+            stop_loss_pct=plan.stop_loss_pct,
+            take_profit_pct=plan.take_profit_pct,
         )
         await self._trade_store.save_open_position(open_position)
 
-        # Record last entry timestamp for cooldown logic.
-        self._last_entry_ts = opened_at.timestamp()
+        await self._manage_open_position(
+            open_position,
+            plan,
+            entry_order_id=entry_order_id,
+            entry_fill=entry_fill,
+            entry_fee_usdt=entry_fee_usdt,
+            record_entry_cooldown=True,
+        )
+
+    async def _manage_open_position(
+        self,
+        open_position: OpenPosition,
+        plan: TradePlan,
+        *,
+        entry_order_id: str,
+        entry_fill: OrderFill | None,
+        entry_fee_usdt: float,
+        record_entry_cooldown: bool,
+    ) -> None:
+        """Monitor an open position to close and record the resulting trade.
+
+        Shared by a freshly-opened trade and by a position resumed from persisted
+        state after a restart, so a resumed position is fully monitored rather than
+        left running unattended.
+        """
+        if record_entry_cooldown:
+            self._last_entry_ts = open_position.opened_at.timestamp()
 
         realized_qty = open_position.quantity
         exit_fill = None
@@ -245,7 +372,7 @@ class TradeEngine:
                 realized_qty = open_position.quantity
             if abs(exchange_size_to_close - open_position.exchange_size) > 1e-8:
                 self._logger.warning(
-                    "Exchange position size for %s changed during trade lifecycle: local_okx_size=%.8f, exchange_okx_size=%.8f.",
+                    "Exchange position size for %s changed during trade lifecycle: local_venue_size=%.8f, exchange_venue_size=%.8f.",
                     open_position.symbol,
                     open_position.exchange_size,
                     exchange_size_to_close,
@@ -352,12 +479,17 @@ class TradeEngine:
         )
 
     async def _startup_safety_checks(self) -> None:
-        if not self._settings.okx_demo_trading:
-            raise RuntimeError("OKX_DEMO_TRADING must be true for this project runtime.")
+        # BingX VST is the only enabled execution environment; live fails closed.
+        if str(getattr(self._settings, "bingx_env", "")).lower() != "vst":
+            raise RuntimeError("BINGX_ENV must be 'vst' for this project runtime.")
 
         await self._client.validate_api_access(self._settings.symbols[0])
-        self._logger.info("OKX demo API connectivity and auth check passed.")
+        self._logger.info("%s VST API connectivity and auth check passed.", self._venue_label.upper())
         await self._reconcile_local_open_positions()
+
+    @property
+    def _venue_label(self) -> str:
+        return str(getattr(self._client, "venue", None) or getattr(self._settings, "exchange_name", "exchange"))
 
     async def _volume_runtime_pause_reason(self) -> str | None:
         if self._settings.strategy_mode not in {"volume", "ai_volume"}:
@@ -392,54 +524,193 @@ class TradeEngine:
         return int(self._settings.trade_target_per_day)
 
     async def _reconcile_local_open_positions(self) -> None:
+        """Match persisted position state against the exchange at startup.
+
+        Matching is on identity, not just symbol: direction/`positionSide`,
+        quantity, and — when persisted — average entry price must agree. A
+        persisted LONG must never be "matched" to an exchange SHORT, or to a
+        position of a materially different size, because the resumed monitor
+        would then apply the wrong stop and close a position it does not model.
+
+        A confirmed match is resumed and fully monitored. Anything else is
+        unknown exposure: entries are blocked and the operator alerted, and it
+        is NEVER auto-flattened.
+        """
         local_positions = await self._trade_store.list_open_positions()
-        local_symbols: set[str] = set()
+        local_by_symbol = {position.symbol: position for position in local_positions}
         if not local_positions:
-            self._logger.info("No local open positions found during startup reconcile.")
-        else:
-            for pos in local_positions:
-                exchange_has_position = await self._client.has_open_position(pos.symbol)
-                if not exchange_has_position:
-                    await self._trade_store.remove_open_position(pos.symbol)
-                    self._logger.warning(
-                        "Removed stale local open position for %s during startup reconcile.",
-                        pos.symbol,
-                    )
-                    continue
-                local_symbols.add(pos.symbol)
-        for symbol in self._settings.symbols:
-            if symbol in local_symbols:
+            self._logger.info("No persisted open positions found during startup reconcile.")
+
+        unknown_exposure: list[str] = []
+
+        for symbol, position in list(local_by_symbol.items()):
+            details = await self._position_details(symbol)
+            if details is None:
+                unknown_exposure.append(f"{symbol} (could not read exchange position state)")
+                local_by_symbol.pop(symbol, None)
                 continue
-            if await self._client.has_open_position(symbol):
-                # Orphan exchange position with no local record (e.g. the bot was
-                # stopped mid-trade). Open positions are not persisted and the original
-                # SL/TP cannot be reconstructed, so leaving it would be an unmonitored
-                # 100x position. Auto-flat it at startup so the bot resumes from a clean,
-                # fully-monitored state instead of blocking all new entries indefinitely.
+            if details.exchange_size <= 0:
+                await self._trade_store.remove_open_position(symbol)
+                local_by_symbol.pop(symbol, None)
                 self._logger.warning(
-                    "Exchange has an unrecorded open position for %s; auto-flattening it "
-                    "at startup (original SL/TP unknown).",
+                    "Removed stale persisted open position for %s (exchange reports flat).",
                     symbol,
                 )
-                try:
-                    resp = await self._client.flatten_position(symbol)
-                    if resp is None:
-                        self._logger.info("Nothing to flatten for %s (already closed).", symbol)
-                    elif await self._client.has_open_position(symbol):
-                        self._logger.error(
-                            "Auto-flatten for %s did not fully close the position; "
-                            "new entries remain blocked until it is closed manually.",
-                            symbol,
-                        )
-                    else:
-                        self._logger.info("Auto-flattened orphan position for %s.", symbol)
-                except Exception as exc:
-                    self._logger.error(
-                        "Failed to auto-flatten orphan position for %s: %s. "
-                        "New entries remain blocked until it is closed manually.",
-                        symbol,
-                        exc,
-                    )
+                continue
+
+            envelope_problem = self._risk_envelope_problem(position)
+            if envelope_problem is not None:
+                unknown_exposure.append(f"{symbol} ({envelope_problem})")
+                local_by_symbol.pop(symbol, None)
+                continue
+
+            mismatch = self._position_mismatch_reason(position, details)
+            if mismatch is not None:
+                unknown_exposure.append(f"{symbol} ({mismatch})")
+                local_by_symbol.pop(symbol, None)
+                continue
+
+            self._resumable_positions.append(position)
+            self._logger.warning(
+                "Resuming persisted %s %s position from restart: entry=%.8f qty=%.8f order_id=%s",
+                position.symbol,
+                position.direction.value,
+                position.entry_price,
+                position.quantity,
+                position.exchange_order_id,
+            )
+
+        for symbol in self._settings.symbols:
+            if symbol in local_by_symbol:
+                continue
+            if await self._client.has_open_position(symbol):
+                unknown_exposure.append(f"{symbol} (no persisted record)")
+
+        if unknown_exposure:
+            self._entries_blocked_reason = (
+                "Unmatched exchange exposure: "
+                + "; ".join(sorted(set(unknown_exposure)))
+                + ". The bot cannot safely model these positions, so it will not trade or flatten them. "
+                "Close or reconcile them manually, then restart."
+            )
+            self._logger.error("STARTUP ALERT: %s", self._entries_blocked_reason)
+
+    async def _position_details(self, symbol: str):
+        try:
+            return await self._client.get_symbol_position_details(symbol)
+        except Exception as exc:
+            self._logger.error("Could not read exchange position details for %s: %s", symbol, exc)
+            return None
+
+    @staticmethod
+    def _risk_envelope_problem(position: OpenPosition) -> str | None:
+        """Reject a persisted position whose own SL/TP cannot be trusted.
+
+        Resuming on the *current* configuration would silently re-price the risk
+        of a trade that is already running, so a missing, non-positive, or
+        non-finite envelope is unknown exposure requiring an operator, not
+        something to paper over with today's settings.
+        """
+        for label, value in (
+            ("stop_loss_pct", position.stop_loss_pct),
+            ("take_profit_pct", position.take_profit_pct),
+        ):
+            if value is None:
+                return (
+                    f"persisted record has no {label}, so the risk envelope this position "
+                    "was opened under is unknown"
+                )
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return f"persisted {label} {value!r} is not a number"
+            if not math.isfinite(numeric) or numeric <= 0:
+                return f"persisted {label} {value!r} is not a valid positive percentage"
+        return None
+
+    def _position_mismatch_reason(self, position: OpenPosition, details) -> str | None:
+        """Return why a persisted position does not match the exchange, or None."""
+        exchange_side = str(getattr(details, "pos_side", "") or "").strip().upper()
+        if exchange_side and exchange_side != position.direction.value:
+            return f"persisted {position.direction.value} but exchange reports {exchange_side}"
+
+        exchange_size = float(getattr(details, "exchange_size", 0.0) or 0.0)
+        expected_size = float(position.exchange_size or position.quantity)
+        if expected_size > 0:
+            drift = abs(exchange_size - expected_size) / expected_size
+            if drift > self._POSITION_MATCH_TOLERANCE:
+                return (
+                    f"persisted size {expected_size:.8f} but exchange reports {exchange_size:.8f} "
+                    f"({drift * 100:.2f}% drift)"
+                )
+        elif exchange_size > 0:
+            return f"persisted size is unknown but exchange reports {exchange_size:.8f}"
+
+        avg_price = getattr(details, "avg_price", None)
+        if avg_price and position.entry_price > 0:
+            price_drift = abs(float(avg_price) - position.entry_price) / position.entry_price
+            if price_drift > self._POSITION_PRICE_TOLERANCE:
+                return (
+                    f"persisted entry {position.entry_price:.8f} but exchange average price is "
+                    f"{float(avg_price):.8f} ({price_drift * 100:.2f}% drift)"
+                )
+
+        position_id = getattr(details, "position_id", None)
+        expected_id = getattr(position, "position_id", None)
+        if expected_id:
+            # We knew this position's venue identity at entry. If the readback no
+            # longer carries it, identity can no longer be confirmed — treat that
+            # as unknown exposure rather than resuming on the weaker checks alone.
+            if not position_id:
+                return (
+                    f"persisted position id {expected_id} but the exchange readback carries no "
+                    "position id, so identity cannot be confirmed"
+                )
+            if str(expected_id) != str(position_id):
+                return f"persisted position id {expected_id} but exchange reports {position_id}"
+        # A record persisted before position ids were captured has no id to check.
+        # Such legacy rows are matched on direction, quantity, and entry price only;
+        # they are resumable, and the first close rewrites them with an id.
+        return None
+
+    async def _resume_persisted_positions(self) -> None:
+        """Take over monitoring of positions that survived a restart."""
+        while self._resumable_positions:
+            position = self._resumable_positions.pop(0)
+            plan = self._plan_from_resumed_position(position)
+            self._logger.info("Resumed monitoring for %s %s.", position.symbol, position.direction.value)
+            try:
+                await self._manage_open_position(
+                    position,
+                    plan,
+                    entry_order_id=position.exchange_order_id,
+                    entry_fill=None,
+                    entry_fee_usdt=0.0,
+                    record_entry_cooldown=False,
+                )
+            except Exception:
+                self._logger.exception("Failed to manage resumed position for %s.", position.symbol)
+
+    def _plan_from_resumed_position(self, position: OpenPosition) -> TradePlan:
+        """Rebuild the trade plan for a resumed position.
+
+        The original AI reasoning is not replayed, but the risk envelope is the
+        one the position was actually opened under — never the current
+        configuration, which may have changed across a redeploy. Reconciliation
+        has already rejected any position whose persisted envelope is unusable.
+        """
+        problem = self._risk_envelope_problem(position)
+        if problem is not None:  # pragma: no cover - reconcile filters these first
+            raise RuntimeError(f"Refusing to resume {position.symbol}: {problem}")
+        return TradePlan(
+            symbol=position.symbol,
+            direction=position.direction,
+            usdt_size=self._settings.position_usdt,
+            leverage=self._settings.leverage,
+            stop_loss_pct=float(position.stop_loss_pct),
+            take_profit_pct=float(position.take_profit_pct),
+            decision_reason=f"resumed_after_restart:{position.entry_reason}",
+        )
 
     async def _monitor_position(self, position: OpenPosition, plan: TradePlan) -> str:
         max_hold_seconds = self._resolve_max_hold_seconds(plan)
@@ -526,7 +797,7 @@ class TradeEngine:
         self,
         plan: TradePlan,
         target_notional: float,
-    ) -> tuple[bool, OKXOrderBook | None]:
+    ) -> tuple[bool, OrderBookSnapshot | None]:
         if not self._settings.execution_guards_enabled:
             return True, None
 
@@ -539,12 +810,12 @@ class TradeEngine:
             self._logger.warning("Skipped %s entry: order book guard failed. error=%s", plan.symbol, exc)
             return False, None
 
-        if order_book.spread_bps > self._settings.okx_max_spread_bps:
+        if order_book.spread_bps > self._settings.max_spread_bps:
             self._logger.warning(
                 "Skipped %s entry: spread %.2fbps > max %.2fbps.",
                 plan.symbol,
                 order_book.spread_bps,
-                self._settings.okx_max_spread_bps,
+                self._settings.max_spread_bps,
             )
             return False, order_book
 
@@ -580,9 +851,9 @@ class TradeEngine:
             )
             return False, order_book
 
-        if funding.next_funding_time is not None and self._settings.okx_funding_blackout_minutes > 0:
+        if funding.next_funding_time is not None and self._settings.funding_blackout_minutes > 0:
             seconds_to_funding = (funding.next_funding_time - datetime.now(timezone.utc)).total_seconds()
-            blackout_seconds = self._settings.okx_funding_blackout_minutes * 60
+            blackout_seconds = self._settings.funding_blackout_minutes * 60
             if 0 <= seconds_to_funding <= blackout_seconds:
                 self._logger.warning(
                     "Skipped %s entry: funding blackout active (%.0fs to funding, rate=%.6f).",
@@ -606,7 +877,7 @@ class TradeEngine:
         self,
         plan: TradePlan,
         exchange_size: float,
-        order_book: OKXOrderBook | None,
+        order_book: OrderBookSnapshot | None,
     ) -> str | None:
         if self._uses_post_only_entry():
             order_id = await self._place_post_only_entry(plan, exchange_size, order_book)
@@ -629,7 +900,7 @@ class TradeEngine:
         self,
         plan: TradePlan,
         exchange_size: float,
-        order_book: OKXOrderBook | None,
+        order_book: OrderBookSnapshot | None,
     ) -> str | None:
         ttl_seconds = self._maker_entry_ttl_seconds()
         attempts = max(1, self._maker_max_reprices() + 1)
@@ -701,7 +972,7 @@ class TradeEngine:
             self._logger.debug("Could not cancel order %s for %s: %s", order_id, symbol, exc)
 
     async def _post_entry_position_guard(self, position: OpenPosition, plan: TradePlan) -> str | None:
-        if self._settings.okx_min_liquidation_distance_bps <= 0:
+        if self._settings.min_liquidation_distance_bps <= 0:
             return None
         try:
             details = await self._client.get_symbol_position_details(position.symbol)
@@ -723,14 +994,14 @@ class TradeEngine:
             position.direction == PositionDirection.SHORT
             and stop_price >= details.liquidation_price
         )
-        if distance_bps < self._settings.okx_min_liquidation_distance_bps or stop_beyond_liq:
+        if distance_bps < self._settings.min_liquidation_distance_bps or stop_beyond_liq:
             self._logger.warning(
                 "Liquidation guard closing %s: liq=%.4f ref=%.4f distance=%.2fbps min=%.2fbps stop=%.4f.",
                 position.symbol,
                 details.liquidation_price,
                 reference_price,
                 distance_bps,
-                self._settings.okx_min_liquidation_distance_bps,
+                self._settings.min_liquidation_distance_bps,
                 stop_price,
             )
             return "liquidation_guard"

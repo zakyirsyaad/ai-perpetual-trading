@@ -26,7 +26,10 @@ class TradeStoreProtocol(Protocol):
         systemic_risk: int,
         reason: str,
         payload: dict[str, Any],
+        ai_call_id: str | None = None,
     ) -> None: ...
+
+    async def save_ai_call_metrics(self, metrics: Any) -> None: ...
 
     async def save_learning_note(
         self,

@@ -7,7 +7,7 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bot.exchange.okx_client import OKXFundingRateInfo, OKXOrderBook
+from bot.exchange.contracts import FundingRateInfo, OrderBookSnapshot
 from realtime_backtest import (
     BacktestCandle,
     _estimate_round_trip_fee,
@@ -52,7 +52,7 @@ class RealtimeBacktestTests(unittest.TestCase):
             volume_breakeven_min_profit_usdt=0,
             execution_guards_enabled=True,
             confluence_enabled=False,
-            okx_max_spread_bps=6,
+            max_spread_bps=6,
             min_orderbook_depth_multiplier=1.2,
             max_abs_funding_rate=0.001,
         )
@@ -67,7 +67,7 @@ class RealtimeBacktestTests(unittest.TestCase):
             ],
         }
         books = {
-            symbol: OKXOrderBook(
+            symbol: OrderBookSnapshot(
                 symbol=symbol,
                 best_bid=99.99,
                 best_ask=100.01,
@@ -81,7 +81,7 @@ class RealtimeBacktestTests(unittest.TestCase):
             for symbol in settings.symbols
         }
         funding = {
-            symbol: OKXFundingRateInfo(symbol=symbol, funding_rate=0.0001, next_funding_time=None, raw={})
+            symbol: FundingRateInfo(symbol=symbol, funding_rate=0.0001, next_funding_time=None, raw={})
             for symbol in settings.symbols
         }
 

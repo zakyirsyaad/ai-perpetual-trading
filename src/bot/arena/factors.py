@@ -55,7 +55,7 @@ class FactorEffectiveness:
 
 
 class FactorRegistry:
-    """Built-in factor library for the OKX demo arena runtime."""
+    """Built-in factor library for the arena runtime."""
 
     def __init__(self) -> None:
         self._definitions = _build_factor_definitions()
@@ -339,11 +339,11 @@ def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
 
 def _build_factor_definitions() -> list[FactorDefinition]:
     definitions = [
-        FactorDefinition("price_momentum_5m", "momentum", "okx_candles", 5, "5m directional price momentum"),
-        FactorDefinition("ema_macd_trend", "trend", "okx_candles", 21, "EMA and MACD trend alignment"),
-        FactorDefinition("atr_volatility_regime", "volatility", "okx_candles", 14, "ATR volatility regime score"),
-        FactorDefinition("volume_participation", "volume", "okx_candles", 5, "Volume expansion or contraction"),
-        FactorDefinition("microstructure_pressure", "microstructure", "okx_orderbook", 1, "Spread, depth, funding, and OI pressure"),
+        FactorDefinition("price_momentum_5m", "momentum", "exchange_candles", 5, "5m directional price momentum"),
+        FactorDefinition("ema_macd_trend", "trend", "exchange_candles", 21, "EMA and MACD trend alignment"),
+        FactorDefinition("atr_volatility_regime", "volatility", "exchange_candles", 14, "ATR volatility regime score"),
+        FactorDefinition("volume_participation", "volume", "exchange_candles", 5, "Volume expansion or contraction"),
+        FactorDefinition("microstructure_pressure", "microstructure", "exchange_orderbook", 1, "Spread, depth, funding, and OI pressure"),
     ]
     categories = {
         "momentum": [
@@ -385,7 +385,7 @@ def _build_factor_definitions() -> list[FactorDefinition]:
                 FactorDefinition(
                     name=name,
                     category=category,
-                    source="okx_live_features",
+                    source="exchange_live_features",
                     lookback=index,
                     description=f"{category} factor {name}",
                 )

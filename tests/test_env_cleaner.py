@@ -16,10 +16,11 @@ class EnvCleanerTests(unittest.TestCase):
             example.write_text(
                 "\n".join(
                     [
-                        "# OKX demo trading",
-                        "OKX_API_KEY=your_okx_demo_api_key",
-                        "OKX_SECRET_KEY=your_okx_demo_secret_key",
-                        "OKX_PASSPHRASE=your_okx_demo_api_passphrase",
+                        "# BingX Perpetual Futures VST",
+                        "BINGX_API_KEY=your_bingx_vst_api_key",
+                        "BINGX_SECRET_KEY=your_bingx_vst_secret_key",
+                        "BINGX_ENV=live",
+                        "BINGX_BASE_URL=https://open-api.bingx.com",
                         "",
                         "# OpenAI-compatible AI brain",
                         "XAI_API_KEY=your_xai_api_key",
@@ -63,15 +64,16 @@ class EnvCleanerTests(unittest.TestCase):
             env.write_text(
                 "\n".join(
                     [
-                        "OKX_API_KEY=real-okx-key",
-                        "OKX_SECRET_KEY=real-okx-secret",
-                        "OKX_PASSPHRASE=real-okx-passphrase",
+                        "BINGX_API_KEY=real-bingx-key",
+                        "BINGX_SECRET_KEY=real-bingx-secret",
                         "XAI_API_KEY=real-xai-key",
                         "SUPABASE_URL=https://example.supabase.co",
                         "SUPABASE_SERVICE_ROLE_KEY=real-supabase-key",
                         "LEVERAGE=150",
                         "EXECUTION_ENTRY_ORDER_TYPE=market",
-                        "BINGX_API_KEY=legacy",
+                        "OKX_API_KEY=legacy-okx",
+                        "OKX_PASSPHRASE=legacy-okx-passphrase",
+                        "AI_PRE_TRADE_CHECK=true",
                         "PERP_ENABLED=true",
                         "OPENAI_API_KEY=legacy-openai",
                         "USE_TESTNET=true",
@@ -86,9 +88,11 @@ class EnvCleanerTests(unittest.TestCase):
 
             cleaned = env.read_text(encoding="utf-8")
             self.assertTrue(result.backup_path.exists())
-            self.assertIn("OKX_API_KEY=real-okx-key", cleaned)
-            self.assertIn("OKX_SECRET_KEY=real-okx-secret", cleaned)
-            self.assertIn("OKX_PASSPHRASE=real-okx-passphrase", cleaned)
+            self.assertIn("BINGX_API_KEY=real-bingx-key", cleaned)
+            self.assertIn("BINGX_SECRET_KEY=real-bingx-secret", cleaned)
+            # VST-only defaults are re-applied even when .env drifted to live values.
+            self.assertIn("BINGX_ENV=vst", cleaned)
+            self.assertIn("BINGX_BASE_URL=https://open-api-vst.bingx.com", cleaned)
             self.assertIn("XAI_API_KEY=real-xai-key", cleaned)
             self.assertIn("XAI_BASE_URL=https://api.freemodel.dev/v1", cleaned)
             self.assertIn("XAI_MODEL=gpt-5.4", cleaned)
@@ -112,12 +116,17 @@ class EnvCleanerTests(unittest.TestCase):
             self.assertIn("EXECUTION_ENTRY_ORDER_TYPE=post_only", cleaned)
             self.assertIn("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET=false", cleaned)
             self.assertIn("MAKER_ALLOW_TAKER_EMERGENCY_EXIT=true", cleaned)
-            self.assertNotIn("BINGX_API_KEY", cleaned)
+            self.assertNotIn("OKX_API_KEY", cleaned)
+            self.assertNotIn("OKX_PASSPHRASE", cleaned)
+            self.assertNotIn("AI_PRE_TRADE_CHECK", cleaned)
             self.assertNotIn("PERP_ENABLED", cleaned)
             self.assertNotIn("OPENAI_API_KEY", cleaned)
             self.assertNotIn("USE_TESTNET", cleaned)
             self.assertNotIn("ENABLE_LIVE_TRADING", cleaned)
-            self.assertLess(cleaned.index("# OKX demo trading"), cleaned.index("# OpenAI-compatible AI brain"))
+            self.assertLess(
+                cleaned.index("# BingX Perpetual Futures VST"),
+                cleaned.index("# OpenAI-compatible AI brain"),
+            )
             self.assertLess(
                 cleaned.index("# OpenAI-compatible AI brain"),
                 cleaned.index("# Required Supabase primary store"),

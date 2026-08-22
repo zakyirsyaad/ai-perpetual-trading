@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 
-OKX_BTC_ETH_USDT_SWAP_FALLBACK_MAX_LEVERAGE = 100
+DEFAULT_FALLBACK_MAX_LEVERAGE = 100
+# Legacy alias kept so existing OKX call sites/tests keep importing one constant.
+OKX_BTC_ETH_USDT_SWAP_FALLBACK_MAX_LEVERAGE = DEFAULT_FALLBACK_MAX_LEVERAGE
 
 
-class OKXPositionTierClient(Protocol):
+class PositionTierClient(Protocol):
     async def get_position_tiers(self, symbol: str, td_mode: str = "isolated") -> list[dict[str, Any]]:
         ...
 
@@ -24,19 +26,23 @@ class LeverageResolution:
     reason: str
 
 
-async def resolve_okx_venue_leverage(
-    client: OKXPositionTierClient,
+OKXPositionTierClient = PositionTierClient
+
+
+async def resolve_venue_leverage(
+    client: PositionTierClient,
     *,
     symbols: tuple[str, ...],
     configured_leverage: int,
     margin_mode: str = "isolated",
-    fallback_max: int = OKX_BTC_ETH_USDT_SWAP_FALLBACK_MAX_LEVERAGE,
+    fallback_max: int = DEFAULT_FALLBACK_MAX_LEVERAGE,
+    venue: str = "exchange",
 ) -> LeverageResolution:
-    """Resolve the venue leverage cap from OKX public position tiers.
+    """Resolve the venue leverage cap from the exchange's position tiers.
 
-    OKX can lower maximum leverage by symbol/tier. For startup safety this uses
-    the lowest symbol max across configured symbols, then caps the configured
-    leverage before the strategy builds position sizes.
+    Venues can lower maximum leverage by symbol/tier. For startup safety this
+    uses the lowest symbol max across configured symbols, then caps the
+    configured leverage before the strategy builds position sizes.
     """
 
     try:
@@ -45,16 +51,16 @@ async def resolve_okx_venue_leverage(
             tiers = await client.get_position_tiers(symbol, td_mode=margin_mode)
             max_leverage = _max_leverage_from_tiers(tiers)
             if max_leverage is None:
-                raise ValueError(f"Missing maxLever in OKX position tiers for {symbol}")
+                raise ValueError(f"Missing maxLever in {venue} position tiers for {symbol}")
             symbol_caps[symbol] = max_leverage
         effective_max = min(symbol_caps.values()) if symbol_caps else fallback_max
-        source = "okx_position_tiers"
-        reason = "Resolved from OKX public position tiers."
+        source = f"{venue}_position_tiers"
+        reason = f"Resolved from {venue} public position tiers."
     except Exception as exc:
         symbol_caps = {symbol: fallback_max for symbol in symbols}
         effective_max = fallback_max
         source = "fallback"
-        reason = f"Using {fallback_max}x fallback because OKX position tiers were unavailable: {exc}"
+        reason = f"Using {fallback_max}x fallback because {venue} position tiers were unavailable: {exc}"
 
     resolved = min(int(configured_leverage), int(effective_max))
     return LeverageResolution(
@@ -82,3 +88,22 @@ def _max_leverage_from_tiers(tiers: list[dict[str, Any]]) -> int | None:
         except (TypeError, ValueError):
             continue
     return max(values) if values else None
+
+
+async def resolve_okx_venue_leverage(
+    client: PositionTierClient,
+    *,
+    symbols: tuple[str, ...],
+    configured_leverage: int,
+    margin_mode: str = "isolated",
+    fallback_max: int = DEFAULT_FALLBACK_MAX_LEVERAGE,
+) -> LeverageResolution:
+    """Legacy OKX-named wrapper around `resolve_venue_leverage`."""
+    return await resolve_venue_leverage(
+        client,
+        symbols=symbols,
+        configured_leverage=configured_leverage,
+        margin_mode=margin_mode,
+        fallback_max=fallback_max,
+        venue="okx",
+    )

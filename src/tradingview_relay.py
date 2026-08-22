@@ -107,7 +107,7 @@ class TradingViewRelayHandler(BaseHTTPRequestHandler):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local TradingView alert relay for the OKX AI bot.")
+    parser = argparse.ArgumentParser(description="Local TradingView alert relay for the BingX VST AI bot.")
     parser.add_argument("--host", default=os.getenv("TRADINGVIEW_RELAY_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.getenv("TRADINGVIEW_RELAY_PORT", str(DEFAULT_PORT))))
     parser.add_argument("--token", default=os.getenv("TRADINGVIEW_SIGNAL_TOKEN", ""))

@@ -8,15 +8,16 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from bot.ai.usage import AICallMetrics
 from bot.config import Settings
-from bot.models import ClosedTrade, OpenPosition
+from bot.models import ClosedTrade, OpenPosition, PositionDirection
 
 
 class SupabaseTradeStore:
     """Primary trade store backed by Supabase REST.
 
     This intentionally does not keep local file state. Open positions are
-    reconciled from OKX on startup by the trade engine.
+    reconciled from the exchange on startup by the trade engine.
     """
 
     def __init__(self, settings: Settings, logger: logging.Logger) -> None:
@@ -25,6 +26,9 @@ class SupabaseTradeStore:
         self._schema = settings.supabase_schema
         self._trades_table = settings.supabase_trades_table
         self._ai_decisions_table = settings.supabase_ai_decisions_table
+        self._ai_call_metrics_table = settings.supabase_ai_call_metrics_table
+        self._open_positions_table = settings.supabase_open_positions_table
+        self._exchange = settings.exchange_name
         self._logger = logger
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
         self._trading_tz = ZoneInfo(settings.trading_timezone)
@@ -44,16 +48,83 @@ class SupabaseTradeStore:
         await self._client.aclose()
 
     async def save_open_position(self, position: OpenPosition) -> None:
-        self._logger.debug(
-            "Not persisting open position locally; OKX is the source of truth for %s.",
-            position.symbol,
-        )
+        """Persist open-position lifecycle state so a restart can resume it.
+
+        The exchange remains the authority on size and price; this record exists
+        so a restart knows which position the bot itself opened, with which
+        SL/TP intent and order ids, instead of treating it as orphan exposure.
+        """
+        try:
+            await self._upsert(
+                self._open_positions_table,
+                {
+                    "exchange": self._exchange,
+                    "symbol": position.symbol,
+                    "status": "open",
+                    "direction": position.direction.value,
+                    "entry_price": position.entry_price,
+                    "quantity": position.quantity,
+                    "exchange_size": position.exchange_size,
+                    "exchange_order_id": position.exchange_order_id,
+                    "position_id": position.position_id,
+                    "stop_loss_pct": position.stop_loss_pct,
+                    "take_profit_pct": position.take_profit_pct,
+                    "entry_reason": position.entry_reason,
+                    "opened_at": position.opened_at.isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="exchange,symbol",
+            )
+        except Exception as exc:
+            # Position-state persistence must never abort an in-flight trade.
+            self._logger.warning("Could not persist open position state for %s: %s", position.symbol, exc)
 
     async def remove_open_position(self, symbol: str) -> None:
-        self._logger.debug("No local open position state to remove for %s.", symbol)
+        try:
+            await self._delete(
+                self._open_positions_table,
+                [("exchange", f"eq.{self._exchange}"), ("symbol", f"eq.{symbol}")],
+            )
+        except Exception as exc:
+            self._logger.warning("Could not clear open position state for %s: %s", symbol, exc)
 
     async def list_open_positions(self) -> list[OpenPosition]:
-        return []
+        try:
+            rows = await self._get_rows(
+                self._open_positions_table,
+                [
+                    ("select", "*"),
+                    ("exchange", f"eq.{self._exchange}"),
+                    ("status", "eq.open"),
+                    ("limit", "50"),
+                ],
+            )
+        except Exception as exc:
+            self._logger.warning("Could not read persisted open positions: %s", exc)
+            return []
+        positions: list[OpenPosition] = []
+        for row in rows:
+            try:
+                positions.append(
+                    OpenPosition(
+                        symbol=str(row["symbol"]),
+                        direction=PositionDirection(str(row["direction"]).upper()),
+                        entry_price=float(row.get("entry_price") or 0.0),
+                        quantity=float(row.get("quantity") or 0.0),
+                        exchange_size=float(row.get("exchange_size") or 0.0),
+                        exchange_order_id=str(row.get("exchange_order_id") or ""),
+                        opened_at=datetime.fromisoformat(str(row["opened_at"]).replace("Z", "+00:00")),
+                        entry_reason=str(row.get("entry_reason") or "unknown"),
+                        position_id=(
+                            str(row["position_id"]) if row.get("position_id") not in (None, "") else None
+                        ),
+                        stop_loss_pct=self._optional_float(row.get("stop_loss_pct")),
+                        take_profit_pct=self._optional_float(row.get("take_profit_pct")),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self._logger.warning("Skipping unreadable persisted open position row: %s", exc)
+        return positions
 
     async def save_closed_trade(self, trade: ClosedTrade) -> None:
         payload = asdict(trade)
@@ -62,6 +133,7 @@ class SupabaseTradeStore:
         payload["closed_at"] = trade.closed_at.isoformat()
         payload["factor_metadata"] = trade.factor_metadata or {}
         payload["trigger_metadata"] = trade.trigger_metadata or {}
+        payload["exchange"] = self._exchange
         await self._insert(self._trades_table, payload)
 
     async def save_ai_decision(
@@ -73,6 +145,7 @@ class SupabaseTradeStore:
         systemic_risk: int,
         reason: str,
         payload: dict[str, Any],
+        ai_call_id: str | None = None,
     ) -> None:
         await self._insert(
             self._ai_decisions_table,
@@ -83,8 +156,33 @@ class SupabaseTradeStore:
                 "systemic_risk": systemic_risk,
                 "reason": reason,
                 "payload_json": payload,
+                "exchange": self._exchange,
+                "ai_call_id": ai_call_id,
             },
         )
+
+    async def save_ai_call_metrics(self, metrics: AICallMetrics) -> None:
+        """Persist one telemetry record per provider request.
+
+        Observability only: a storage failure is logged and swallowed so token
+        accounting can never stop trading.
+        """
+        record = metrics.to_record()
+        record["exchange"] = record.get("exchange") or self._exchange
+        try:
+            await self._insert(self._ai_call_metrics_table, record)
+        except Exception as exc:
+            self._logger.warning("Could not persist AI call metrics (%s): %s", metrics.call_id, exc)
+
+    async def recent_ai_call_metrics(self, *, limit: int = 1000, since: str | None = None) -> list[dict[str, Any]]:
+        params: list[tuple[str, str]] = [
+            ("select", "*"),
+            ("order", "created_at.desc"),
+            ("limit", str(limit)),
+        ]
+        if since:
+            params.append(("created_at", f"gte.{since}"))
+        return await self._get_rows(self._ai_call_metrics_table, params)
 
     async def save_learning_note(
         self,
@@ -212,6 +310,29 @@ class SupabaseTradeStore:
         )
         self._raise_for_status(response, table)
 
+    async def _upsert(self, table: str, payload: dict[str, Any], *, on_conflict: str) -> None:
+        response = await self._client.post(
+            f"{self._url}/rest/v1/{table}",
+            params=[("on_conflict", on_conflict)],
+            json=payload,
+            headers={
+                **self._headers(),
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+                "Content-Profile": self._schema,
+            },
+        )
+        self._raise_for_status(response, table)
+
+    async def _delete(self, table: str, params: list[tuple[str, str]]) -> None:
+        response = await self._client.request(
+            "DELETE",
+            f"{self._url}/rest/v1/{table}",
+            params=params,
+            headers={**self._headers(), "Prefer": "return=minimal", "Content-Profile": self._schema},
+        )
+        self._raise_for_status(response, table)
+
     async def _get_rows(self, table: str, params: list[tuple[str, str]]) -> list[dict[str, Any]]:
         response = await self._client.get(
             f"{self._url}/rest/v1/{table}",
@@ -238,6 +359,15 @@ class SupabaseTradeStore:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500] if exc.response is not None else ""
             raise RuntimeError(f"Supabase request failed for table {table}: {exc} body={body}") from exc
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:

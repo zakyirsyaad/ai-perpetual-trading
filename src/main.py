@@ -7,8 +7,9 @@ from bot.ai.orchestration import AIOrchestrator
 from bot.config import Settings
 from bot.core.trade_engine import TradeEngine
 from bot.data.providers import ExternalSignalAggregator
-from bot.exchange.okx_client import OKXAPIError, OKXFuturesClient
-from bot.exchange.leverage import resolve_okx_venue_leverage
+from bot.exchange.bingx_client import BingXFuturesClient
+from bot.exchange.contracts import ExchangeAPIError
+from bot.exchange.leverage import resolve_venue_leverage
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.logger import setup_logging
 from bot.risk.risk_manager import RiskManager
@@ -21,9 +22,9 @@ async def run() -> None:
     settings = Settings()
     logger = setup_logging(settings.log_level)
     logger.info(
-        "OKX endpoint: %s (%s)",
-        settings.okx_base_url,
-        "DEMO" if settings.okx_demo_trading else "LIVE",
+        "BingX endpoint: %s (%s)",
+        settings.bingx_base_url,
+        settings.bingx_env.upper(),
     )
     logger.info("Strategy mode: %s", settings.strategy_mode)
     if settings.strategy_mode in {"grok", "ai_volume"}:
@@ -35,28 +36,32 @@ async def run() -> None:
         )
     logger.info("Supabase primary store enabled; local trade.db will not be used.")
 
-    client = OKXFuturesClient(
-        api_key=settings.okx_api_key,
-        secret_key=settings.okx_secret_key,
-        passphrase=settings.okx_passphrase,
-        base_url=settings.okx_base_url,
-        demo_trading=settings.okx_demo_trading,
-        margin_mode=settings.okx_margin_mode,
-        instrument_type=settings.okx_instrument_type,
+    client = BingXFuturesClient(
+        api_key=settings.bingx_api_key,
+        secret_key=settings.bingx_secret_key,
+        base_url=settings.bingx_base_url,
+        env=settings.bingx_env,
+        margin_mode=settings.bingx_margin_mode,
+        position_mode=settings.bingx_position_mode,
         timeout_seconds=settings.request_timeout_seconds,
-        insecure_ssl=settings.okx_insecure_ssl,
-        debug_http=settings.okx_debug_http,
+        recv_window_ms=settings.bingx_recv_window_ms,
+        source_key=settings.bingx_source_key,
+        route_min_interval_seconds=settings.bingx_route_min_interval_seconds,
+        market_cache_seconds=settings.bingx_market_cache_seconds,
+        insecure_ssl=settings.bingx_insecure_ssl,
+        debug_http=settings.bingx_debug_http,
     )
-    resolution = await resolve_okx_venue_leverage(
+    resolution = await resolve_venue_leverage(
         client,
         symbols=settings.symbols,
         configured_leverage=settings.leverage,
-        margin_mode=settings.okx_margin_mode,
+        margin_mode=settings.bingx_margin_mode,
+        venue=client.venue,
     )
-    settings.okx_venue_max_leverage = resolution.effective_max_leverage
+    settings.venue_max_leverage = resolution.effective_max_leverage
     if resolution.was_capped:
         logger.warning(
-            "Configured leverage %sx capped to %sx by OKX venue max %sx. source=%s",
+            "Configured leverage %sx capped to %sx by the BingX venue max %sx. source=%s",
             resolution.configured_leverage,
             resolution.resolved_leverage,
             resolution.effective_max_leverage,
@@ -65,7 +70,7 @@ async def run() -> None:
         settings.leverage = resolution.resolved_leverage
     else:
         logger.info(
-            "OKX leverage cap resolved: configured=%sx venue_max=%sx source=%s",
+            "BingX leverage cap resolved: configured=%sx venue_max=%sx source=%s",
             resolution.configured_leverage,
             resolution.effective_max_leverage,
             resolution.source,
@@ -87,13 +92,16 @@ async def run() -> None:
         strategy = VolumeStrategy(settings, intelligence)
     else:
         brain = GrokBrain(settings, logger)
+        # One telemetry record per provider request (observability only: it must
+        # never stop trading, so the sink swallows storage failures internally).
+        brain.set_metrics_sink(store.save_ai_call_metrics)
         orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
         strategy = GrokStrategy(orchestrator)
     engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal=None)
 
     try:
         await engine.run_forever()
-    except (OKXAPIError, RuntimeError, ValueError) as exc:
+    except (ExchangeAPIError, RuntimeError, ValueError) as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from None
     finally:
