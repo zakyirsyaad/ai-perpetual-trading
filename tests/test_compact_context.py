@@ -211,7 +211,8 @@ class EntryPayloadTests(unittest.TestCase):
         external = self.payload["external_signals"]
         self.assertIn("tradingview", external)
         self.assertNotIn("dune", external)
-        self.assertIsInstance(external["tradingview"], str)
+        # Semantics are preserved, not reduced to a count.
+        self.assertEqual(external["tradingview"]["summary"], "BUY")
 
     def test_no_duplicate_factor_collections(self) -> None:
         text = compact_json(self.payload)
@@ -259,6 +260,101 @@ class EntryPayloadTests(unittest.TestCase):
             payload_hash(self.payload["symbols"]),
             payload_hash(again["symbols"]),
         )
+
+
+class ExternalSignalProjectionTests(unittest.TestCase):
+    """Compaction must keep decision-relevant meaning, not just element counts."""
+
+    def setUp(self) -> None:
+        self.builder = CompactDecisionContextBuilder(_settings())
+
+    def _external(self, payload: dict) -> dict:
+        context = _full_context()
+        context["external_signals"] = payload
+        result = self.builder.build_entry_payload(
+            market_context=context,
+            daily_state=_daily_state(),
+            recent_performance={},
+            trade_memory={},
+            strategy_objective={},
+        )
+        return result["external_signals"]
+
+    def test_nested_coinmarketcap_quotes_keep_direction_and_change(self) -> None:
+        external = self._external(
+            {
+                "coinmarketcap": {
+                    "BTC": {
+                        "price": 60000.0,
+                        "percent_change_24h": 2.5,
+                        "volume_change_24h": -12.0,
+                        "market_cap_dominance": 54.2,
+                        "cmc_rank": 1,
+                        "last_updated": "2026-08-22T00:00:00Z",
+                    }
+                }
+            }
+        )
+        btc = external["coinmarketcap"]["BTC"]
+        self.assertEqual(btc["percent_change_24h"], 2.5)
+        self.assertEqual(btc["price"], 60000.0)
+        self.assertEqual(btc["volume_change_24h"], -12.0)
+
+    def test_dune_bias_and_confidence_survive(self) -> None:
+        external = self._external(
+            {
+                "dune": {
+                    "builtin_signals": {
+                        "eth_dex_volume_regime": {
+                            "rows": [{"bias": "bullish_liquidity", "confidence": 0.7, "value": 1.2e8}],
+                        }
+                    }
+                }
+            }
+        )
+        text = compact_json(external)
+        self.assertIn("bullish_liquidity", text)
+        self.assertIn("0.7", text)
+
+    def test_tradingview_recommendation_survives(self) -> None:
+        external = self._external({"tradingview": {"summary": "STRONG_BUY", "confidence": 0.8}})
+        self.assertEqual(external["tradingview"]["summary"], "STRONG_BUY")
+        self.assertEqual(external["tradingview"]["confidence"], 0.8)
+
+    def test_semantic_keys_win_over_noise_when_capped(self) -> None:
+        payload = {f"noise_{index}": index for index in range(20)}
+        payload["bias"] = "risk_on"
+        payload["confidence"] = 0.65
+        external = self._external({"tradingview": payload})
+        projected = external["tradingview"]
+        self.assertEqual(projected["bias"], "risk_on")
+        self.assertEqual(projected["confidence"], 0.65)
+        self.assertIn("_omitted", projected)
+
+    def test_projection_stays_bounded_on_huge_payloads(self) -> None:
+        huge = {
+            "coinmarketcap": {f"SYM{i}": {"price": i, "percent_change_24h": i} for i in range(200)},
+            "dune": {"rows": [{"v": i} for i in range(500)]},
+            "tradingview": {"signals": ["x"] * 500},
+        }
+        external = self._external(huge)
+        self.assertLessEqual(estimate_payload_tokens(external), 400)
+
+    def test_entry_payload_still_within_budget_with_semantic_projection(self) -> None:
+        context = _full_context()
+        context["external_signals"] = {
+            "coinmarketcap": {f"SYM{i}": {"price": i, "percent_change_24h": i} for i in range(50)},
+            "tradingview": {"summary": "BUY", "confidence": 0.7},
+            "collected_at": "2026-08-22T00:00:00+00:00",
+        }
+        payload = self.builder.build_entry_payload(
+            market_context=context,
+            daily_state=_daily_state(),
+            recent_performance={},
+            trade_memory={},
+            strategy_objective={},
+        )
+        self.assertLessEqual(estimate_payload_tokens(payload), 4000)
 
 
 class ExitPayloadTests(unittest.TestCase):

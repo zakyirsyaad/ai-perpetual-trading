@@ -297,7 +297,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         client = _client(
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
-                _FakeResponse({"code": 0, "data": {"order": {"orderId": 42, "clientOrderID": "x"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 42, "clientOrderId": "x"}}}),
             ]
         )
         await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
@@ -306,7 +306,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["positionSide"], "LONG")
         self.assertEqual(sent["type"], "MARKET")
         self.assertNotIn("reduceOnly", sent)
-        self.assertTrue(sent["clientOrderID"])
+        self.assertTrue(sent["clientOrderId"])
 
     async def test_hedge_close_uses_opposite_side_same_position_side(self) -> None:
         client = _client(
@@ -356,7 +356,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         )
         await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
-        ids = [item["params"]["clientOrderID"] for item in client._client.requests[1:]]  # type: ignore[attr-defined]
+        ids = [item["params"]["clientOrderId"] for item in client._client.requests[1:]]  # type: ignore[attr-defined]
         self.assertEqual(len(set(ids)), 2)
 
     async def test_order_below_min_notional_is_rejected(self) -> None:
@@ -378,7 +378,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_on_post_looks_up_client_order_id_instead_of_resubmitting(self) -> None:
         found = {
             "code": 0,
-            "data": {"order": {"orderId": "99", "clientOrderID": "seen", "status": "FILLED"}},
+            "data": {"order": {"orderId": "99", "clientOrderId": "seen", "status": "FILLED"}},
         }
         client = _client(
             [
@@ -392,7 +392,22 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(methods.count("POST"), 1)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "99")
 
-    async def test_uncertain_post_that_never_landed_is_resubmitted_once(self) -> None:
+    async def test_conclusively_absent_order_is_resubmitted_once(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                # Explicit "order does not exist" proves the first POST never landed.
+                _FakeResponse({"code": 80016, "msg": "order not exist"}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "7"}}}),
+            ]
+        )
+        ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 2)
+        self.assertEqual(str(ack["data"]["order"]["orderId"]), "7")
+
+    async def test_empty_lookup_result_counts_as_absent(self) -> None:
         client = _client(
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
@@ -402,9 +417,76 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
-        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
-        self.assertEqual(methods.count("POST"), 2)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "7")
+
+    async def test_inconclusive_lookup_fails_closed_without_resubmitting(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                # Lookup itself fails: the order state is unknown, so resubmitting
+                # could create a duplicate position.
+                httpx.ReadTimeout("lookup timeout"),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertIn("unknown state", str(ctx.exception))
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_lookup_error_that_is_not_order_not_found_fails_closed(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 100500, "msg": "internal error"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_order_post_is_never_retried_by_the_transport(self) -> None:
+        # A 5xx can still mean the order reached the exchange, so the POST itself
+        # must be single-attempt; recovery goes through the clientOrderId lookup.
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "msg": "bad gateway"}, status_code=502),
+                _FakeResponse({"code": 80016, "msg": "order not exist"}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "5"}}}),
+            ]
+        )
+        ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 2, "one initial attempt plus one post-lookup resubmit")
+        self.assertEqual(str(ack["data"]["order"]["orderId"]), "5")
+
+    async def test_definitive_business_rejection_is_not_looked_up(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 100400, "msg": "insufficient margin"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertEqual(len(client._client.requests), 2)  # type: ignore[attr-defined]
+
+    async def test_order_post_does_not_fail_over_to_the_pro_domain(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ConnectError("boom"),
+                httpx.ConnectError("lookup boom"),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        hosts = {item["url"].split("/openApi")[0] for item in client._client.requests}  # type: ignore[attr-defined]
+        self.assertEqual(hosts, {BINGX_VST_BASE_URL})
 
     async def test_cancel_order(self) -> None:
         client = _client([_FakeResponse({"code": 0, "data": {}})])
@@ -414,6 +496,49 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["params"]["orderId"], "123")
 
 
+class WireContractTests(unittest.IsolatedAsyncioTestCase):
+    """Assert the exact parameter names BingX documents, not our internal casing.
+
+    Reference: https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-trade/api-reference.md
+    The documented field is `clientOrderId` (camelCase); an internally-consistent
+    but wrong casing would be silently ignored by the venue.
+    """
+
+    async def test_create_order_sends_documented_client_order_id_field(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 1}}}),
+            ]
+        )
+        await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertIn("clientOrderId", params)
+        self.assertNotIn("clientOrderID", params)
+
+    async def test_order_query_sends_documented_client_order_id_field(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {}})])
+        await client.get_order_fill_by_client_id("BTC/USDT", "abc")
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertIn("clientOrderId", params)
+        self.assertNotIn("clientOrderID", params)
+
+    async def test_response_client_order_id_is_parsed(self) -> None:
+        payload = {
+            "code": 0,
+            "data": {"order": {"orderId": "1", "clientOrderId": "cid-1", "executedQty": "1", "status": "FILLED"}},
+        }
+        client = _client([_FakeResponse(payload)])
+        fill = await client.get_order_fill("BTC/USDT", "1")
+        self.assertEqual(fill.client_order_id, "cid-1")
+
+    async def test_recv_window_never_exceeds_the_documented_maximum(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
+        await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
+        params = client._client.requests[0]["params"]  # type: ignore[attr-defined]
+        self.assertLessEqual(int(params["recvWindow"]), 5000)
+
+
 class FillTests(unittest.IsolatedAsyncioTestCase):
     async def test_order_fill_parsing_with_partial_fill(self) -> None:
         payload = {
@@ -421,7 +546,7 @@ class FillTests(unittest.IsolatedAsyncioTestCase):
             "data": {
                 "order": {
                     "orderId": "1",
-                    "clientOrderID": "c1",
+                    "clientOrderId": "c1",
                     "executedQty": "0.05",
                     "avgPrice": "64000",
                     "commission": "-0.5",
@@ -443,6 +568,43 @@ class FillTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_order_returns_none(self) -> None:
         client = _client([_FakeResponse({"code": 0, "data": {}})])
         self.assertIsNone(await client.get_order_fill("BTC/USDT", "nope"))
+
+    async def test_fill_history_request_matches_the_documented_contract(self) -> None:
+        order_payload = {
+            "code": 0,
+            "data": {"order": {"orderId": "1", "executedQty": "0.05", "avgPrice": "64000", "status": "FILLED"}},
+        }
+        client = _client([_FakeResponse(order_payload), _FakeResponse({"code": 0, "data": {"fill_orders": []}})])
+        await client.get_order_fill("BTC/USDT", "1")
+        request = client._client.requests[-1]  # type: ignore[attr-defined]
+        self.assertIn("/openApi/swap/v2/trade/allFillOrders", request["url"])
+        params = request["params"]
+        # startTs/endTs/tradingUnit are required by the documented endpoint.
+        self.assertIn("tradingUnit", params)
+        self.assertIn("startTs", params)
+        self.assertIn("endTs", params)
+        self.assertLess(int(params["startTs"]), int(params["endTs"]))
+
+    async def test_fill_history_failure_is_logged_not_silently_swallowed(self) -> None:
+        class _Logger:
+            def __init__(self) -> None:
+                self.warnings: list[str] = []
+
+            def warning(self, message: str, *args) -> None:
+                self.warnings.append(message % args if args else message)
+
+        logger = _Logger()
+        order_payload = {
+            "code": 0,
+            "data": {"order": {"orderId": "1", "executedQty": "0.05", "avgPrice": "64000", "status": "FILLED"}},
+        }
+        client = _client(
+            [_FakeResponse(order_payload), _FakeResponse({"code": 100400, "msg": "bad range"})],
+            logger=logger,
+        )
+        fill = await client.get_order_fill("BTC/USDT", "1")
+        self.assertEqual(fill.fee_usdt, 0.0)
+        self.assertTrue(any("fill history unavailable" in item.lower() for item in logger.warnings))
 
     async def test_fee_aggregation_from_fill_history(self) -> None:
         order_payload = {

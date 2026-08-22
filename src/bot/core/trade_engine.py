@@ -15,6 +15,12 @@ from bot.strategy.grok_strategy import GrokStrategy
 
 
 class TradeEngine:
+    # Restart matching tolerances: partial fills and mark-price rounding produce
+    # small legitimate drift, but anything larger means the exchange position is
+    # not the one this bot persisted.
+    _POSITION_MATCH_TOLERANCE = 0.02
+    _POSITION_PRICE_TOLERANCE = 0.01
+
     def __init__(
         self,
         settings: Settings,
@@ -120,6 +126,13 @@ class TradeEngine:
         await self._execute_single_trade(plan)
 
     async def _initialize_leverage(self) -> None:
+        """Apply margin mode, position mode, and leverage, then VERIFY them.
+
+        Applying is best-effort (the venue may already be configured, which some
+        endpoints report as an error), but verification is mandatory: if the
+        effective account state does not match the configuration, startup fails
+        closed rather than trading with the wrong margin mode or leverage.
+        """
         set_margin_mode = getattr(self._client, "set_margin_mode", None)
         if set_margin_mode is not None:
             for symbol in self._settings.symbols:
@@ -127,9 +140,9 @@ class TradeEngine:
                     await set_margin_mode(symbol, self._settings.margin_mode)
                 except Exception as exc:
                     self._logger.warning(
-                        "Could not set margin mode %s for %s; continuing with the venue's current mode. error=%s",
-                        self._settings.margin_mode,
+                        "set_margin_mode(%s, %s) failed; will verify the effective mode. error=%s",
                         symbol,
+                        self._settings.margin_mode,
                         exc,
                     )
         try:
@@ -137,7 +150,7 @@ class TradeEngine:
             self._logger.info("Set exchange position mode: %s", resp.get("msg", "ok"))
         except Exception as exc:
             self._logger.warning(
-                "Could not set exchange position mode to %s. Continuing with current account mode. error=%s",
+                "set_position_mode(%s) failed; will verify the effective mode. error=%s",
                 self._settings.position_mode,
                 exc,
             )
@@ -146,13 +159,72 @@ class TradeEngine:
                 resp = await self._client.set_leverage(symbol=symbol, leverage=self._settings.leverage)
                 self._logger.info("Set leverage for %s: %s", symbol, resp.get("msg", "ok"))
             except Exception as exc:
-                message = (
-                    f"Could not set exchange leverage for {symbol} to {self._settings.leverage}x. "
-                    f"Continuing with the leverage currently configured on the venue. error={exc}"
+                self._logger.warning(
+                    "set_leverage(%s, %sx) failed; will verify the effective leverage. error=%s",
+                    symbol,
+                    self._settings.leverage,
+                    exc,
                 )
-                if self._settings.bingx_require_set_leverage:
-                    raise RuntimeError(message) from exc
-                self._logger.warning(message)
+
+        await self._verify_account_configuration()
+
+    async def _verify_account_configuration(self) -> None:
+        """Fail closed when the venue's effective account state is not what we configured."""
+        mismatches: list[str] = []
+
+        get_position_mode = getattr(self._client, "get_position_mode", None)
+        if get_position_mode is not None:
+            effective = await self._checked(get_position_mode(), "position mode", mismatches)
+            if effective is not None and str(effective).lower() != self._settings.position_mode:
+                mismatches.append(
+                    f"position mode is {effective!r}, expected {self._settings.position_mode!r}"
+                )
+
+        get_margin_mode = getattr(self._client, "get_margin_mode", None)
+        get_effective_leverage = getattr(self._client, "get_effective_leverage", None)
+        for symbol in self._settings.symbols:
+            if get_margin_mode is not None:
+                effective = await self._checked(get_margin_mode(symbol), f"margin mode for {symbol}", mismatches)
+                if effective is not None and not self._margin_modes_match(str(effective)):
+                    mismatches.append(
+                        f"{symbol} margin mode is {effective!r}, expected {self._settings.margin_mode!r}"
+                    )
+            if get_effective_leverage is not None:
+                effective = await self._checked(
+                    get_effective_leverage(symbol), f"leverage for {symbol}", mismatches
+                )
+                if effective is not None:
+                    long_leverage, short_leverage = effective
+                    configured = int(self._settings.leverage)
+                    if long_leverage != configured or short_leverage != configured:
+                        mismatches.append(
+                            f"{symbol} leverage is long={long_leverage}x short={short_leverage}x, "
+                            f"expected {configured}x on both sides"
+                        )
+
+        if mismatches:
+            raise RuntimeError(
+                "Exchange account configuration does not match this runtime's settings: "
+                + "; ".join(mismatches)
+                + ". Fix the account on the venue (or the configuration) before trading."
+            )
+        self._logger.info("Verified effective margin mode, position mode, and leverage on the venue.")
+
+    async def _checked(self, awaitable, label: str, mismatches: list[str]):
+        """Await a verification query; an unreadable value is itself a mismatch."""
+        try:
+            return await awaitable
+        except Exception as exc:
+            mismatches.append(f"could not read {label} ({type(exc).__name__}: {exc})")
+            return None
+
+    def _margin_modes_match(self, effective: str) -> bool:
+        configured = str(self._settings.margin_mode).strip().lower()
+        normalized = effective.strip().lower()
+        # BingX reports isolated margin as "isolated"; cross appears as "crossed"/"cross".
+        if configured == "isolated":
+            return normalized == "isolated"
+        return normalized in {configured, f"{configured}ed"}
 
     async def _execute_single_trade(self, plan: TradePlan) -> None:
         target_notional = plan.usdt_size * plan.leverage
@@ -162,13 +234,17 @@ class TradeEngine:
 
         entry_price = order_book.mid_price if order_book is not None else await self._client.get_last_price(plan.symbol)
         base_quantity = self._calculate_quantity(plan.usdt_size, plan.leverage, entry_price)
+        # `calculate_order_size` returns 0 when the venue's own tradeMinQuantity /
+        # tradeMinUSDT metadata rejects the size. That metadata is the only
+        # authority here: the old MIN_ORDER_CONTRACTS floor was an OKX
+        # contract-count concept and, applied to BingX base-asset quantity, it
+        # silently blocked every BTC entry (18,000 USDT notional is ~0.3 BTC < 1).
         exchange_size = await self._client.calculate_order_size(plan.symbol, base_quantity)
-        if exchange_size < self._settings.min_order_contracts:
+        if exchange_size <= 0:
             self._logger.warning(
-                "Skipped trade for %s, order size %.8f below MIN_ORDER_CONTRACTS %.8f",
+                "Skipped trade for %s: base quantity %.8f is below the venue minimum quantity/notional.",
                 plan.symbol,
-                exchange_size,
-                self._settings.min_order_contracts,
+                base_quantity,
             )
             return
         self._logger.info(
@@ -442,19 +518,30 @@ class TradeEngine:
     async def _reconcile_local_open_positions(self) -> None:
         """Match persisted position state against the exchange at startup.
 
-        A persisted position that the exchange confirms is *resumed* and fully
-        monitored. Exchange exposure the bot cannot match to its own persisted
-        state is NEVER auto-flattened: new entries are blocked and the operator
-        is alerted, because flattening unknown exposure could close a position
-        this process did not open.
+        Matching is on identity, not just symbol: direction/`positionSide`,
+        quantity, and — when persisted — average entry price must agree. A
+        persisted LONG must never be "matched" to an exchange SHORT, or to a
+        position of a materially different size, because the resumed monitor
+        would then apply the wrong stop and close a position it does not model.
+
+        A confirmed match is resumed and fully monitored. Anything else is
+        unknown exposure: entries are blocked and the operator alerted, and it
+        is NEVER auto-flattened.
         """
         local_positions = await self._trade_store.list_open_positions()
         local_by_symbol = {position.symbol: position for position in local_positions}
         if not local_positions:
             self._logger.info("No persisted open positions found during startup reconcile.")
 
+        unknown_exposure: list[str] = []
+
         for symbol, position in list(local_by_symbol.items()):
-            if not await self._client.has_open_position(symbol):
+            details = await self._position_details(symbol)
+            if details is None:
+                unknown_exposure.append(f"{symbol} (could not read exchange position state)")
+                local_by_symbol.pop(symbol, None)
+                continue
+            if details.exchange_size <= 0:
                 await self._trade_store.remove_open_position(symbol)
                 local_by_symbol.pop(symbol, None)
                 self._logger.warning(
@@ -462,6 +549,13 @@ class TradeEngine:
                     symbol,
                 )
                 continue
+
+            mismatch = self._position_mismatch_reason(position, details)
+            if mismatch is not None:
+                unknown_exposure.append(f"{symbol} ({mismatch})")
+                local_by_symbol.pop(symbol, None)
+                continue
+
             self._resumable_positions.append(position)
             self._logger.warning(
                 "Resuming persisted %s %s position from restart: entry=%.8f qty=%.8f order_id=%s",
@@ -472,21 +566,61 @@ class TradeEngine:
                 position.exchange_order_id,
             )
 
-        unmatched: list[str] = []
         for symbol in self._settings.symbols:
             if symbol in local_by_symbol:
                 continue
             if await self._client.has_open_position(symbol):
-                unmatched.append(symbol)
+                unknown_exposure.append(f"{symbol} (no persisted record)")
 
-        if unmatched:
+        if unknown_exposure:
             self._entries_blocked_reason = (
-                "Unmatched exchange position(s) for "
-                + ", ".join(unmatched)
-                + ". The bot has no persisted record of these, so it will not trade or flatten them. "
+                "Unmatched exchange exposure: "
+                + "; ".join(sorted(set(unknown_exposure)))
+                + ". The bot cannot safely model these positions, so it will not trade or flatten them. "
                 "Close or reconcile them manually, then restart."
             )
             self._logger.error("STARTUP ALERT: %s", self._entries_blocked_reason)
+
+    async def _position_details(self, symbol: str):
+        try:
+            return await self._client.get_symbol_position_details(symbol)
+        except Exception as exc:
+            self._logger.error("Could not read exchange position details for %s: %s", symbol, exc)
+            return None
+
+    def _position_mismatch_reason(self, position: OpenPosition, details) -> str | None:
+        """Return why a persisted position does not match the exchange, or None."""
+        exchange_side = str(getattr(details, "pos_side", "") or "").strip().upper()
+        if exchange_side and exchange_side != position.direction.value:
+            return f"persisted {position.direction.value} but exchange reports {exchange_side}"
+
+        exchange_size = float(getattr(details, "exchange_size", 0.0) or 0.0)
+        expected_size = float(position.exchange_size or position.quantity)
+        if expected_size > 0:
+            drift = abs(exchange_size - expected_size) / expected_size
+            if drift > self._POSITION_MATCH_TOLERANCE:
+                return (
+                    f"persisted size {expected_size:.8f} but exchange reports {exchange_size:.8f} "
+                    f"({drift * 100:.2f}% drift)"
+                )
+        elif exchange_size > 0:
+            return f"persisted size is unknown but exchange reports {exchange_size:.8f}"
+
+        avg_price = getattr(details, "avg_price", None)
+        if avg_price and position.entry_price > 0:
+            price_drift = abs(float(avg_price) - position.entry_price) / position.entry_price
+            if price_drift > self._POSITION_PRICE_TOLERANCE:
+                return (
+                    f"persisted entry {position.entry_price:.8f} but exchange average price is "
+                    f"{float(avg_price):.8f} ({price_drift * 100:.2f}% drift)"
+                )
+
+        position_id = getattr(details, "position_id", None)
+        expected_id = getattr(position, "position_id", None)
+        if expected_id and position_id and str(expected_id) != str(position_id):
+            return f"persisted position id {expected_id} but exchange reports {position_id}"
+
+        return None
 
     async def _resume_persisted_positions(self) -> None:
         """Take over monitoring of positions that survived a restart."""

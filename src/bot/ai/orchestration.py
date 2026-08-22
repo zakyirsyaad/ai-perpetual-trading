@@ -270,16 +270,16 @@ class AIOrchestrator:
         """
         now = datetime.now(timezone.utc).timestamp()
         self._ensure_exit_trade_started(position, now)
-
-        gate = self._exit_policy.evaluate(
-            now=now,
-            price=current_price,
-            last_closed_candle_ms=AIExitPolicy.last_closed_candle_ms(
-                int(now * 1000),
-                str(getattr(self._settings, "ai_kline_interval", "3m")),
-            ),
+        candle_ms = AIExitPolicy.last_closed_candle_ms(
+            int(now * 1000),
+            str(getattr(self._settings, "ai_kline_interval", "3m")),
         )
-        if not gate.allowed:
+
+        # Stage 1 — cheap gate. Budget, minimum interval, a newly closed candle,
+        # and adverse price movement all resolve without any network call, so a
+        # blocked monitor tick costs nothing.
+        gate = self._exit_policy.evaluate(now=now, price=current_price, last_closed_candle_ms=candle_ms)
+        if not gate.allowed and gate.reason in {"exit_call_budget_exhausted", "min_interval"}:
             self._logger.debug(
                 "AI exit evaluation skipped for %s (%s); deterministic protection stays active.",
                 position.symbol,
@@ -290,6 +290,26 @@ class AIOrchestrator:
         market_context = await self._intelligence.build_context(symbols=(position.symbol,))
         context_dict = market_context.to_dict()
         flow_signature = AIExitPolicy.flow_signature(context_dict, position.symbol)
+
+        if not gate.allowed:
+            # Stage 2 — the cheap events did not fire, so the only remaining
+            # trigger is a materially new regime or flow state, which can only be
+            # judged once the context exists.
+            gate = self._exit_policy.evaluate(
+                now=now,
+                price=current_price,
+                last_closed_candle_ms=candle_ms,
+                flow_signature=flow_signature,
+            )
+            if not gate.allowed:
+                self._exit_policy.note_probe(now=now, flow_signature=flow_signature)
+                self._logger.debug(
+                    "AI exit evaluation skipped for %s (%s); deterministic protection stays active.",
+                    position.symbol,
+                    gate.reason,
+                )
+                return self._deterministic_exit_fallback(elapsed_seconds, ai_called=False)
+
         payload = self._compact_context.build_exit_payload(
             position={
                 "symbol": position.symbol,
@@ -306,6 +326,7 @@ class AIOrchestrator:
             # Identical compact request: the model already answered this exact
             # state, so skip the provider call and keep the budget intact.
             self._exit_policy.note_deduplicated()
+            self._exit_policy.note_probe(now=now, flow_signature=flow_signature)
             self._logger.debug(
                 "Skipped duplicate AI exit request for %s (hash=%s).",
                 position.symbol,
@@ -316,10 +337,7 @@ class AIOrchestrator:
         self._exit_policy.mark_called(
             now=now,
             price=current_price,
-            last_closed_candle_ms=AIExitPolicy.last_closed_candle_ms(
-                int(now * 1000),
-                str(getattr(self._settings, "ai_kline_interval", "3m")),
-            ),
+            last_closed_candle_ms=candle_ms,
             flow_signature=flow_signature,
             request_hash=request_hash,
         )

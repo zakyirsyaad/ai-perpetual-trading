@@ -25,6 +25,20 @@ Implemented in code:
 - [x] §10 Configuration, env cleaner, and Supabase migration (exchange, ai_call_id, ai_call_metrics, open_position_state).
 - [x] §11 Tests written per behavior; coverage gate at 80% (`pyproject.toml`, CI workflow).
 
+Review round 1 (PR #2) — all P0/P1/P2/P3 fixed:
+
+- [x] P0 Order POST is single-attempt; clientOrderId lookup is tri-state and fails closed.
+- [x] P0 Wire field corrected to the documented `clientOrderId`, with contract-level tests.
+- [x] P1 Legacy `MIN_ORDER_CONTRACTS` floor removed; venue metadata is the only minimum.
+- [x] P1 Startup verifies effective margin mode, position mode, and leverage; fails closed.
+- [x] P1 Restart reconciliation matches side, quantity, average price, and position id.
+- [x] P1 AI usage/bytes accumulate across every attempt of a request.
+- [x] P1 External signals use a bounded semantic projection instead of element counts.
+- [x] P2 `allFillOrders` called with required `tradingUnit`/`startTs`/`endTs`; failures logged.
+- [x] P2 `regime_or_flow_change` trigger is reachable via two-stage gating.
+- [x] P2 `BINGX_RECV_WINDOW_MS` capped at the documented 5000 ms maximum.
+- [x] P3 Trailing whitespace removed; `git diff --check` clean.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

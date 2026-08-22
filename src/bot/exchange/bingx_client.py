@@ -49,6 +49,10 @@ _CLOCK_DRIFT_TOKENS = ("timestamp", "recvwindow", "recv window")
 # Permanent business failures: never retried, never failed over to `.pro`.
 _PERMANENT_CODE_PREFIXES = ("1004", "1005", "8001", "1001")
 
+# BingX codes meaning "this order does not exist", which is the only
+# conclusive proof that an uncertain order placement never landed.
+_ORDER_NOT_FOUND_CODES = {"80016", "80017", "100400"}
+
 _KLINE_INTERVALS = {
     "1m": "1m",
     "3m": "3m",
@@ -98,8 +102,10 @@ class BingXFuturesClient:
         source_key: str = DEFAULT_SOURCE_KEY,
         route_min_interval_seconds: float = 0.0,
         market_cache_seconds: float = 0.0,
+        fill_history_lookback_seconds: int = 3600,
         insecure_ssl: bool = False,
         debug_http: bool = False,
+        logger: Any | None = None,
     ) -> None:
         normalized_env = str(env).strip().lower()
         if normalized_env != "vst":
@@ -121,6 +127,8 @@ class BingXFuturesClient:
         self._route_min_interval = float(route_min_interval_seconds)
         self._market_cache_seconds = float(market_cache_seconds)
         self._debug_http = debug_http
+        self._logger = logger
+        self._fill_history_lookback_ms = max(int(fill_history_lookback_seconds), 60) * 1000
         self._client = httpx.AsyncClient(
             timeout=timeout_seconds,
             follow_redirects=True,
@@ -383,6 +391,34 @@ class BingXFuturesClient:
             {"symbol": self.venue_symbol(symbol), "marginType": "ISOLATED"},
         )
 
+    async def get_position_mode(self) -> str:
+        """Effective account position mode: 'hedge' or 'one_way'."""
+        resp = await self._signed_request("GET", "/openApi/swap/v1/positionSide/dual", {})
+        row = self._data_object(resp)
+        return "hedge" if self._truthy(row.get("dualSidePosition")) else "one_way"
+
+    async def get_margin_mode(self, symbol: str) -> str:
+        """Effective margin mode for a symbol, lowercased ('isolated' / 'crossed')."""
+        resp = await self._signed_request(
+            "GET",
+            "/openApi/swap/v2/trade/marginType",
+            {"symbol": self.venue_symbol(symbol)},
+        )
+        row = self._data_object(resp)
+        return str(row.get("marginType") or "").strip().lower()
+
+    async def get_effective_leverage(self, symbol: str) -> tuple[int, int]:
+        """Effective (long, short) leverage the venue currently has for a symbol."""
+        resp = await self._signed_request(
+            "GET",
+            "/openApi/swap/v2/trade/leverage",
+            {"symbol": self.venue_symbol(symbol)},
+        )
+        row = self._data_object(resp)
+        long_leverage = self._min_optional_int(row.get("longLeverage")) or 0
+        short_leverage = self._min_optional_int(row.get("shortLeverage")) or 0
+        return int(long_leverage), int(short_leverage)
+
     async def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         instrument = await self.get_instrument(symbol)
         if instrument.max_leverage is not None and int(leverage) > instrument.max_leverage:
@@ -452,7 +488,7 @@ class BingXFuturesClient:
         return await self._order_fill(symbol, {"orderId": str(order_id)})
 
     async def get_order_fill_by_client_id(self, symbol: str, client_order_id: str) -> OrderFill | None:
-        return await self._order_fill(symbol, {"clientOrderID": str(client_order_id)})
+        return await self._order_fill(symbol, {"clientOrderId": str(client_order_id)})
 
     # ------------------------------------------------------------------
     # positions
@@ -584,40 +620,80 @@ class BingXFuturesClient:
             "side": side,
             "positionSide": position_side,
             "quantity": self._format_quantity(quantity),
-            "clientOrderID": self._new_client_order_id(),
+            "clientOrderId": self._new_client_order_id(),
         }
 
     async def _submit_order(self, symbol: str, params: dict[str, Any]) -> dict[str, Any]:
-        client_order_id = str(params["clientOrderID"])
+        """Place one order with strict idempotency.
+
+        The initial POST is single-attempt: the transport must never retry an
+        order placement, because a 5xx or timeout can still mean the order
+        reached the exchange. On any uncertain outcome the order is looked up by
+        `clientOrderId`, and only a *conclusive* "absent" answer permits exactly
+        one resubmission. An inconclusive lookup fails closed.
+        """
+        client_order_id = str(params["clientOrderId"])
         try:
             return await self._signed_request(
                 "POST",
                 "/openApi/swap/v2/trade/order",
                 params,
                 allow_failover=False,
+                allow_retries=False,
             )
         except (httpx.TimeoutException, httpx.TransportError, ExchangeAPIError) as exc:
             if isinstance(exc, ExchangeAPIError) and not exc.retryable:
+                # A definitive business rejection never created an order.
                 raise
-            # Uncertain POST: the order may already have reached the exchange.
-            # Look it up by clientOrderId BEFORE any resubmission or failover.
-            existing = await self._lookup_order_by_client_id(symbol, client_order_id)
-            if existing is not None:
-                return existing
-            return await self._signed_request("POST", "/openApi/swap/v2/trade/order", params)
+            status, resp = await self._lookup_order_by_client_id(symbol, client_order_id)
+            if status == "found":
+                return resp  # type: ignore[return-value]
+            if status == "absent":
+                return await self._signed_request(
+                    "POST",
+                    "/openApi/swap/v2/trade/order",
+                    params,
+                    allow_failover=False,
+                    allow_retries=False,
+                )
+            raise ExchangeAPIError(
+                f"Order {client_order_id} for {symbol} is in an unknown state: the request failed "
+                f"({type(exc).__name__}: {exc}) and the clientOrderId lookup was inconclusive. "
+                "Refusing to resubmit — reconcile this order manually.",
+                retryable=False,
+                venue=self.venue,
+            ) from exc
 
-    async def _lookup_order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any] | None:
+    async def _lookup_order_by_client_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Resolve an uncertain order to ("found", response) / ("absent", None) / ("unknown", None)."""
         try:
             resp = await self._signed_request(
                 "GET",
                 "/openApi/swap/v2/trade/order",
-                {"symbol": self.venue_symbol(symbol), "clientOrderID": client_order_id},
+                {"symbol": self.venue_symbol(symbol), "clientOrderId": client_order_id},
+                allow_failover=False,
             )
-        except ExchangeAPIError:
-            return None
+        except ExchangeAPIError as exc:
+            # Only an explicit "no such order" proves the order never landed.
+            if self._is_order_not_found(exc):
+                return "absent", None
+            return "unknown", None
+        except (httpx.TimeoutException, httpx.TransportError):
+            return "unknown", None
         if self._order_row(resp):
-            return resp
-        return None
+            return "found", resp
+        return "absent", None
+
+    @staticmethod
+    def _is_order_not_found(exc: ExchangeAPIError) -> bool:
+        if str(exc.code or "") in _ORDER_NOT_FOUND_CODES:
+            return True
+        lowered = str(exc).lower()
+        return "not exist" in lowered or "not found" in lowered
 
     async def _order_fill(self, symbol: str, selector: dict[str, Any]) -> OrderFill | None:
         resp = await self._signed_request(
@@ -647,19 +723,35 @@ class BingXFuturesClient:
             pnl_usdt=float(pnl) if pnl is not None else None,
             state=str(row.get("status") or "").lower() or None,
             raw=row,
-            client_order_id=str(row.get("clientOrderID") or "") or None,
+            client_order_id=str(row.get("clientOrderId") or "") or None,
         )
 
     async def _aggregate_fills(self, symbol: str, order_id: str) -> tuple[Decimal, Decimal] | None:
+        """Sum commission and realized PnL across every fill for one order.
+
+        Uses the documented trade fill-history endpoint, which requires
+        `tradingUnit`, `startTs`, and `endTs`. A failure here is logged rather
+        than silently swallowed, because the caller then falls back to an
+        *estimated* fee instead of the venue's actual charge.
+        """
         if not order_id:
             return None
+        now_ms = self._now_ms()
         try:
             resp = await self._signed_request(
                 "GET",
-                "/openApi/swap/v2/trade/fillHistory",
-                {"symbol": self.venue_symbol(symbol), "orderId": order_id},
+                "/openApi/swap/v2/trade/allFillOrders",
+                {
+                    "symbol": self.venue_symbol(symbol),
+                    "orderId": order_id,
+                    # BingX sizes these perpetuals in base asset, so fills are COIN.
+                    "tradingUnit": "COIN",
+                    "startTs": now_ms - self._fill_history_lookback_ms,
+                    "endTs": now_ms,
+                },
             )
-        except ExchangeAPIError:
+        except ExchangeAPIError as exc:
+            self._log_fill_aggregation_gap(symbol, order_id, exc)
             return None
         data = resp.get("data")
         rows: list[Any] = []
@@ -682,6 +774,17 @@ class BingXFuturesClient:
             fee += abs(self._decimal(row.get("commission") or row.get("fee")))
             pnl += self._decimal(row.get("profit") or row.get("realisedPNL"))
         return (fee, pnl) if matched else None
+
+    def _log_fill_aggregation_gap(self, symbol: str, order_id: str, exc: Exception) -> None:
+        message = (
+            f"BingX fill history unavailable for {symbol} order {order_id}: {exc}. "
+            "Actual fee/PnL for this order could not be read; the engine will fall back "
+            "to an estimated taker fee."
+        )
+        if self._logger is not None:
+            self._logger.warning("%s", message)
+        elif self._debug_http:
+            print(message)
 
     def _position_sides(self) -> tuple[str, ...]:
         return ("LONG", "SHORT") if self._position_mode == "hedge" else ("BOTH",)
@@ -715,7 +818,14 @@ class BingXFuturesClient:
             cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached
-        body = await self._request(method, path, dict(params or {}), signed=False, allow_failover=True)
+        body = await self._request(
+            method,
+            path,
+            dict(params or {}),
+            signed=False,
+            allow_failover=True,
+            allow_retries=True,
+        )
         if cache_key is not None:
             self._cache_put(cache_key, body)
         return body
@@ -727,8 +837,16 @@ class BingXFuturesClient:
         params: dict[str, Any] | None = None,
         *,
         allow_failover: bool = True,
+        allow_retries: bool = True,
     ) -> dict[str, Any]:
-        return await self._request(method, path, dict(params or {}), signed=True, allow_failover=allow_failover)
+        return await self._request(
+            method,
+            path,
+            dict(params or {}),
+            signed=True,
+            allow_failover=allow_failover,
+            allow_retries=allow_retries,
+        )
 
     async def _request(
         self,
@@ -738,13 +856,16 @@ class BingXFuturesClient:
         *,
         signed: bool,
         allow_failover: bool,
+        allow_retries: bool = True,
     ) -> dict[str, Any]:
         method_upper = method.upper()
         hosts = [self._base_url]
         if allow_failover and self.fallback_base_url not in hosts:
             hosts.append(self.fallback_base_url)
 
-        attempts_per_host = 3
+        # Order placement passes allow_retries=False: a retried POST can create a
+        # duplicate position when the first attempt actually reached the exchange.
+        attempts_per_host = 3 if allow_retries else 1
         last_error: Exception | None = None
         for host in hosts:
             for attempt in range(attempts_per_host):

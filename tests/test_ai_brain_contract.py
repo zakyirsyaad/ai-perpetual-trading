@@ -203,6 +203,57 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(recorded[-1].attempts, 2)
 
 
+class UsageAccumulationTests(unittest.TestCase):
+    """A retried or repaired call really spends every attempt's tokens."""
+
+    def test_repair_accumulates_both_attempts(self) -> None:
+        brain, _, recorded = _brain(
+            [
+                _ok_response("garbage", usage={"prompt_tokens": 1000, "completion_tokens": 50, "total_tokens": 1050}),
+                _ok_response('{"ok": true}', usage={"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}),
+            ]
+        )
+        result = asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
+        self.assertEqual(result, _Result(ok=True))
+        metric = recorded[-1]
+        self.assertEqual(metric.usage.total_tokens, 1160, "1050 (invalid) + 110 (repair)")
+        self.assertEqual(metric.usage.input_tokens, 1100)
+        self.assertEqual(metric.usage.output_tokens, 60)
+        self.assertEqual(metric.attempts, 2)
+        self.assertTrue(metric.repaired)
+
+    def test_retry_accumulates_request_and_response_bytes(self) -> None:
+        brain, _, recorded = _brain(
+            [
+                httpx.ReadTimeout("slow"),
+                _ok_response('{"ok": true}', usage={"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}),
+            ]
+        )
+        asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
+        metric = recorded[-1]
+        # Both attempts sent the request body, so bytes must reflect both.
+        self.assertGreater(metric.request_bytes, 0)
+        self.assertEqual(metric.attempts, 2)
+
+    def test_mixed_reported_and_estimated_usage_is_flagged_estimated(self) -> None:
+        from bot.ai.usage import TokenUsage
+
+        combined = TokenUsage(10, 1, 11, False) + TokenUsage(5, 1, 6, True)
+        self.assertTrue(combined.estimated)
+        self.assertEqual(combined.total_tokens, 17)
+
+    def test_failed_call_still_records_the_tokens_it_spent(self) -> None:
+        brain, _, recorded = _brain(
+            [
+                _ok_response("garbage", usage={"prompt_tokens": 900, "completion_tokens": 20, "total_tokens": 920}),
+                _ok_response("still garbage", usage={"prompt_tokens": 40, "completion_tokens": 5, "total_tokens": 45}),
+            ]
+        )
+        result = asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
+        self.assertIsNone(result)
+        self.assertEqual(recorded[-1].usage.total_tokens, 965)
+
+
 class MetricsTests(unittest.TestCase):
     def test_metrics_capture_provider_usage(self) -> None:
         brain, _, recorded = _brain(

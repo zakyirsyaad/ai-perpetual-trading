@@ -1,7 +1,7 @@
 # Token Optimization and BingX VST Migration Plan
 
-Date: 2026-08-22  
-Status: Approved implementation plan  
+Date: 2026-08-22
+Status: Approved implementation plan
 Runtime target: BingX Perpetual Futures VST only
 
 ## 1. Objective

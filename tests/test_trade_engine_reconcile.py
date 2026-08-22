@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from bot.core.trade_engine import TradeEngine
+from bot.exchange.contracts import PositionDetails
 from bot.models import OpenPosition, PositionDirection
 
 
@@ -34,12 +35,31 @@ def _settings(**overrides) -> SimpleNamespace:
 class _FakeClient:
     venue = "bingx"
 
-    def __init__(self, open_symbols: set[str]) -> None:
+    def __init__(self, open_symbols: set[str], *, details: dict | None = None) -> None:
         self._open = set(open_symbols)
         self.flattened: list[str] = []
+        self._details = details or {}
+        self.details_error = False
 
     async def has_open_position(self, symbol: str) -> bool:
         return symbol in self._open
+
+    async def get_symbol_position_details(self, symbol: str) -> PositionDetails:
+        if self.details_error:
+            raise RuntimeError("positions endpoint down")
+        override = self._details.get(symbol, {})
+        size = 0.01 if symbol in self._open else 0.0
+        return PositionDetails(
+            symbol=symbol,
+            exchange_size=override.get("exchange_size", size),
+            base_quantity=override.get("exchange_size", size),
+            avg_price=override.get("avg_price", 60000.0 if size else None),
+            mark_price=None,
+            liquidation_price=None,
+            pos_side=override.get("pos_side", "LONG" if size else None),
+            raw={},
+            position_id=override.get("position_id"),
+        )
 
     async def flatten_position(self, symbol: str):
         self.flattened.append(symbol)
@@ -87,6 +107,56 @@ def _engine(client, store, settings=None) -> TradeEngine:
 
 
 class ReconcileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_opposite_side_is_treated_as_unknown_exposure(self) -> None:
+        # A persisted LONG must never be matched to an exchange SHORT.
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"pos_side": "SHORT"}})
+        engine = _engine(client, _FakeStore([_position()]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("SHORT", engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+        self.assertEqual(client.flattened, [])
+
+    async def test_size_drift_is_treated_as_unknown_exposure(self) -> None:
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"exchange_size": 0.5}})
+        engine = _engine(client, _FakeStore([_position()]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("drift", engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+
+    async def test_entry_price_drift_is_treated_as_unknown_exposure(self) -> None:
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"avg_price": 90000.0}})
+        engine = _engine(client, _FakeStore([_position()]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+
+    async def test_small_partial_fill_drift_still_resumes(self) -> None:
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"exchange_size": 0.0101}})
+        engine = _engine(client, _FakeStore([_position()]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNone(engine._entries_blocked_reason)
+        self.assertEqual([item.symbol for item in engine._resumable_positions], ["BTC/USDT"])
+
+    async def test_unreadable_position_state_blocks_entries(self) -> None:
+        client = _FakeClient({"BTC/USDT"})
+        client.details_error = True
+        engine = _engine(client, _FakeStore([_position()]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertEqual(client.flattened, [])
+
     async def test_unmatched_exchange_position_blocks_entries_and_is_not_flattened(self) -> None:
         client = _FakeClient({"ETH/USDT"})
         engine = _engine(client, _FakeStore([]))

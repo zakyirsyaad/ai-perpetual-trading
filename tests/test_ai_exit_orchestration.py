@@ -22,18 +22,22 @@ class _FakeBrain:
 
 
 class _FakeIntelligence:
-    def __init__(self) -> None:
+    def __init__(self, regime: str = "normal", flow: list | None = None) -> None:
         self.builds = 0
+        self.regime = regime
+        self.flow = flow if flow is not None else []
 
     async def build_context(self, symbols=None):
         self.builds += 1
+        regime = self.regime
+        flow = list(self.flow)
         return SimpleNamespace(
             to_dict=lambda: {
                 "technicals": [{"symbol": "BTC/USDT", "last_price": 60000.0, "rsi_14": 50.0}],
                 "external_signals": {},
-                "intelligence": {"regime": "normal", "risk_flags": [], "symbol_scores": {}},
+                "intelligence": {"regime": regime, "risk_flags": [], "symbol_scores": {}},
                 "factor_snapshots": [],
-                "active_flow_signals": [],
+                "active_flow_signals": flow,
             }
         )
 
@@ -172,6 +176,67 @@ class EventDrivenExitTests(unittest.IsolatedAsyncioTestCase):
         )
         await orchestrator.exit_signal(second, 50000.0, 1.0)
         self.assertEqual(orchestrator.exit_policy_state()["calls_made"], 1)
+
+    async def test_regime_change_alone_can_open_the_gate(self) -> None:
+        # Regression: this trigger was unreachable because evaluate() ran before
+        # the flow signature existed, so only candle/adverse events could fire.
+        brain = _FakeBrain()
+        intelligence = _FakeIntelligence(regime="calm")
+        orchestrator = _orchestrator(brain, intelligence, _settings(ai_exit_check_interval_seconds=0))
+        position = _position()
+
+        await orchestrator.exit_signal(position, 60000.0, 10.0)
+        calls_after_first = brain.calls
+
+        # Same candle, no adverse move: only the regime changed.
+        orchestrator._exit_policy._last_candle_ms = orchestrator._exit_policy._last_candle_ms
+        intelligence.regime = "volatile"
+        await orchestrator.exit_signal(position, 60000.0, 11.0)
+
+        self.assertEqual(brain.calls, calls_after_first + 1)
+
+    async def test_new_flow_trigger_alone_can_open_the_gate(self) -> None:
+        brain = _FakeBrain()
+        intelligence = _FakeIntelligence()
+        orchestrator = _orchestrator(brain, intelligence, _settings(ai_exit_check_interval_seconds=0))
+        position = _position()
+
+        await orchestrator.exit_signal(position, 60000.0, 10.0)
+        calls_after_first = brain.calls
+
+        intelligence.flow = [{"symbol": "BTC/USDT", "name": "oi_surge", "direction": "LONG", "strength": 0.8}]
+        await orchestrator.exit_signal(position, 60000.0, 11.0)
+
+        self.assertEqual(brain.calls, calls_after_first + 1)
+
+    async def test_unchanged_regime_does_not_call_the_ai(self) -> None:
+        brain = _FakeBrain()
+        intelligence = _FakeIntelligence()
+        orchestrator = _orchestrator(brain, intelligence, _settings(ai_exit_check_interval_seconds=0))
+        position = _position()
+
+        await orchestrator.exit_signal(position, 60000.0, 10.0)
+        calls_after_first = brain.calls
+
+        await orchestrator.exit_signal(position, 60000.0, 11.0)
+
+        self.assertEqual(brain.calls, calls_after_first)
+
+    async def test_probes_are_rate_limited_to_the_minimum_interval(self) -> None:
+        # A probe builds context; without rate-limiting it would do so on every
+        # five-second monitor tick.
+        brain = _FakeBrain()
+        intelligence = _FakeIntelligence()
+        orchestrator = _orchestrator(brain, intelligence, _settings())
+        position = _position()
+
+        await orchestrator.exit_signal(position, 60000.0, 10.0)
+        builds_after_first = intelligence.builds
+
+        for _ in range(10):
+            await orchestrator.exit_signal(position, 60000.0, 11.0)
+
+        self.assertEqual(intelligence.builds, builds_after_first)
 
     async def test_identical_payload_is_deduplicated(self) -> None:
         brain = _FakeBrain()

@@ -296,11 +296,14 @@ class GrokBrain:
             schema=schema,
             reasoning_effort=reasoning_effort,
         )
-        request_bytes = len(compact_json(body))
 
         attempts = 0
         repaired = False
         repair_used = False
+        # Accumulated across every attempt: a retry or repair genuinely spends the
+        # tokens and bytes of each attempt, so recording only the last one would
+        # understate real cost.
+        request_bytes_total = 0
         response_bytes = 0
         usage: TokenUsage | None = None
         last_error: Exception | None = None
@@ -310,6 +313,7 @@ class GrokBrain:
 
         while attempts < max_transport_attempts:
             attempts += 1
+            request_bytes_total += len(compact_json(body))
             raw_text = ""
             try:
                 response = await self._client.post(
@@ -318,8 +322,13 @@ class GrokBrain:
                 )
                 response.raise_for_status()
                 response_payload = response.json()
-                response_bytes = len(compact_json(response_payload))
-                usage = parse_provider_usage(response_payload)
+                response_bytes += len(compact_json(response_payload))
+                attempt_usage = parse_provider_usage(response_payload)
+                if attempt_usage is not None:
+                    # Keep `usage` None while the provider reports nothing, so the
+                    # final record can substitute an explicitly-estimated figure
+                    # rather than a misleading zero.
+                    usage = attempt_usage if usage is None else usage + attempt_usage
                 raw_text = self._extract_response_text(response_payload)
                 last_raw_text = raw_text
                 parsed = self._load_json_object(raw_text)
@@ -328,12 +337,12 @@ class GrokBrain:
                     purpose=purpose,
                     reasoning_effort=reasoning_effort,
                     request_hash=request_hash,
-                    request_bytes=request_bytes,
+                    request_bytes=request_bytes_total,
                     response_bytes=response_bytes,
                     started=started,
                     attempts=attempts,
                     success=True,
-                    usage=usage or self._estimated_usage(body, raw_text),
+                    usage=self._accumulate_usage(usage, None, body=body, raw_text=raw_text),
                     error_category=None,
                     error_message=None,
                     repaired=repaired,
@@ -415,7 +424,7 @@ class GrokBrain:
             purpose=purpose,
             reasoning_effort=reasoning_effort,
             request_hash=request_hash,
-            request_bytes=request_bytes,
+            request_bytes=request_bytes_total,
             response_bytes=response_bytes,
             started=started,
             attempts=attempts,
@@ -591,6 +600,28 @@ class GrokBrain:
             "Respond ONLY with a single JSON object, no markdown, matching this JSON Schema:\n"
             + compact_json(schema.model_json_schema())
         )
+
+    @classmethod
+    def _accumulate_usage(
+        cls,
+        running: TokenUsage | None,
+        latest: TokenUsage | None,
+        *,
+        body: dict[str, Any] | None = None,
+        raw_text: str | None = None,
+    ) -> TokenUsage:
+        """Fold one attempt's usage into the running total for this request.
+
+        When the provider reported nothing at all, the final call substitutes an
+        explicitly-estimated figure so the record is never silently zero.
+        """
+        if latest is not None:
+            return latest if running is None else running + latest
+        if running is not None:
+            return running
+        if body is not None:
+            return cls._estimated_usage(body, raw_text or "")
+        return TokenUsage(estimated=True)
 
     @staticmethod
     def _estimated_usage(body: dict[str, Any], raw_text: str) -> TokenUsage:

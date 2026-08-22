@@ -48,6 +48,22 @@ class TokenUsage:
     reasoning_tokens: int = 0
     cached_tokens: int = 0
 
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        """Accumulate usage across every attempt of one logical provider request.
+
+        A retried or repaired call really did spend the tokens of each attempt;
+        recording only the last attempt understates real cost.
+        """
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            # Mixed provider-reported and estimated attempts are flagged estimated.
+            estimated=self.estimated or other.estimated,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "input_tokens": self.input_tokens,

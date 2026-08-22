@@ -42,6 +42,7 @@ class AIExitPolicy:
         self._last_call_price: float | None = None
         self._last_candle_ms: int | None = None
         self._last_flow_signature: str | None = None
+        self._last_probe_ts: float | None = None
         self._seen_request_hashes: set[str] = set()
 
     # ------------------------------------------------------------------
@@ -56,6 +57,7 @@ class AIExitPolicy:
         self._last_call_price = None
         self._last_candle_ms = None
         self._last_flow_signature = None
+        self._last_probe_ts = None
         self._seen_request_hashes.clear()
         del now  # reserved for future time-based budgets
 
@@ -90,10 +92,14 @@ class AIExitPolicy:
             # Budget exhausted: deterministic SL/TP/time protection stays active.
             return ExitCallGate(False, "exit_call_budget_exhausted")
 
-        if self._last_call_ts is not None:
-            elapsed = now - self._last_call_ts
-            if elapsed < self._min_interval_seconds:
-                return ExitCallGate(False, "min_interval")
+        # Probes count toward the interval too: without this, a tick that built
+        # context and found no flow change would re-probe every five seconds.
+        last_activity = max(
+            [value for value in (self._last_call_ts, self._last_probe_ts) if value is not None],
+            default=None,
+        )
+        if last_activity is not None and (now - last_activity) < self._min_interval_seconds:
+            return ExitCallGate(False, "min_interval")
 
         if last_closed_candle_ms is not None and last_closed_candle_ms != self._last_candle_ms:
             return ExitCallGate(True, "new_candle")
@@ -123,6 +129,16 @@ class AIExitPolicy:
         self._last_flow_signature = flow_signature
         if request_hash:
             self._seen_request_hashes.add(request_hash)
+
+    def note_probe(self, *, now: float, flow_signature: str | None) -> None:
+        """Record that context was built and inspected without calling the AI.
+
+        Keeps the flow signature fresh and rate-limits the next probe, so the
+        regime/flow trigger is real without turning every five-second monitor
+        tick into a context build.
+        """
+        self._last_probe_ts = now
+        self._last_flow_signature = flow_signature
 
     def note_deduplicated(self) -> None:
         """An identical compact payload was skipped: no provider call, no budget spent."""

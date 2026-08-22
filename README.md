@@ -51,7 +51,8 @@ src/
 ## Safety Defaults
 
 - `BINGX_ENV=vst` is required and `BINGX_BASE_URL` must be a VST host. Both the client constructor and the trade engine refuse to start otherwise, so live endpoints fail closed.
-- Every order intent carries a unique `clientOrderId`. After a timeout or uncertain POST the client queries the order by `clientOrderId` before any resubmission or `.pro` failover, so an order is never blindly retried.
+- Every order intent carries a unique `clientOrderId`. The order POST itself is **single-attempt** — the transport never retries it, because a 5xx or timeout can still mean the order reached the exchange. On any uncertain outcome the client looks the order up by `clientOrderId`; only a conclusive "order does not exist" permits exactly one resubmission, and an inconclusive lookup **fails closed**.
+- Margin mode, position mode, and leverage are applied and then **verified** against the venue's effective state at startup. A mismatch, or a value that cannot be read, aborts startup rather than trading with the wrong configuration.
 - The `.pro` VST domain is used only after a network error or timeout, never after a valid business/API error.
 - AI provider is pluggable via `XAI_API_STYLE` (`responses` / `chat` / `messages`). `config.py` defaults to the `chat` profile (`XAI_MODEL=gpt-5.4`, freemodel.dev); the live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai. The `xai_*` names and "Grok" log lines are historical — the brain is provider-agnostic.
 - xAI reasoning effort defaults to `high` (`XAI_REASONING_EFFORT`); ignored by providers that don't accept a reasoning field.
@@ -73,8 +74,10 @@ market signals, changing the trading objective, or relaxing any deterministic gu
   collapsed into aggregates (category scores, directional agreement, strongest
   positive/negative) plus one small ranked list per symbol, instead of being repeated
   across `factor_snapshots`, `factor_intelligence.snapshots`, `.by_symbol`, and
-  `top_factor_details`. Flow signals are capped, external provider responses become
-  one-line summaries, and absent providers are omitted rather than sent empty.
+  `top_factor_details`. Flow signals are capped, and absent providers are omitted rather
+  than sent empty. External provider responses go through a **bounded semantic
+  projection** that preserves the decision-relevant fields (bias, direction, confidence,
+  liquidity, price/volume change) instead of collapsing them to element counts.
   Engineering budgets: two-symbol entry at or below ~4,000 estimated tokens,
   one-symbol exit at or below ~1,500.
 - **Merged risk review** (`bot/ai/brain.py`). The separate `PreTradeCheck` provider
@@ -89,8 +92,11 @@ market signals, changing the trading objective, or relaxing any deterministic gu
   closed, price has moved adversely by at least `AI_EXIT_PRICE_MOVE_THRESHOLD_PCT`, or
   a materially new regime/flow trigger appears — subject to a minimum
   `AI_EXIT_CHECK_INTERVAL_SECONDS` gap, a cap of `AI_EXIT_MAX_CALLS_PER_TRADE` calls per
-  trade, and a request-hash skip for identical payloads. When the budget is exhausted or
-  the provider is unavailable, deterministic protection stays fully active.
+  trade, and a request-hash skip for identical payloads. Gating is two-stage: budget,
+  interval, candle close, and adverse move resolve with no network call at all; only when
+  those are inconclusive is context built to test for a regime/flow change, and those
+  probes are rate-limited by the same interval. When the budget is exhausted or the
+  provider is unavailable, deterministic protection stays fully active.
 - **Retry policy** (`bot/ai/usage.py`). Only connection failures, timeouts, short
   `429`s, and retryable `5xx` are retried. Authentication, authorization, validation,
   and other permanent `4xx` errors fail immediately. A structurally invalid response
@@ -99,7 +105,9 @@ market signals, changing the trading objective, or relaxing any deterministic gu
 - **Usage telemetry.** One `ai_call_metrics` record per provider request: call id,
   request hash, purpose, provider/model/api-style/prompt-version, provider-reported or
   explicitly-estimated tokens, sizes, latency, attempts, error category, dedupe and
-  repair flags, and optional estimated cost.
+  repair flags, and optional estimated cost. Tokens and bytes are **accumulated across
+  every attempt** of a request, so a retried or repaired call reports what it actually
+  spent rather than only the final attempt.
 
 ```bash
 PYTHONPATH=src python src/report_ai_usage.py --days 1
@@ -132,10 +140,14 @@ BingX specifics handled by `bot/exchange/bingx_client.py`:
 Open-position lifecycle state is persisted to Supabase (`open_position_state`). On
 restart the engine matches persisted state against the exchange:
 
-- A persisted position the exchange confirms is **resumed** and fully monitored.
-- Exchange exposure that cannot be matched to persisted state is **never auto-flattened**.
-  New entries are blocked and the operator is alerted, because flattening unknown
-  exposure could close a position this process did not open.
+- Matching is on **identity, not just symbol**: `positionSide`/direction, quantity (within a
+  small partial-fill tolerance), average entry price, and position id must all agree. A
+  persisted LONG is never matched to an exchange SHORT, or to a materially different size.
+- A confirmed match is **resumed** and fully monitored.
+- Anything else — a mismatch, an unreadable position, or exposure with no persisted record —
+  is unknown exposure and is **never auto-flattened**. New entries are blocked and the
+  operator is alerted, because flattening unknown exposure could close a position this
+  process did not open.
 
 ## Volume Builder Profile
 
@@ -333,5 +345,5 @@ book depth, funding, or fill behavior.
 ## Notes
 
 - Internal symbols such as `BTC/USDT` are mapped to BingX symbols such as `BTC-USDT`.
-- `POSITION_USDT * LEVERAGE` defines target notional. BingX perpetual order quantity is **base-asset quantity**, not a contract count; the client rounds it with `quantityPrecision` and validates `tradeMinQuantity` / `tradeMinUSDT` before placing an order.
+- `POSITION_USDT * LEVERAGE` defines target notional. BingX perpetual order quantity is **base-asset quantity**, not a contract count; the client rounds it with `quantityPrecision` and validates `tradeMinQuantity` / `tradeMinUSDT` before placing an order. That venue metadata is the only minimum-size authority — there is no contract-count floor (the legacy `MIN_ORDER_CONTRACTS=1` silently blocked every sub-1-BTC entry and has been removed).
 - Trading is risky even in demo mode. Validate order sizing, contract metadata, and account position mode before leaving the bot unattended.

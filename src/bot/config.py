@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     bingx_base_url: str = Field(default=BINGX_VST_BASE_URL, alias="BINGX_BASE_URL")
     bingx_margin_mode: str = Field(default="isolated", alias="BINGX_MARGIN_MODE")
     bingx_position_mode: str = Field(default="hedge", alias="BINGX_POSITION_MODE")
-    bingx_recv_window_ms: int = Field(default=5000, ge=1000, le=60000, alias="BINGX_RECV_WINDOW_MS")
+    # BingX documents recvWindow as "max 5000" ms; a larger value is rejected.
+    bingx_recv_window_ms: int = Field(default=5000, ge=1000, le=5000, alias="BINGX_RECV_WINDOW_MS")
     bingx_source_key: str = Field(default="ai-perpetual-trading", alias="BINGX_SOURCE_KEY")
     bingx_route_min_interval_seconds: float = Field(
         default=0.2,
@@ -37,7 +38,6 @@ class Settings(BaseSettings):
     bingx_market_cache_seconds: float = Field(default=1.0, ge=0.0, alias="BINGX_MARKET_CACHE_SECONDS")
     bingx_insecure_ssl: bool = Field(default=False, alias="BINGX_INSECURE_SSL")
     bingx_debug_http: bool = Field(default=False, alias="BINGX_DEBUG_HTTP")
-    bingx_require_set_leverage: bool = Field(default=False, alias="BINGX_REQUIRE_SET_LEVERAGE")
     strategy_mode: str = Field(default="grok", alias="STRATEGY_MODE")
 
     symbols: Annotated[tuple[str, ...], NoDecode] = Field(
@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     max_stop_loss_per_day: int = Field(default=2, alias="MAX_STOP_LOSS_PER_DAY")
     leverage: int = Field(default=100, ge=1, le=200, alias="LEVERAGE")
     position_usdt: float = Field(default=180.0, alias="POSITION_USDT")
-    min_order_contracts: float = Field(default=1.0, alias="MIN_ORDER_CONTRACTS")
     volume_margin_per_entry_usdt: float | None = Field(default=None, gt=0.0, alias="VOLUME_MARGIN_PER_ENTRY_USDT")
     volume_sides_per_entry: int = Field(default=2, ge=1, le=4, alias="VOLUME_SIDES_PER_ENTRY")
     volume_execution_mode: str = Field(default="market", alias="VOLUME_EXECUTION_MODE")

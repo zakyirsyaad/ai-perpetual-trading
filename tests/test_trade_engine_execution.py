@@ -19,7 +19,6 @@ def _settings(**overrides) -> SimpleNamespace:
         symbols=("BTC/USDT",),
         position_usdt=180.0,
         leverage=100,
-        min_order_contracts=0.0,
         stop_loss_pct=0.1,
         take_profit_pct=0.2,
         position_hold_minutes=60,
@@ -89,6 +88,9 @@ class FakeClient:
         self.leverages: list[tuple[str, int]] = []
         self.fee_error = False
         self.liquidation_price: float | None = None
+        self.effective_position_mode = "hedge"
+        self.effective_margin_mode = "isolated"
+        self.effective_leverage = (100, 100)
 
     async def get_last_price(self, symbol: str) -> float:
         self.price *= self.price_drift
@@ -179,6 +181,15 @@ class FakeClient:
     async def set_leverage(self, symbol: str, leverage: int):
         self.leverages.append((symbol, leverage))
         return {"msg": "ok"}
+
+    async def get_position_mode(self) -> str:
+        return self.effective_position_mode
+
+    async def get_margin_mode(self, symbol: str) -> str:
+        return self.effective_margin_mode
+
+    async def get_effective_leverage(self, symbol: str):
+        return self.effective_leverage
 
 
 class FakeStore:
@@ -364,15 +375,31 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(allowed)
         self.assertIsNone(book)
 
-    async def test_order_below_min_size_is_skipped(self) -> None:
-        client = FakeClient()
-        engine = _engine(
-            client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), _settings(min_order_contracts=1e9)
-        )
+    async def test_size_below_the_venue_minimum_is_skipped(self) -> None:
+        # The venue's own metadata is the authority: calculate_order_size returns 0
+        # when tradeMinQuantity / tradeMinUSDT rejects the size.
+        class BelowMinimumClient(FakeClient):
+            async def calculate_order_size(self, symbol: str, base_quantity: float) -> float:
+                return 0.0
+
+        client = BelowMinimumClient()
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk())
 
         await engine._execute_single_trade(_plan())
 
         self.assertEqual(client.orders, [])
+
+    async def test_sub_one_btc_quantity_is_allowed(self) -> None:
+        # Regression: 180 USDT margin at 100x is ~0.3 BTC. The removed
+        # MIN_ORDER_CONTRACTS=1 floor silently blocked every BTC entry.
+        client = FakeClient(price=60000.0)
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        await engine._execute_single_trade(_plan())
+
+        self.assertTrue(client.orders, "a 0.3 BTC entry must reach the exchange")
+        self.assertLess(client.orders[0]["size"], 1.0)
 
     async def test_post_only_entry_is_used_when_configured(self) -> None:
         client = FakeClient()
@@ -507,6 +534,54 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.margin_modes, [("BTC/USDT", "isolated")])
         self.assertEqual(client.position_modes, ["hedge"])
         self.assertEqual(client.leverages, [("BTC/USDT", 100)])
+
+    async def test_wrong_effective_margin_mode_fails_startup(self) -> None:
+        client = FakeClient()
+        client.effective_margin_mode = "crossed"
+        engine = _engine(client, FakeStore(), FakeStrategy(), FakeRisk())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await engine._initialize_leverage()
+        self.assertIn("margin mode", str(ctx.exception))
+
+    async def test_wrong_effective_position_mode_fails_startup(self) -> None:
+        client = FakeClient()
+        client.effective_position_mode = "one_way"
+        engine = _engine(client, FakeStore(), FakeStrategy(), FakeRisk())
+
+        with self.assertRaises(RuntimeError):
+            await engine._initialize_leverage()
+
+    async def test_wrong_effective_leverage_fails_startup(self) -> None:
+        client = FakeClient()
+        client.effective_leverage = (100, 20)
+        engine = _engine(client, FakeStore(), FakeStrategy(), FakeRisk())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await engine._initialize_leverage()
+        self.assertIn("leverage", str(ctx.exception))
+
+    async def test_unreadable_effective_state_fails_closed(self) -> None:
+        class BlindClient(FakeClient):
+            async def get_effective_leverage(self, symbol: str):
+                raise RuntimeError("endpoint down")
+
+        engine = _engine(BlindClient(), FakeStore(), FakeStrategy(), FakeRisk())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await engine._initialize_leverage()
+        self.assertIn("could not read", str(ctx.exception))
+
+    async def test_failed_set_calls_still_pass_when_effective_state_is_correct(self) -> None:
+        # The venue rejects "no change needed" on some endpoints; what matters is
+        # the verified effective state, not whether the setter returned an error.
+        class StubbornClient(FakeClient):
+            async def set_leverage(self, symbol: str, leverage: int):
+                raise RuntimeError("no need to change leverage")
+
+        engine = _engine(StubbornClient(), FakeStore(), FakeStrategy(), FakeRisk())
+
+        await engine._initialize_leverage()  # must not raise
 
     async def test_fee_refresh_uses_exchange_rates(self) -> None:
         client = FakeClient()

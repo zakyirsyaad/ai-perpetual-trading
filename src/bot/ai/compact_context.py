@@ -370,24 +370,93 @@ def _factor_label(item: dict[str, Any]) -> dict[str, Any] | None:
     return {"name": str(item.get("name") or ""), "score": round(_float(item.get("score")), 4)}
 
 
-def _summarize_provider(payload: Any) -> str:
-    """One short line per provider instead of the raw provider response."""
-    if isinstance(payload, str):
-        return payload[:200]
-    if isinstance(payload, dict):
-        parts: list[str] = []
-        for key in sorted(payload):
-            value = payload[key]
-            if isinstance(value, (str, int, float, bool)):
-                parts.append(f"{key}={value}")
-            elif isinstance(value, (list, tuple)):
-                parts.append(f"{key}[{len(value)}]")
-            elif isinstance(value, dict):
-                parts.append(f"{key}{{{len(value)}}}")
-            if len(parts) >= 8:
-                break
-        return " ".join(parts)[:200]
-    return str(payload)[:200]
+# Keys that carry decision-relevant meaning. Counting a nested provider block as
+# `BTC{10}` is compact but throws away exactly the signal the model needs, so
+# these are projected through by name (matched case-insensitively on substrings).
+_SEMANTIC_KEY_HINTS: tuple[str, ...] = (
+    "bias",
+    "direction",
+    "signal",
+    "recommendation",
+    "summary",
+    "trend",
+    "regime",
+    "confidence",
+    "score",
+    "state",
+    "liquidity",
+    "sentiment",
+    "percent_change",
+    "change_pct",
+    "price",
+    "volume",
+    "dominance",
+    "funding",
+    "open_interest",
+    "value",
+    "rank",
+)
+
+_MAX_PROVIDER_ENTRIES = 6
+_MAX_NESTED_ENTRIES = 5
+# Dune nests provider -> builtin_signals -> <signal> -> rows -> row, so the
+# limit must reach the row itself or the bias/confidence never arrive.
+_MAX_PROVIDER_DEPTH = 5
+
+
+def _summarize_provider(payload: Any) -> Any:
+    """Bounded semantic projection of one external provider's response.
+
+    Keeps direction/bias/confidence/liquidity/price-change style fields — the
+    things the model actually reasons over — while staying inside the payload
+    budget. Only unnamed bulk collections degrade to a count.
+    """
+    return _project(payload, depth=0)
+
+
+def _project(value: Any, *, depth: int) -> Any:
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return _round_value(value, 6)
+    if isinstance(value, str):
+        return value[:120]
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if depth >= _MAX_PROVIDER_DEPTH:
+            return f"{{{len(value)}}}"
+        limit = _MAX_PROVIDER_ENTRIES if depth == 0 else _MAX_NESTED_ENTRIES
+        projected: dict[str, Any] = {}
+        for key in _ranked_keys(value, limit):
+            projected[key] = _project(value[key], depth=depth + 1)
+        omitted = len(value) - len(projected)
+        if omitted > 0:
+            projected["_omitted"] = omitted
+        return projected
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        if not items:
+            return []
+        if depth >= _MAX_PROVIDER_DEPTH:
+            return f"[{len(items)}]"
+        head = [_project(item, depth=depth + 1) for item in items[:2]]
+        if len(items) > 2:
+            head.append(f"+{len(items) - 2} more")
+        return head
+    return str(value)[:120]
+
+
+def _ranked_keys(payload: dict[str, Any], limit: int) -> list[str]:
+    """Semantic keys first, then remaining scalars, capped at `limit`."""
+    semantic: list[str] = []
+    other: list[str] = []
+    for key in sorted(payload):
+        lowered = str(key).lower()
+        if any(hint in lowered for hint in _SEMANTIC_KEY_HINTS):
+            semantic.append(key)
+        else:
+            other.append(key)
+    ranked = semantic + other
+    return ranked[:limit]
 
 
 def _as_list(value: Any) -> list[Any]:
