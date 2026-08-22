@@ -38,6 +38,9 @@ class OpenPosition:
     exchange_order_id: str
     opened_at: datetime
     entry_reason: str = "unknown"
+    # Venue position identifier, captured at entry so a restart can verify it is
+    # the same position rather than merely the same symbol.
+    position_id: str | None = None
 
 
 @dataclass(slots=True)

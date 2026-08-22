@@ -66,6 +66,7 @@ class SupabaseTradeStore:
                     "quantity": position.quantity,
                     "exchange_size": position.exchange_size,
                     "exchange_order_id": position.exchange_order_id,
+                    "position_id": position.position_id,
                     "entry_reason": position.entry_reason,
                     "opened_at": position.opened_at.isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -112,6 +113,9 @@ class SupabaseTradeStore:
                         exchange_order_id=str(row.get("exchange_order_id") or ""),
                         opened_at=datetime.fromisoformat(str(row["opened_at"]).replace("Z", "+00:00")),
                         entry_reason=str(row.get("entry_reason") or "unknown"),
+                        position_id=(
+                            str(row["position_id"]) if row.get("position_id") not in (None, "") else None
+                        ),
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:

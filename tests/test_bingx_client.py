@@ -398,7 +398,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
                 # Explicit "order does not exist" proves the first POST never landed.
-                _FakeResponse({"code": 80016, "msg": "order not exist"}),
+                _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
                 _FakeResponse({"code": 0, "data": {"order": {"orderId": "7"}}}),
             ]
         )
@@ -407,17 +407,34 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(methods.count("POST"), 2)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "7")
 
-    async def test_empty_lookup_result_counts_as_absent(self) -> None:
+    async def test_empty_lookup_result_is_inconclusive_not_absent(self) -> None:
+        # A success envelope with no order payload is ambiguous; resubmitting on
+        # that basis could duplicate a position.
         client = _client(
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
                 _FakeResponse({"code": 0, "data": {}}),
-                _FakeResponse({"code": 0, "data": {"order": {"orderId": "7"}}}),
             ]
         )
-        ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
-        self.assertEqual(str(ack["data"]["order"]["orderId"]), "7")
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_parameter_error_is_not_treated_as_order_not_found(self) -> None:
+        # 101400 is "order parameter validation failed", not proof of absence.
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 101400, "msg": "order parameter validation failed"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
 
     async def test_inconclusive_lookup_fails_closed_without_resubmitting(self) -> None:
         client = _client(
@@ -455,7 +472,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 _FakeResponse({"code": 0, "msg": "bad gateway"}, status_code=502),
-                _FakeResponse({"code": 80016, "msg": "order not exist"}),
+                _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
                 _FakeResponse({"code": 0, "data": {"order": {"orderId": "5"}}}),
             ]
         )
@@ -549,8 +566,8 @@ class FillTests(unittest.IsolatedAsyncioTestCase):
                     "clientOrderId": "c1",
                     "executedQty": "0.05",
                     "avgPrice": "64000",
-                    "commission": "-0.5",
-                    "profit": "1.25",
+                    "fee": "-0.5",
+                    "realizedPnl": "1.25",
                     "status": "PARTIALLY_FILLED",
                 }
             },
@@ -606,7 +623,8 @@ class FillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fill.fee_usdt, 0.0)
         self.assertTrue(any("fill history unavailable" in item.lower() for item in logger.warnings))
 
-    async def test_fee_aggregation_from_fill_history(self) -> None:
+    async def test_fee_and_realized_pnl_use_the_documented_fill_fields(self) -> None:
+        # allFillOrders documents `fee` (negative = paid) and `realizedPnl`.
         order_payload = {
             "code": 0,
             "data": {"order": {"orderId": "1", "executedQty": "0.05", "avgPrice": "64000", "status": "FILLED"}},
@@ -615,9 +633,37 @@ class FillTests(unittest.IsolatedAsyncioTestCase):
             "code": 0,
             "data": {
                 "fill_orders": [
-                    {"orderId": "1", "qty": "0.03", "price": "64000", "commission": "-0.3", "profit": "1"},
-                    {"orderId": "1", "qty": "0.02", "price": "64010", "commission": "-0.2", "profit": "0.5"},
-                    {"orderId": "2", "qty": "9", "price": "1", "commission": "-9", "profit": "9"},
+                    {
+                        "tradeId": "t1",
+                        "symbol": "BTC-USDT",
+                        "orderId": "1",
+                        "side": "BUY",
+                        "price": "64000",
+                        "qty": "0.05",
+                        "fee": "-0.5",
+                        "realizedPnl": "1.25",
+                        "time": 1_700_000_000_000,
+                    }
+                ]
+            },
+        }
+        client = _client([_FakeResponse(order_payload), _FakeResponse(fills_payload)])
+        fill = await client.get_order_fill("BTC/USDT", "1")
+        self.assertAlmostEqual(fill.fee_usdt, 0.5)
+        self.assertAlmostEqual(fill.pnl_usdt, 1.25)
+
+    async def test_fee_and_pnl_aggregate_across_partial_fills(self) -> None:
+        order_payload = {
+            "code": 0,
+            "data": {"order": {"orderId": "1", "executedQty": "0.05", "avgPrice": "64000", "status": "FILLED"}},
+        }
+        fills_payload = {
+            "code": 0,
+            "data": {
+                "fill_orders": [
+                    {"orderId": "1", "qty": "0.03", "price": "64000", "fee": "-0.3", "realizedPnl": "1"},
+                    {"orderId": "1", "qty": "0.02", "price": "64010", "fee": "-0.2", "realizedPnl": "0.5"},
+                    {"orderId": "2", "qty": "9", "price": "1", "fee": "-9", "realizedPnl": "9"},
                 ]
             },
         }

@@ -39,6 +39,17 @@ Review round 1 (PR #2) — all P0/P1/P2/P3 fixed:
 - [x] P2 `BINGX_RECV_WINDOW_MS` capped at the documented 5000 ms maximum.
 - [x] P3 Trailing whitespace removed; `git diff --check` clean.
 
+Review round 2 (PR #2) — all four follow-ups fixed:
+
+- [x] P0 Not-found detection uses the documented `109421` only; parameter-error codes
+      no longer authorise a resubmit, and an unrecognised/empty lookup shape is `unknown`.
+- [x] P1 Token usage is estimated *per attempt* when the provider reports none, so a
+      large invalid response followed by a small repair is no longer costed as the repair.
+- [x] P2 Fill parsing uses the documented `realizedPnl` and `fee` fields, with the
+      official `allFillOrders` payload shape in the regression tests.
+- [x] P2 `position_id` is captured at entry, persisted, loaded, and compared, so the
+      identity-matching claim is now actually enforced.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

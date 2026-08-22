@@ -273,7 +273,11 @@ class TradeEngine:
         await asyncio.sleep(self._settings.order_fill_wait_seconds)
         entry_fill = await self._client.get_order_fill(plan.symbol, entry_order_id)
         # Verify that a position actually exists and adjust to the filled quantity.
-        filled_size, filled_entry_price = await self._client.get_symbol_position_snapshot(plan.symbol)
+        # Read full details (not just the snapshot) so the venue position id is
+        # captured for restart identity matching.
+        position_details = await self._client.get_symbol_position_details(plan.symbol)
+        filled_size = position_details.exchange_size
+        filled_entry_price = position_details.avg_price
         if filled_size <= 0:
             raise RuntimeError(
                 f"Entry order placed but no open position detected for {plan.symbol}."
@@ -307,6 +311,7 @@ class TradeEngine:
             exchange_order_id=entry_order_id,
             opened_at=opened_at,
             entry_reason=plan.decision_reason,
+            position_id=getattr(position_details, "position_id", None),
         )
         await self._trade_store.save_open_position(open_position)
 

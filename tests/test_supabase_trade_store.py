@@ -91,6 +91,7 @@ def _open_position() -> OpenPosition:
         exchange_order_id="e1",
         opened_at=datetime.now(timezone.utc),
         entry_reason="ai_volume:OPEN_LONG",
+        position_id="p-1",
     )
 
 
@@ -179,6 +180,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post["params"], [("on_conflict", "exchange,symbol")])
         self.assertEqual(post["json"]["status"], "open")
         self.assertEqual(post["json"]["exchange"], "bingx")
+        self.assertEqual(post["json"]["position_id"], "p-1")
 
     async def test_open_position_write_failure_does_not_raise(self) -> None:
         await _store(_FakeHTTP(status=500)).save_open_position(_open_position())
@@ -202,12 +204,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
                     "exchange_order_id": "e1",
                     "opened_at": "2026-08-22T00:00:00+00:00",
                     "entry_reason": "ai_volume",
+                    "position_id": "p-1",
                 }
             ]
         )
         positions = await _store(http).list_open_positions()
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].direction, PositionDirection.LONG)
+        self.assertEqual(positions[0].position_id, "p-1")
 
     async def test_unreadable_position_rows_are_skipped(self) -> None:
         http = _FakeHTTP(rows=[{"symbol": "BTC/USDT"}])

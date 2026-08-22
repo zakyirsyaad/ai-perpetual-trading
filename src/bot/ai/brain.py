@@ -323,13 +323,12 @@ class GrokBrain:
                 response.raise_for_status()
                 response_payload = response.json()
                 response_bytes += len(compact_json(response_payload))
-                attempt_usage = parse_provider_usage(response_payload)
-                if attempt_usage is not None:
-                    # Keep `usage` None while the provider reports nothing, so the
-                    # final record can substitute an explicitly-estimated figure
-                    # rather than a misleading zero.
-                    usage = attempt_usage if usage is None else usage + attempt_usage
-                raw_text = self._extract_response_text(response_payload)
+                raw_text, extraction_error = self._extract_response_text_safe(response_payload)
+                # Account for THIS attempt before anything can raise: an attempt
+                # that produced an unusable response still spent its tokens.
+                usage = self._add_attempt_usage(usage, response_payload, body, raw_text)
+                if extraction_error is not None:
+                    raise extraction_error
                 last_raw_text = raw_text
                 parsed = self._load_json_object(raw_text)
                 result = schema.model_validate(parsed)
@@ -342,7 +341,7 @@ class GrokBrain:
                     started=started,
                     attempts=attempts,
                     success=True,
-                    usage=self._accumulate_usage(usage, None, body=body, raw_text=raw_text),
+                    usage=usage if usage is not None else TokenUsage(estimated=True),
                     error_category=None,
                     error_message=None,
                     repaired=repaired,
@@ -602,26 +601,32 @@ class GrokBrain:
         )
 
     @classmethod
-    def _accumulate_usage(
+    def _add_attempt_usage(
         cls,
         running: TokenUsage | None,
-        latest: TokenUsage | None,
-        *,
-        body: dict[str, Any] | None = None,
-        raw_text: str | None = None,
+        response_payload: dict[str, Any],
+        body: dict[str, Any],
+        raw_text: str,
     ) -> TokenUsage:
-        """Fold one attempt's usage into the running total for this request.
+        """Fold one attempt's spend into the running total for this request.
 
-        When the provider reported nothing at all, the final call substitutes an
-        explicitly-estimated figure so the record is never silently zero.
+        Uses the provider's own numbers when present and an explicitly-estimated
+        figure otherwise — per attempt, not once at the end. Estimating only the
+        final attempt made a large invalid response followed by a small repair
+        look like the cost of the repair alone.
         """
-        if latest is not None:
-            return latest if running is None else running + latest
-        if running is not None:
-            return running
-        if body is not None:
-            return cls._estimated_usage(body, raw_text or "")
-        return TokenUsage(estimated=True)
+        attempt = parse_provider_usage(response_payload)
+        if attempt is None:
+            attempt = cls._estimated_usage(body, raw_text)
+        return attempt if running is None else running + attempt
+
+    @staticmethod
+    def _extract_response_text_safe(payload: dict[str, Any]) -> tuple[str, Exception | None]:
+        """Extract output text without raising, so accounting can run first."""
+        try:
+            return GrokBrain._extract_response_text(payload), None
+        except (KeyError, TypeError) as exc:
+            return "", exc
 
     @staticmethod
     def _estimated_usage(body: dict[str, Any], raw_text: str) -> TokenUsage:

@@ -49,9 +49,13 @@ _CLOCK_DRIFT_TOKENS = ("timestamp", "recvwindow", "recv window")
 # Permanent business failures: never retried, never failed over to `.pro`.
 _PERMANENT_CODE_PREFIXES = ("1004", "1005", "8001", "1001")
 
-# BingX codes meaning "this order does not exist", which is the only
-# conclusive proof that an uncertain order placement never landed.
-_ORDER_NOT_FOUND_CODES = {"80016", "80017", "100400"}
+# The ONLY documented code proving an order never existed:
+#   109421 "The specified order does not exist - may have been filled,
+#           cancelled, or order ID is incorrect."
+# Parameter-validation codes (e.g. 101400) are deliberately NOT here: they say
+# the request was malformed, not that the order is absent, so treating them as
+# "absent" could authorise a duplicate submission.
+_ORDER_NOT_FOUND_CODES = {"109421"}
 
 _KLINE_INTERVALS = {
     "1m": "1m",
@@ -686,7 +690,10 @@ class BingXFuturesClient:
             return "unknown", None
         if self._order_row(resp):
             return "found", resp
-        return "absent", None
+        # A success envelope with no recognisable order payload is ambiguous: it
+        # may mean "no such order", or a shape this adapter does not model. Until
+        # the VST contract proves otherwise, that ambiguity fails closed.
+        return "unknown", None
 
     @staticmethod
     def _is_order_not_found(exc: ExchangeAPIError) -> bool:
@@ -707,8 +714,10 @@ class BingXFuturesClient:
         order_id = str(row.get("orderId") or selector.get("orderId") or "")
         filled = self._decimal(row.get("executedQty"))
         avg_price = self._optional_decimal(row.get("avgPrice"))
-        fee = self._optional_decimal(row.get("commission") or row.get("fee"))
-        pnl = self._optional_decimal(row.get("profit") or row.get("realisedPNL"))
+        fee = self._optional_decimal(self._first_present(row, ("fee", "commission")))
+        pnl = self._optional_decimal(
+            self._first_present(row, ("realizedPnl", "realisedPnl", "profit", "realisedPNL"))
+        )
         if fee is None or pnl is None:
             aggregated = await self._aggregate_fills(symbol, order_id)
             if aggregated is not None:
@@ -771,8 +780,12 @@ class BingXFuturesClient:
             if not isinstance(row, dict) or str(row.get("orderId")) != order_id:
                 continue
             matched = True
-            fee += abs(self._decimal(row.get("commission") or row.get("fee")))
-            pnl += self._decimal(row.get("profit") or row.get("realisedPNL"))
+            # Documented allFillOrders fields are `fee` (negative = paid) and
+            # `realizedPnl`; the others are tolerated legacy spellings.
+            fee += abs(self._decimal(self._first_present(row, ("fee", "commission"))))
+            pnl += self._decimal(
+                self._first_present(row, ("realizedPnl", "realisedPnl", "profit", "realisedPNL"))
+            )
         return (fee, pnl) if matched else None
 
     def _log_fill_aggregation_gap(self, symbol: str, order_id: str, exc: Exception) -> None:
@@ -1103,6 +1116,15 @@ class BingXFuturesClient:
                 continue
             total += price * size
         return total
+
+    @staticmethod
+    def _first_present(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        """First key actually present with a value, preferring the documented spelling."""
+        for key in keys:
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return None
 
     @staticmethod
     def _decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:

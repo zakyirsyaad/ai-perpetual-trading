@@ -80,7 +80,7 @@ class _FakeStore:
         self._positions = [item for item in self._positions if item.symbol != symbol]
 
 
-def _position(symbol: str = "BTC/USDT") -> OpenPosition:
+def _position(symbol: str = "BTC/USDT", position_id: str | None = None) -> OpenPosition:
     return OpenPosition(
         symbol=symbol,
         direction=PositionDirection.LONG,
@@ -90,6 +90,7 @@ def _position(symbol: str = "BTC/USDT") -> OpenPosition:
         exchange_order_id="order-1",
         opened_at=datetime.now(timezone.utc) - timedelta(minutes=5),
         entry_reason="ai_volume:OPEN_LONG",
+        position_id=position_id,
     )
 
 
@@ -156,6 +157,26 @@ class ReconcileTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(engine._entries_blocked_reason)
         self.assertEqual(client.flattened, [])
+
+    async def test_different_position_id_is_treated_as_unknown_exposure(self) -> None:
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"position_id": "p-999"}})
+        engine = _engine(client, _FakeStore([_position(position_id="p-1")]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("position id", engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+        self.assertEqual(client.flattened, [])
+
+    async def test_matching_position_id_resumes(self) -> None:
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"position_id": "p-1"}})
+        engine = _engine(client, _FakeStore([_position(position_id="p-1")]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNone(engine._entries_blocked_reason)
+        self.assertEqual([item.symbol for item in engine._resumable_positions], ["BTC/USDT"])
 
     async def test_unmatched_exchange_position_blocks_entries_and_is_not_flattened(self) -> None:
         client = _FakeClient({"ETH/USDT"})

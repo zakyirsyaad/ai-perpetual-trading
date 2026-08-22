@@ -162,6 +162,7 @@ class FakeClient:
             liquidation_price=self.liquidation_price,
             pos_side="LONG",
             raw={},
+            position_id="p-live",
         )
 
     async def has_open_position(self, symbol: str) -> bool:
@@ -290,6 +291,15 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(trade.reason.startswith("strategy_exit") or trade.reason in {"take_profit", "time_stop"})
         self.assertEqual(store.removed, ["BTC/USDT"])
         self.assertEqual(store.open_positions[0].symbol, "BTC/USDT")
+
+    async def test_entry_captures_the_venue_position_id(self) -> None:
+        client = FakeClient()
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        await engine._execute_single_trade(_plan())
+
+        self.assertEqual(store.open_positions[0].position_id, "p-live")
 
     async def test_take_profit_exit_is_detected(self) -> None:
         store = FakeStore()

@@ -242,6 +242,49 @@ class UsageAccumulationTests(unittest.TestCase):
         self.assertTrue(combined.estimated)
         self.assertEqual(combined.total_tokens, 17)
 
+    def test_repair_without_provider_usage_estimates_both_attempts(self) -> None:
+        # No `usage` object from the provider: each attempt must still be
+        # estimated and summed, not estimated once at the end.
+        big_payload = {"blob": "x" * 4000}
+        brain, _, recorded = _brain([_ok_response("garbage"), _ok_response('{"ok": true}')])
+        result = asyncio.run(
+            brain._ask_grok(system_prompt="p", payload=big_payload, schema=_Result, reasoning_effort="low")
+        )
+        self.assertEqual(result, _Result(ok=True))
+        metric = recorded[-1]
+        self.assertTrue(metric.usage.estimated)
+        self.assertEqual(metric.attempts, 2)
+        # The first attempt alone carries the ~4000-char payload, so the total must
+        # be far larger than an estimate of the small repair request by itself.
+        self.assertGreater(metric.usage.total_tokens, 1000)
+
+    def test_retry_without_provider_usage_accumulates_each_attempt(self) -> None:
+        big_payload = {"blob": "y" * 4000}
+        brain, _, recorded = _brain([httpx.ReadTimeout("slow"), _ok_response('{"ok": true}')])
+        asyncio.run(
+            brain._ask_grok(system_prompt="p", payload=big_payload, schema=_Result, reasoning_effort="low")
+        )
+        metric = recorded[-1]
+        # The timed-out attempt produced no response, so only the delivered
+        # attempt is billable — but it must be estimated, not zero.
+        self.assertTrue(metric.usage.estimated)
+        self.assertGreater(metric.usage.total_tokens, 900)
+
+    def test_mixed_reported_and_estimated_attempts_are_summed(self) -> None:
+        brain, _, recorded = _brain(
+            [
+                # First attempt: provider reports usage but the body is invalid.
+                _ok_response("garbage", usage={"prompt_tokens": 1000, "completion_tokens": 50, "total_tokens": 1050}),
+                # Repair attempt: no usage reported, so it must be estimated.
+                _ok_response('{"ok": true}'),
+            ]
+        )
+        result = asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
+        self.assertEqual(result, _Result(ok=True))
+        metric = recorded[-1]
+        self.assertGreater(metric.usage.total_tokens, 1050, "reported 1050 plus the estimated repair")
+        self.assertTrue(metric.usage.estimated, "a partly-estimated total must be flagged estimated")
+
     def test_failed_call_still_records_the_tokens_it_spent(self) -> None:
         brain, _, recorded = _brain(
             [
