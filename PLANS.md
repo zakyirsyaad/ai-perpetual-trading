@@ -79,6 +79,14 @@ Review round 5 (PR #2) — fixed:
       only `https://open-api-vst.bingx.com`; `.pro` remains an internal fallback reachable
       only after a network error or timeout.
 
+Review round 6 (PR #2) — fixed:
+
+- [x] P0 HTTP redirects are never followed. `follow_redirects=True` sat below this
+      client's retry/failover control and could re-send an order POST to whatever host
+      `Location` named; 3xx is now a fail-closed, non-retryable error.
+- [x] P3 Removed the extra blank line at EOF so `git diff --check` is clean across the
+      accumulated PR diff, not just the latest delta.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

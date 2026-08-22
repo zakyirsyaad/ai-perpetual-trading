@@ -155,7 +155,12 @@ class BingXFuturesClient:
         self._fill_history_lookback_ms = max(int(fill_history_lookback_seconds), 60) * 1000
         self._client = httpx.AsyncClient(
             timeout=timeout_seconds,
-            follow_redirects=True,
+            # Redirects are NEVER followed. httpx would resolve a 307/308 inside a
+            # single `request()` call, below this client's own retry/failover
+            # control, and re-send the body to whatever host `Location` names —
+            # defeating "order POST is single-attempt" and "order placement never
+            # fails over", and potentially pointing at a live or arbitrary host.
+            follow_redirects=False,
             verify=(not insecure_ssl),
         )
         self._instruments: dict[str, Instrument] = {}
@@ -1018,6 +1023,19 @@ class BingXFuturesClient:
             )
         if self._debug_http:
             print(json.dumps(body, ensure_ascii=True)[:1000])
+        if 300 <= status_code < 400:
+            location = ""
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                location = str(headers.get("location") or headers.get("Location") or "")
+            raise ExchangeAPIError(
+                f"BingX returned HTTP {status_code} redirect on {path} to {location or 'an unspecified host'}. "
+                "Redirects are never followed: doing so would re-send the request — including an order "
+                "placement — to a host this client did not choose.",
+                status_code=status_code,
+                retryable=False,
+                venue=self.venue,
+            )
         if status_code >= 400:
             raise ExchangeAPIError(
                 f"BingX HTTP {status_code} on {path}: {json.dumps(body, ensure_ascii=True)[:300]}",

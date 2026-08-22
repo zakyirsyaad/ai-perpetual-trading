@@ -133,6 +133,10 @@ BingX specifics handled by `bot/exchange/bingx_client.py`:
   public market data, so both the client and config validate that exact value and fail
   fast on anything else. Clock-drift responses are reported with an explicit
   "synchronize the system clock" hint.
+- HTTP redirects are never followed. Left enabled, the HTTP client would resolve a
+  307/308 inside a single request — below this client's own retry and failover control —
+  and re-send the body, including an order placement, to whatever host `Location` named.
+  Any 3xx is a fail-closed error.
 - `.pro` is used **only** after a connection error or timeout. Any HTTP response — success
   or business error — is handled on the host that produced it: documented transient codes
   (`100500`, `110500`, `101214`, `101219`, `109500`) are retried on the same host and then

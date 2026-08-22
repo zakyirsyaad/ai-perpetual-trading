@@ -21,10 +21,16 @@ from bot.models import PositionDirection
 
 
 class _FakeResponse:
-    def __init__(self, payload: Any, status_code: int = 200, url: str = "https://open-api-vst.bingx.com/x") -> None:
+    def __init__(
+        self,
+        payload: Any,
+        status_code: int = 200,
+        url: str = "https://open-api-vst.bingx.com/x",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
-        self.headers = {"content-type": "application/json"}
+        self.headers = {"content-type": "application/json", **(headers or {})}
         self.text = json.dumps(payload) if not isinstance(payload, str) else payload
         self.request = httpx.Request("GET", url)
 
@@ -270,6 +276,97 @@ class BusinessErrorPolicyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExchangeAPIError):
             await client.get_last_price("BTC/USDT")
         self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+
+class RedirectPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Redirects must never be followed: httpx would re-send below our retry control."""
+
+    def test_client_disables_automatic_redirects(self) -> None:
+        client = BingXFuturesClient(
+            api_key="k",
+            secret_key="s",
+            base_url=BINGX_VST_BASE_URL,
+            env="vst",
+        )
+        self.assertFalse(client._client.follow_redirects)
+
+    async def test_order_redirect_produces_exactly_one_post(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse(
+                    {},
+                    status_code=307,
+                    headers={"location": "https://open-api-vst.bingx.pro/openApi/swap/v2/trade/order"},
+                ),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertIn("redirect", str(ctx.exception).lower())
+        requests = client._client.requests  # type: ignore[attr-defined]
+        self.assertEqual([item["method"] for item in requests].count("POST"), 1)
+
+    async def test_order_redirect_never_reaches_the_pro_host(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse(
+                    {},
+                    status_code=307,
+                    headers={"location": "https://open-api-vst.bingx.pro/openApi/swap/v2/trade/order"},
+                ),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        hosts = {item["url"].split("/openApi")[0] for item in client._client.requests}  # type: ignore[attr-defined]
+        self.assertEqual(hosts, {BINGX_VST_BASE_URL})
+
+    async def test_order_redirect_to_a_live_host_is_refused(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse(
+                    {},
+                    status_code=308,
+                    headers={"location": "https://open-api.bingx.com/openApi/swap/v2/trade/order"},
+                ),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        urls = [item["url"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertTrue(all("open-api.bingx.com" not in url for url in urls))
+
+    async def test_order_redirect_to_an_arbitrary_host_is_refused(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({}, status_code=302, headers={"location": "https://attacker.example/collect"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        urls = [item["url"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertTrue(all("attacker.example" not in url for url in urls))
+
+    async def test_redirect_is_not_retried_or_failed_over_on_reads(self) -> None:
+        # A read route would otherwise be free to retry and then try `.pro`.
+        client = _client(
+            [
+                _FakeResponse({}, status_code=307, headers={"location": "https://open-api-vst.bingx.pro/x"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.get_last_price("BTC/USDT")
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+    async def test_redirect_without_location_still_fails_closed(self) -> None:
+        client = _client([_FakeResponse({}, status_code=307)])
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_last_price("BTC/USDT")
 
 
 class HedgeExposureTests(unittest.IsolatedAsyncioTestCase):
