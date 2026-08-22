@@ -622,9 +622,20 @@ class TradeEngine:
 
         position_id = getattr(details, "position_id", None)
         expected_id = getattr(position, "position_id", None)
-        if expected_id and position_id and str(expected_id) != str(position_id):
-            return f"persisted position id {expected_id} but exchange reports {position_id}"
-
+        if expected_id:
+            # We knew this position's venue identity at entry. If the readback no
+            # longer carries it, identity can no longer be confirmed — treat that
+            # as unknown exposure rather than resuming on the weaker checks alone.
+            if not position_id:
+                return (
+                    f"persisted position id {expected_id} but the exchange readback carries no "
+                    "position id, so identity cannot be confirmed"
+                )
+            if str(expected_id) != str(position_id):
+                return f"persisted position id {expected_id} but exchange reports {position_id}"
+        # A record persisted before position ids were captured has no id to check.
+        # Such legacy rows are matched on direction, quantity, and entry price only;
+        # they are resumable, and the first close rewrites them with an id.
         return None
 
     async def _resume_persisted_positions(self) -> None:

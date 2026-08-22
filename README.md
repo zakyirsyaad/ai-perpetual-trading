@@ -51,7 +51,7 @@ src/
 ## Safety Defaults
 
 - `BINGX_ENV=vst` is required and `BINGX_BASE_URL` must be a VST host. Both the client constructor and the trade engine refuse to start otherwise, so live endpoints fail closed.
-- Every order intent carries a unique `clientOrderId`. The order POST itself is **single-attempt** — the transport never retries it, because a 5xx or timeout can still mean the order reached the exchange. On any uncertain outcome the client looks the order up by `clientOrderId`; only a conclusive "order does not exist" permits exactly one resubmission, and an inconclusive lookup **fails closed**.
+- Every order intent carries a unique `clientOrderId`. The order POST itself is **single-attempt** — the transport never retries it, because a 5xx or timeout can still mean the order reached the exchange. On an uncertain outcome the client **never issues a second POST**: it reconciles by `clientOrderId` with a bounded number of lookups, and anything short of a confirmed hit raises for operator intervention. BingX documents `109421` as "may have been filled, cancelled, or order ID is incorrect", so even that code does not prove the intent never landed. A missed entry is recoverable; a duplicate leveraged position is not. Automatic resubmission can be reconsidered once the VST contract is validated against the live venue.
 - Margin mode, position mode, and leverage are applied and then **verified** against the venue's effective state at startup. A mismatch, or a value that cannot be read, aborts startup rather than trading with the wrong configuration.
 - The `.pro` VST domain is used only after a network error or timeout, never after a valid business/API error.
 - AI provider is pluggable via `XAI_API_STYLE` (`responses` / `chat` / `messages`). `config.py` defaults to the `chat` profile (`XAI_MODEL=gpt-5.4`, freemodel.dev); the live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai. The `xai_*` names and "Grok" log lines are historical — the brain is provider-agnostic.
@@ -132,7 +132,9 @@ BingX specifics handled by `bot/exchange/bingx_client.py`:
   responses are reported with an explicit "synchronize the system clock" hint.
 - Klines are filtered so only candles whose close time has passed are used.
 - Hedge mode: closing uses the **opposite order side with the same `positionSide`**, and
-  `reduceOnly` is omitted because BingX rejects it for dual-side positions.
+  `reduceOnly` is omitted because BingX rejects it for dual-side positions. One-way mode
+  does send `reduceOnly=true`, so a close whose quantity exceeds the live position cannot
+  flip into a new opposite position.
 - Per-route throttling and short-lived market-data caching for rate limits.
 
 ## Restart Behavior

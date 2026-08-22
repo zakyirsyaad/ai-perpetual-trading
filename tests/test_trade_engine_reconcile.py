@@ -169,6 +169,30 @@ class ReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._resumable_positions, [])
         self.assertEqual(client.flattened, [])
 
+    async def test_missing_exchange_position_id_blocks_a_known_identity(self) -> None:
+        # Identity was known at entry; if the readback loses it, resume must not
+        # fall back to the weaker side/quantity/price checks.
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"position_id": None}})
+        engine = _engine(client, _FakeStore([_position(position_id="p-1")]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("identity cannot be confirmed", engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+        self.assertEqual(client.flattened, [])
+
+    async def test_legacy_record_without_persisted_id_still_resumes(self) -> None:
+        # Rows written before position ids were captured have nothing to compare;
+        # they are matched on direction, quantity, and entry price only.
+        client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"position_id": "p-9"}})
+        engine = _engine(client, _FakeStore([_position(position_id=None)]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNone(engine._entries_blocked_reason)
+        self.assertEqual([item.symbol for item in engine._resumable_positions], ["BTC/USDT"])
+
     async def test_matching_position_id_resumes(self) -> None:
         client = _FakeClient({"BTC/USDT"}, details={"BTC/USDT": {"position_id": "p-1"}})
         engine = _engine(client, _FakeStore([_position(position_id="p-1")]))

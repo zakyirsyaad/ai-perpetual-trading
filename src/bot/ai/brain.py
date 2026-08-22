@@ -314,6 +314,11 @@ class GrokBrain:
         while attempts < max_transport_attempts:
             attempts += 1
             request_bytes_total += len(compact_json(body))
+            # A dispatched attempt may already have been billed by the provider
+            # even if we never see a usable response (a client timeout does not
+            # prove inference did not run). Assume it was, conservatively, and
+            # clear the flag only once the real response has been accounted.
+            attempt_accounted = False
             raw_text = ""
             try:
                 response = await self._client.post(
@@ -327,6 +332,7 @@ class GrokBrain:
                 # Account for THIS attempt before anything can raise: an attempt
                 # that produced an unusable response still spent its tokens.
                 usage = self._add_attempt_usage(usage, response_payload, body, raw_text)
+                attempt_accounted = True
                 if extraction_error is not None:
                     raise extraction_error
                 last_raw_text = raw_text
@@ -350,6 +356,8 @@ class GrokBrain:
                 return result
             except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
                 last_error = exc
+                if not attempt_accounted:
+                    usage = self._add_dispatched_attempt_usage(usage, body)
                 classification = classify_provider_error(exc, schema_violation=True)
                 last_category = classification.category.value
                 self._logger.warning(
@@ -375,6 +383,8 @@ class GrokBrain:
                 continue
             except httpx.HTTPStatusError as exc:
                 last_error = exc
+                if not attempt_accounted:
+                    usage = self._add_dispatched_attempt_usage(usage, body)
                 classification = classify_provider_error(exc)
                 last_category = classification.category.value
                 status = exc.response.status_code if exc.response is not None else None
@@ -397,6 +407,8 @@ class GrokBrain:
                     break
             except Exception as exc:
                 last_error = exc
+                if not attempt_accounted:
+                    usage = self._add_dispatched_attempt_usage(usage, body)
                 classification = classify_provider_error(exc)
                 last_category = classification.category.value
                 self._logger.warning(
@@ -618,6 +630,27 @@ class GrokBrain:
         attempt = parse_provider_usage(response_payload)
         if attempt is None:
             attempt = cls._estimated_usage(body, raw_text)
+        return attempt if running is None else running + attempt
+
+    @classmethod
+    def _add_dispatched_attempt_usage(
+        cls,
+        running: TokenUsage | None,
+        body: dict[str, Any],
+    ) -> TokenUsage:
+        """Conservatively bill a dispatched attempt with an unknown outcome.
+
+        The request left this process, so the provider may well have run and
+        charged for it. Output length is genuinely unknown, so only the input is
+        estimated; the result is always flagged estimated.
+        """
+        input_tokens = estimate_tokens(compact_json(body))
+        attempt = TokenUsage(
+            input_tokens=input_tokens,
+            output_tokens=0,
+            total_tokens=input_tokens,
+            estimated=True,
+        )
         return attempt if running is None else running + attempt
 
     @staticmethod

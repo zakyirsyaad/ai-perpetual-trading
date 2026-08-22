@@ -617,24 +617,39 @@ class BingXFuturesClient:
                     venue=self.venue,
                 )
         side, position_side = self._order_sides(direction, reduce_only=reduce_only)
-        # Hedge mode: closing uses the opposite side with the SAME positionSide.
-        # `reduceOnly` is deliberately omitted — BingX rejects it for dual-side positions.
-        return {
+        payload = {
             "symbol": instrument.venue_symbol,
             "side": side,
             "positionSide": position_side,
             "quantity": self._format_quantity(quantity),
             "clientOrderId": self._new_client_order_id(),
         }
+        if reduce_only and self._position_mode != "hedge":
+            # One-way mode: without reduceOnly, a close whose quantity exceeds the
+            # live position (drift, race, partial fill) flips into a new opposite
+            # position. Hedge mode omits it because BingX rejects reduceOnly for
+            # dual-side positions, where the opposite side + same positionSide
+            # already constrains the order to closing.
+            payload["reduceOnly"] = "true"
+        return payload
 
     async def _submit_order(self, symbol: str, params: dict[str, Any]) -> dict[str, Any]:
         """Place one order with strict idempotency.
 
-        The initial POST is single-attempt: the transport must never retry an
-        order placement, because a 5xx or timeout can still mean the order
-        reached the exchange. On any uncertain outcome the order is looked up by
-        `clientOrderId`, and only a *conclusive* "absent" answer permits exactly
-        one resubmission. An inconclusive lookup fails closed.
+        The POST is single-attempt: the transport must never retry an order
+        placement, because a 5xx or timeout can still mean the order reached the
+        exchange.
+
+        On an uncertain outcome this NEVER issues a second POST. BingX's own
+        description of `109421` is "may have been filled, cancelled, or order ID
+        is incorrect", so even that code does not prove the intent never landed —
+        resubmitting on it could duplicate a filled leveraged position. Instead
+        the order is reconciled by `clientOrderId` with a bounded number of
+        lookups; anything short of a confirmed "found" raises for operator
+        intervention. A missed entry is recoverable, a duplicate position is not.
+
+        Automatic resubmission may be reconsidered once the VST contract has been
+        validated against the live venue (plan §12.4/§12.5).
         """
         client_order_id = str(params["clientOrderId"])
         try:
@@ -649,31 +664,44 @@ class BingXFuturesClient:
             if isinstance(exc, ExchangeAPIError) and not exc.retryable:
                 # A definitive business rejection never created an order.
                 raise
-            status, resp = await self._lookup_order_by_client_id(symbol, client_order_id)
+            status, resp = await self._reconcile_uncertain_order(symbol, client_order_id)
             if status == "found":
                 return resp  # type: ignore[return-value]
-            if status == "absent":
-                return await self._signed_request(
-                    "POST",
-                    "/openApi/swap/v2/trade/order",
-                    params,
-                    allow_failover=False,
-                    allow_retries=False,
-                )
             raise ExchangeAPIError(
                 f"Order {client_order_id} for {symbol} is in an unknown state: the request failed "
-                f"({type(exc).__name__}: {exc}) and the clientOrderId lookup was inconclusive. "
-                "Refusing to resubmit — reconcile this order manually.",
+                f"({type(exc).__name__}: {exc}) and reconciliation by clientOrderId returned "
+                f"{status!r}. Refusing to resubmit — reconcile this order manually.",
                 retryable=False,
                 venue=self.venue,
             ) from exc
+
+    async def _reconcile_uncertain_order(
+        self,
+        symbol: str,
+        client_order_id: str,
+        attempts: int = 3,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Look the order up repeatedly; only a confirmed hit ends the uncertainty."""
+        status = "unknown"
+        resp: dict[str, Any] | None = None
+        for attempt in range(max(attempts, 1)):
+            status, resp = await self._lookup_order_by_client_id(symbol, client_order_id)
+            if status == "found":
+                return status, resp
+            if attempt < attempts - 1:
+                await self._sleep(min(0.5 * (2**attempt), 2.0))
+        return status, resp
 
     async def _lookup_order_by_client_id(
         self,
         symbol: str,
         client_order_id: str,
     ) -> tuple[str, dict[str, Any] | None]:
-        """Resolve an uncertain order to ("found", response) / ("absent", None) / ("unknown", None)."""
+        """Resolve an order to ("found", response) / ("absent", None) / ("unknown", None).
+
+        "absent" is reported ONLY for the documented `109421` code and is used for
+        diagnostics; it is deliberately not an authorization to resubmit.
+        """
         try:
             resp = await self._signed_request(
                 "GET",
@@ -682,7 +710,6 @@ class BingXFuturesClient:
                 allow_failover=False,
             )
         except ExchangeAPIError as exc:
-            # Only an explicit "no such order" proves the order never landed.
             if self._is_order_not_found(exc):
                 return "absent", None
             return "unknown", None
@@ -697,10 +724,13 @@ class BingXFuturesClient:
 
     @staticmethod
     def _is_order_not_found(exc: ExchangeAPIError) -> bool:
-        if str(exc.code or "") in _ORDER_NOT_FOUND_CODES:
-            return True
-        lowered = str(exc).lower()
-        return "not exist" in lowered or "not found" in lowered
+        """Documented order-not-found code only.
+
+        Free-text matching on "not exist"/"not found" is deliberately absent:
+        `109425` ("The trading pair does not exist") would match it while saying
+        nothing at all about whether our order was accepted.
+        """
+        return str(exc.code or "") in _ORDER_NOT_FOUND_CODES
 
     async def _order_fill(self, symbol: str, selector: dict[str, Any]) -> OrderFill | None:
         resp = await self._signed_request(

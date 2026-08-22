@@ -50,6 +50,20 @@ Review round 2 (PR #2) — all four follow-ups fixed:
 - [x] P2 `position_id` is captured at entry, persisted, loaded, and compared, so the
       identity-matching claim is now actually enforced.
 
+Review round 3 (PR #2) — all four follow-ups fixed:
+
+- [x] P0 Not-found detection is code-only (`109421`); free-text "not exist" matching removed
+      so `109425` (trading pair) can no longer authorise anything. Going further than asked:
+      an uncertain initial POST now NEVER triggers an automatic second POST, because BingX
+      describes `109421` itself as "may have been filled" — recovery is lookup/reconcile or
+      operator intervention.
+- [x] P1 Any dispatched attempt is conservatively billed (input estimated, flagged
+      estimated) even when it times out or fails before a parsed response.
+- [x] P1 A known position identity that the exchange readback no longer carries is unknown
+      exposure and blocks resume; legacy rows with no persisted id remain resumable and are
+      documented as such.
+- [x] P1 One-way mode close sends `reduceOnly=true`; hedge mode still omits it.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

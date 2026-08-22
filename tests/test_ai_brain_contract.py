@@ -258,16 +258,38 @@ class UsageAccumulationTests(unittest.TestCase):
         # be far larger than an estimate of the small repair request by itself.
         self.assertGreater(metric.usage.total_tokens, 1000)
 
-    def test_retry_without_provider_usage_accumulates_each_attempt(self) -> None:
+    def test_timed_out_attempt_is_still_billed_conservatively(self) -> None:
+        # A client timeout does not prove the provider skipped inference, so a
+        # dispatched attempt must be costed rather than assumed free.
         big_payload = {"blob": "y" * 4000}
         brain, _, recorded = _brain([httpx.ReadTimeout("slow"), _ok_response('{"ok": true}')])
         asyncio.run(
             brain._ask_grok(system_prompt="p", payload=big_payload, schema=_Result, reasoning_effort="low")
         )
         metric = recorded[-1]
-        # The timed-out attempt produced no response, so only the delivered
-        # attempt is billable — but it must be estimated, not zero.
         self.assertTrue(metric.usage.estimated)
+        self.assertEqual(metric.attempts, 2)
+        # Both dispatched requests carried the ~4000-char payload.
+        self.assertGreater(metric.usage.total_tokens, 2000)
+
+    def test_retryable_http_error_attempt_is_billed(self) -> None:
+        big_payload = {"blob": "z" * 4000}
+        brain, _, recorded = _brain([_status_error(503), _ok_response('{"ok": true}')])
+        asyncio.run(
+            brain._ask_grok(system_prompt="p", payload=big_payload, schema=_Result, reasoning_effort="low")
+        )
+        metric = recorded[-1]
+        self.assertEqual(metric.attempts, 2)
+        self.assertGreater(metric.usage.total_tokens, 2000)
+
+    def test_permanent_error_attempt_is_billed(self) -> None:
+        big_payload = {"blob": "q" * 4000}
+        brain, _, recorded = _brain([_status_error(401)])
+        asyncio.run(
+            brain._ask_grok(system_prompt="p", payload=big_payload, schema=_Result, reasoning_effort="low")
+        )
+        metric = recorded[-1]
+        self.assertFalse(metric.success)
         self.assertGreater(metric.usage.total_tokens, 900)
 
     def test_mixed_reported_and_estimated_attempts_are_summed(self) -> None:

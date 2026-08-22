@@ -64,6 +64,12 @@ def _client(responses: list[Any] | None = None, **kwargs: Any) -> BingXFuturesCl
         **kwargs,
     )
     client._client = _RecordingClient(responses or [])  # type: ignore[assignment]
+
+    async def _no_sleep(seconds: float) -> None:
+        # Reconciliation and retry backoff are real; tests should not pay for them.
+        return None
+
+    client._sleep = _no_sleep  # type: ignore[assignment]
     return client
 
 
@@ -392,20 +398,58 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(methods.count("POST"), 1)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "99")
 
-    async def test_conclusively_absent_order_is_resubmitted_once(self) -> None:
+    async def test_order_not_found_still_never_triggers_a_second_post(self) -> None:
+        # BingX documents 109421 as "may have been filled, cancelled, or order ID
+        # is incorrect", so it does not prove the intent never landed. Resubmitting
+        # on it could duplicate a filled position.
         client = _client(
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
-                # Explicit "order does not exist" proves the first POST never landed.
                 _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
-                _FakeResponse({"code": 0, "data": {"order": {"orderId": "7"}}}),
+                _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
+                _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertIn("Refusing to resubmit", str(ctx.exception))
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_trading_pair_not_found_is_not_read_as_order_absence(self) -> None:
+        # 109425 "The trading pair does not exist" says nothing about our order;
+        # free-text "not exist" matching used to accept it as proof of absence.
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 109425, "msg": "The trading pair does not exist"}),
+                _FakeResponse({"code": 109425, "msg": "The trading pair does not exist"}),
+                _FakeResponse({"code": 109425, "msg": "The trading pair does not exist"}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertIn("'unknown'", str(ctx.exception))
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_uncertain_post_reconciles_before_giving_up(self) -> None:
+        # The lookup is retried; a late confirmation resolves the uncertainty
+        # without ever issuing a second POST.
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                httpx.ReadTimeout("lookup timeout"),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "42", "clientOrderId": "x"}}}),
             ]
         )
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
-        self.assertEqual(methods.count("POST"), 2)
-        self.assertEqual(str(ack["data"]["order"]["orderId"]), "7")
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(str(ack["data"]["order"]["orderId"]), "42")
 
     async def test_empty_lookup_result_is_inconclusive_not_absent(self) -> None:
         # A success envelope with no order payload is ambiguous; resubmitting on
@@ -414,6 +458,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 0, "data": {}}),
+                _FakeResponse({"code": 0, "data": {}}),
                 _FakeResponse({"code": 0, "data": {}}),
             ]
         )
@@ -429,6 +475,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
                 _FakeResponse({"code": 101400, "msg": "order parameter validation failed"}),
+                _FakeResponse({"code": 101400, "msg": "order parameter validation failed"}),
+                _FakeResponse({"code": 101400, "msg": "order parameter validation failed"}),
             ]
         )
         with self.assertRaises(ExchangeAPIError):
@@ -441,8 +489,10 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
-                # Lookup itself fails: the order state is unknown, so resubmitting
-                # could create a duplicate position.
+                # Lookup itself keeps failing: the order state stays unknown, so
+                # resubmitting could create a duplicate position.
+                httpx.ReadTimeout("lookup timeout"),
+                httpx.ReadTimeout("lookup timeout"),
                 httpx.ReadTimeout("lookup timeout"),
             ]
         )
@@ -458,6 +508,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ReadTimeout("timeout"),
                 _FakeResponse({"code": 100500, "msg": "internal error"}),
+                _FakeResponse({"code": 100500, "msg": "internal error"}),
+                _FakeResponse({"code": 100500, "msg": "internal error"}),
             ]
         )
         with self.assertRaises(ExchangeAPIError):
@@ -472,13 +524,12 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 _FakeResponse({"code": 0, "msg": "bad gateway"}, status_code=502),
-                _FakeResponse({"code": 109421, "msg": "The specified order does not exist"}),
-                _FakeResponse({"code": 0, "data": {"order": {"orderId": "5"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "5", "clientOrderId": "x"}}}),
             ]
         )
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
-        self.assertEqual(methods.count("POST"), 2, "one initial attempt plus one post-lookup resubmit")
+        self.assertEqual(methods.count("POST"), 1)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "5")
 
     async def test_definitive_business_rejection_is_not_looked_up(self) -> None:
@@ -497,6 +548,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             [
                 _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
                 httpx.ConnectError("boom"),
+                httpx.ConnectError("lookup boom"),
+                httpx.ConnectError("lookup boom"),
                 httpx.ConnectError("lookup boom"),
             ]
         )
@@ -554,6 +607,65 @@ class WireContractTests(unittest.IsolatedAsyncioTestCase):
         await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
         params = client._client.requests[0]["params"]  # type: ignore[attr-defined]
         self.assertLessEqual(int(params["recvWindow"]), 5000)
+
+
+class ReduceOnlyModeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hedge_mode_close_omits_reduce_only(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 1}}}),
+            ],
+            position_mode="hedge",
+        )
+        await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1, reduce_only=True)
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertNotIn("reduceOnly", params)
+        self.assertEqual(params["positionSide"], "LONG")
+        self.assertEqual(params["side"], "SELL")
+
+    async def test_one_way_mode_close_sets_reduce_only(self) -> None:
+        # Without reduceOnly a one-way close whose quantity exceeds the live
+        # position flips into a new opposite position.
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 1}}}),
+            ],
+            position_mode="one_way",
+        )
+        await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1, reduce_only=True)
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertEqual(params["reduceOnly"], "true")
+        self.assertEqual(params["positionSide"], "BOTH")
+        self.assertEqual(params["side"], "SELL")
+
+    async def test_one_way_mode_entry_does_not_set_reduce_only(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 1}}}),
+            ],
+            position_mode="one_way",
+        )
+        await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertNotIn("reduceOnly", params)
+
+    async def test_one_way_limit_close_sets_reduce_only(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": 1}}}),
+            ],
+            position_mode="one_way",
+        )
+        await client.place_limit_order(
+            "BTC/USDT", PositionDirection.SHORT, 0.1, 64000.0, reduce_only=True, post_only=True
+        )
+        params = client._client.requests[-1]["params"]  # type: ignore[attr-defined]
+        self.assertEqual(params["reduceOnly"], "true")
+        self.assertEqual(params["timeInForce"], "PostOnly")
 
 
 class FillTests(unittest.IsolatedAsyncioTestCase):
