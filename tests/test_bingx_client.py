@@ -11,6 +11,7 @@ import httpx
 
 from bot.exchange.bingx_client import (
     BINGX_VST_BASE_URL,
+    REQUIRED_SOURCE_KEY,
     BingXFuturesClient,
     build_signature,
     canonical_param_string,
@@ -132,6 +133,33 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.venue_symbol("BTC/USDT"), "BTC-USDT")
         self.assertEqual(client.venue_symbol("eth-usdt"), "ETH-USDT")
 
+    async def test_source_key_header_matches_the_documented_value(self) -> None:
+        # BingX requires X-SOURCE-KEY: BX-AI-SKILL on every request, including
+        # public market endpoints. A free-form app identifier is not accepted.
+        self.assertEqual(REQUIRED_SOURCE_KEY, "BX-AI-SKILL")
+        client = _client([_FakeResponse({"code": 0, "data": {"price": "1"}})])
+        await client.get_last_price("BTC/USDT")
+        headers = client._client.requests[0]["headers"]  # type: ignore[attr-defined]
+        self.assertEqual(headers["X-SOURCE-KEY"], "BX-AI-SKILL")
+        self.assertNotIn("X-BX-APIKEY", headers, "public endpoints must not need the api key")
+
+    async def test_signed_request_also_sends_the_documented_source_key(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {}})])
+        await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
+        headers = client._client.requests[0]["headers"]  # type: ignore[attr-defined]
+        self.assertEqual(headers["X-SOURCE-KEY"], "BX-AI-SKILL")
+        self.assertEqual(headers["X-BX-APIKEY"], "test-key")
+
+    def test_incompatible_source_key_fails_fast(self) -> None:
+        with self.assertRaises(ValueError):
+            BingXFuturesClient(
+                api_key="k",
+                secret_key="s",
+                base_url=BINGX_VST_BASE_URL,
+                env="vst",
+                source_key="ai-perpetual-trading",
+            )
+
     async def test_signed_request_sends_headers_timestamp_and_recv_window(self) -> None:
         client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
         await client._signed_request("GET", "/openApi/swap/v2/user/positions", {"symbol": "BTC-USDT"})
@@ -171,6 +199,109 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExchangeAPIError) as ctx:
             await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
         self.assertIn("clock", str(ctx.exception).lower())
+
+
+class BusinessErrorPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Documented policy: `.pro` is for network failures only, never after a response."""
+
+    async def test_system_busy_is_transient_and_retried_on_the_same_host(self) -> None:
+        # 100500 "System busy. Please retry later." — the old prefix grouping
+        # classified this as permanent.
+        client = _client(
+            [
+                _FakeResponse({"code": 100500, "msg": "System busy. Please retry later."}),
+                _FakeResponse({"code": 0, "data": {"price": "5"}}),
+            ]
+        )
+        self.assertEqual(await client.get_last_price("BTC/USDT"), 5.0)
+        hosts = {item["url"].split("/openApi")[0] for item in client._client.requests}  # type: ignore[attr-defined]
+        self.assertEqual(hosts, {BINGX_VST_BASE_URL})
+
+    async def test_exhausted_transient_business_error_raises_without_pro_failover(self) -> None:
+        # 110500 "Order system busy. Please retry later." must never reach `.pro`.
+        client = _client(
+            [_FakeResponse({"code": 110500, "msg": "Order system busy. Please retry later."})] * 6
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_last_price("BTC/USDT")
+        hosts = {item["url"].split("/openApi")[0] for item in client._client.requests}  # type: ignore[attr-defined]
+        self.assertEqual(hosts, {BINGX_VST_BASE_URL}, "a business response must not fail over")
+        self.assertLessEqual(len(client._client.requests), 3)  # type: ignore[attr-defined]
+
+    async def test_permanent_business_error_raises_immediately(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 100413, "msg": "API Key is incorrect or missing."}),
+                _FakeResponse({"code": 0, "data": {"price": "9"}}),
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_last_price("BTC/USDT")
+        self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+    async def test_signature_failure_is_permanent_not_clock_drift(self) -> None:
+        client = _client([_FakeResponse({"code": 100001, "msg": "Request signature verification failed"})])
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+    async def test_trading_pair_not_supported_is_permanent(self) -> None:
+        client = _client(
+            [_FakeResponse({"code": 109425, "msg": "The trading pair does not exist or is not supported."})]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_last_price("BTC/USDT")
+        self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+
+class HedgeExposureTests(unittest.IsolatedAsyncioTestCase):
+    """Two simultaneous sides must never collapse into whichever row came first."""
+
+    def _payload(self, rows: list[dict]) -> _FakeResponse:
+        return _FakeResponse({"code": 0, "data": rows})
+
+    def _row(self, side: str, amount: str, position_id: str) -> dict:
+        return {
+            "symbol": "BTC-USDT",
+            "positionId": position_id,
+            "positionSide": side,
+            "positionAmt": amount,
+            "avgPrice": "64000",
+            "markPrice": "64100",
+            "liquidationPrice": "60000",
+        }
+
+    async def test_long_then_short_is_rejected(self) -> None:
+        client = _client(
+            [self._payload([self._row("LONG", "0.01", "p-1"), self._row("SHORT", "0.02", "p-2")])]
+        )
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client.get_symbol_position_details("BTC/USDT")
+        self.assertIn("simultaneous open positions", str(ctx.exception))
+
+    async def test_short_then_long_is_rejected_identically(self) -> None:
+        # Ordering must not decide whether exposure is detected.
+        client = _client(
+            [self._payload([self._row("SHORT", "0.02", "p-2"), self._row("LONG", "0.01", "p-1")])]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_symbol_position_details("BTC/USDT")
+
+    async def test_zero_rows_alongside_one_open_position_are_ignored(self) -> None:
+        client = _client(
+            [self._payload([self._row("SHORT", "0", "p-2"), self._row("LONG", "0.01", "p-1")])]
+        )
+        details = await client.get_symbol_position_details("BTC/USDT")
+        self.assertEqual(details.pos_side, "LONG")
+        self.assertEqual(details.position_id, "p-1")
+
+    async def test_dual_exposure_propagates_through_has_open_position(self) -> None:
+        client = _client(
+            [self._payload([self._row("LONG", "0.01", "p-1"), self._row("SHORT", "0.02", "p-2")])]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.has_open_position("BTC/USDT")
 
 
 class ContractMetadataTests(unittest.IsolatedAsyncioTestCase):

@@ -64,6 +64,15 @@ Review round 3 (PR #2) — all four follow-ups fixed:
       documented as such.
 - [x] P1 One-way mode close sends `reduceOnly=true`; hedge mode still omits it.
 
+Review round 4 (PR #2) — all three follow-ups fixed:
+
+- [x] P0 `X-SOURCE-KEY` is the documented `BX-AI-SKILL`, validated in both the client and
+      `Settings`, with wire tests on public and signed requests.
+- [x] P1 Business-error policy uses documented codes instead of prefixes (`100500` was
+      wrongly permanent), and no HTTP response can ever trigger `.pro` failover.
+- [x] P1 Multiple nonzero position rows for one symbol raise instead of silently
+      returning the first, so hedge dual exposure cannot hide from reconciliation.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

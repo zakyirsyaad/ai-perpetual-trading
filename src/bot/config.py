@@ -6,7 +6,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from bot.exchange.bingx_client import BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL
+from bot.exchange.bingx_client import (
+    BINGX_VST_BASE_URL,
+    BINGX_VST_FALLBACK_BASE_URL,
+    REQUIRED_SOURCE_KEY as BINGX_REQUIRED_SOURCE_KEY,
+)
 from bot.volume import VolumeBuildProfile
 
 BINGX_VST_HOSTS = frozenset({BINGX_VST_BASE_URL, BINGX_VST_FALLBACK_BASE_URL})
@@ -29,7 +33,8 @@ class Settings(BaseSettings):
     bingx_position_mode: str = Field(default="hedge", alias="BINGX_POSITION_MODE")
     # BingX documents recvWindow as "max 5000" ms; a larger value is rejected.
     bingx_recv_window_ms: int = Field(default=5000, ge=1000, le=5000, alias="BINGX_RECV_WINDOW_MS")
-    bingx_source_key: str = Field(default="ai-perpetual-trading", alias="BINGX_SOURCE_KEY")
+    # BingX requires the exact X-SOURCE-KEY value BX-AI-SKILL on every request.
+    bingx_source_key: str = Field(default=BINGX_REQUIRED_SOURCE_KEY, alias="BINGX_SOURCE_KEY")
     bingx_route_min_interval_seconds: float = Field(
         default=0.2,
         ge=0.0,
@@ -389,6 +394,17 @@ class Settings(BaseSettings):
         out = value.lower().strip()
         if out not in {"hedge", "one_way"}:
             raise ValueError("BINGX_POSITION_MODE must be 'hedge' or 'one_way'")
+        return out
+
+    @field_validator("bingx_source_key")
+    @classmethod
+    def validate_source_key(cls, value: str) -> str:
+        out = value.strip()
+        if out != BINGX_REQUIRED_SOURCE_KEY:
+            raise ValueError(
+                f"BINGX_SOURCE_KEY must be exactly {BINGX_REQUIRED_SOURCE_KEY!r} "
+                "(required by BingX on every request, including public endpoints)."
+            )
         return out
 
     @field_validator("bingx_env")

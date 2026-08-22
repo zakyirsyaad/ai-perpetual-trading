@@ -128,8 +128,19 @@ depend on that contract, never on a venue client.
 BingX specifics handled by `bot/exchange/bingx_client.py`:
 
 - ASCII-key-ordered canonical parameter string, HMAC-SHA256 lowercase-hex signature,
-  millisecond `timestamp` + `recvWindow`, `X-BX-APIKEY` and source headers. Clock-drift
-  responses are reported with an explicit "synchronize the system clock" hint.
+  millisecond `timestamp` + `recvWindow`, and `X-BX-APIKEY` on signed routes. The
+  `X-SOURCE-KEY: BX-AI-SKILL` header is required by BingX on **every** request including
+  public market data, so both the client and config validate that exact value and fail
+  fast on anything else. Clock-drift responses are reported with an explicit
+  "synchronize the system clock" hint.
+- `.pro` is used **only** after a connection error or timeout. Any HTTP response — success
+  or business error — is handled on the host that produced it: documented transient codes
+  (`100500`, `110500`, `101214`, `101219`, `109500`) are retried on the same host and then
+  raise, and every other `code != 0` raises immediately.
+- Hedge mode can report a LONG and a SHORT for one symbol at once. Rather than returning
+  whichever row came first — which would make exposure detection depend on response
+  ordering — multiple nonzero rows raise, because this runtime's invariant is one open
+  position in total.
 - Klines are filtered so only candles whose close time has passed are used.
 - Hedge mode: closing uses the **opposite order side with the same `positionSide`**, and
   `reduceOnly` is omitted because BingX rejects it for dual-side positions. One-way mode

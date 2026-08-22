@@ -38,16 +38,30 @@ from bot.models import PositionDirection
 
 BINGX_VST_BASE_URL = "https://open-api-vst.bingx.com"
 BINGX_VST_FALLBACK_BASE_URL = "https://open-api-vst.bingx.pro"
-DEFAULT_SOURCE_KEY = "ai-perpetual-trading"
+# Required by the BingX authentication contract on ALL requests, including
+# public market endpoints. The value is fixed, not a free-form app identifier.
+# Reference: skills/references/authentication.md
+REQUIRED_SOURCE_KEY = "BX-AI-SKILL"
+DEFAULT_SOURCE_KEY = REQUIRED_SOURCE_KEY
 DEFAULT_RECV_WINDOW_MS = 5000
 
 # BingX business codes that mean "your machine clock is wrong", surfaced with an
 # explicit hint because the raw message ("timestamp expired") is easy to misread.
-_CLOCK_DRIFT_CODES = {"100421", "100001", "80014"}
+_CLOCK_DRIFT_CODES = {"100421", "80014"}
 _CLOCK_DRIFT_TOKENS = ("timestamp", "recvwindow", "recv window")
 
-# Permanent business failures: never retried, never failed over to `.pro`.
-_PERMANENT_CODE_PREFIXES = ("1004", "1005", "8001", "1001")
+# Documented transient business codes — the only ones whose message actually says
+# "retry later". Everything else with code != 0 is a business error and is raised
+# immediately. Prefix grouping is deliberately gone: it classified 100500
+# ("System busy. Please retry later.") as permanent.
+# Reference: skills/references/error-codes.md
+_TRANSIENT_BUSINESS_CODES = {
+    "100500",  # System busy. Please retry later.
+    "110500",  # Order system busy. Please retry later.
+    "101214",  # Funding fee settlement is in progress. Retry in a few seconds.
+    "101219",  # Account assets are being processed and temporarily unavailable.
+    "109500",  # Internal server error. If it persists, please retry later.
+}
 
 # The ONLY documented code proving an order never existed:
 #   109421 "The specified order does not exist - may have been filled,
@@ -127,6 +141,11 @@ class BingXFuturesClient:
         self._margin_mode = str(margin_mode).strip().lower()
         self._position_mode = str(position_mode).strip().lower()
         self._recv_window_ms = int(recv_window_ms)
+        if str(source_key).strip() != REQUIRED_SOURCE_KEY:
+            raise ValueError(
+                f"BINGX_SOURCE_KEY must be exactly {REQUIRED_SOURCE_KEY!r}; BingX requires this "
+                "X-SOURCE-KEY value on every request, including public endpoints."
+            )
         self._source_key = source_key
         self._route_min_interval = float(route_min_interval_seconds)
         self._market_cache_seconds = float(market_cache_seconds)
@@ -505,17 +524,40 @@ class BingXFuturesClient:
         )
 
     async def get_symbol_position_details(self, symbol: str) -> PositionDetails:
+        """Return the single open position for a symbol.
+
+        In hedge mode BingX can report a LONG and a SHORT position for the same
+        symbol simultaneously. Returning whichever nonzero row happens to come
+        first would make exposure detection depend on response ordering and could
+        hide an entire opposite-side position from reconciliation. This runtime's
+        invariant is one open position in total, so multiple nonzero rows are an
+        error, not something to silently collapse.
+        """
         resp = await self.get_position_info(symbol)
         rows = resp.get("data") if isinstance(resp.get("data"), list) else []
         venue_symbol = self.venue_symbol(symbol)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("symbol", "")).upper() != venue_symbol:
-                continue
+        open_rows = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("symbol", "")).upper() == venue_symbol
+            and abs(self._decimal(row.get("positionAmt"))) > 0
+        ]
+        if len(open_rows) > 1:
+            described = ", ".join(
+                f"{row.get('positionSide') or '?'} size={abs(self._decimal(row.get('positionAmt')))}"
+                f" id={row.get('positionId') or '?'}"
+                for row in open_rows
+            )
+            raise ExchangeAPIError(
+                f"BingX reports {len(open_rows)} simultaneous open positions for {venue_symbol} "
+                f"({described}), but this runtime allows one position in total. Refusing to "
+                "represent multi-sided exposure as a single position — reconcile manually.",
+                retryable=False,
+                venue=self.venue,
+            )
+        for row in open_rows:
             size = abs(self._decimal(row.get("positionAmt")))
-            if size <= 0:
-                continue
             avg_price = self._decimal(row.get("avgPrice"))
             mark_price = self._optional_decimal(row.get("markPrice"))
             liquidation_price = self._optional_decimal(row.get("liquidationPrice"))
@@ -922,18 +964,20 @@ class BingXFuturesClient:
                         headers=self._headers(signed),
                     )
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
-                    # Network-level failure only: this is the sole condition under
-                    # which the `.pro` host is allowed to be tried.
+                    # Network-level failure only: a connection error or timeout is
+                    # the sole documented condition for trying the `.pro` host.
                     last_error = exc
                     break
                 try:
                     return self._parse_response(response, path)
                 except ExchangeAPIError as exc:
-                    last_error = exc
-                    if not exc.retryable:
+                    # We received an HTTP response. Per the documented domain
+                    # policy the business error is thrown here and NEVER retried
+                    # against `.pro`; transient codes may only be retried against
+                    # the same host, and exhausting them raises rather than
+                    # falling through to the next host.
+                    if not exc.retryable or attempt == attempts_per_host - 1:
                         raise
-                    if attempt == attempts_per_host - 1:
-                        break
                     await self._sleep(min(0.8 * (2**attempt), 4.0))
         if isinstance(last_error, ExchangeAPIError):
             raise last_error
@@ -1015,12 +1059,10 @@ class BingXFuturesClient:
 
     @classmethod
     def _is_transient_business_code(cls, code: str, message: str) -> bool:
+        """Only the documented "please retry later" codes are transient."""
         if cls._is_clock_drift(code, message):
             return False
-        if any(code.startswith(prefix) for prefix in _PERMANENT_CODE_PREFIXES):
-            return False
-        lowered = message.lower()
-        return "too many" in lowered or "rate limit" in lowered or "busy" in lowered
+        return code in _TRANSIENT_BUSINESS_CODES
 
     async def _throttle(self, route: str) -> None:
         if self._route_min_interval <= 0:
