@@ -19,7 +19,7 @@ Catatan untuk codex / sesi berikutnya. File ini boleh dihapus setelah dibaca.
 2. Sync `0794e06` + kerjaan codex ke VPS.
 3. **Update `.env` VPS manual** (gitignored — TIDAK ikut git):
    ```
-   XAI_API_KEY=fe_oa_32f6f90268d90a01d487c6435dcfb1865ebe885238bf3941
+   XAI_API_KEY=<set-on-vps-env>
    XAI_BASE_URL=https://api.freemodel.dev/v1
    XAI_MODEL=gpt-5.4
    XAI_API_STYLE=chat

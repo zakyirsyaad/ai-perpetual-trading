@@ -6,6 +6,7 @@ from typing import Any
 
 from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, GrokBrain
+from bot.ai.trade_memory import build_trade_decision_memory
 from bot.config import Settings
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
@@ -59,7 +60,13 @@ class AIOrchestrator:
 
     async def next_trade_plan(self, daily_state: DailyRiskState) -> TradePlan | None:
         market_context = await self._intelligence.build_context()
-        recent_performance = await self._trade_store.recent_performance_summary(limit=50)
+        recent_performance = await self._trade_store.recent_performance_summary(
+            limit=self._settings.ai_recent_performance_limit,
+        )
+        recent_trade_records = await self._trade_store.recent_closed_trade_records(
+            limit=self._settings.ai_trade_memory_limit,
+        )
+        learned_trade_memory = build_trade_decision_memory(recent_trade_records)
         context_dict = market_context.to_dict()
         payload = {
             "task": "ai_volume_entry_decision" if self._strategy_mode == "ai_volume" else "entry_decision",
@@ -94,16 +101,19 @@ class AIOrchestrator:
                 self._signal_designer.review(context_dict).to_dict(),
             ],
             "recent_executed_trade_performance": recent_performance,
+            "learned_trade_memory": learned_trade_memory,
             "output_rules": {
-                "allowed_actions": ["OPEN_LONG", "OPEN_SHORT"],
+                "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
                 "use_only_allowed_symbols": True,
                 "only_demo_trades_are_executed": True,
                 "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
                 "choose_best_symbol_not_default_symbol": True,
                 "return_one_decision_per_symbol": True,
                 "ai_volume_mode_priorities": [
-                    "This is a volume-building run: always open a directional trade, never sit out.",
-                    "Pick the side the OKX technicals lean toward; the execution layer handles volume sizing.",
+                    "This is a volume-building run, but realized net PnL matters more than forced entries.",
+                    "Use learned_trade_memory to avoid entry patterns that recently ended in stop_loss or liquidation_guard.",
+                    "HOLD is valid when no symbol has enough expected gross move to beat round-trip taker fees plus a buffer.",
+                    "Prefer fewer cleaner trades over repeating recent losing decision patterns.",
                 ]
                 if self._strategy_mode == "ai_volume"
                 else [],

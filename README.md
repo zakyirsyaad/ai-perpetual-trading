@@ -48,6 +48,7 @@ src/
 - OKX demo requests include the `x-simulated-trading: 1` header.
 - AI provider is pluggable via `XAI_API_STYLE` (`responses` / `chat` / `messages`). `config.py` defaults to the `chat` profile (`XAI_MODEL=gpt-5.4`, freemodel.dev); the live `.env` runs `messages` + `deepseek-v4-flash` on openmodel.ai. The `xai_*` names and "Grok" log lines are historical — the brain is provider-agnostic.
 - xAI reasoning effort defaults to `high` (`XAI_REASONING_EFFORT`); ignored by providers that don't accept a reasoning field.
+- Keep AI requests compact with `XAI_MAX_TOKENS`, `AI_RECENT_PERFORMANCE_LIMIT`, and `AI_TRADE_MEMORY_LIMIT`. This reduces model TPM rate-limit risk without changing the decision strategy.
 - OKX safety defaults are isolated margin, explicit leverage caps, and one net open position total.
 - `STRATEGY_MODE=ai_volume` lets Grok choose timing, symbol, and direction while execution size follows the volume-builder profile. `STRATEGY_MODE=volume` keeps deterministic rotation, and `STRATEGY_MODE=grok` keeps normal AI risk-sized trading.
 - The OKX runtime refreshes exchange taker fees when `USE_EXCHANGE_FEE_RATES=true`, blocks entries when order-book spread/depth is poor, skips entries near funding, and checks liquidation distance after entry.
@@ -73,14 +74,16 @@ VOLUME_BREAKEVEN_EXIT_ENABLED=false
 VOLUME_BREAKEVEN_MIN_PROFIT_USDT=0
 VOLUME_STOP_AT_TARGET_ENABLED=true
 VOLUME_DAILY_FEE_BUDGET_USDT=600
+TRADING_TIMEZONE=Asia/Jakarta
 ```
 
 That profile projects `180 * 100 * 2 = 36,000 USDT` round-trip volume per
 completed entry and `36,000 * 28 = 1,008,000 USDT` per day, so a `30,000,000 USDT`
 target is roughly a one-month demo run before partial fills, skipped entries,
 fees, and exchange limits. `VOLUME_DAILY_TARGET_USDT=1000000` pauses new volume
-entries after the daily minimum is reached, while `VOLUME_DAILY_FEE_BUDGET_USDT`
-caps estimated daily taker fee spend. Keep `VOLUME_BREAKEVEN_EXIT_ENABLED=false`
+entries after the daily minimum is reached for the configured `TRADING_TIMEZONE`,
+while `VOLUME_DAILY_FEE_BUDGET_USDT` caps estimated daily taker fee spend. Keep
+`VOLUME_BREAKEVEN_EXIT_ENABLED=false`
 for the live `ai_volume` profile; enabling it closes winners near breakeven
 before the confluence TP can play out. In `ai_volume` mode the AI key is
 required because Grok chooses whether to trade; in deterministic `volume` mode

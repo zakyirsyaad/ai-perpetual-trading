@@ -79,6 +79,7 @@ async def run() -> None:
         max_stop_losses_per_day=settings.max_stop_loss_per_day,
         max_daily_drawdown_usdt=settings.max_daily_drawdown_usdt,
         max_consecutive_losses=settings.max_consecutive_losses,
+        trading_timezone=settings.trading_timezone,
     )
     signal_aggregator = ExternalSignalAggregator.from_settings(settings, logger)
     intelligence = MarketIntelligence(settings, client, signal_aggregator, logger)

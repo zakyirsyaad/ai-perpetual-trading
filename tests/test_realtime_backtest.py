@@ -5,6 +5,7 @@ from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from io import StringIO
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from bot.exchange.okx_client import OKXFundingRateInfo, OKXOrderBook
 from realtime_backtest import (
@@ -50,6 +51,7 @@ class RealtimeBacktestTests(unittest.TestCase):
             volume_breakeven_min_seconds=5,
             volume_breakeven_min_profit_usdt=0,
             execution_guards_enabled=True,
+            confluence_enabled=False,
             okx_max_spread_bps=6,
             min_orderbook_depth_multiplier=1.2,
             max_abs_funding_rate=0.001,
@@ -95,6 +97,61 @@ class RealtimeBacktestTests(unittest.TestCase):
         self.assertGreater(summary.window_notional_volume_usdt, 0)
         self.assertGreater(summary.projected_daily_volume_usdt, 0)
         self.assertEqual(summary.configured_daily_entries_to_target, 2)
+
+    def test_volume_simulation_holds_when_confluence_rejects_entry(self) -> None:
+        settings = SimpleNamespace(
+            symbols=("BTC/USDT",),
+            account_balance_usdt=1_500,
+            volume_margin_per_entry_usdt=180,
+            position_usdt=180,
+            leverage=100,
+            volume_sides_per_entry=2,
+            trade_target_per_day=28,
+            volume_target_usdt=10_000_000,
+            volume_daily_target_usdt=1_000_000,
+            position_hold_minutes=5,
+            entry_interval_minutes=3,
+            stop_loss_pct=0.08,
+            take_profit_pct=0.12,
+            taker_fee_pct=0.05,
+            volume_breakeven_exit_enabled=False,
+            volume_breakeven_min_seconds=0,
+            volume_breakeven_min_profit_usdt=0,
+            execution_guards_enabled=False,
+            confluence_enabled=True,
+            confluence_min_agreement=0.55,
+            confluence_min_atr_pct=0.05,
+            confluence_min_score=0.05,
+            confluence_atr_tp_mult=3.0,
+            confluence_atr_sl_mult=1.0,
+        )
+        candles = {
+            "BTC/USDT": [
+                BacktestCandle(
+                    timestamp_ms=i * 60_000,
+                    open=100 + i * 0.01,
+                    high=100.1 + i * 0.01,
+                    low=99.9 + i * 0.01,
+                    close=100 + i * 0.01,
+                    volume=1_000,
+                )
+                for i in range(80)
+            ]
+        }
+
+        with patch("realtime_backtest.FactorRegistry") as registry_class:
+            registry_class.return_value.score_symbol.return_value = []
+            summary = simulate_realtime_backtest(
+                settings,
+                candles,
+                order_books={"BTC/USDT": None},
+                funding={"BTC/USDT": None},
+                interval_minutes=1,
+                strategy="volume",
+            )
+
+        self.assertEqual(summary.simulated_trades, 0)
+        self.assertGreater(summary.skipped_entries, 0)
 
     def test_maker_only_uses_maker_fee_on_non_forced_exits(self) -> None:
         maker_only = SimpleNamespace(

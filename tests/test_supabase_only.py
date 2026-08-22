@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import date
 import unittest
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from bot.config import Settings
+from bot.storage.supabase_trade_store import SupabaseTradeStore
 from report_arena import build_parser
 
 
@@ -65,6 +68,30 @@ class SupabaseOnlyTests(unittest.TestCase):
         self.assertNotIn("--db", help_text)
         self.assertIn("--supabase-url", help_text)
         self.assertIn("--service-role-key", help_text)
+
+    def test_daily_trade_window_uses_configured_trading_timezone(self) -> None:
+        store = object.__new__(SupabaseTradeStore)
+        store._trades_table = "trades"
+        store._trading_tz = ZoneInfo("Asia/Jakarta")
+        captured: dict[str, object] = {}
+
+        async def fake_get_rows(table, params):
+            captured["table"] = table
+            captured["params"] = params
+            return []
+
+        store._get_rows = fake_get_rows
+
+        async def run() -> None:
+            await store._closed_trade_rows_for_day(date(2026, 6, 23), "id")
+
+        import asyncio
+
+        asyncio.run(run())
+
+        self.assertEqual(captured["table"], "trades")
+        self.assertIn(("closed_at", "gte.2026-06-22T17:00:00+00:00"), captured["params"])
+        self.assertIn(("closed_at", "lt.2026-06-23T17:00:00+00:00"), captured["params"])
 
 
 if __name__ == "__main__":
