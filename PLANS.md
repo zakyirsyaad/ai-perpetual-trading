@@ -87,6 +87,14 @@ Review round 6 (PR #2) — fixed:
 - [x] P3 Removed the extra blank line at EOF so `git diff --check` is clean across the
       accumulated PR diff, not just the latest delta.
 
+Review round 7 (PR #2) — fixed:
+
+- [x] P1 The effective SL/TP is captured at entry, persisted, loaded, and used when a
+      position is resumed, so a restart cannot substitute the current configuration for the
+      risk envelope a running trade was opened under. Missing/invalid envelopes fail closed.
+- [x] P1 `X-SOURCE-KEY` is validated byte-exact in the client and stored normalised, so a
+      padded value can never reach the wire.
+
 Operational, not code — must be done on the VPS/exchange before and after cutover:
 
 - [ ] §12.1 Collect a baseline with usage instrumentation before behavior changes.

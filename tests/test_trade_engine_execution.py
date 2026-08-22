@@ -301,6 +301,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.open_positions[0].position_id, "p-live")
 
+    async def test_entry_persists_the_effective_risk_envelope(self) -> None:
+        client = FakeClient()
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        await engine._execute_single_trade(_plan(stop_loss_pct=0.5, take_profit_pct=1.2))
+
+        self.assertEqual(store.open_positions[0].stop_loss_pct, 0.5)
+        self.assertEqual(store.open_positions[0].take_profit_pct, 1.2)
+
     async def test_take_profit_exit_is_detected(self) -> None:
         store = FakeStore()
 

@@ -142,12 +142,16 @@ class BingXFuturesClient:
         self._margin_mode = str(margin_mode).strip().lower()
         self._position_mode = str(position_mode).strip().lower()
         self._recv_window_ms = int(recv_window_ms)
-        if str(source_key).strip() != REQUIRED_SOURCE_KEY:
+        # Byte-exact: a padded value would validate but then be sent verbatim,
+        # putting a non-conformant X-SOURCE-KEY on the wire. Settings normalises
+        # whitespace for the config path; direct construction must still be safe.
+        if source_key != REQUIRED_SOURCE_KEY:
             raise ValueError(
-                f"BINGX_SOURCE_KEY must be exactly {REQUIRED_SOURCE_KEY!r}; BingX requires this "
-                "X-SOURCE-KEY value on every request, including public endpoints."
+                f"BINGX_SOURCE_KEY must be exactly {REQUIRED_SOURCE_KEY!r} with no surrounding "
+                "whitespace; BingX requires this X-SOURCE-KEY value on every request, including "
+                f"public endpoints (received {source_key!r})."
             )
-        self._source_key = source_key
+        self._source_key = REQUIRED_SOURCE_KEY
         self._route_min_interval = float(route_min_interval_seconds)
         self._market_cache_seconds = float(market_cache_seconds)
         self._debug_http = debug_http

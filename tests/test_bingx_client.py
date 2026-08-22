@@ -178,6 +178,25 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
                 source_key="ai-perpetual-trading",
             )
 
+    def test_padded_source_key_is_rejected_not_silently_sent(self) -> None:
+        # A padded value would validate under a strip() comparison and then go on
+        # the wire verbatim, breaking the exact-value contract.
+        with self.assertRaises(ValueError):
+            BingXFuturesClient(
+                api_key="k",
+                secret_key="s",
+                base_url=BINGX_VST_BASE_URL,
+                env="vst",
+                source_key=" BX-AI-SKILL ",
+            )
+
+    async def test_header_value_on_the_wire_is_byte_exact(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {"price": "1"}})])
+        await client.get_last_price("BTC/USDT")
+        header = client._client.requests[0]["headers"]["X-SOURCE-KEY"]  # type: ignore[attr-defined]
+        self.assertEqual(header, "BX-AI-SKILL")
+        self.assertEqual(header, header.strip())
+
     async def test_signed_request_sends_headers_timestamp_and_recv_window(self) -> None:
         client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
         await client._signed_request("GET", "/openApi/swap/v2/user/positions", {"symbol": "BTC-USDT"})

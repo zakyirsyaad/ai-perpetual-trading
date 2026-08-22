@@ -92,6 +92,8 @@ def _open_position() -> OpenPosition:
         opened_at=datetime.now(timezone.utc),
         entry_reason="ai_volume:OPEN_LONG",
         position_id="p-1",
+        stop_loss_pct=0.5,
+        take_profit_pct=1.2,
     )
 
 
@@ -181,6 +183,8 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post["json"]["status"], "open")
         self.assertEqual(post["json"]["exchange"], "bingx")
         self.assertEqual(post["json"]["position_id"], "p-1")
+        self.assertEqual(post["json"]["stop_loss_pct"], 0.5)
+        self.assertEqual(post["json"]["take_profit_pct"], 1.2)
 
     async def test_open_position_write_failure_does_not_raise(self) -> None:
         await _store(_FakeHTTP(status=500)).save_open_position(_open_position())
@@ -205,6 +209,8 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
                     "opened_at": "2026-08-22T00:00:00+00:00",
                     "entry_reason": "ai_volume",
                     "position_id": "p-1",
+                    "stop_loss_pct": 0.5,
+                    "take_profit_pct": 1.2,
                 }
             ]
         )
@@ -212,6 +218,26 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].direction, PositionDirection.LONG)
         self.assertEqual(positions[0].position_id, "p-1")
+        self.assertEqual(positions[0].stop_loss_pct, 0.5)
+        self.assertEqual(positions[0].take_profit_pct, 1.2)
+
+    async def test_missing_envelope_columns_load_as_none(self) -> None:
+        http = _FakeHTTP(
+            rows=[
+                {
+                    "symbol": "BTC/USDT",
+                    "direction": "LONG",
+                    "entry_price": 60000.0,
+                    "quantity": 0.01,
+                    "exchange_size": 0.01,
+                    "exchange_order_id": "e1",
+                    "opened_at": "2026-08-22T00:00:00+00:00",
+                }
+            ]
+        )
+        positions = await _store(http).list_open_positions()
+        self.assertIsNone(positions[0].stop_loss_pct)
+        self.assertIsNone(positions[0].take_profit_pct)
 
     async def test_unreadable_position_rows_are_skipped(self) -> None:
         http = _FakeHTTP(rows=[{"symbol": "BTC/USDT"}])

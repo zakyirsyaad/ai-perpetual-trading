@@ -160,7 +160,11 @@ restart the engine matches persisted state against the exchange:
 - Matching is on **identity, not just symbol**: `positionSide`/direction, quantity (within a
   small partial-fill tolerance), average entry price, and position id must all agree. A
   persisted LONG is never matched to an exchange SHORT, or to a materially different size.
-- A confirmed match is **resumed** and fully monitored.
+- A confirmed match is **resumed** and fully monitored **on its own persisted SL/TP**, never
+  on whatever the configuration says after a redeploy — a running trade keeps the risk
+  envelope it was opened under. A persisted record whose envelope is missing, non-positive,
+  or non-finite is treated as unknown exposure rather than silently re-priced with current
+  settings.
 - Anything else — a mismatch, an unreadable position, or exposure with no persisted record —
   is unknown exposure and is **never auto-flattened**. New entries are blocked and the
   operator is alerted, because flattening unknown exposure could close a position this

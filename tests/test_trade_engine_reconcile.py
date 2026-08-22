@@ -80,7 +80,12 @@ class _FakeStore:
         self._positions = [item for item in self._positions if item.symbol != symbol]
 
 
-def _position(symbol: str = "BTC/USDT", position_id: str | None = None) -> OpenPosition:
+def _position(
+    symbol: str = "BTC/USDT",
+    position_id: str | None = None,
+    stop_loss_pct: float | None = 0.5,
+    take_profit_pct: float | None = 1.2,
+) -> OpenPosition:
     return OpenPosition(
         symbol=symbol,
         direction=PositionDirection.LONG,
@@ -91,6 +96,8 @@ def _position(symbol: str = "BTC/USDT", position_id: str | None = None) -> OpenP
         opened_at=datetime.now(timezone.utc) - timedelta(minutes=5),
         entry_reason="ai_volume:OPEN_LONG",
         position_id=position_id,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
     )
 
 
@@ -244,14 +251,49 @@ class ReconcileTests(unittest.IsolatedAsyncioTestCase):
 
         await engine._tick()  # must return before any risk-state work
 
-    async def test_resumed_plan_uses_configured_risk_envelope(self) -> None:
+    async def test_resumed_plan_uses_the_persisted_risk_envelope(self) -> None:
+        # Envelope A at entry; Settings now carry envelope B (0.08 / 0.12). The
+        # running trade must keep the risk it was actually opened under.
         engine = _engine(_FakeClient({"BTC/USDT"}), _FakeStore([]))
-        plan = engine._plan_from_resumed_position(_position())
+        plan = engine._plan_from_resumed_position(_position(stop_loss_pct=0.5, take_profit_pct=1.2))
         self.assertEqual(plan.symbol, "BTC/USDT")
         self.assertEqual(plan.direction, PositionDirection.LONG)
-        self.assertEqual(plan.stop_loss_pct, 0.08)
-        self.assertEqual(plan.take_profit_pct, 0.12)
+        self.assertEqual(plan.stop_loss_pct, 0.5)
+        self.assertEqual(plan.take_profit_pct, 1.2)
+        self.assertNotEqual(plan.stop_loss_pct, engine._settings.stop_loss_pct)
         self.assertIn("resumed_after_restart", plan.decision_reason)
+
+    async def test_legacy_row_without_an_envelope_blocks_entries(self) -> None:
+        client = _FakeClient({"BTC/USDT"})
+        engine = _engine(client, _FakeStore([_position(stop_loss_pct=None, take_profit_pct=None)]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("risk envelope", engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+        self.assertEqual(client.flattened, [])
+
+    async def test_non_positive_persisted_envelope_blocks_entries(self) -> None:
+        engine = _engine(_FakeClient({"BTC/USDT"}), _FakeStore([_position(stop_loss_pct=0.0)]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("valid positive percentage", engine._entries_blocked_reason)
+
+    async def test_non_finite_persisted_envelope_blocks_entries(self) -> None:
+        engine = _engine(_FakeClient({"BTC/USDT"}), _FakeStore([_position(take_profit_pct=float("nan"))]))
+
+        await engine._reconcile_local_open_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertEqual(engine._resumable_positions, [])
+
+    async def test_resume_refuses_an_unusable_envelope_defensively(self) -> None:
+        engine = _engine(_FakeClient({"BTC/USDT"}), _FakeStore([]))
+        with self.assertRaises(RuntimeError):
+            engine._plan_from_resumed_position(_position(stop_loss_pct=None))
 
 
 class StartupSafetyTests(unittest.IsolatedAsyncioTestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 
 from bot.config import Settings
@@ -312,6 +313,8 @@ class TradeEngine:
             opened_at=opened_at,
             entry_reason=plan.decision_reason,
             position_id=getattr(position_details, "position_id", None),
+            stop_loss_pct=plan.stop_loss_pct,
+            take_profit_pct=plan.take_profit_pct,
         )
         await self._trade_store.save_open_position(open_position)
 
@@ -555,6 +558,12 @@ class TradeEngine:
                 )
                 continue
 
+            envelope_problem = self._risk_envelope_problem(position)
+            if envelope_problem is not None:
+                unknown_exposure.append(f"{symbol} ({envelope_problem})")
+                local_by_symbol.pop(symbol, None)
+                continue
+
             mismatch = self._position_mismatch_reason(position, details)
             if mismatch is not None:
                 unknown_exposure.append(f"{symbol} ({mismatch})")
@@ -592,6 +601,32 @@ class TradeEngine:
         except Exception as exc:
             self._logger.error("Could not read exchange position details for %s: %s", symbol, exc)
             return None
+
+    @staticmethod
+    def _risk_envelope_problem(position: OpenPosition) -> str | None:
+        """Reject a persisted position whose own SL/TP cannot be trusted.
+
+        Resuming on the *current* configuration would silently re-price the risk
+        of a trade that is already running, so a missing, non-positive, or
+        non-finite envelope is unknown exposure requiring an operator, not
+        something to paper over with today's settings.
+        """
+        for label, value in (
+            ("stop_loss_pct", position.stop_loss_pct),
+            ("take_profit_pct", position.take_profit_pct),
+        ):
+            if value is None:
+                return (
+                    f"persisted record has no {label}, so the risk envelope this position "
+                    "was opened under is unknown"
+                )
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return f"persisted {label} {value!r} is not a number"
+            if not math.isfinite(numeric) or numeric <= 0:
+                return f"persisted {label} {value!r} is not a valid positive percentage"
+        return None
 
     def _position_mismatch_reason(self, position: OpenPosition, details) -> str | None:
         """Return why a persisted position does not match the exchange, or None."""
@@ -657,18 +692,23 @@ class TradeEngine:
                 self._logger.exception("Failed to manage resumed position for %s.", position.symbol)
 
     def _plan_from_resumed_position(self, position: OpenPosition) -> TradePlan:
-        """Reconstruct the deterministic risk envelope for a resumed position.
+        """Rebuild the trade plan for a resumed position.
 
-        The original AI reasoning is not replayed; the configured SL/TP and hold
-        window are applied so a resumed position is protected immediately.
+        The original AI reasoning is not replayed, but the risk envelope is the
+        one the position was actually opened under — never the current
+        configuration, which may have changed across a redeploy. Reconciliation
+        has already rejected any position whose persisted envelope is unusable.
         """
+        problem = self._risk_envelope_problem(position)
+        if problem is not None:  # pragma: no cover - reconcile filters these first
+            raise RuntimeError(f"Refusing to resume {position.symbol}: {problem}")
         return TradePlan(
             symbol=position.symbol,
             direction=position.direction,
             usdt_size=self._settings.position_usdt,
             leverage=self._settings.leverage,
-            stop_loss_pct=self._settings.stop_loss_pct,
-            take_profit_pct=self._settings.take_profit_pct,
+            stop_loss_pct=float(position.stop_loss_pct),
+            take_profit_pct=float(position.take_profit_pct),
             decision_reason=f"resumed_after_restart:{position.entry_reason}",
         )
 

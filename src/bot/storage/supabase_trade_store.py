@@ -67,6 +67,8 @@ class SupabaseTradeStore:
                     "exchange_size": position.exchange_size,
                     "exchange_order_id": position.exchange_order_id,
                     "position_id": position.position_id,
+                    "stop_loss_pct": position.stop_loss_pct,
+                    "take_profit_pct": position.take_profit_pct,
                     "entry_reason": position.entry_reason,
                     "opened_at": position.opened_at.isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -116,6 +118,8 @@ class SupabaseTradeStore:
                         position_id=(
                             str(row["position_id"]) if row.get("position_id") not in (None, "") else None
                         ),
+                        stop_loss_pct=self._optional_float(row.get("stop_loss_pct")),
+                        take_profit_pct=self._optional_float(row.get("take_profit_pct")),
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
@@ -355,6 +359,15 @@ class SupabaseTradeStore:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500] if exc.response is not None else ""
             raise RuntimeError(f"Supabase request failed for table {table}: {exc} body={body}") from exc
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
