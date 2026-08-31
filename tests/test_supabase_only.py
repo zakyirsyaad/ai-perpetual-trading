@@ -85,6 +85,8 @@ class SupabaseOnlyTests(unittest.TestCase):
     def test_daily_trade_window_uses_configured_trading_timezone(self) -> None:
         store = object.__new__(SupabaseTradeStore)
         store._trades_table = "trades"
+        store._exchange = "bingx"
+        store._volume_cycle_started_at = None
         store._trading_tz = ZoneInfo("Asia/Jakarta")
         captured: dict[str, object] = {}
 
@@ -103,6 +105,7 @@ class SupabaseOnlyTests(unittest.TestCase):
         asyncio.run(run())
 
         self.assertEqual(captured["table"], "trades")
+        self.assertIn(("exchange", "eq.bingx"), captured["params"])
         self.assertIn(("closed_at", "gte.2026-06-22T17:00:00+00:00"), captured["params"])
         self.assertIn(("closed_at", "lt.2026-06-23T17:00:00+00:00"), captured["params"])
 
