@@ -254,6 +254,7 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
                         build_signature("test-secret", signed_payload),
                     )
                 )
+                self.assertEqual(client._client.requests[0]["wire_body"], "")  # type: ignore[attr-defined]
 
     async def test_signed_post_uses_form_body_not_query_params(self) -> None:
         timestamp = 1_700_000_000_000
@@ -276,16 +277,34 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signed_payload, expected_payload)
         self.assertTrue(hmac.compare_digest(wire_signature, build_signature("test-secret", signed_payload)))
 
-    async def test_signed_params_reject_query_delimiter_in_values(self) -> None:
-        client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
-        with self.assertRaises(ExchangeAPIError) as ctx:
-            await client._signed_request(
-                "GET",
-                "/openApi/swap/v2/user/positions",
-                {"symbol": "BTC-USDT&side=BUY"},
-            )
-        self.assertIn("forbidden character", str(ctx.exception))
-        self.assertEqual(client._client.requests, [])  # type: ignore[attr-defined]
+    async def test_signed_get_and_delete_do_not_claim_to_have_a_json_body(self) -> None:
+        for method in ("GET", "DELETE"):
+            with self.subTest(method=method):
+                client = _client([_FakeResponse({"code": 0, "data": {}})])
+                await client._signed_request(method, "/openApi/swap/v2/trade/order", {"orderId": "1"})
+                headers = client._client.requests[0]["headers"]  # type: ignore[attr-defined]
+                self.assertNotIn("Content-Type", headers)
+
+    async def test_public_request_transport_is_unchanged(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {"price": "1"}})])
+        await client.get_last_price("BTC/USDT")
+        sent = client._client.requests[0]  # type: ignore[attr-defined]
+        self.assertEqual(sent["params"]["symbol"], "BTC-USDT")
+        self.assertEqual(sent["wire_body"], "")
+        self.assertEqual(sent["headers"]["Content-Type"], "application/json")
+
+    async def test_signed_params_reject_delimiters_and_header_breaks_before_sending(self) -> None:
+        for forbidden in ("&", "=", "?", "#", "\r", "\n"):
+            for params in (
+                {f"sym{forbidden}bol": "BTC-USDT"},
+                {"symbol": f"BTC{forbidden}USDT"},
+            ):
+                with self.subTest(forbidden=repr(forbidden), params=params):
+                    client = _client([_FakeResponse({"code": 0, "data": {}})])
+                    with self.assertRaises(ExchangeAPIError) as ctx:
+                        await client._signed_request("POST", "/openApi/swap/v2/trade/order", params)
+                    self.assertIn("forbidden character", str(ctx.exception))
+                    self.assertEqual(client._client.requests, [])  # type: ignore[attr-defined]
 
     async def test_business_error_is_not_retried_on_pro_domain(self) -> None:
         client = _client([_FakeResponse({"code": 100413, "msg": "Incorrect apiKey"})])

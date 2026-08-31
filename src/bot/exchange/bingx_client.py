@@ -1034,10 +1034,14 @@ class BingXFuturesClient:
                 )
 
     def _headers(self, signed: bool, *, form_body: bool = False) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded" if form_body else "application/json",
-            "X-SOURCE-KEY": self._source_key,
-        }
+        # Preserve the established public-request headers. Signed GET/DELETE
+        # requests have no entity body, so advertising JSON there is misleading;
+        # the official helper only sets Content-Type for signed POST form bodies.
+        headers = {"X-SOURCE-KEY": self._source_key}
+        if not signed:
+            headers["Content-Type"] = "application/json"
+        elif form_body:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         if signed:
             headers["X-BX-APIKEY"] = self._api_key
         return headers
