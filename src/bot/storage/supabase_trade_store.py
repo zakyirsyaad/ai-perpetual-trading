@@ -29,6 +29,7 @@ class SupabaseTradeStore:
         self._ai_call_metrics_table = settings.supabase_ai_call_metrics_table
         self._open_positions_table = settings.supabase_open_positions_table
         self._exchange = settings.exchange_name
+        self._volume_cycle_started_at = getattr(settings, "volume_cycle_started_at", None)
         self._logger = logger
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
         self._trading_tz = ZoneInfo(settings.trading_timezone)
@@ -202,6 +203,7 @@ class SupabaseTradeStore:
             self._trades_table,
             [
                 ("select", "entry_reason,pnl_usdt,closed_at"),
+                ("exchange", f"eq.{self._exchange}"),
                 ("order", "closed_at.desc"),
                 ("limit", str(limit)),
             ],
@@ -217,7 +219,11 @@ class SupabaseTradeStore:
         return sum(1 for row in rows if row.get("reason") == "stop_loss")
 
     async def total_volume_for_day(self, day: date | None = None) -> float:
-        rows = await self._closed_trade_rows_for_day(day, "entry_price,exit_price,quantity")
+        rows = await self._closed_trade_rows_for_day(
+            day,
+            "entry_price,exit_price,quantity",
+            apply_cycle_start=True,
+        )
         return self._sum_trade_volume(rows)
 
     async def total_volume_all_time(self) -> float:
@@ -256,21 +262,32 @@ class SupabaseTradeStore:
                     "opened_at,closed_at,exchange_entry_order_id,exchange_exit_order_id,confidence,"
                     "factor_metadata,trigger_metadata",
                 ),
+                ("exchange", f"eq.{self._exchange}"),
                 ("order", "closed_at.desc"),
                 ("limit", str(limit)),
             ],
         )
 
-    async def _closed_trade_rows_for_day(self, day: date | None, select: str) -> list[dict[str, Any]]:
+    async def _closed_trade_rows_for_day(
+        self,
+        day: date | None,
+        select: str,
+        *,
+        apply_cycle_start: bool = False,
+    ) -> list[dict[str, Any]]:
         target_day = day or datetime.now(self._trading_tz).date()
         start_local = datetime.combine(target_day, datetime.min.time(), tzinfo=self._trading_tz)
         end_local = start_local + timedelta(days=1)
-        start = start_local.astimezone(timezone.utc).isoformat()
+        start_utc = start_local.astimezone(timezone.utc)
+        if apply_cycle_start and self._volume_cycle_started_at is not None:
+            start_utc = max(start_utc, self._volume_cycle_started_at.astimezone(timezone.utc))
+        start = start_utc.isoformat()
         end = end_local.astimezone(timezone.utc).isoformat()
         return await self._get_rows(
             self._trades_table,
             [
                 ("select", select),
+                ("exchange", f"eq.{self._exchange}"),
                 ("closed_at", f"gte.{start}"),
                 ("closed_at", f"lt.{end}"),
                 ("order", "closed_at.desc"),
@@ -283,14 +300,19 @@ class SupabaseTradeStore:
         page_size = 1000
         offset = 0
         while True:
+            params = [
+                ("select", select),
+                ("exchange", f"eq.{self._exchange}"),
+                ("order", "closed_at.asc"),
+                ("limit", str(page_size)),
+                ("offset", str(offset)),
+            ]
+            if self._volume_cycle_started_at is not None:
+                cycle_start = self._volume_cycle_started_at.astimezone(timezone.utc).isoformat()
+                params.insert(2, ("closed_at", f"gte.{cycle_start}"))
             page = await self._get_rows(
                 self._trades_table,
-                [
-                    ("select", select),
-                    ("order", "closed_at.asc"),
-                    ("limit", str(page_size)),
-                    ("offset", str(offset)),
-                ],
+                params,
             )
             rows.extend(page)
             if len(page) < page_size:

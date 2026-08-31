@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
     volume_min_filled_entries_per_day: int = Field(default=28, ge=1, alias="VOLUME_MIN_FILLED_ENTRIES_PER_DAY")
     volume_target_usdt: float = Field(default=30_000_000.0, ge=0.0, alias="VOLUME_TARGET_USDT")
     volume_daily_target_usdt: float = Field(default=1_000_000.0, ge=0.0, alias="VOLUME_DAILY_TARGET_USDT")
+    volume_cycle_started_at: datetime | None = Field(default=None, alias="VOLUME_CYCLE_STARTED_AT")
     volume_neutral_exit_enabled: bool = Field(default=False, alias="VOLUME_NEUTRAL_EXIT_ENABLED")
     volume_neutral_exit_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_NEUTRAL_EXIT_MIN_SECONDS")
     volume_neutral_exit_min_net_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_MIN_NET_USDT")
@@ -324,6 +326,22 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return None
         return float(value)
+
+    @field_validator("volume_cycle_started_at", mode="before")
+    @classmethod
+    def parse_optional_datetime(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return value
+
+    @field_validator("volume_cycle_started_at")
+    @classmethod
+    def require_timezone_aware_volume_cycle_start(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("VOLUME_CYCLE_STARTED_AT must be a timezone-aware ISO-8601 timestamp")
+        return value.astimezone(timezone.utc)
 
     @field_validator("strategy_mode")
     @classmethod
