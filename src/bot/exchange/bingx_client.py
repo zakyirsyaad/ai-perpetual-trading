@@ -998,10 +998,15 @@ class BingXFuturesClient:
         ) from last_error
 
     def _sign_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        signed = {key: value for key, value in params.items() if value is not None}
-        signed["timestamp"] = self._now_ms()
-        signed["recvWindow"] = self._recv_window_ms
-        signed["signature"] = build_signature(self._secret_key, canonical_param_string(signed))
+        unsigned = {key: value for key, value in params.items() if value is not None}
+        unsigned["timestamp"] = self._now_ms()
+        unsigned["recvWindow"] = self._recv_window_ms
+
+        # httpx preserves mapping insertion order when serialising query params.
+        # The signature is calculated over ASCII key order, so the pre-signature
+        # wire payload must use that exact same order or BingX rejects it.
+        signed = {key: unsigned[key] for key in sorted(unsigned)}
+        signed["signature"] = build_signature(self._secret_key, canonical_param_string(unsigned))
         return signed
 
     def _headers(self, signed: bool) -> dict[str, str]:

@@ -52,7 +52,15 @@ class _RecordingClient:
         self.requests: list[dict[str, Any]] = []
 
     async def request(self, method: str, url: str, **kwargs: Any):
-        self.requests.append({"method": method, "url": url, **kwargs})
+        serialized = httpx.Request(method, url, params=kwargs.get("params"))
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "wire_query": serialized.url.query.decode("ascii"),
+                **kwargs,
+            }
+        )
         item = self._responses.pop(0) if self._responses else _FakeResponse({"code": 0, "data": {}})
         if isinstance(item, Exception):
             raise item
@@ -210,6 +218,32 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
             params["signature"],
             build_signature("test-secret", canonical_param_string({k: v for k, v in params.items() if k != "signature"})),
         )
+
+    async def test_get_and_delete_sign_the_exact_canonical_wire_query(self) -> None:
+        timestamp = 1_700_000_000_000
+        expected_payload = f"amount=2&recvWindow=5000&symbol=BTC-USDT&timestamp={timestamp}"
+
+        for method in ("GET", "DELETE"):
+            with self.subTest(method=method):
+                client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
+                client._now_ms = lambda: timestamp  # type: ignore[method-assign]
+
+                await client._signed_request(
+                    method,
+                    "/openApi/swap/v2/user/positions",
+                    {"symbol": "BTC-USDT", "amount": 2},
+                )
+
+                wire_query = client._client.requests[0]["wire_query"]  # type: ignore[attr-defined]
+                signed_payload, separator, wire_signature = wire_query.rpartition("&signature=")
+                self.assertEqual(separator, "&signature=")
+                self.assertEqual(signed_payload, expected_payload)
+                self.assertTrue(
+                    hmac.compare_digest(
+                        wire_signature,
+                        build_signature("test-secret", signed_payload),
+                    )
+                )
 
     async def test_business_error_is_not_retried_on_pro_domain(self) -> None:
         client = _client([_FakeResponse({"code": 100413, "msg": "Incorrect apiKey"})])
