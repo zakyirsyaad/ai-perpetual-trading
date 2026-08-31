@@ -283,6 +283,11 @@ class TradeEngine:
             raise RuntimeError(
                 f"Entry order placed but no open position detected for {plan.symbol}."
             )
+        self._validate_entry_position_readback(
+            plan,
+            submitted_size=exchange_size,
+            position_details=position_details,
+        )
         if filled_size < exchange_size * 0.5:
             self._logger.warning(
                 "Entry for %s appears partially filled: target_venue_size=%.8f, exchange_venue_size=%.8f. "
@@ -490,6 +495,33 @@ class TradeEngine:
                 exc,
             )
             return None
+
+    def _validate_entry_position_readback(
+        self,
+        plan: TradePlan,
+        *,
+        submitted_size: float,
+        position_details,
+    ) -> None:
+        expected_side = plan.direction.value
+        exchange_side = str(getattr(position_details, "pos_side", "") or "").strip().upper()
+        position_mode = str(getattr(self._settings, "position_mode", "") or "").strip().lower()
+        allowed_sides = {expected_side} if position_mode == "hedge" else {expected_side, "BOTH"}
+        if exchange_side not in allowed_sides:
+            qualifier = "opposite-side" if exchange_side and exchange_side != "BOTH" else "unidentified-side"
+            raise RuntimeError(
+                f"Entry readback for {plan.symbol} returned an {qualifier} position "
+                f"({exchange_side or 'UNKNOWN'}); expected {expected_side}."
+            )
+
+        filled_size = float(getattr(position_details, "exchange_size", 0.0) or 0.0)
+        maximum_expected_size = submitted_size * (1.0 + self._POSITION_MATCH_TOLERANCE)
+        if filled_size > maximum_expected_size:
+            raise RuntimeError(
+                f"Entry readback for {plan.symbol} is larger than submitted entry size: "
+                f"submitted={submitted_size:.8f}, exchange={filled_size:.8f}. "
+                "Refusing to persist potentially unrelated exposure."
+            )
 
     async def _startup_safety_checks(self) -> None:
         # BingX VST is the only enabled execution environment; live fails closed.

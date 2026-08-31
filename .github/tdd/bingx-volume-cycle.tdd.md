@@ -31,8 +31,27 @@ AssertionError: ValidationError not raised
 
 ```text
 Focused config/store tests: 38 passed
-Full test suite: 428 passed
+Full test suite before final audit: 428 passed
 Line coverage: 82% (required minimum: 80%)
+compileall: passed
+git diff --check: passed
+pip check: passed
+secret hygiene test: passed
+```
+
+## Final audit correction
+
+The first Sol audit found that a failed fill lookup could accept an unrelated exchange position. Two negative tests were added first and failed because no exception was raised for either readback:
+
+- an opposite-side position;
+- a position 50% larger than the submitted entry size.
+
+The engine now requires a compatible venue side and rejects readback size above the submitted size plus the existing 2% matching tolerance before persisting or managing it.
+
+```text
+Focused fallback tests: 3 passed
+Full test suite after correction: 431 passed
+Line coverage after correction: 82%
 compileall: passed
 git diff --check: passed
 pip check: passed

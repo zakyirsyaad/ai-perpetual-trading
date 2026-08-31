@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -332,6 +333,43 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.open_positions[0].exchange_order_id, "o1")
         self.assertEqual(store.open_positions[0].position_id, "p-live")
         self.assertGreaterEqual(client.fill_calls, 2)
+
+    async def test_entry_fill_fallback_rejects_opposite_side_position(self) -> None:
+        class OppositeSideClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                raise ExchangeAPIError("BingX order lookup rejected", retryable=False, venue=self.venue)
+
+            async def get_symbol_position_details(self, symbol: str) -> PositionDetails:
+                details = await super().get_symbol_position_details(symbol)
+                return replace(details, pos_side="SHORT")
+
+        client = OppositeSideClient()
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        with self.assertRaisesRegex(RuntimeError, "opposite-side position"):
+            await engine._execute_single_trade(_plan())
+
+        self.assertEqual(store.open_positions, [])
+
+    async def test_entry_fill_fallback_rejects_oversized_position(self) -> None:
+        class OversizedPositionClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                raise ExchangeAPIError("BingX order lookup rejected", retryable=False, venue=self.venue)
+
+            async def get_symbol_position_details(self, symbol: str) -> PositionDetails:
+                details = await super().get_symbol_position_details(symbol)
+                oversized = details.exchange_size * 1.5
+                return replace(details, exchange_size=oversized, base_quantity=oversized)
+
+        client = OversizedPositionClient()
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        with self.assertRaisesRegex(RuntimeError, "larger than submitted entry size"):
+            await engine._execute_single_trade(_plan())
+
+        self.assertEqual(store.open_positions, [])
 
     async def test_take_profit_exit_is_detected(self) -> None:
         store = FakeStore()
