@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from bot.core.trade_engine import TradeEngine
-from bot.exchange.contracts import FundingRateInfo, OrderBookSnapshot, OrderFill, PositionDetails
+from bot.exchange.contracts import ExchangeAPIError, FundingRateInfo, OrderBookSnapshot, OrderFill, PositionDetails
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
 from bot.strategy.base import ExitSignal
@@ -310,6 +310,28 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.open_positions[0].stop_loss_pct, 0.5)
         self.assertEqual(store.open_positions[0].take_profit_pct, 1.2)
+
+    async def test_entry_persists_position_when_fill_lookup_fails(self) -> None:
+        class FillLookupFailingClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fill_calls = 0
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                self.fill_calls += 1
+                if self.fill_calls == 1:
+                    raise ExchangeAPIError("BingX order lookup rejected", retryable=False, venue=self.venue)
+                return await super().get_order_fill(symbol, order_id)
+
+        client = FillLookupFailingClient()
+        store = FakeStore()
+        engine = _engine(client, store, FakeStrategy(_plan()), FakeRisk())
+
+        await engine._execute_single_trade(_plan())
+
+        self.assertEqual(store.open_positions[0].exchange_order_id, "o1")
+        self.assertEqual(store.open_positions[0].position_id, "p-live")
+        self.assertGreaterEqual(client.fill_calls, 2)
 
     async def test_take_profit_exit_is_detected(self) -> None:
         store = FakeStore()

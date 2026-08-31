@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 
 from bot.config import Settings
-from bot.exchange.contracts import FuturesExchangeProtocol, OrderBookSnapshot, OrderFill
+from bot.exchange.contracts import ExchangeAPIError, FuturesExchangeProtocol, OrderBookSnapshot, OrderFill
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import RiskManager
 from bot.storage.interfaces import TradeStoreProtocol
@@ -272,7 +272,7 @@ class TradeEngine:
         if entry_order_id is None:
             return
         await asyncio.sleep(self._settings.order_fill_wait_seconds)
-        entry_fill = await self._client.get_order_fill(plan.symbol, entry_order_id)
+        entry_fill = await self._try_get_order_fill(plan.symbol, entry_order_id, phase="entry")
         # Verify that a position actually exists and adjust to the filled quantity.
         # Read full details (not just the snapshot) so the venue position id is
         # captured for restart identity matching.
@@ -397,7 +397,7 @@ class TradeEngine:
                     exit_reason = None
                     continue
             await asyncio.sleep(self._settings.order_fill_wait_seconds)
-            exit_fill = await self._client.get_order_fill(open_position.symbol, exit_order_id)
+            exit_fill = await self._try_get_order_fill(open_position.symbol, exit_order_id, phase="exit")
             if exit_fill is not None and exit_fill.base_quantity > 0:
                 realized_qty = exit_fill.base_quantity
             if await self._client.has_open_position(open_position.symbol):
@@ -477,6 +477,19 @@ class TradeEngine:
             self._settings.max_stop_loss_per_day,
             daily_volume,
         )
+
+    async def _try_get_order_fill(self, symbol: str, order_id: str, *, phase: str) -> OrderFill | None:
+        try:
+            return await self._client.get_order_fill(symbol, order_id)
+        except ExchangeAPIError as exc:
+            self._logger.warning(
+                "Could not read %s fill for %s order_id=%s; continuing with exchange position state. error=%s",
+                phase,
+                symbol,
+                order_id,
+                exc,
+            )
+            return None
 
     async def _startup_safety_checks(self) -> None:
         # BingX VST is the only enabled execution environment; live fails closed.
@@ -1107,6 +1120,10 @@ class TradeEngine:
         if isinstance(data, list) and data:
             first = data[0] if isinstance(data[0], dict) else {}
             value = first.get("ordId") or first.get("orderId") or first.get("id") or "UNKNOWN_ORDER_ID"
+            return str(value)
+        if isinstance(data, dict) and isinstance(data.get("order"), dict):
+            order = data["order"]
+            value = order.get("ordId") or order.get("orderId") or order.get("id") or "UNKNOWN_ORDER_ID"
             return str(value)
         value = data.get("ordId") or data.get("orderId") or data.get("id") or "UNKNOWN_ORDER_ID"
         return str(value)
