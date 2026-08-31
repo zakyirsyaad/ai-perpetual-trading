@@ -53,12 +53,22 @@ class _RecordingClient:
 
     async def request(self, method: str, url: str, **kwargs: Any):
         serialized = httpx.Request(method, url, params=kwargs.get("params"))
+        wire_body = kwargs.get("content")
+        if isinstance(wire_body, bytes):
+            wire_body = wire_body.decode("ascii")
+        if wire_body is None:
+            wire_body = ""
+        logical_params = kwargs.get("params")
+        if logical_params is None and wire_body:
+            logical_params = dict(httpx.QueryParams(wire_body))
         self.requests.append(
             {
                 "method": method,
                 "url": url,
-                "wire_query": serialized.url.query.decode("ascii"),
                 **kwargs,
+                "wire_query": serialized.url.query.decode("ascii"),
+                "wire_body": wire_body,
+                "params": logical_params,
             }
         )
         item = self._responses.pop(0) if self._responses else _FakeResponse({"code": 0, "data": {}})
@@ -244,6 +254,38 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
                         build_signature("test-secret", signed_payload),
                     )
                 )
+
+    async def test_signed_post_uses_form_body_not_query_params(self) -> None:
+        timestamp = 1_700_000_000_000
+        client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
+        client._now_ms = lambda: timestamp  # type: ignore[method-assign]
+
+        await client._signed_request(
+            "POST",
+            "/openApi/swap/v2/trade/order",
+            {"symbol": "BTC-USDT", "quantity": "0.1", "side": "BUY"},
+            allow_retries=False,
+        )
+
+        sent = client._client.requests[0]  # type: ignore[attr-defined]
+        self.assertEqual(sent["wire_query"], "")
+        self.assertEqual(sent["headers"]["Content-Type"], "application/x-www-form-urlencoded")
+        expected_payload = f"quantity=0.1&recvWindow=5000&side=BUY&symbol=BTC-USDT&timestamp={timestamp}"
+        signed_payload, separator, wire_signature = sent["wire_body"].rpartition("&signature=")
+        self.assertEqual(separator, "&signature=")
+        self.assertEqual(signed_payload, expected_payload)
+        self.assertTrue(hmac.compare_digest(wire_signature, build_signature("test-secret", signed_payload)))
+
+    async def test_signed_params_reject_query_delimiter_in_values(self) -> None:
+        client = _client([_FakeResponse({"code": 0, "data": {"ok": 1}})])
+        with self.assertRaises(ExchangeAPIError) as ctx:
+            await client._signed_request(
+                "GET",
+                "/openApi/swap/v2/user/positions",
+                {"symbol": "BTC-USDT&side=BUY"},
+            )
+        self.assertIn("forbidden character", str(ctx.exception))
+        self.assertEqual(client._client.requests, [])  # type: ignore[attr-defined]
 
     async def test_business_error_is_not_retried_on_pro_domain(self) -> None:
         client = _client([_FakeResponse({"code": 100413, "msg": "Incorrect apiKey"})])

@@ -70,6 +70,7 @@ _TRANSIENT_BUSINESS_CODES = {
 # the request was malformed, not that the order is absent, so treating them as
 # "absent" could authorise a duplicate submission.
 _ORDER_NOT_FOUND_CODES = {"109421"}
+_FORBIDDEN_SIGNED_PARAM_CHARS = ("&", "=", "?", "#", "\r", "\n")
 
 _KLINE_INTERVALS = {
     "1m": "1m",
@@ -965,13 +966,18 @@ class BingXFuturesClient:
         for host in hosts:
             for attempt in range(attempts_per_host):
                 await self._throttle(path)
-                request_params = self._sign_params(params) if signed else dict(params)
+                request_kwargs: dict[str, Any] = {
+                    "headers": self._headers(signed, form_body=signed and method_upper == "POST"),
+                }
+                if signed and method_upper == "POST":
+                    request_kwargs["content"] = self._signed_form_body(params)
+                else:
+                    request_kwargs["params"] = self._sign_params(params) if signed else dict(params)
                 try:
                     response = await self._client.request(
                         method_upper,
                         f"{host}{path}",
-                        params=request_params,
-                        headers=self._headers(signed),
+                        **request_kwargs,
                     )
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     # Network-level failure only: a connection error or timeout is
@@ -1001,6 +1007,7 @@ class BingXFuturesClient:
         unsigned = {key: value for key, value in params.items() if value is not None}
         unsigned["timestamp"] = self._now_ms()
         unsigned["recvWindow"] = self._recv_window_ms
+        self._validate_signed_params(unsigned)
 
         # httpx preserves mapping insertion order when serialising query params.
         # The signature is calculated over ASCII key order, so the pre-signature
@@ -1009,9 +1016,26 @@ class BingXFuturesClient:
         signed["signature"] = build_signature(self._secret_key, canonical_param_string(unsigned))
         return signed
 
-    def _headers(self, signed: bool) -> dict[str, str]:
+    def _signed_form_body(self, params: dict[str, Any]) -> str:
+        signed = self._sign_params(params)
+        signature = str(signed.pop("signature"))
+        return f"{canonical_param_string(signed)}&signature={signature}"
+
+    def _validate_signed_params(self, params: dict[str, Any]) -> None:
+        for key, value in params.items():
+            if value is None:
+                continue
+            text = "true" if value is True else "false" if value is False else str(value)
+            if any(char in str(key) or char in text for char in _FORBIDDEN_SIGNED_PARAM_CHARS):
+                raise ExchangeAPIError(
+                    f"BingX signed param {key!r} contains a forbidden character.",
+                    retryable=False,
+                    venue=self.venue,
+                )
+
+    def _headers(self, signed: bool, *, form_body: bool = False) -> dict[str, str]:
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded" if form_body else "application/json",
             "X-SOURCE-KEY": self._source_key,
         }
         if signed:
