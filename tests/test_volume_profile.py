@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -179,6 +179,16 @@ class VolumeProfileTests(unittest.TestCase):
                 BINGX_SECRET_KEY="vst-secret",
                 STRATEGY_MODE="volume",
                 VOLUME_CYCLE_STARTED_AT="2026-08-31T19:00:00",
+            )
+
+    def test_settings_rejects_volume_cycle_start_far_in_the_future(self) -> None:
+        with self.assertRaises(ValidationError):
+            Settings(
+                _env_file=None,
+                BINGX_API_KEY="vst-key",
+                BINGX_SECRET_KEY="vst-secret",
+                STRATEGY_MODE="volume",
+                VOLUME_CYCLE_STARTED_AT=(datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
             )
 
     def test_settings_rejects_removed_regression_modes(self) -> None:
