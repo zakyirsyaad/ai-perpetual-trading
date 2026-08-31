@@ -158,17 +158,20 @@ class VolumeProfileTests(unittest.TestCase):
         self.assertEqual(settings.bingx_base_url, "https://open-api-vst.bingx.com")
 
     def test_settings_parses_timezone_aware_volume_cycle_start(self) -> None:
+        local_start = (datetime.now(timezone.utc) - timedelta(hours=1)).astimezone(
+            timezone(timedelta(hours=7))
+        )
         settings = Settings(
             _env_file=None,
             BINGX_API_KEY="vst-key",
             BINGX_SECRET_KEY="vst-secret",
             STRATEGY_MODE="volume",
-            VOLUME_CYCLE_STARTED_AT="2026-08-31T19:00:00+07:00",
+            VOLUME_CYCLE_STARTED_AT=local_start.isoformat(),
         )
 
         self.assertEqual(
             settings.volume_cycle_started_at,
-            datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+            local_start.astimezone(timezone.utc),
         )
 
     def test_settings_rejects_timezone_naive_volume_cycle_start(self) -> None:

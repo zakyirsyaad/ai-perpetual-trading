@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -341,7 +341,10 @@ class Settings(BaseSettings):
             return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("VOLUME_CYCLE_STARTED_AT must be a timezone-aware ISO-8601 timestamp")
-        return value.astimezone(timezone.utc)
+        normalized = value.astimezone(timezone.utc)
+        if normalized > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("VOLUME_CYCLE_STARTED_AT cannot be more than 5 minutes in the future")
+        return normalized
 
     @field_validator("strategy_mode")
     @classmethod
