@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -155,6 +156,30 @@ class VolumeProfileTests(unittest.TestCase):
             BINGX_BASE_URL="https://open-api-vst.bingx.com",
         )
         self.assertEqual(settings.bingx_base_url, "https://open-api-vst.bingx.com")
+
+    def test_settings_parses_timezone_aware_volume_cycle_start(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            BINGX_API_KEY="vst-key",
+            BINGX_SECRET_KEY="vst-secret",
+            STRATEGY_MODE="volume",
+            VOLUME_CYCLE_STARTED_AT="2026-08-31T19:00:00+07:00",
+        )
+
+        self.assertEqual(
+            settings.volume_cycle_started_at,
+            datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def test_settings_rejects_timezone_naive_volume_cycle_start(self) -> None:
+        with self.assertRaises(ValidationError):
+            Settings(
+                _env_file=None,
+                BINGX_API_KEY="vst-key",
+                BINGX_SECRET_KEY="vst-secret",
+                STRATEGY_MODE="volume",
+                VOLUME_CYCLE_STARTED_AT="2026-08-31T19:00:00",
+            )
 
     def test_settings_rejects_removed_regression_modes(self) -> None:
         base = {

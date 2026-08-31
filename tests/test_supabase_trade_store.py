@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -21,6 +21,7 @@ def _settings(**overrides) -> SimpleNamespace:
         supabase_ai_call_metrics_table="ai_call_metrics",
         supabase_open_positions_table="open_position_state",
         exchange_name="bingx",
+        volume_cycle_started_at=None,
         request_timeout_seconds=5,
         trading_timezone="Asia/Jakarta",
     )
@@ -279,6 +280,60 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         store = _store(http)
         self.assertAlmostEqual(await store.total_volume_for_day(), 402.0)
         self.assertAlmostEqual(await store.total_pnl_for_day(), 2.0)
+
+    async def test_all_time_volume_is_scoped_to_current_exchange(self) -> None:
+        http = _FakeHTTP(rows=[])
+
+        await _store(http).total_volume_all_time()
+
+        self.assertIn(("exchange", "eq.bingx"), http.gets[0]["params"])
+
+    async def test_all_time_volume_is_scoped_to_cycle_start(self) -> None:
+        cycle_start = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        http = _FakeHTTP(rows=[])
+
+        await _store(http, _settings(volume_cycle_started_at=cycle_start)).total_volume_all_time()
+
+        self.assertIn(("exchange", "eq.bingx"), http.gets[0]["params"])
+        self.assertIn(("closed_at", "gte.2026-08-31T12:00:00+00:00"), http.gets[0]["params"])
+
+    async def test_daily_volume_uses_later_of_day_start_and_cycle_start(self) -> None:
+        cycle_start = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        http = _FakeHTTP(rows=[])
+
+        await _store(http, _settings(volume_cycle_started_at=cycle_start)).total_volume_for_day(
+            date(2026, 8, 31)
+        )
+
+        params = http.gets[0]["params"]
+        self.assertIn(("exchange", "eq.bingx"), params)
+        self.assertIn(("closed_at", "gte.2026-08-31T12:00:00+00:00"), params)
+        self.assertNotIn(("closed_at", "gte.2026-08-30T17:00:00+00:00"), params)
+
+    async def test_daily_risk_queries_ignore_cycle_start_but_filter_exchange(self) -> None:
+        cycle_start = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        http = _FakeHTTP(rows=[])
+        store = _store(http, _settings(volume_cycle_started_at=cycle_start))
+
+        await store.count_closed_trades_for_day(date(2026, 8, 31))
+        await store.count_stop_losses_for_day(date(2026, 8, 31))
+        await store.total_pnl_for_day(date(2026, 8, 31))
+
+        for request in http.gets:
+            params = request["params"]
+            self.assertIn(("exchange", "eq.bingx"), params)
+            self.assertIn(("closed_at", "gte.2026-08-30T17:00:00+00:00"), params)
+            self.assertNotIn(("closed_at", "gte.2026-08-31T12:00:00+00:00"), params)
+
+    async def test_recent_trade_queries_filter_exchange(self) -> None:
+        http = _FakeHTTP(rows=[])
+        store = _store(http)
+
+        await store.recent_performance_summary()
+        await store.recent_closed_trade_records()
+
+        for request in http.gets:
+            self.assertIn(("exchange", "eq.bingx"), request["params"])
 
     async def test_learning_note_is_a_no_op(self) -> None:
         http = _FakeHTTP()
