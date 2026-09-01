@@ -6,13 +6,30 @@ import math
 from datetime import datetime, timezone
 
 from bot.config import Settings
-from bot.exchange.contracts import ExchangeAPIError, FuturesExchangeProtocol, OrderBookSnapshot, OrderFill
+from bot.exchange.contracts import (
+    ExchangeAPIError,
+    FreshOrderBookProvider,
+    FuturesExchangeProtocol,
+    MaintenanceMarginTierProvider,
+    OrderBookSnapshot,
+    OrderFill,
+    UncertainOrderSubmissionError,
+)
+from bot.exchange.liquidation import estimate_isolated_liquidation_constraint, stop_loss_is_strictly_before_liquidation
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import RiskManager
 from bot.storage.interfaces import TradeStoreProtocol
 from bot.storage.supabase_journal import SupabaseJournal
 from bot.strategy.base import BaseStrategy
 from bot.strategy.grok_strategy import GrokStrategy
+
+
+class _UncertainEntryOrderState(RuntimeError):
+    """A prior entry order cannot be proven flat, so no follow-up is safe."""
+
+    def __init__(self, order_id: str) -> None:
+        self.order_id = order_id
+        super().__init__(f"Prior entry order {order_id} cannot be confirmed canceled or filled.")
 
 
 class TradeEngine:
@@ -332,6 +349,41 @@ class TradeEngine:
             record_entry_cooldown=True,
         )
 
+    async def _passes_pre_order_liquidation_gate(
+        self,
+        plan: TradePlan,
+        entry_price: float,
+        quantity_base: float,
+    ) -> bool:
+        """Fail closed before every entry order, including deterministic plans."""
+        if not isinstance(self._client, MaintenanceMarginTierProvider):
+            self._logger.warning("Skipped %s entry: exchange has no maintenance-margin tier capability.", plan.symbol)
+            return False
+        try:
+            tiers = await self._client.get_maintenance_margin_tiers(plan.symbol)
+            constraint = estimate_isolated_liquidation_constraint(
+                reference_price=entry_price,
+                quantity_base=quantity_base,
+                leverage=plan.leverage,
+                taker_close_fee_rate=self._taker_fee_pct(plan.symbol) / 100.0,
+                tiers=tiers,
+            )
+        except Exception as exc:
+            self._logger.warning("Skipped %s entry: liquidation constraint unavailable. error=%s", plan.symbol, exc)
+            return False
+        if not stop_loss_is_strictly_before_liquidation(
+            direction=plan.direction,
+            stop_loss_pct=plan.stop_loss_pct,
+            constraint=constraint,
+        ):
+            self._logger.warning(
+                "Skipped %s entry: stop_loss_pct=%.6f is not strictly before estimated liquidation.",
+                plan.symbol,
+                plan.stop_loss_pct,
+            )
+            return False
+        return True
+
     async def _manage_open_position(
         self,
         open_position: OpenPosition,
@@ -353,7 +405,7 @@ class TradeEngine:
 
         realized_qty = open_position.quantity
         exit_fill = None
-        exit_reason = await self._post_entry_position_guard(open_position, plan)
+        exit_reason = None
         while True:
             if exit_reason is None:
                 exit_reason = await self._monitor_position(open_position, plan)
@@ -925,7 +977,11 @@ class TradeEngine:
         order_book: OrderBookSnapshot | None,
     ) -> str | None:
         if self._uses_post_only_entry():
-            order_id = await self._place_post_only_entry(plan, exchange_size, order_book)
+            try:
+                order_id = await self._place_post_only_entry(plan, exchange_size, order_book)
+            except (_UncertainEntryOrderState, UncertainOrderSubmissionError) as exc:
+                self._block_entries_for_uncertain_order(exc, plan.symbol)
+                return None
             if order_id is not None:
                 return order_id
             if not self._allow_taker_entry_fallback():
@@ -933,13 +989,42 @@ class TradeEngine:
                 return None
             self._logger.warning("Post-only entry for %s did not fill; falling back to market order.", plan.symbol)
 
-        entry_resp = await self._client.place_market_order(
-            symbol=plan.symbol,
-            direction=plan.direction,
-            size=exchange_size,
-            reduce_only=False,
+        candidate_price = await self._market_entry_candidate_price(plan)
+        if candidate_price is None:
+            return None
+        if not await self._passes_last_mile_liquidation_gate(plan, exchange_size, candidate_price):
+            return None
+        try:
+            entry_resp = await self._client.place_market_order(
+                symbol=plan.symbol,
+                direction=plan.direction,
+                size=exchange_size,
+                reduce_only=False,
+            )
+            return self._extract_entry_order_id(entry_resp, plan.symbol)
+        except UncertainOrderSubmissionError as exc:
+            self._block_entries_for_uncertain_order(exc, plan.symbol)
+            return None
+
+    def _block_entries_for_uncertain_order(
+        self,
+        exc: _UncertainEntryOrderState | UncertainOrderSubmissionError,
+        fallback_symbol: str,
+    ) -> None:
+        """Latch entry processing when an existing intent may still be live."""
+        if isinstance(exc, UncertainOrderSubmissionError):
+            symbol = exc.symbol or fallback_symbol
+            order_identity = exc.order_id or exc.client_order_id
+            state = "accepted or rejected"
+        else:
+            symbol = fallback_symbol
+            order_identity = exc.order_id
+            state = "canceled or filled"
+        self._entries_blocked_reason = (
+            f"Entry order {order_identity} for {symbol} could not be confirmed {state}; "
+            "manual reconciliation is required before restart."
         )
-        return self._extract_order_id(entry_resp)
+        self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
 
     async def _place_post_only_entry(
         self,
@@ -949,13 +1034,17 @@ class TradeEngine:
     ) -> str | None:
         ttl_seconds = self._maker_entry_ttl_seconds()
         attempts = max(1, self._maker_max_reprices() + 1)
-        terminal_states = {"filled", "canceled", "mmp_canceled"}
+        canceled_states = {"canceled", "mmp_canceled"}
         for attempt in range(attempts):
-            book = order_book if attempt == 0 and order_book is not None else await self._client.get_order_book(
-                plan.symbol,
-                depth=self._settings.orderbook_depth_levels,
-            )
+            book = await self._fresh_entry_order_book(plan)
+            if book is None:
+                return None
             price = book.best_bid if plan.direction == PositionDirection.LONG else book.best_ask
+            if not math.isfinite(price) or price <= 0:
+                self._logger.warning("Skipped %s entry: fresh executable-side quote is invalid.", plan.symbol)
+                return None
+            if not await self._passes_last_mile_liquidation_gate(plan, exchange_size, price):
+                return None
             response = await self._client.place_limit_order(
                 symbol=plan.symbol,
                 direction=plan.direction,
@@ -964,19 +1053,139 @@ class TradeEngine:
                 reduce_only=False,
                 post_only=True,
             )
-            order_id = self._extract_order_id(response)
+            order_id = self._extract_entry_order_id(response, plan.symbol)
             deadline = datetime.now(timezone.utc).timestamp() + ttl_seconds
+            confirmed_canceled = False
             while datetime.now(timezone.utc).timestamp() < deadline:
                 await asyncio.sleep(min(1.0, ttl_seconds))
-                fill = await self._client.get_order_fill(plan.symbol, order_id)
-                if fill is not None and fill.filled_size > 0:
-                    if fill.state not in {"filled", None}:
-                        await self._cancel_order_best_effort(plan.symbol, order_id)
-                    return order_id
-                if fill is not None and fill.state in terminal_states:
+                try:
+                    fill = await self._client.get_order_fill(plan.symbol, order_id)
+                except Exception as exc:
+                    self._logger.warning(
+                        "Could not poll post-only entry %s for %s; resolving before any retry. error=%s",
+                        order_id,
+                        plan.symbol,
+                        exc,
+                    )
                     break
-            await self._cancel_order_best_effort(plan.symbol, order_id)
+                if fill is None:
+                    continue
+                if not self._is_proven_entry_fill(fill, order_id):
+                    break
+                state = (fill.state or "").lower()
+                if state == "filled":
+                    return order_id
+                if fill.filled_size > 0:
+                    if state in canceled_states:
+                        # The exchange confirms the unfilled remainder is inactive.
+                        return order_id
+                    # A non-terminal partial fill may still have a live remainder.
+                    break
+                if state in canceled_states:
+                    confirmed_canceled = True
+                    break
+            if confirmed_canceled:
+                continue
+            resolution = await self._cancel_and_resolve_entry_order(plan.symbol, order_id)
+            if resolution == "filled":
+                return order_id
+            if resolution != "canceled":
+                raise _UncertainEntryOrderState(order_id)
         return None
+
+    async def _cancel_and_resolve_entry_order(self, symbol: str, order_id: str) -> str:
+        """Return canceled, filled, or uncertain; only canceled permits another entry."""
+        try:
+            response = await self._client.cancel_order(symbol, order_id)
+        except Exception as exc:
+            self._logger.warning("Skipped entry retry for %s: cancel of %s failed. error=%s", symbol, order_id, exc)
+            return "uncertain"
+        if not isinstance(response, dict):
+            self._logger.warning("Skipped entry retry for %s: cancel of %s returned an ambiguous response.", symbol, order_id)
+            return "uncertain"
+        try:
+            fill = await self._client.get_order_fill(symbol, order_id)
+        except Exception as exc:
+            self._logger.warning("Skipped entry retry for %s: cannot confirm cancellation of %s. error=%s", symbol, order_id, exc)
+            return "uncertain"
+        if fill is None:
+            self._logger.warning("Skipped entry retry for %s: cancellation of %s is unconfirmed.", symbol, order_id)
+            return "uncertain"
+        if not self._is_proven_entry_fill(fill, order_id):
+            return "uncertain"
+        state = (fill.state or "").lower()
+        if state == "filled":
+            return "filled"
+        if state in {"canceled", "mmp_canceled"}:
+            # A canceled order is terminal: preserve a partial fill for normal
+            # position readback, but allow a retry only when it filled nothing.
+            return "filled" if fill.filled_size > 0 else "canceled"
+        if fill.filled_size > 0:
+            self._logger.warning(
+                "Skipped entry retry for %s: %s has a partial fill with an active or unknown remainder.",
+                symbol,
+                order_id,
+            )
+            return "uncertain"
+        self._logger.warning("Skipped entry retry for %s: cancellation of %s remains non-terminal.", symbol, order_id)
+        return "uncertain"
+
+    def _is_proven_entry_fill(self, fill: OrderFill, expected_order_id: str) -> bool:
+        """Validate the minimum evidence needed to safely retry a canceled entry."""
+        if not isinstance(fill.order_id, str) or not fill.order_id.strip() or fill.order_id != expected_order_id:
+            self._logger.warning("Skipped entry retry: cancellation fill identity is missing or mismatched for %s.", expected_order_id)
+            return False
+        try:
+            quantity = float(fill.filled_size)
+        except (TypeError, ValueError):
+            self._logger.warning("Skipped entry retry: cancellation fill quantity is invalid for %s.", expected_order_id)
+            return False
+        if not math.isfinite(quantity) or quantity < 0:
+            self._logger.warning("Skipped entry retry: cancellation fill quantity is invalid for %s.", expected_order_id)
+            return False
+        return True
+
+    async def _passes_last_mile_liquidation_gate(
+        self,
+        plan: TradePlan,
+        exchange_size: float,
+        candidate_price: float,
+    ) -> bool:
+        """Prove this exact entry attempt is safe immediately before placement."""
+        try:
+            quantity_base = await self._client.estimate_base_quantity(plan.symbol, exchange_size)
+        except Exception as exc:
+            self._logger.warning(
+                "Skipped %s entry: exchange size cannot be resolved for liquidation proof. error=%s",
+                plan.symbol,
+                exc,
+            )
+            return False
+        if not math.isfinite(quantity_base) or quantity_base <= 0:
+            self._logger.warning("Skipped %s entry: exchange size cannot be converted to positive base quantity.", plan.symbol)
+            return False
+        return await self._passes_pre_order_liquidation_gate(plan, candidate_price, quantity_base)
+
+    async def _market_entry_candidate_price(self, plan: TradePlan) -> float | None:
+        """Use only a fresh executable-side quote for a market-entry proof."""
+        book = await self._fresh_entry_order_book(plan)
+        if book is None:
+            return None
+        candidate = book.best_ask if plan.direction == PositionDirection.LONG else book.best_bid
+        if not math.isfinite(candidate) or candidate <= 0:
+            self._logger.warning("Skipped %s entry: fresh executable-side quote is invalid.", plan.symbol)
+            return None
+        return candidate
+
+    async def _fresh_entry_order_book(self, plan: TradePlan) -> OrderBookSnapshot | None:
+        if not isinstance(self._client, FreshOrderBookProvider):
+            self._logger.warning("Skipped %s entry: exchange has no uncached order-book capability.", plan.symbol)
+            return None
+        try:
+            return await self._client.get_fresh_order_book(plan.symbol, depth=self._settings.orderbook_depth_levels)
+        except Exception as exc:
+            self._logger.warning("Skipped %s entry: fresh order-book quote unavailable. error=%s", plan.symbol, exc)
+            return None
 
     async def _place_post_only_exit(self, position: OpenPosition, exchange_size: float) -> str | None:
         ttl_seconds = self._maker_exit_ttl_seconds()
@@ -1015,42 +1224,6 @@ class TradeEngine:
             await self._client.cancel_order(symbol, order_id)
         except Exception as exc:
             self._logger.debug("Could not cancel order %s for %s: %s", order_id, symbol, exc)
-
-    async def _post_entry_position_guard(self, position: OpenPosition, plan: TradePlan) -> str | None:
-        if self._settings.min_liquidation_distance_bps <= 0:
-            return None
-        try:
-            details = await self._client.get_symbol_position_details(position.symbol)
-        except Exception as exc:
-            self._logger.warning("Could not verify liquidation distance for %s: %s", position.symbol, exc)
-            return "liquidation_guard_unverified"
-
-        if details.liquidation_price is None:
-            return None
-        reference_price = details.mark_price or details.avg_price or position.entry_price
-        if reference_price <= 0:
-            return None
-        distance_bps = abs(reference_price - details.liquidation_price) / reference_price * 10_000
-        stop_price = self._planned_stop_price(position.direction, position.entry_price, plan.stop_loss_pct)
-        stop_beyond_liq = (
-            position.direction == PositionDirection.LONG
-            and stop_price <= details.liquidation_price
-        ) or (
-            position.direction == PositionDirection.SHORT
-            and stop_price >= details.liquidation_price
-        )
-        if distance_bps < self._settings.min_liquidation_distance_bps or stop_beyond_liq:
-            self._logger.warning(
-                "Liquidation guard closing %s: liq=%.4f ref=%.4f distance=%.2fbps min=%.2fbps stop=%.4f.",
-                position.symbol,
-                details.liquidation_price,
-                reference_price,
-                distance_bps,
-                self._settings.min_liquidation_distance_bps,
-                stop_price,
-            )
-            return "liquidation_guard"
-        return None
 
     def _taker_fee_pct(self, symbol: str) -> float:
         return self._taker_fee_pct_by_symbol.get(symbol, self._settings.taker_fee_pct)
@@ -1151,11 +1324,36 @@ class TradeEngine:
         data = response.get("data") or {}
         if isinstance(data, list) and data:
             first = data[0] if isinstance(data[0], dict) else {}
-            value = first.get("ordId") or first.get("orderId") or first.get("id") or "UNKNOWN_ORDER_ID"
+            value = first.get("ordId") or first.get("orderId") or first.get("orderID") or first.get("id") or "UNKNOWN_ORDER_ID"
             return str(value)
         if isinstance(data, dict) and isinstance(data.get("order"), dict):
             order = data["order"]
-            value = order.get("ordId") or order.get("orderId") or order.get("id") or "UNKNOWN_ORDER_ID"
+            value = order.get("ordId") or order.get("orderId") or order.get("orderID") or order.get("id") or "UNKNOWN_ORDER_ID"
             return str(value)
-        value = data.get("ordId") or data.get("orderId") or data.get("id") or "UNKNOWN_ORDER_ID"
+        value = data.get("ordId") or data.get("orderId") or data.get("orderID") or data.get("id") or "UNKNOWN_ORDER_ID"
         return str(value)
+
+    @classmethod
+    def _extract_entry_order_id(cls, response: dict, symbol: str) -> str:
+        data = response.get("data")
+        rows: list[dict] = []
+        if isinstance(data, dict):
+            nested = data.get("order")
+            if isinstance(nested, dict):
+                rows.append(nested)
+            rows.append(data)
+            orders = data.get("orders")
+            if isinstance(orders, list) and orders and isinstance(orders[0], dict):
+                rows.append(orders[0])
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            rows.append(data[0])
+        for row in rows:
+            value = row.get("orderId") or row.get("orderID")
+            if value not in (None, "") and str(value).strip():
+                return str(value).strip()
+        raise UncertainOrderSubmissionError(
+            "Entry acknowledgement has no supported order identity.",
+            symbol=symbol,
+            client_order_id="unavailable",
+            venue="bingx",
+        )

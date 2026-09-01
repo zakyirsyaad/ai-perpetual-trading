@@ -5,8 +5,9 @@ import unittest
 from datetime import date
 from types import SimpleNamespace
 
+from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, RiskReview
-from bot.ai.compact_context import CompactDecisionContextBuilder, estimate_payload_tokens
+from bot.ai.compact_context import CompactDecisionContextBuilder, compact_json, estimate_payload_tokens
 from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.orchestration import AIOrchestrator
 from bot.models import PositionDirection
@@ -35,7 +36,7 @@ def _settings(**overrides) -> SimpleNamespace:
         atr_sl_multiplier=1.5,
         atr_tp_multiplier=3.0,
         ai_min_fee_adjusted_rr=0.1,
-        ai_min_confidence=0.5,
+        ai_min_confidence=0.75,
         ai_recent_performance_limit=10,
         ai_trade_memory_limit=10,
         ai_kline_interval="3m",
@@ -87,6 +88,10 @@ def _context() -> dict:
         },
         "factor_snapshots": factors,
         "active_flow_signals": [{"symbol": "BTC/USDT", "name": "volume_spike", "direction": "LONG", "strength": 0.6}],
+        "liquidation_constraints": {
+            "BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 1.0, "max_short_stop_loss_pct": 1.0},
+            "ETH/USDT": {"status": "available", "max_long_stop_loss_pct": 1.0, "max_short_stop_loss_pct": 1.0},
+        },
     }
 
 
@@ -184,13 +189,71 @@ class EntryPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.usdt_size, 180.0)
         self.assertEqual(len(store.decisions), 2)
 
-    async def test_entry_payload_is_compact_and_within_budget(self) -> None:
+    async def test_entry_payload_has_context_parity_and_liquidation_rules(self) -> None:
         brain = _FakeBrain([_decision("BTC/USDT")])
         await _orchestrator(brain, _FakeStore()).next_trade_plan(_state())
         payload = brain.payloads[0]
-        self.assertLessEqual(estimate_payload_tokens(payload), 4000)
-        self.assertIn("symbols", payload)
-        self.assertNotIn("market_context", payload)
+        self.assertIn("market_context", payload)
+        self.assertIn("risk_constraints", payload)
+        self.assertIn("arena_reviews", payload)
+        self.assertEqual(payload["risk_constraints"]["min_confidence"], 0.75)
+        self.assertTrue(payload["output_rules"]["open_requires_final_stop_strictly_before_estimated_liquidation_or_hold"])
+
+    async def test_entry_payload_keeps_each_new_flow_record_once_across_context_and_arena_review(self) -> None:
+        trigger = {
+            "symbol": "BTC/USDT",
+            "name": "fresh_btc_trigger",
+            "direction": "LONG",
+            "strength": 0.9,
+            "state": "new",
+        }
+        context = _context()
+        context["new_flow_signals"] = [trigger]
+        context["intelligence"]["market_flow_signals"] = {
+            "active": [trigger],
+            "new_triggers": [trigger],
+            "trigger_names": ["fresh_btc_trigger"],
+        }
+
+        class _FlowIntelligence:
+            async def build_context(self, symbols=None):
+                return SimpleNamespace(to_dict=lambda: context)
+
+        brain = _FakeBrain([_decision("BTC/USDT")])
+        orchestrator = _orchestrator(brain, _FakeStore())
+        orchestrator._intelligence = _FlowIntelligence()
+        orchestrator._signal_designer = SignalDesigner()
+
+        await orchestrator.next_trade_plan(_state())
+
+        payload = brain.payloads[0]
+        serialized = compact_json(payload)
+        self.assertEqual(serialized.count(compact_json(trigger)), 1)
+        self.assertEqual(serialized.count("fresh_btc_trigger"), 1)
+        review = next(item for item in payload["arena_reviews"] if item.get("role") == "SignalDesigner")
+        self.assertNotIn("new_triggers", review["payload"])
+        self.assertNotIn("trigger_names", review["payload"])
+        self.assertNotIn("fresh_btc_trigger", review["summary"])
+
+    async def test_entry_payload_keeps_risk_flags_once_across_context_and_arena_review(self) -> None:
+        context = _context()
+        context["intelligence"]["risk_flags"] = ["liquidity_thin"]
+
+        class _RiskIntelligence:
+            async def build_context(self, symbols=None):
+                return SimpleNamespace(to_dict=lambda: context)
+
+        brain = _FakeBrain([_decision("BTC/USDT")])
+        orchestrator = _orchestrator(brain, _FakeStore())
+        orchestrator._intelligence = _RiskIntelligence()
+        orchestrator._market_analyzer = MarketAnalyzer()
+
+        await orchestrator.next_trade_plan(_state())
+
+        payload = brain.payloads[0]
+        self.assertEqual(compact_json(payload).count("liquidity_thin"), 1)
+        review = next(item for item in payload["arena_reviews"] if item.get("role") == "MarketAnalyzer")
+        self.assertNotIn("risk_flags", review["payload"])
 
     async def test_stored_decision_carries_the_ai_call_id(self) -> None:
         brain = _FakeBrain([_decision("BTC/USDT")])

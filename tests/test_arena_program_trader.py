@@ -1,12 +1,38 @@
 from __future__ import annotations
 
+import multiprocessing
 import time
 import unittest
+from unittest.mock import patch
 
 from bot.arena.program_trader import ProgramStrategyRunner, validate_strategy_code
 
 
 class ArenaProgramTraderTests(unittest.TestCase):
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "fork is unavailable")
+    def test_runner_prefers_fork_context_when_available(self) -> None:
+        code = """
+def build_signal(context):
+    return {
+        "symbol": "BTC/USDT",
+        "timeframe": "1m",
+        "side": "flat",
+        "confidence": 0.8,
+        "expected_move_bps": 0,
+        "stop_bps": 0,
+        "take_bps": 0,
+        "max_hold_minutes": 1,
+        "rationale_codes": ["program:test"],
+        "invalidation_reason": "none",
+        "model_latency_ms": 0,
+    }
+"""
+        with patch("bot.arena.program_trader.multiprocessing.get_context", wraps=multiprocessing.get_context) as get_context:
+            result = ProgramStrategyRunner(timeout_seconds=1).run_signal(code, {})
+
+        self.assertTrue(result.success, result.error)
+        get_context.assert_called_once_with("fork")
+
     def test_runner_accepts_strategy_returning_normalized_signal(self) -> None:
         code = """
 def build_signal(context):

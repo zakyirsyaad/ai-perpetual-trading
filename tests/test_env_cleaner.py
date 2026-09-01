@@ -42,6 +42,7 @@ class EnvCleanerTests(unittest.TestCase):
                         "VOLUME_MIN_FILLED_ENTRIES_PER_DAY=28",
                         "",
                         "# Risk and timing",
+                        "ENTRY_INTERVAL_MINUTES=15",
                         "POSITION_HOLD_MINUTES=20",
                         "EXECUTION_ENTRY_ORDER_TYPE=post_only",
                         "EXECUTION_POST_ONLY_FALLBACK_TO_MARKET=false",
@@ -106,6 +107,7 @@ class EnvCleanerTests(unittest.TestCase):
             self.assertIn("VOLUME_ATTEMPT_TARGET_PER_DAY=34", cleaned)
             self.assertIn("VOLUME_MIN_FILLED_ENTRIES_PER_DAY=28", cleaned)
             self.assertIn("POSITION_HOLD_MINUTES=60", cleaned)
+            self.assertIn("ENTRY_INTERVAL_MINUTES=3", cleaned)
             self.assertIn("AI_KLINE_INTERVAL=3m", cleaned)
             self.assertIn("CONFLUENCE_ENABLED=true", cleaned)
             self.assertIn("CONFLUENCE_MIN_AGREEMENT=0.55", cleaned)
@@ -113,7 +115,7 @@ class EnvCleanerTests(unittest.TestCase):
             self.assertIn("CONFLUENCE_MIN_SCORE=0.05", cleaned)
             self.assertIn("CONFLUENCE_ATR_TP_MULT=3.0", cleaned)
             self.assertIn("CONFLUENCE_ATR_SL_MULT=1.0", cleaned)
-            self.assertIn("EXECUTION_ENTRY_ORDER_TYPE=post_only", cleaned)
+            self.assertIn("EXECUTION_ENTRY_ORDER_TYPE=market", cleaned)
             self.assertIn("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET=false", cleaned)
             self.assertIn("MAKER_ALLOW_TAKER_EMERGENCY_EXIT=true", cleaned)
             self.assertNotIn("OKX_API_KEY", cleaned)

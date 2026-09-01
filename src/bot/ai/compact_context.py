@@ -1,26 +1,16 @@
-"""Compact AI decision context.
-
-The full market context stays available to deterministic execution, factor
-attribution, reporting, and audit storage. Only the *AI representation* is
-compacted here: duplicated factor collections are collapsed into aggregates
-plus one small ranked list per symbol, flow signals are capped, and external
-provider payloads become one-line summaries.
-
-Engineering budgets (see plan §4):
-- two-symbol entry input at or below ~4,000 estimated tokens
-- one-symbol exit input at or below ~1,500 estimated tokens
-"""
+"""Parity AI decision context with structural duplicate removal only."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any, Iterable
 
 from bot.ai.usage import estimate_tokens
 
 # Prompt/contract version stamped on every AI call record.
-COMPACT_PROMPT_VERSION = "compact-v1"
+COMPACT_PROMPT_VERSION = "okx-context-parity-v2"
 
 _TECHNICAL_FIELDS: tuple[tuple[str, int], ...] = (
     ("last_price", 4),
@@ -72,58 +62,32 @@ class CompactDecisionContextBuilder:
         recent_performance: dict[str, Any],
         trade_memory: dict[str, Any],
         strategy_objective: dict[str, Any],
+        arena_reviews: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        technicals = _as_list(market_context.get("technicals"))
-        intelligence = _as_dict(market_context.get("intelligence"))
-        factors_by_symbol = self._factors_by_symbol(market_context)
-        composite_scores = {
-            symbol: round(_float(scores.get("composite_score")), 4)
-            for symbol, scores in _as_dict(intelligence.get("symbol_scores")).items()
-        }
-
-        symbols: list[dict[str, Any]] = []
-        for features in technicals:
-            symbol = str(features.get("symbol") or "")
-            if not symbol:
-                continue
-            symbol_factors = factors_by_symbol.get(symbol, [])
-            symbols.append(
-                {
-                    "symbol": symbol,
-                    "technicals": self._compact_technicals(features),
-                    "factor_aggregates": self._factor_aggregates(symbol_factors),
-                    "top_factors": self._ranked_factors(symbol_factors),
-                    "composite_score": composite_scores.get(symbol, 0.0),
-                }
-            )
-
         return {
-            "task": "entry_decision",
+            "task": "ai_volume_entry_decision" if str(getattr(self._settings, "strategy_mode", "")) == "ai_volume" else "entry_decision",
             "execution_environment": {
                 "exchange": str(getattr(self._settings, "exchange_name", "bingx")),
                 "mode": "vst_demo",
                 "margin_mode": str(getattr(self._settings, "margin_mode", "isolated")),
                 "position_mode": str(getattr(self._settings, "position_mode", "hedge")),
+                "symbols": [str(item) for item in getattr(self._settings, "symbols", ())],
             },
-            "allowed_symbols": [str(item) for item in getattr(self._settings, "symbols", ())],
-            "strategy_objective": self._compact_objective(strategy_objective),
-            "market": {
-                "regime": str(intelligence.get("regime") or "unknown"),
-                "risk_flags": [str(flag) for flag in _as_list(intelligence.get("risk_flags"))[:8]],
-                "composite_scores": composite_scores,
-            },
-            "symbols": symbols,
-            "flow_signals": self._compact_flow_signals(market_context),
-            "external_signals": self._compact_external_signals(market_context),
-            "risk_state": self._compact_risk_state(daily_state),
-            "fees": self._fee_assumptions(),
-            "recent_performance": self._compact_recent_performance(recent_performance),
-            "trade_memory": self._compact_trade_memory(trade_memory),
+            "strategy_objective": deepcopy(_as_dict(strategy_objective)),
+            "risk_constraints": self._entry_risk_constraints(daily_state),
+            "market_context": self._deduplicated_market_context(market_context),
+            "arena_reviews": self._deduplicated_entry_arena_reviews(arena_reviews),
+            "recent_executed_trade_performance": deepcopy(_as_dict(recent_performance)),
+            "learned_trade_memory": deepcopy(_as_dict(trade_memory)),
             "output_rules": {
-                "one_decision_per_allowed_symbol": True,
-                "open_requires_stop_loss_pct_take_profit_pct": True,
+                "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
+                "use_only_allowed_symbols": True,
+                "only_vst_demo_trades_are_executed": True,
+                "return_one_decision_per_symbol": True,
+                "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
                 "risk_review_required": True,
                 "risk_review_approved_false_vetoes_the_candidate": True,
+                "open_requires_final_stop_strictly_before_estimated_liquidation_or_hold": True,
             },
         }
 
@@ -137,30 +101,95 @@ class CompactDecisionContextBuilder:
         market_context: dict[str, Any],
     ) -> dict[str, Any]:
         symbol = str(position.get("symbol") or "")
-        technicals = _as_list(market_context.get("technicals"))
-        features = next((item for item in technicals if str(item.get("symbol")) == symbol), None)
-        intelligence = _as_dict(market_context.get("intelligence"))
-        symbol_factors = self._factors_by_symbol(market_context).get(symbol, [])
         return {
             "task": "exit_decision",
-            "position": {key: _round_value(value, 6) for key, value in position.items()},
-            "market": {
-                "regime": str(intelligence.get("regime") or "unknown"),
-                "risk_flags": [str(flag) for flag in _as_list(intelligence.get("risk_flags"))[:5]],
-                "composite_score": round(
-                    _float(_as_dict(_as_dict(intelligence.get("symbol_scores")).get(symbol)).get("composite_score")),
-                    4,
-                ),
-            },
-            "technicals": self._compact_technicals(features or {}),
-            "factor_aggregates": self._factor_aggregates(symbol_factors),
-            "top_factors": self._ranked_factors(symbol_factors, limit=4),
-            "flow_signals": self._compact_flow_signals(market_context, limit=3),
+            "position": deepcopy(_as_dict(position)),
+            "market_context": self._deduplicated_market_context(market_context, symbol=symbol),
             "constraints": {
+                "min_confidence": float(getattr(self._settings, "ai_min_confidence", 0.75)),
                 "position_hold_minutes": int(getattr(self._settings, "position_hold_minutes", 60)),
+                "taker_fee_pct": float(getattr(self._settings, "taker_fee_pct", 0.0)),
                 "round_trip_taker_fee_pct": self._round_trip_fee_pct(),
             },
         }
+
+    def _entry_risk_constraints(self, daily_state: Any) -> dict[str, Any]:
+        return {
+            "trade_target_per_day": int(getattr(self._settings, "trade_target_per_day", 0)),
+            "closed_trades_today": int(getattr(daily_state, "closed_trades", 0)),
+            "stop_losses_today": int(getattr(daily_state, "stop_losses", 0)),
+            "max_stop_losses_per_day": int(getattr(self._settings, "max_stop_loss_per_day", 0)),
+            "consecutive_losses_today": int(getattr(daily_state, "consecutive_losses", 0)),
+            "max_consecutive_losses": int(getattr(self._settings, "max_consecutive_losses", 0)),
+            "day_pnl_usdt": float(getattr(daily_state, "total_pnl_usdt", 0.0)),
+            "max_daily_drawdown_usdt": float(getattr(self._settings, "max_daily_drawdown_usdt", 0.0)),
+            "configured_leverage": int(getattr(self._settings, "leverage", 1)),
+            "configured_position_usdt": float(getattr(self._settings, "position_usdt", 0.0)),
+            "min_confidence": float(getattr(self._settings, "ai_min_confidence", 0.75)),
+            "min_fee_adjusted_risk_reward": float(getattr(self._settings, "ai_min_fee_adjusted_rr", 0.0)),
+            "round_trip_taker_fee_pct": self._round_trip_fee_pct(),
+        }
+
+    def _deduplicated_market_context(self, market_context: dict[str, Any], symbol: str | None = None) -> dict[str, Any]:
+        """Keep complete values once, removing only mirrored factor/flow arrays."""
+        context = deepcopy(_as_dict(market_context))
+        if symbol:
+            context["technicals"] = [
+                item for item in _as_list(context.get("technicals")) if _as_dict(item).get("symbol") == symbol
+            ]
+            context["factor_snapshots"] = [
+                item for item in _as_list(context.get("factor_snapshots")) if _as_dict(item).get("symbol") == symbol
+            ]
+            context["active_flow_signals"] = [
+                item for item in _as_list(context.get("active_flow_signals")) if _as_dict(item).get("symbol") == symbol
+            ]
+            context["new_flow_signals"] = [
+                item for item in _as_list(context.get("new_flow_signals")) if _as_dict(item).get("symbol") == symbol
+            ]
+            constraints = _as_dict(context.get("liquidation_constraints"))
+            context["liquidation_constraints"] = {symbol: deepcopy(constraints[symbol])} if symbol in constraints else {}
+        intelligence = _as_dict(context.get("intelligence"))
+        if symbol:
+            symbol_scores = _as_dict(intelligence.get("symbol_scores"))
+            intelligence["symbol_scores"] = (
+                {symbol: deepcopy(symbol_scores[symbol])} if symbol in symbol_scores else {}
+            )
+        factor_intelligence = _as_dict(intelligence.get("factor_intelligence"))
+        for key in ("snapshots", "by_symbol", "top_factor_details", "top_factors"):
+            factor_intelligence.pop(key, None)
+        if factor_intelligence:
+            intelligence["factor_intelligence"] = factor_intelligence
+        else:
+            intelligence.pop("factor_intelligence", None)
+        flow = _as_dict(intelligence.get("market_flow_signals"))
+        for key in ("active", "new_triggers", "by_symbol", "trigger_names"):
+            flow.pop(key, None)
+        if flow:
+            intelligence["market_flow_signals"] = flow
+        else:
+            intelligence.pop("market_flow_signals", None)
+        new_flows = _as_list(context.get("new_flow_signals"))
+        new_flow_records = {compact_json(item) for item in new_flows}
+        context["active_flow_signals"] = [
+            item for item in _as_list(context.get("active_flow_signals")) if compact_json(item) not in new_flow_records
+        ]
+        context["intelligence"] = intelligence
+        return context
+
+    @staticmethod
+    def _deduplicated_entry_arena_reviews(arena_reviews: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Keep arena conclusions while excluding flow records already in market_context."""
+        reviews = deepcopy(arena_reviews or [])
+        for review in reviews:
+            payload = _as_dict(_as_dict(review).get("payload"))
+            if _as_dict(review).get("role") == "SignalDesigner":
+                for key in ("active", "new_triggers", "by_symbol", "trigger_names"):
+                    payload.pop(key, None)
+                review["summary"] = "Market-flow review complete; trigger records are in market_context."
+            if _as_dict(review).get("role") == "MarketAnalyzer":
+                payload.pop("risk_flags", None)
+            review["payload"] = payload
+        return reviews
 
     # ------------------------------------------------------------------
     # internals

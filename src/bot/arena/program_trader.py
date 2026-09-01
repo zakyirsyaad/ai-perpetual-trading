@@ -120,7 +120,13 @@ class ProgramStrategyRunner:
             return ProgramExecutionResult(False, error="Validation failed: " + "; ".join(validation.errors))
 
         started = time.perf_counter()
-        process_context = multiprocessing.get_context("spawn")
+        # ``spawn`` has a substantial interpreter/import startup cost on macOS
+        # and can consume the entire strategy budget before untrusted code runs.
+        # Prefer a forked child where the platform supports it; the process is
+        # still isolated and receives the exact same hard timeout/termination
+        # path below. Windows retains the portable spawn fallback.
+        start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+        process_context = multiprocessing.get_context(start_method)
         result_queue = process_context.Queue(maxsize=1)
         process = process_context.Process(
             target=_execute_strategy_in_child,

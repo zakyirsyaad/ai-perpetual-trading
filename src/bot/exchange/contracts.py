@@ -37,6 +37,24 @@ class ExchangeAPIError(Exception):
         self.venue = venue
 
 
+class UncertainOrderSubmissionError(ExchangeAPIError):
+    """An order request may have been accepted, but cannot be reconciled safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        symbol: str,
+        client_order_id: str,
+        order_id: str | None = None,
+        venue: str = "unknown",
+    ) -> None:
+        super().__init__(message, retryable=False, venue=venue)
+        self.symbol = symbol
+        self.client_order_id = client_order_id
+        self.order_id = order_id
+
+
 @dataclass(slots=True)
 class Instrument:
     """Venue instrument metadata normalized to internal units.
@@ -125,6 +143,30 @@ class TradeFeeRates:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class MaintenanceMarginTier:
+    """Normalized isolated-margin maintenance tier in USDT notional units."""
+
+    min_position_value: Decimal
+    max_position_value: Decimal
+    maintenance_margin_ratio: Decimal
+    maintenance_amount: Decimal
+
+
+@runtime_checkable
+class MaintenanceMarginTierProvider(Protocol):
+    """Optional capability needed for pre-order liquidation safety."""
+
+    async def get_maintenance_margin_tiers(self, symbol: str) -> list[MaintenanceMarginTier]: ...
+
+
+@runtime_checkable
+class FreshOrderBookProvider(Protocol):
+    """Optional capability for last-mile entry proofs that cannot use cached data."""
+
+    async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot: ...
+
+
 @runtime_checkable
 class FuturesExchangeProtocol(Protocol):
     """Capabilities the runtime requires from any perpetual-futures venue."""
@@ -164,8 +206,6 @@ class FuturesExchangeProtocol(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     async def set_position_mode(self, position_mode: str) -> dict[str, Any]: ...
-
-    async def set_margin_mode(self, symbol: str, margin_mode: str) -> dict[str, Any]: ...
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]: ...
 

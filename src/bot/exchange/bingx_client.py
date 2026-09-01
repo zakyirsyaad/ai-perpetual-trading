@@ -29,10 +29,12 @@ from bot.exchange.contracts import (
     ExchangeAPIError,
     FundingRateInfo,
     Instrument,
+    MaintenanceMarginTier,
     OrderBookSnapshot,
     OrderFill,
     PositionDetails,
     TradeFeeRates,
+    UncertainOrderSubmissionError,
 )
 from bot.models import PositionDirection
 
@@ -308,13 +310,26 @@ class BingXFuturesClient:
         return [row for row in parsed if row["close"] > 0]
 
     async def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+        return await self._get_order_book(symbol, depth=depth, use_cache=True)
+
+    async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+        """Read current depth directly for an entry-order liquidation proof."""
+        return await self._get_order_book(symbol, depth=depth, use_cache=False)
+
+    async def _get_order_book(
+        self,
+        symbol: str,
+        *,
+        depth: int,
+        use_cache: bool,
+    ) -> OrderBookSnapshot:
         venue_symbol = self.venue_symbol(symbol)
         await self.get_instrument(symbol)
         resp = await self._public_request(
             "GET",
             "/openApi/swap/v2/quote/depth",
             {"symbol": venue_symbol, "limit": int(depth)},
-            cache_key=f"depth:{venue_symbol}:{depth}",
+            cache_key=f"depth:{venue_symbol}:{depth}" if use_cache else None,
         )
         row = self._data_object(resp)
         bids = row.get("bids") if isinstance(row.get("bids"), list) else []
@@ -402,6 +417,56 @@ class BingXFuturesClient:
             taker_fee_pct=float(abs(taker) * Decimal("100")),
             raw=row,
         )
+
+    async def get_maintenance_margin_tiers(self, symbol: str) -> list[MaintenanceMarginTier]:
+        """Return validated isolated-margin maintenance tiers for a symbol.
+
+        This is authenticated account/risk data.  A partial or malformed reply is
+        unsafe for pre-entry liquidation estimates, so it fails closed rather than
+        guessing a ratio from the instrument's leverage limits.
+        """
+        venue_symbol = self.venue_symbol(symbol)
+        response = await self._signed_request(
+            "GET",
+            "/openApi/swap/v1/maintMarginRatio",
+            {"symbol": venue_symbol},
+        )
+        data = response.get("data")
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict) and isinstance(data.get("tiers"), list):
+            rows = data["tiers"]
+        elif isinstance(data, dict):
+            rows = [data]
+        else:
+            rows = []
+        tiers: list[MaintenanceMarginTier] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ExchangeAPIError(
+                    f"Invalid maintenance margin tier for {venue_symbol}",
+                    retryable=False,
+                    venue=self.venue,
+                )
+            tier = self._maintenance_margin_tier(row, venue_symbol)
+            tiers.append(tier)
+        if not tiers:
+            raise ExchangeAPIError(
+                f"Missing maintenance margin tiers for {venue_symbol}",
+                retryable=False,
+                venue=self.venue,
+            )
+        ordered = sorted(tiers, key=lambda item: item.min_position_value)
+        previous_max: Decimal | None = None
+        for tier in ordered:
+            if previous_max is not None and tier.min_position_value != previous_max:
+                raise ExchangeAPIError(
+                    f"Non-contiguous or overlapping maintenance margin tiers for {venue_symbol}",
+                    retryable=False,
+                    venue=self.venue,
+                )
+            previous_max = tier.max_position_value
+        return ordered
 
     async def set_position_mode(self, position_mode: str) -> dict[str, Any]:
         dual = str(position_mode).strip().lower() in {"hedge", "dual", "long_short_mode", "true"}
@@ -706,7 +771,7 @@ class BingXFuturesClient:
         """
         client_order_id = str(params["clientOrderId"])
         try:
-            return await self._signed_request(
+            acknowledgement = await self._signed_request(
                 "POST",
                 "/openApi/swap/v2/trade/order",
                 params,
@@ -714,19 +779,45 @@ class BingXFuturesClient:
                 allow_retries=False,
             )
         except (httpx.TimeoutException, httpx.TransportError, ExchangeAPIError) as exc:
-            if isinstance(exc, ExchangeAPIError) and not exc.retryable:
+            if isinstance(exc, ExchangeAPIError) and exc.code is not None and not exc.retryable:
                 # A definitive business rejection never created an order.
                 raise
-            status, resp = await self._reconcile_uncertain_order(symbol, client_order_id)
-            if status == "found":
-                return resp  # type: ignore[return-value]
-            raise ExchangeAPIError(
-                f"Order {client_order_id} for {symbol} is in an unknown state: the request failed "
-                f"({type(exc).__name__}: {exc}) and reconciliation by clientOrderId returned "
-                f"{status!r}. Refusing to resubmit — reconcile this order manually.",
-                retryable=False,
-                venue=self.venue,
-            ) from exc
+            return await self._reconcile_unconfirmed_submission(
+                symbol=symbol,
+                client_order_id=client_order_id,
+                reason=f"the request failed ({type(exc).__name__}: {exc})",
+                cause=exc,
+            )
+        if self._acknowledged_order_id(acknowledgement) is not None:
+            return acknowledgement
+        return await self._reconcile_unconfirmed_submission(
+            symbol=symbol,
+            client_order_id=client_order_id,
+            reason="the successful acknowledgement had no supported order identity",
+        )
+
+    async def _reconcile_unconfirmed_submission(
+        self,
+        *,
+        symbol: str,
+        client_order_id: str,
+        reason: str,
+        cause: Exception | None = None,
+    ) -> dict[str, Any]:
+        """Return a reconciled submission or raise typed uncertainty without resubmitting."""
+        status, response = await self._reconcile_uncertain_order(symbol, client_order_id)
+        if status == "found" and response is not None:
+            return response
+        error = UncertainOrderSubmissionError(
+            f"Order {client_order_id} for {symbol} is in an unknown state: {reason} and reconciliation "
+            f"by clientOrderId returned {status!r}. Refusing to resubmit — reconcile this order manually.",
+            symbol=symbol,
+            client_order_id=client_order_id,
+            venue=self.venue,
+        )
+        if cause is not None:
+            raise error from cause
+        raise error
 
     async def _reconcile_uncertain_order(
         self,
@@ -768,7 +859,7 @@ class BingXFuturesClient:
             return "unknown", None
         except (httpx.TimeoutException, httpx.TransportError):
             return "unknown", None
-        if self._order_row(resp):
+        if self._acknowledged_order_id(resp, expected_client_order_id=client_order_id) is not None:
             return "found", resp
         # A success envelope with no recognisable order payload is ambiguous: it
         # may mean "no such order", or a shape this adapter does not model. Until
@@ -794,8 +885,35 @@ class BingXFuturesClient:
         row = self._order_row(resp)
         if not row:
             return None
-        order_id = str(row.get("orderId") or selector.get("orderId") or "")
-        filled = self._decimal(row.get("executedQty"))
+        response_order_id = row.get("orderId") or row.get("orderID")
+        response_client_order_id = row.get("clientOrderId")
+        expected_order_id = selector.get("orderId")
+        expected_client_order_id = selector.get("clientOrderId")
+        if expected_order_id not in (None, ""):
+            if response_order_id in (None, "") or str(response_order_id) != str(expected_order_id):
+                raise ExchangeAPIError(
+                    f"Order fill identity does not match requested order for {symbol}",
+                    retryable=False,
+                    venue=self.venue,
+                )
+            order_id = str(response_order_id)
+        elif expected_client_order_id not in (None, ""):
+            if response_client_order_id in (None, "") or str(response_client_order_id) != str(expected_client_order_id):
+                raise ExchangeAPIError(
+                    f"Order fill client identity does not match requested order for {symbol}",
+                    retryable=False,
+                    venue=self.venue,
+                )
+            order_id = str(response_order_id or response_client_order_id)
+        elif response_order_id not in (None, ""):
+            order_id = str(response_order_id)
+        else:
+            raise ExchangeAPIError(
+                f"Order fill is missing a supported order identity for {symbol}",
+                retryable=False,
+                venue=self.venue,
+            )
+        filled = self._required_nonnegative_order_quantity(row.get("executedQty"), symbol)
         avg_price = self._optional_decimal(row.get("avgPrice"))
         fee = self._optional_decimal(self._first_present(row, ("fee", "commission")))
         pnl = self._optional_decimal(
@@ -815,7 +933,7 @@ class BingXFuturesClient:
             pnl_usdt=float(pnl) if pnl is not None else None,
             state=str(row.get("status") or "").lower() or None,
             raw=row,
-            client_order_id=str(row.get("clientOrderId") or "") or None,
+            client_order_id=str(response_client_order_id or "") or None,
         )
 
     async def _aggregate_fills(self, symbol: str, order_id: str) -> tuple[Decimal, Decimal] | None:
@@ -1212,7 +1330,7 @@ class BingXFuturesClient:
             order = data.get("order")
             if isinstance(order, dict) and order:
                 return order
-            if data.get("orderId") not in (None, ""):
+            if data.get("orderId") not in (None, "") or data.get("orderID") not in (None, ""):
                 return data
             orders = data.get("orders")
             if isinstance(orders, list) and orders and isinstance(orders[0], dict):
@@ -1220,6 +1338,40 @@ class BingXFuturesClient:
         if isinstance(data, list) and data and isinstance(data[0], dict):
             return data[0]
         return {}
+
+    @classmethod
+    def _acknowledged_order_id(
+        cls,
+        response: dict[str, Any],
+        *,
+        expected_client_order_id: str | None = None,
+    ) -> str | None:
+        """Extract an order ID, optionally proving the requested client identity.
+
+        A POST acknowledgement belongs to this request directly. A later lookup
+        does not: it may return stale data despite querying by clientOrderId, so
+        it must echo the exact normalized identity before it can prove acceptance.
+        """
+        row = cls._order_row(response)
+        value = row.get("orderId") or row.get("orderID")
+        if value in (None, ""):
+            return None
+        identity = str(value).strip()
+        if not identity:
+            return None
+        if expected_client_order_id is not None:
+            expected = cls._normalized_client_order_id(expected_client_order_id)
+            returned = cls._normalized_client_order_id(row.get("clientOrderId"))
+            if expected is None or returned != expected:
+                return None
+        return identity
+
+    @staticmethod
+    def _normalized_client_order_id(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     def _match_contract_row(self, response: dict[str, Any], venue_symbol: str) -> dict[str, Any]:
         data = response.get("data")
@@ -1272,6 +1424,102 @@ class BingXFuturesClient:
             return Decimal(str(value))
         except Exception:
             return None
+
+    def _required_nonnegative_order_quantity(self, value: Any, symbol: str) -> Decimal:
+        if value in (None, ""):
+            raise ExchangeAPIError(
+                f"Order fill is missing executedQty for {symbol}",
+                retryable=False,
+                venue=self.venue,
+            )
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ExchangeAPIError(
+                f"Order fill has invalid executedQty for {symbol}",
+                retryable=False,
+                venue=self.venue,
+            ) from exc
+        if not parsed.is_finite() or parsed < 0:
+            raise ExchangeAPIError(
+                f"Order fill has invalid executedQty for {symbol}",
+                retryable=False,
+                venue=self.venue,
+            )
+        return parsed
+
+    @staticmethod
+    def _maintenance_margin_tier(row: dict[str, Any], venue_symbol: str) -> MaintenanceMarginTier:
+        canonical_amount = row.get("maintAmount")
+        alias_amount = row.get("maintMarginAmount")
+        if canonical_amount in (None, "") and alias_amount in (None, ""):
+            raise ExchangeAPIError(
+                f"Missing maintAmount in maintenance margin tier for {venue_symbol}",
+                retryable=False,
+                venue="bingx",
+            )
+        if canonical_amount not in (None, "") and alias_amount not in (None, ""):
+            try:
+                canonical_decimal = Decimal(str(canonical_amount))
+                alias_decimal = Decimal(str(alias_amount))
+            except Exception as exc:
+                raise ExchangeAPIError(
+                    f"Invalid maintenance amount in tier for {venue_symbol}",
+                    retryable=False,
+                    venue="bingx",
+                ) from exc
+            if not canonical_decimal.is_finite() or not alias_decimal.is_finite() or canonical_decimal != alias_decimal:
+                raise ExchangeAPIError(
+                    f"Conflicting maintenance amounts in tier for {venue_symbol}",
+                    retryable=False,
+                    venue="bingx",
+                )
+        normalized_row = dict(row)
+        normalized_row["maintMarginAmount"] = (
+            canonical_amount if canonical_amount not in (None, "") else alias_amount
+        )
+        values: dict[str, Decimal] = {}
+        for field in ("minPositionVal", "maxPositionVal", "maintMarginRatio", "maintMarginAmount"):
+            raw = normalized_row.get(field)
+            if raw in (None, ""):
+                raise ExchangeAPIError(
+                    f"Missing {field} in maintenance margin tier for {venue_symbol}",
+                    retryable=False,
+                    venue="bingx",
+                )
+            try:
+                value = Decimal(str(raw))
+            except Exception as exc:
+                raise ExchangeAPIError(
+                    f"Invalid {field} in maintenance margin tier for {venue_symbol}",
+                    retryable=False,
+                    venue="bingx",
+                ) from exc
+            if not value.is_finite():
+                raise ExchangeAPIError(
+                    f"Invalid {field} in maintenance margin tier for {venue_symbol}",
+                    retryable=False,
+                    venue="bingx",
+                )
+            values[field] = value
+        if (
+            values["minPositionVal"] < 0
+            or values["maxPositionVal"] <= values["minPositionVal"]
+            or values["maintMarginRatio"] < 0
+            or values["maintMarginRatio"] >= 1
+            or values["maintMarginAmount"] < 0
+        ):
+            raise ExchangeAPIError(
+                f"Out-of-range maintenance margin tier for {venue_symbol}",
+                retryable=False,
+                venue="bingx",
+            )
+        return MaintenanceMarginTier(
+            min_position_value=values["minPositionVal"],
+            max_position_value=values["maxPositionVal"],
+            maintenance_margin_ratio=values["maintMarginRatio"],
+            maintenance_amount=values["maintMarginAmount"],
+        )
 
     @staticmethod
     def _min_optional_int(*values: Any) -> int | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -82,6 +83,10 @@ class AIOrchestrator:
             recent_performance=recent_performance,
             trade_memory=learned_trade_memory,
             strategy_objective=self._strategy_objective_payload(),
+            arena_reviews=[
+                self._market_analyzer.review(context_dict).to_dict(),
+                self._signal_designer.review(context_dict).to_dict(),
+            ],
         )
         decisions = await self._brain.entry_decisions(payload)
         if decisions is None:
@@ -138,6 +143,14 @@ class AIOrchestrator:
             return None
         if decision.symbol not in self._settings.symbols:
             self._logger.warning("Grok returned unsupported symbol %s.", decision.symbol)
+            return None
+        if decision.confidence < self._settings.ai_min_confidence:
+            self._logger.info(
+                "Entry candidate %s rejected: confidence %.3f is below minimum %.3f.",
+                decision.symbol,
+                decision.confidence,
+                self._settings.ai_min_confidence,
+            )
             return None
 
         # Merged risk review (replaces the separate PreTradeCheck call). A missing or
@@ -317,6 +330,7 @@ class AIOrchestrator:
                 "entry_price": position.entry_price,
                 "current_price": current_price,
                 "quantity_base": position.quantity,
+                "exchange_size": position.exchange_size,
                 "elapsed_seconds": round(elapsed_seconds, 1),
             },
             market_context=context_dict,
@@ -352,10 +366,7 @@ class AIOrchestrator:
         decision = await self._brain.exit_decision(payload)
         if decision is None:
             return self._deterministic_exit_fallback(elapsed_seconds, ai_called=True)
-        min_confidence = self._settings.ai_min_confidence
-        if elapsed_seconds >= self._settings.position_hold_minutes * 60:
-            min_confidence = max(0.4, min_confidence - 0.2)
-        if decision.confidence < min_confidence:
+        if decision.confidence < self._settings.ai_min_confidence:
             return ExitSignal(close_now=False, reason="hold")
         return ExitSignal(close_now=decision.action == "CLOSE", reason=decision.reason)
 
@@ -405,6 +416,8 @@ class AIOrchestrator:
         )
         tp_pct = max(base_tp, atr_pct * self._settings.atr_tp_multiplier, min_tp_for_net_rr)
         fee_adjusted_rr = self._fee_adjusted_rr(sl_pct, tp_pct)
+        if not self._stop_is_strictly_before_liquidation(decision, sl_pct, market_context):
+            return None
         # Volume-building run: fee-adjusted RR and TP-vs-fee rejections removed. The
         # computed fee_adjusted_rr is still returned for candidate scoring.
         return ResolvedTradeTargets(
@@ -414,6 +427,39 @@ class AIOrchestrator:
             fee_adjusted_rr=fee_adjusted_rr,
             round_trip_fee_pct=round_trip_fee_pct,
         )
+
+    def _stop_is_strictly_before_liquidation(
+        self,
+        decision: EntryDecision,
+        stop_loss_pct: float,
+        market_context: dict[str, Any],
+    ) -> bool:
+        constraints = market_context.get("liquidation_constraints")
+        constraint = constraints.get(decision.symbol) if isinstance(constraints, dict) else None
+        if not isinstance(constraint, dict) or constraint.get("status") != "available":
+            self._logger.warning("Entry candidate %s rejected: liquidation constraint unavailable.", decision.symbol)
+            return False
+        key = "max_long_stop_loss_pct" if decision.action == "OPEN_LONG" else "max_short_stop_loss_pct"
+        try:
+            maximum = float(constraint[key])
+        except (KeyError, TypeError, ValueError):
+            self._logger.warning("Entry candidate %s rejected: malformed liquidation constraint.", decision.symbol)
+            return False
+        if (
+            not math.isfinite(stop_loss_pct)
+            or not math.isfinite(maximum)
+            or stop_loss_pct <= 0
+            or maximum <= 0
+            or stop_loss_pct >= maximum
+        ):
+            self._logger.warning(
+                "Entry candidate %s rejected: stop_loss_pct=%.6f must be strictly below liquidation maximum %.6f.",
+                decision.symbol,
+                stop_loss_pct,
+                maximum,
+            )
+            return False
+        return True
 
     async def _record_ai_decision(self, decision: EntryDecision, request_payload: dict[str, Any]) -> None:
         # Link the stored decision to the provider call that produced it so token

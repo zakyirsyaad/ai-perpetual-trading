@@ -16,7 +16,11 @@ from bot.exchange.bingx_client import (
     build_signature,
     canonical_param_string,
 )
-from bot.exchange.contracts import ExchangeAPIError
+from bot.exchange.contracts import ExchangeAPIError, MaintenanceMarginTier, UncertainOrderSubmissionError
+from bot.exchange.contracts import FuturesExchangeProtocol, MaintenanceMarginTierProvider
+from bot.exchange.okx_client import OKXFuturesClient
+from bot.config import Settings
+from pydantic import ValidationError
 from bot.models import PositionDirection
 
 
@@ -229,6 +233,138 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
             build_signature("test-secret", canonical_param_string({k: v for k, v in params.items() if k != "signature"})),
         )
 
+    async def test_maintenance_margin_tiers_are_normalized_and_validated(self) -> None:
+        client = _client(
+            [
+                _FakeResponse(
+                    {
+                        "code": 0,
+                        "data": [
+                            {
+                                "minPositionVal": "0",
+                                "maxPositionVal": "50000",
+                                "maintMarginRatio": "0.004",
+                                "maintAmount": "0",
+                            },
+                            {
+                                "minPositionVal": "50000",
+                                "maxPositionVal": "250000",
+                                "maintMarginRatio": "0.005",
+                                "maintAmount": "50",
+                            },
+                        ],
+                    }
+                )
+            ]
+        )
+
+        tiers = await client.get_maintenance_margin_tiers("BTC/USDT")
+
+        self.assertEqual(
+            tiers,
+            [
+                MaintenanceMarginTier(Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0")),
+                MaintenanceMarginTier(Decimal("50000"), Decimal("250000"), Decimal("0.005"), Decimal("50")),
+            ],
+        )
+        sent = client._client.requests[0]  # type: ignore[attr-defined]
+        self.assertEqual(sent["url"].split(BINGX_VST_BASE_URL)[-1], "/openApi/swap/v1/maintMarginRatio")
+        self.assertEqual(sent["params"]["symbol"], "BTC-USDT")
+
+    async def test_invalid_maintenance_margin_tier_fails_closed(self) -> None:
+        client = _client(
+            [
+                _FakeResponse(
+                    {"code": 0, "data": [{"minPositionVal": "0", "maxPositionVal": "10", "maintMarginRatio": "nope"}]}
+                )
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_maintenance_margin_tiers("BTC/USDT")
+
+    async def test_gapped_maintenance_margin_schedule_fails_closed(self) -> None:
+        client = _client(
+            [
+                _FakeResponse(
+                    {
+                        "code": 0,
+                        "data": [
+                            {"minPositionVal": "0", "maxPositionVal": "50000", "maintMarginRatio": "0.004", "maintAmount": "0"},
+                            {"minPositionVal": "60000", "maxPositionVal": "250000", "maintMarginRatio": "0.005", "maintAmount": "50"},
+                        ],
+                    }
+                )
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await client.get_maintenance_margin_tiers("BTC/USDT")
+
+    async def test_maintenance_margin_amount_alias_is_accepted_but_conflicts_fail_closed(self) -> None:
+        alias_client = _client(
+            [
+                _FakeResponse(
+                    {
+                        "code": 0,
+                        "data": [
+                            {
+                                "minPositionVal": "0",
+                                "maxPositionVal": "50000",
+                                "maintMarginRatio": "0.004",
+                                "maintMarginAmount": "12",
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        self.assertEqual((await alias_client.get_maintenance_margin_tiers("BTC/USDT"))[0].maintenance_amount, Decimal("12"))
+
+        conflict_client = _client(
+            [
+                _FakeResponse(
+                    {
+                        "code": 0,
+                        "data": [
+                            {
+                                "minPositionVal": "0",
+                                "maxPositionVal": "50000",
+                                "maintMarginRatio": "0.004",
+                                "maintAmount": "12",
+                                "maintMarginAmount": "13",
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        with self.assertRaises(ExchangeAPIError):
+            await conflict_client.get_maintenance_margin_tiers("BTC/USDT")
+
+    async def test_maintenance_margin_tiers_accept_nested_and_direct_api_shapes(self) -> None:
+        nested_client = _client(
+            [
+                _FakeResponse(
+                    {"code": 0, "data": {"tiers": [{"minPositionVal": "0", "maxPositionVal": "100", "maintMarginRatio": "0.004", "maintAmount": "0"}]}}
+                )
+            ]
+        )
+        direct_client = _client(
+            [
+                _FakeResponse(
+                    {"code": 0, "data": {"minPositionVal": "0", "maxPositionVal": "100", "maintMarginRatio": "0.004", "maintAmount": "0"}}
+                )
+            ]
+        )
+        self.assertEqual(len(await nested_client.get_maintenance_margin_tiers("BTC/USDT")), 1)
+        self.assertEqual(len(await direct_client.get_maintenance_margin_tiers("BTC/USDT")), 1)
+
+    def test_okx_remains_base_protocol_compatible_but_not_tier_provider(self) -> None:
+        client = object.__new__(OKXFuturesClient)
+        self.assertIsInstance(client, FuturesExchangeProtocol)
+        self.assertNotIsInstance(client, MaintenanceMarginTierProvider)
+        self.assertFalse(hasattr(OKXFuturesClient, "get_maintenance_margin_tiers"))
+
+
     async def test_get_and_delete_sign_the_exact_canonical_wire_query(self) -> None:
         timestamp = 1_700_000_000_000
         expected_payload = f"amount=2&recvWindow=5000&symbol=BTC-USDT&timestamp={timestamp}"
@@ -336,6 +472,25 @@ class SymbolAndHeaderTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExchangeAPIError) as ctx:
             await client._signed_request("GET", "/openApi/swap/v2/user/positions", {})
         self.assertIn("clock", str(ctx.exception).lower())
+
+
+class SettingsConfidenceFloorTests(unittest.TestCase):
+    def _settings(self, confidence: float) -> Settings:
+        return Settings(
+            _env_file=None,
+            BINGX_API_KEY="test-key",
+            BINGX_SECRET_KEY="test-secret",
+            STRATEGY_MODE="volume",
+            AI_MIN_CONFIDENCE=confidence,
+        )
+
+    def test_minimum_confidence_rejects_values_below_point_75(self) -> None:
+        with self.assertRaises(ValidationError):
+            self._settings(0.65)
+
+    def test_minimum_confidence_accepts_boundaries(self) -> None:
+        self.assertEqual(self._settings(0.75).ai_min_confidence, 0.75)
+        self.assertEqual(self._settings(1.0).ai_min_confidence, 1.0)
 
 
 class BusinessErrorPolicyTests(unittest.IsolatedAsyncioTestCase):
@@ -752,10 +907,116 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse(found),
             ]
         )
+        client._new_client_order_id = lambda: "seen"  # type: ignore[method-assign]
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
         self.assertEqual(methods.count("POST"), 1)
         self.assertEqual(str(ack["data"]["order"]["orderId"]), "99")
+
+    async def test_reconciliation_requires_a_matching_client_order_id(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale", "clientOrderId": "other-order"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale", "clientOrderId": "other-order"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale", "clientOrderId": "other-order"}}}),
+            ]
+        )
+        client._new_client_order_id = lambda: "expected-order"  # type: ignore[method-assign]
+
+        with self.assertRaises(UncertainOrderSubmissionError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_reconciliation_requires_a_present_client_order_id(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                httpx.ReadTimeout("timeout"),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale"}}}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderId": "stale"}}}),
+            ]
+        )
+        client._new_client_order_id = lambda: "expected-order"  # type: ignore[method-assign]
+
+        with self.assertRaises(UncertainOrderSubmissionError):
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_empty_successful_order_acknowledgement_is_reconciled_before_returning(self) -> None:
+        reconciled = {"code": 0, "data": {"order": {"orderId": "reconciled-1", "clientOrderId": "reconciled-1"}}}
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {}}),
+                _FakeResponse(reconciled),
+            ]
+        )
+        client._new_client_order_id = lambda: "reconciled-1"  # type: ignore[method-assign]
+
+        acknowledgement = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        self.assertEqual(str(acknowledgement["data"]["order"]["orderId"]), "reconciled-1")
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(methods.count("GET"), 2)
+
+    async def test_unexpected_successful_order_acknowledgement_is_reconciled_before_returning(self) -> None:
+        reconciled = {"code": 0, "data": {"order": {"orderId": "reconciled-2", "clientOrderId": "reconciled-2"}}}
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"accepted": True}}),
+                _FakeResponse(reconciled),
+            ]
+        )
+        client._new_client_order_id = lambda: "reconciled-2"  # type: ignore[method-assign]
+
+        acknowledgement = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        self.assertEqual(str(acknowledgement["data"]["order"]["orderId"]), "reconciled-2")
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(methods.count("GET"), 2)
+
+    async def test_empty_successful_order_acknowledgement_with_unknown_lookup_is_uncertain(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {}}),
+                _FakeResponse({"code": 0, "data": {}}),
+                _FakeResponse({"code": 0, "data": {}}),
+                _FakeResponse({"code": 0, "data": {}}),
+            ]
+        )
+
+        with self.assertRaises(UncertainOrderSubmissionError) as ctx:
+            await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        self.assertEqual(ctx.exception.symbol, "BTC/USDT")
+        self.assertTrue(ctx.exception.client_order_id)
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("POST"), 1)
+
+    async def test_compatible_order_id_alias_is_accepted_without_reconciliation(self) -> None:
+        client = _client(
+            [
+                _FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}),
+                _FakeResponse({"code": 0, "data": {"order": {"orderID": "compat-1"}}}),
+            ]
+        )
+
+        acknowledgement = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+
+        self.assertEqual(str(acknowledgement["data"]["order"]["orderID"]), "compat-1")
+        methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
+        self.assertEqual(methods.count("GET"), 1)
 
     async def test_order_not_found_still_never_triggers_a_second_post(self) -> None:
         # BingX documents 109421 as "may have been filled, cancelled, or order ID
@@ -805,6 +1066,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 0, "data": {"order": {"orderId": "42", "clientOrderId": "x"}}}),
             ]
         )
+        client._new_client_order_id = lambda: "x"  # type: ignore[method-assign]
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
         self.assertEqual(methods.count("POST"), 1)
@@ -855,9 +1117,11 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 httpx.ReadTimeout("lookup timeout"),
             ]
         )
-        with self.assertRaises(ExchangeAPIError) as ctx:
+        with self.assertRaises(UncertainOrderSubmissionError) as ctx:
             await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         self.assertIn("unknown state", str(ctx.exception))
+        self.assertEqual(ctx.exception.symbol, "BTC/USDT")
+        self.assertTrue(ctx.exception.client_order_id)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
         self.assertEqual(methods.count("POST"), 1)
 
@@ -886,6 +1150,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 0, "data": {"order": {"orderId": "5", "clientOrderId": "x"}}}),
             ]
         )
+        client._new_client_order_id = lambda: "x"  # type: ignore[method-assign]
         ack = await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
         methods = [item["method"] for item in client._client.requests]  # type: ignore[attr-defined]
         self.assertEqual(methods.count("POST"), 1)
@@ -898,8 +1163,9 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
                 _FakeResponse({"code": 100400, "msg": "insufficient margin"}),
             ]
         )
-        with self.assertRaises(ExchangeAPIError):
+        with self.assertRaises(ExchangeAPIError) as ctx:
             await client.place_market_order("BTC/USDT", PositionDirection.LONG, 0.1)
+        self.assertNotIsInstance(ctx.exception, UncertainOrderSubmissionError)
         self.assertEqual(len(client._client.requests), 2)  # type: ignore[attr-defined]
 
     async def test_order_post_does_not_fail_over_to_the_pro_domain(self) -> None:
@@ -1028,6 +1294,29 @@ class ReduceOnlyModeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_canceled_fill_requires_identity_and_finite_executed_quantity(self) -> None:
+        malformed_rows = [
+            {"orderId": "1", "status": "CANCELED"},
+            {"orderId": "1", "executedQty": "not-a-number", "status": "CANCELED"},
+            {"orderId": "1", "executedQty": "NaN", "status": "CANCELED"},
+            {"orderId": "1", "executedQty": "Infinity", "status": "CANCELED"},
+            {"executedQty": "0", "status": "CANCELED"},
+            {"orderId": "other", "executedQty": "0", "status": "CANCELED"},
+        ]
+        for row in malformed_rows:
+            with self.subTest(row=row):
+                client = _client([_FakeResponse({"code": 0, "data": {"order": row}})])
+                with self.assertRaises(ExchangeAPIError):
+                    await client.get_order_fill("BTC/USDT", "1")
+
+    async def test_canceled_zero_fill_with_matching_identity_is_preserved(self) -> None:
+        client = _client(
+            [_FakeResponse({"code": 0, "data": {"order": {"orderId": "1", "executedQty": "0", "status": "CANCELED"}}})]
+        )
+        fill = await client.get_order_fill("BTC/USDT", "1")
+        self.assertEqual(fill.order_id, "1")
+        self.assertEqual(fill.filled_size, 0.0)
+
     async def test_order_fill_parsing_with_partial_fill(self) -> None:
         payload = {
             "code": 0,
@@ -1185,6 +1474,21 @@ class CachingTests(unittest.IsolatedAsyncioTestCase):
         second = await client.get_last_price("BTC/USDT")
         self.assertEqual(first, second)
         self.assertEqual(len(client._client.requests), 1)  # type: ignore[attr-defined]
+
+    async def test_fresh_order_book_bypasses_a_cached_depth_response(self) -> None:
+        stale = {"code": 0, "data": {"bids": [["100", "2"]], "asks": [["101", "3"]]}}
+        fresh = {"code": 0, "data": {"bids": [["110", "2"]], "asks": [["111", "3"]]}}
+        client = _client(
+            [_FakeResponse({"code": 0, "data": [_CONTRACT_ROW]}), _FakeResponse(stale), _FakeResponse(fresh)],
+            market_cache_seconds=60.0,
+        )
+
+        cached = await client.get_order_book("BTC/USDT")
+        uncached = await client.get_fresh_order_book("BTC/USDT")
+
+        self.assertEqual(cached.best_ask, 101.0)
+        self.assertEqual(uncached.best_ask, 111.0)
+        self.assertEqual(len(client._client.requests), 3)  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     volume_daily_fee_budget_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_DAILY_FEE_BUDGET_USDT")
     trading_timezone: str = Field(default="Asia/Jakarta", alias="TRADING_TIMEZONE")
 
-    entry_interval_minutes: int = Field(default=15, alias="ENTRY_INTERVAL_MINUTES")
+    entry_interval_minutes: int = Field(default=3, alias="ENTRY_INTERVAL_MINUTES")
     position_hold_minutes: int = Field(default=60, alias="POSITION_HOLD_MINUTES")
     stop_loss_pct: float = Field(default=0.35, alias="STOP_LOSS_PCT")
     take_profit_pct: float = Field(default=0.7, alias="TAKE_PROFIT_PCT")
@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     order_fill_wait_seconds: int = Field(default=3, alias="ORDER_FILL_WAIT_SECONDS")
     use_exchange_fee_rates: bool = Field(default=True, alias="USE_EXCHANGE_FEE_RATES")
     execution_guards_enabled: bool = Field(default=True, alias="EXECUTION_GUARDS_ENABLED")
-    execution_entry_order_type: str = Field(default="post_only", alias="EXECUTION_ENTRY_ORDER_TYPE")
+    execution_entry_order_type: str = Field(default="market", alias="EXECUTION_ENTRY_ORDER_TYPE")
     execution_post_only_timeout_seconds: float = Field(
         default=3.0,
         ge=0.5,
@@ -123,11 +123,6 @@ class Settings(BaseSettings):
     max_abs_funding_rate: float = Field(default=0.001, ge=0.0, alias="MAX_ABS_FUNDING_RATE")
     max_spread_bps: float = Field(default=6.0, ge=0.0, alias="MAX_SPREAD_BPS")
     funding_blackout_minutes: int = Field(default=10, ge=0, alias="FUNDING_BLACKOUT_MINUTES")
-    min_liquidation_distance_bps: float = Field(
-        default=250.0,
-        ge=0.0,
-        alias="MIN_LIQUIDATION_DISTANCE_BPS",
-    )
     hard_max_leverage: int = Field(default=100, ge=1, le=200, alias="HARD_MAX_LEVERAGE")
     venue_max_leverage: int | None = Field(default=100, ge=1, le=200, alias="VENUE_MAX_LEVERAGE")
 
@@ -162,7 +157,7 @@ class Settings(BaseSettings):
     ai_kline_limit: int = Field(default=120, alias="AI_KLINE_LIMIT")
     ai_recent_performance_limit: int = Field(default=20, ge=1, le=100, alias="AI_RECENT_PERFORMANCE_LIMIT")
     ai_trade_memory_limit: int = Field(default=40, ge=1, le=200, alias="AI_TRADE_MEMORY_LIMIT")
-    ai_min_confidence: float = Field(default=0.65, alias="AI_MIN_CONFIDENCE")
+    ai_min_confidence: float = Field(default=0.75, ge=0.75, le=1.0, alias="AI_MIN_CONFIDENCE")
     ai_min_setup_score: float = Field(default=0.58, ge=0.0, le=1.0, alias="AI_MIN_SETUP_SCORE")
     ai_min_fee_adjusted_rr: float = Field(default=1.35, ge=0.1, alias="AI_MIN_FEE_ADJUSTED_RR")
     ai_systemic_risk_no_trade_threshold: int = Field(

@@ -9,7 +9,8 @@ from bot.arena.flow_signals import FactorDistributionTracker, MarketFlowSignalDe
 from bot.config import Settings
 from bot.data.market_signals import ExternalMarketSignals, MarketContext, TechnicalFeatures
 from bot.data.providers import ExternalSignalAggregator
-from bot.exchange.contracts import FuturesExchangeProtocol
+from bot.exchange.contracts import FuturesExchangeProtocol, MaintenanceMarginTier, MaintenanceMarginTierProvider
+from bot.exchange.liquidation import estimate_isolated_liquidation_constraint, select_maintenance_margin_tier
 from bot.strategy.indicators import atr, ema, macd, pct_change, rsi
 
 
@@ -60,12 +61,15 @@ class MarketIntelligence:
         intelligence = self._summarize_market(technicals, external)
         intelligence["factor_intelligence"] = factor_payload
         intelligence["market_flow_signals"] = flow_payload
+        liquidation_constraints = await self._build_liquidation_constraints(technicals)
         return MarketContext(
             technicals=technicals,
             external_signals=external,
             intelligence=intelligence,
             factor_snapshots=factor_payload.get("snapshots") or [],
             active_flow_signals=flow_payload.get("active") or [],
+            new_flow_signals=flow_payload.get("new_triggers") or [],
+            liquidation_constraints=liquidation_constraints,
         )
 
     async def close(self) -> None:
@@ -137,6 +141,59 @@ class MarketIntelligence:
             bid_depth_notional=bid_depth_notional,
             ask_depth_notional=ask_depth_notional,
         )
+
+    async def _build_liquidation_constraints(
+        self,
+        technicals: list[TechnicalFeatures],
+    ) -> dict[str, dict[str, Any]]:
+        constraints: dict[str, dict[str, Any]] = {}
+        for technical in technicals:
+            try:
+                if not isinstance(self._client, MaintenanceMarginTierProvider):
+                    raise TypeError("exchange does not provide maintenance margin tiers")
+                tiers = await self._client.get_maintenance_margin_tiers(technical.symbol)
+                constraints[technical.symbol] = self._liquidation_constraint(technical, tiers)
+            except Exception as exc:
+                self._logger.warning("Liquidation tiers unavailable for %s: %s", technical.symbol, exc)
+                constraints[technical.symbol] = {
+                    "status": "unavailable",
+                    "error": f"maintenance_margin_tier_lookup_failed:{type(exc).__name__}",
+                }
+        return constraints
+
+    def _liquidation_constraint(
+        self,
+        technical: TechnicalFeatures,
+        tiers: list[MaintenanceMarginTier],
+    ) -> dict[str, Any]:
+        planned_notional = self._planned_notional()
+        close_fee_rate = float(self._settings.taker_fee_pct) / 100.0
+        reference_price = float(technical.last_price)
+        if reference_price <= 0:
+            raise ValueError("invalid liquidation reference price")
+        constraint = estimate_isolated_liquidation_constraint(
+            reference_price=reference_price,
+            quantity_base=planned_notional / reference_price,
+            leverage=int(self._settings.leverage),
+            taker_close_fee_rate=close_fee_rate,
+            tiers=tiers,
+        )
+        return constraint.to_dict()
+
+    def _planned_notional(self) -> float:
+        profile = getattr(self._settings, "volume_profile", None)
+        if str(getattr(self._settings, "strategy_mode", "")) == "ai_volume" and profile is not None:
+            value = getattr(profile, "notional_per_side_usdt", None)
+            if value is not None:
+                return float(value)
+        return float(self._settings.position_usdt) * float(self._settings.leverage)
+
+    @staticmethod
+    def _select_maintenance_tier(
+        tiers: list[MaintenanceMarginTier],
+        notional: float,
+    ) -> MaintenanceMarginTier | None:
+        return select_maintenance_margin_tier(tiers, notional)
 
     def _summarize_market(
         self,

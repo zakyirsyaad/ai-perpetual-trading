@@ -7,10 +7,21 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from bot.core.trade_engine import TradeEngine
-from bot.exchange.contracts import ExchangeAPIError, FundingRateInfo, OrderBookSnapshot, OrderFill, PositionDetails
+from bot.config import Settings
+from bot.exchange.contracts import (
+    ExchangeAPIError,
+    FundingRateInfo,
+    MaintenanceMarginTier,
+    OrderBookSnapshot,
+    OrderFill,
+    PositionDetails,
+    UncertainOrderSubmissionError,
+)
+from decimal import Decimal
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
 from bot.strategy.base import ExitSignal
+from bot.strategy.volume_strategy import VolumeStrategy
 
 
 def _settings(**overrides) -> SimpleNamespace:
@@ -19,6 +30,8 @@ def _settings(**overrides) -> SimpleNamespace:
         exchange_name="bingx",
         symbols=("BTC/USDT",),
         position_usdt=180.0,
+        account_balance_usdt=1500.0,
+        volume_margin_per_entry_usdt=180.0,
         leverage=100,
         stop_loss_pct=0.1,
         take_profit_pct=0.2,
@@ -59,7 +72,6 @@ def _settings(**overrides) -> SimpleNamespace:
         max_abs_funding_rate=0.01,
         max_spread_bps=50.0,
         funding_blackout_minutes=0,
-        min_liquidation_distance_bps=0.0,
         margin_mode="isolated",
         position_mode="hedge",
         taker_fee_pct=0.05,
@@ -110,6 +122,9 @@ class FakeClient:
             raw={},
         )
 
+    async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+        return await self.get_order_book(symbol, depth)
+
     async def get_funding_rate_info(self, symbol: str) -> FundingRateInfo:
         return FundingRateInfo(symbol=symbol, funding_rate=0.0, next_funding_time=None, raw={})
 
@@ -117,6 +132,9 @@ class FakeClient:
         if self.fee_error:
             raise RuntimeError("fee endpoint down")
         return SimpleNamespace(maker_fee_pct=-0.02, taker_fee_pct=0.05, raw={})
+
+    async def get_maintenance_margin_tiers(self, symbol: str):
+        return [MaintenanceMarginTier(Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0"))]
 
     async def calculate_order_size(self, symbol: str, base_quantity: float) -> float:
         return round(base_quantity, 6)
@@ -277,6 +295,456 @@ def _engine(client, store, strategy, risk, settings=None) -> TradeEngine:
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_settings_default_routes_entries_as_market_orders(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            BINGX_API_KEY="test-key",
+            BINGX_SECRET_KEY="test-secret",
+            STRATEGY_MODE="volume",
+        )
+        client = FakeClient()
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)
+
+        await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertEqual(settings.execution_entry_order_type, "market")
+        self.assertEqual(settings.entry_interval_minutes, 3)
+        self.assertEqual(client.orders[0]["type"], "market")
+
+    async def test_market_entry_has_a_last_mile_liquidation_gate_at_the_ask_price(self) -> None:
+        class RecordingGateEngine(TradeEngine):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.gate_attempts: list[tuple[float, float]] = []
+
+            async def _passes_pre_order_liquidation_gate(self, plan, entry_price, quantity_base):
+                self.gate_attempts.append((entry_price, quantity_base))
+                return await super()._passes_pre_order_liquidation_gate(plan, entry_price, quantity_base)
+
+        class TrackingClient(FakeClient):
+            async def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                return OrderBookSnapshot(symbol, 99.0, 101.0, 100.0, 2.0, 1_000_000.0, 1_000_000.0, None, {})
+
+        client = TrackingClient()
+        engine = RecordingGateEngine(_settings(), logging.getLogger("test.last_mile.market"), client, FakeStrategy(_plan()), FakeRisk(), FakeStore())
+
+        await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertEqual(engine.gate_attempts, [(101.0, 1.0)])
+        self.assertEqual(client.orders[0]["type"], "market")
+
+    async def test_market_entry_proof_uses_uncached_book_instead_of_a_stale_cached_book(self) -> None:
+        class RecordingGateEngine(TradeEngine):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.gate_attempts: list[float] = []
+
+            async def _passes_pre_order_liquidation_gate(self, plan, entry_price, quantity_base):
+                self.gate_attempts.append(entry_price)
+                return await super()._passes_pre_order_liquidation_gate(plan, entry_price, quantity_base)
+
+        class StaleBookClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fresh_calls = 0
+
+            async def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                return OrderBookSnapshot(symbol, 90.0, 91.0, 90.5, 2.0, 1_000_000.0, 1_000_000.0, None, {})
+
+            async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                self.fresh_calls += 1
+                return OrderBookSnapshot(symbol, 99.0, 102.0, 100.5, 2.0, 1_000_000.0, 1_000_000.0, None, {})
+
+        client = StaleBookClient()
+        engine = RecordingGateEngine(_settings(), logging.getLogger("test.fresh.market"), client, FakeStrategy(_plan()), FakeRisk(), FakeStore())
+        await client.get_order_book("BTC/USDT")
+
+        await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertEqual(engine.gate_attempts, [102.0])
+        self.assertEqual(client.fresh_calls, 1)
+        self.assertTrue(client.orders)
+
+    async def test_fresh_entry_quote_failure_fails_closed_without_order(self) -> None:
+        class FreshQuoteFailureClient(FakeClient):
+            async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                raise ExchangeAPIError("fresh depth unavailable")
+
+        client = FreshQuoteFailureClient()
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk())
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertIsNone(order_id)
+        self.assertEqual(client.orders, [])
+
+    async def test_post_only_initial_reprice_and_market_fallback_each_have_last_mile_gates(self) -> None:
+        class RecordingGateEngine(TradeEngine):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.gate_attempts: list[tuple[float, float]] = []
+
+            async def _passes_pre_order_liquidation_gate(self, plan, entry_price, quantity_base):
+                self.gate_attempts.append((entry_price, quantity_base))
+                return await super()._passes_pre_order_liquidation_gate(plan, entry_price, quantity_base)
+
+        class RetryingClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.book_calls = 0
+                self.fresh_calls = 0
+
+            async def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                self.book_calls += 1
+                bid = 99.0 - self.book_calls
+                return OrderBookSnapshot(symbol, bid, 101.0 + self.book_calls, 100.0, 2.0, 1_000_000.0, 1_000_000.0, None, {})
+
+            async def get_fresh_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+                self.fresh_calls += 1
+                return await self.get_order_book(symbol, depth)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return OrderFill(order_id, None, 0.0, 0.0, 0.0, 0.0, "canceled", {})
+
+        client = RetryingClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = RecordingGateEngine(settings, logging.getLogger("test.last_mile.post_only"), client, FakeStrategy(_plan()), FakeRisk(), FakeStore())
+
+        await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertEqual([item["type"] for item in client.orders], ["limit", "limit", "market"])
+        self.assertEqual(engine.gate_attempts, [(98.0, 1.0), (97.0, 1.0), (104.0, 1.0)])
+        self.assertEqual(client.fresh_calls, 3)
+
+    async def test_post_only_cancel_exception_blocks_reprice_and_market_fallback(self) -> None:
+        class CancelFailureClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return None
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                raise ExchangeAPIError("cancel unavailable")
+
+        client = CancelFailureClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.0,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+
+    async def test_uncertain_post_only_order_blocks_future_entry_ticks_until_restart(self) -> None:
+        class CancelFailureClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return None
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                raise ExchangeAPIError("cancel unavailable")
+
+        client = CancelFailureClient()
+        strategy = FakeStrategy(_plan())
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.0,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = _engine(client, FakeStore(), strategy, FakeRisk(), settings)
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+        first_orders = list(client.orders)
+        await engine._tick()
+
+        self.assertIsNone(order_id)
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("manual reconciliation", engine._entries_blocked_reason.lower())
+        self.assertIn("restart", engine._entries_blocked_reason.lower())
+        self.assertEqual(client.orders, first_orders)
+        self.assertEqual(strategy.next_calls, 0)
+
+    async def test_post_only_poll_exception_latches_uncertainty_and_blocks_future_tick(self) -> None:
+        class PollFailureClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fill_calls = 0
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                self.fill_calls += 1
+                if self.fill_calls == 1:
+                    raise ExchangeAPIError("poll unavailable")
+                return None
+
+        client = PollFailureClient()
+        strategy = FakeStrategy(_plan())
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = _engine(client, FakeStore(), strategy, FakeRisk(), settings)
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+        first_orders = list(client.orders)
+        await engine._tick()
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertEqual(client.orders, first_orders)
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertEqual(strategy.next_calls, 0)
+
+    async def test_post_only_poll_exception_then_canceled_partial_fill_returns_original_order(self) -> None:
+        class PollFailureThenCanceledPartialClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fill_calls = 0
+                self.cancelled_once = False
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                self.cancelled_once = True
+                return await super().cancel_order(symbol, order_id)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                self.fill_calls += 1
+                if self.fill_calls == 1:
+                    raise ExchangeAPIError("poll unavailable")
+                return OrderFill(order_id, self.price, 0.5, 0.5, 0.0, 0.0, "mmp_canceled", {})
+
+        client = PollFailureThenCanceledPartialClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertEqual(order_id, "o1")
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertEqual(client.cancelled, ["o1"])
+
+    async def test_post_only_partial_fill_canceled_remainder_returns_original_order(self) -> None:
+        class PartialFillClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled_once = False
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                self.cancelled_once = True
+                return await super().cancel_order(symbol, order_id)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                state = "canceled" if self.cancelled_once else "partially_filled"
+                return OrderFill(order_id, self.price, 0.5, 0.5, 0.0, 0.0, state, {})
+
+        client = PartialFillClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertEqual(order_id, "o1")
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertEqual(client.cancelled, ["o1"])
+
+    async def test_post_only_partial_fill_cancel_failure_latches_without_duplicate(self) -> None:
+        class PartialFillCancelFailureClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return OrderFill(order_id, self.price, 0.5, 0.5, 0.0, 0.0, "partially_filled", {})
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                raise ExchangeAPIError("cancel unavailable")
+
+        client = PartialFillCancelFailureClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_post_only_partial_fill_ambiguous_remainder_latches_without_duplicate(self) -> None:
+        class PartialFillAmbiguousClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled_once = False
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                self.cancelled_once = True
+                return await super().cancel_order(symbol, order_id)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                if self.cancelled_once:
+                    return None
+                return OrderFill(order_id, self.price, 0.5, 0.5, 0.0, 0.0, "partially_filled", {})
+
+        client = PartialFillAmbiguousClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_uncertain_market_entry_submission_blocks_all_future_ticks(self) -> None:
+        class UncertainSubmissionClient(FakeClient):
+            async def place_market_order(self, symbol, direction, size, reduce_only=False):
+                self.orders.append({"type": "market", "symbol": symbol, "size": size, "reduce_only": reduce_only})
+                raise UncertainOrderSubmissionError(
+                    "order acknowledgement was lost",
+                    symbol=symbol,
+                    client_order_id="entry-uncertain-1",
+                    venue="bingx",
+                )
+
+        client = UncertainSubmissionClient()
+        strategy = FakeStrategy(_plan())
+        engine = _engine(client, FakeStore(), strategy, FakeRisk(), _settings(execution_entry_order_type="market"))
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+        first_orders = list(client.orders)
+        await engine._tick()
+
+        self.assertIsNone(order_id)
+        self.assertEqual(client.orders, first_orders)
+        self.assertEqual(len(client.orders), 1)
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("manual reconciliation", engine._entries_blocked_reason.lower())
+        self.assertIn("restart", engine._entries_blocked_reason.lower())
+        self.assertEqual(strategy.next_calls, 0)
+
+    async def test_post_only_ambiguous_post_cancel_status_blocks_reprice_and_fallback(self) -> None:
+        class AmbiguousCancelClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return None
+
+        client = AmbiguousCancelClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.0,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+
+    async def test_post_only_malformed_canceled_fill_latches_without_reprice_or_fallback(self) -> None:
+        class MalformedCanceledFillClient(FakeClient):
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                return OrderFill("other-order", None, float("nan"), 0.0, 0.0, 0.0, "canceled", {})
+
+        client = MalformedCanceledFillClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.001,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)
+
+        order_id = await engine._place_entry_order(_plan(), exchange_size=1.0, order_book=None)
+
+        self.assertIsNone(order_id)
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_post_only_confirmed_cancellation_allows_reprice(self) -> None:
+        class ConfirmedCancelClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled_once = False
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                self.cancelled_once = True
+                return await super().cancel_order(symbol, order_id)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                if order_id == "o1":
+                    if self.cancelled_once:
+                        return OrderFill(order_id, None, 0.0, 0.0, 0.0, 0.0, "canceled", {})
+                    return None
+                return OrderFill(order_id, self.price, 1.0, 1.0, 0.0, 0.0, "filled", {})
+
+        client = ConfirmedCancelClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.0,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=False,
+        )
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertEqual(order_id, "o2")
+        self.assertEqual([item["type"] for item in client.orders], ["limit", "limit"])
+
+    async def test_post_only_late_fill_after_cancel_returns_original_order_without_duplicate(self) -> None:
+        class LateFillClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled_once = False
+
+            async def cancel_order(self, symbol: str, order_id: str):
+                self.cancelled_once = True
+                return await super().cancel_order(symbol, order_id)
+
+            async def get_order_fill(self, symbol: str, order_id: str) -> OrderFill | None:
+                if self.cancelled_once:
+                    return OrderFill(order_id, self.price, 0.5, 0.5, 0.0, 0.0, "filled", {})
+                return None
+
+        client = LateFillClient()
+        settings = _settings(
+            execution_entry_order_type="post_only",
+            execution_post_only_timeout_seconds=0.0,
+            execution_post_only_max_reprices=1,
+            execution_post_only_fallback_to_market=True,
+        )
+        order_id = await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk(), settings)._place_entry_order(
+            _plan(), exchange_size=1.0, order_book=None
+        )
+
+        self.assertEqual(order_id, "o1")
+        self.assertEqual([item["type"] for item in client.orders], ["limit"])
+
     async def test_full_trade_lifecycle_records_a_closed_trade(self) -> None:
         client = FakeClient()
         store = FakeStore()
@@ -496,17 +964,37 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.orders[0]["type"], "limit")
         self.assertTrue(client.orders[0]["post_only"])
 
-    async def test_liquidation_guard_closes_immediately(self) -> None:
+    async def test_post_entry_liquidation_guard_never_closes_a_valid_new_position(self) -> None:
         client = FakeClient()
         client.liquidation_price = 99.999
         store = FakeStore()
         engine = _engine(
-            client, store, FakeStrategy(_plan()), FakeRisk(), _settings(min_liquidation_distance_bps=5000.0)
+            client, store, FakeStrategy(_plan()), FakeRisk()
         )
 
         await engine._execute_single_trade(_plan())
 
-        self.assertEqual(store.closed[0].reason, "liquidation_guard")
+        self.assertNotEqual(store.closed[0].reason, "liquidation_guard")
+
+    async def test_volume_plan_fails_closed_before_order_when_maintenance_tiers_are_unavailable(self) -> None:
+        class MissingTierClient(FakeClient):
+            get_maintenance_margin_tiers = None
+
+        client = MissingTierClient()
+        plan = VolumeStrategy(_settings()).next_trade()
+        await _engine(client, FakeStore(), FakeStrategy(plan), FakeRisk())._execute_single_trade(plan)
+        self.assertEqual(client.orders, [])
+
+    async def test_volume_plan_fails_closed_before_order_when_stop_reaches_liquidation(self) -> None:
+        client = FakeClient()
+        await _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk())._execute_single_trade(_plan(stop_loss_pct=99.0))
+        self.assertEqual(client.orders, [])
+
+    async def test_volume_plan_places_order_when_pre_order_liquidation_constraint_is_valid(self) -> None:
+        client = FakeClient()
+        plan = VolumeStrategy(_settings()).next_trade()
+        await _engine(client, FakeStore(), FakeStrategy(plan), FakeRisk())._execute_single_trade(plan)
+        self.assertTrue(client.orders)
 
 
 class TickGateTests(unittest.IsolatedAsyncioTestCase):

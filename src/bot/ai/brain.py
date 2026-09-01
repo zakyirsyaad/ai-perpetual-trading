@@ -132,12 +132,15 @@ Principles:
   stop_loss or liquidation_guard, and favor patterns that recently produced positive net exits.
 - HOLD is valid when no allowed symbol has enough edge for the expected gross move to beat round-trip taker fees
   plus a buffer. Prefer fewer cleaner entries over forced entries.
-- Exchange technicals and factor aggregates are the execution truth; CoinMarketCap, Dune, and TradingView are
+- Exchange technicals, factors, flow signals, and liquidation_constraints are the execution truth; CoinMarketCap, Dune, and TradingView are
   OPTIONAL supporting context. An external provider that is absent from external_signals is simply unavailable:
   note it in your reason, but do not reduce confidence on that basis.
 - High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise and take-profit
   far enough to beat taker fees.
 - For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct and take_profit_pct.
+- For OPEN_LONG or OPEN_SHORT, the final stop_loss_pct must be strictly smaller than that direction's
+  max_*_stop_loss_pct in market_context.liquidation_constraints. If the constraint is unavailable or the stop
+  would reach/exceed estimated liquidation, return HOLD.
 - For OPEN_LONG or OPEN_SHORT you MUST also return risk_review with approved, confirmations, and
   invalidation_trigger. Act as your own skeptical pre-trade risk controller: set approved=false when the live
   confirmations are weak, the invalidation is unrealistic, or there is an obvious data gap. An omitted or
@@ -149,7 +152,7 @@ Principles:
 
 
 EXIT_SYSTEM_PROMPT = """You are Layer 1 Brain for a BingX VST perpetual-futures bot. Decide whether to close an
-already open position. Use the supplied live technicals, factor aggregates, and flow signals. Prefer closing when the
+already open position. Use the supplied one-symbol market context, including live technicals, factors, and flow signals. Prefer closing when the
 trend invalidates, volatility expands against the position, or the original setup has decayed. Deterministic stop-loss,
 take-profit, and time-stop protection runs independently every few seconds, so only call for a discretionary close.
 Return a strict structured decision and keep the reason short."""

@@ -183,7 +183,10 @@ class SignalDesigner:
         triggers = flow.get("trigger_names") or []
         return ArenaReview(
             role="SignalDesigner",
-            summary=f"Active market-flow triggers: {', '.join(triggers) if triggers else 'none'}",
+            summary=(
+                f"Market-flow review complete: {len(triggers)} active trigger(s); "
+                "detailed trigger records are in market_context."
+            ),
             payload=flow,
         )
 

@@ -34,6 +34,7 @@ def _volume_run_settings() -> SimpleNamespace:
         maker_fee_pct=-0.02,
         leverage=100,
         ai_min_fee_adjusted_rr=0.1,
+        ai_min_confidence=0.75,
         ai_compact_max_factors_per_symbol=6,
         ai_compact_max_flow_signals=5,
         ai_compact_max_memory_lessons=3,
@@ -47,9 +48,7 @@ class EntryGateRemovalTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._logger = logging.getLogger("test.entry_gate_removal")
         return orchestrator
 
-    def test_low_confidence_high_risk_low_rr_decision_still_opens(self) -> None:
-        # A decision that the deleted gates would have vetoed: confidence below the
-        # old floor, max systemic risk, and risk/reward under the old 1.2 floor.
+    def test_low_confidence_decision_is_rejected_even_for_ai_volume(self) -> None:
         orchestrator = self._orchestrator()
         decision = EntryDecision(
             symbol="BTC/USDT",
@@ -64,11 +63,7 @@ class EntryGateRemovalTests(unittest.IsolatedAsyncioTestCase):
             risk_review=_approved_review(),
         )
 
-        candidate = orchestrator._build_entry_candidate(decision, {"technicals": []})
-
-        self.assertIsNotNone(candidate)
-        self.assertEqual(candidate.direction, PositionDirection.LONG)
-        self.assertEqual(candidate.decision.symbol, "BTC/USDT")
+        self.assertIsNone(orchestrator._build_entry_candidate(decision, {"technicals": []}))
 
     def test_hold_decision_is_skipped(self) -> None:
         # HOLD is no longer offered to the model, but if one slips through it must be
@@ -282,8 +277,39 @@ class MergedRiskReviewGateTests(unittest.TestCase):
         return EntryDecision(**base)
 
     def test_approved_review_allows_candidate(self) -> None:
-        candidate = self._orchestrator()._build_entry_candidate(self._decision(), {"technicals": []})
+        candidate = self._orchestrator()._build_entry_candidate(
+            self._decision(),
+            {
+                "technicals": [],
+                "liquidation_constraints": {
+                    "BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5}
+                },
+            },
+        )
         self.assertIsNotNone(candidate)
+
+    def test_stop_at_or_beyond_estimated_liquidation_is_rejected(self) -> None:
+        decision = self._decision(stop_loss_pct=0.5)
+        context = {
+            "technicals": [],
+            "liquidation_constraints": {
+                "BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5}
+            },
+        }
+        self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, context))
+
+    def test_non_finite_stop_or_liquidation_limit_is_rejected(self) -> None:
+        for stop_loss_pct, maximum in ((float("nan"), 0.5), (float("inf"), 0.5), (0.1, float("nan")), (0.1, float("inf"))):
+            with self.subTest(stop_loss_pct=stop_loss_pct, maximum=maximum):
+                decision = self._decision()
+                decision.stop_loss_pct = stop_loss_pct
+                context = {
+                    "technicals": [],
+                    "liquidation_constraints": {
+                        "BTC/USDT": {"status": "available", "max_long_stop_loss_pct": maximum}
+                    },
+                }
+                self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, context))
 
     def test_vetoed_review_blocks_candidate(self) -> None:
         decision = self._decision(

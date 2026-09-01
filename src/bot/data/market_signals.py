@@ -55,6 +55,8 @@ class MarketContext:
     intelligence: dict[str, Any]
     factor_snapshots: list[dict[str, Any]] = field(default_factory=list)
     active_flow_signals: list[dict[str, Any]] = field(default_factory=list)
+    new_flow_signals: list[dict[str, Any]] = field(default_factory=list)
+    liquidation_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,4 +65,6 @@ class MarketContext:
             "intelligence": self.intelligence,
             "factor_snapshots": self.factor_snapshots,
             "active_flow_signals": self.active_flow_signals,
+            "new_flow_signals": self.new_flow_signals,
+            "liquidation_constraints": self.liquidation_constraints,
         }

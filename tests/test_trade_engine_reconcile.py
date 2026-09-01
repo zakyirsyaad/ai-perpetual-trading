@@ -24,7 +24,6 @@ def _settings(**overrides) -> SimpleNamespace:
         max_consecutive_losses=3,
         max_spread_bps=6.0,
         funding_blackout_minutes=10,
-        min_liquidation_distance_bps=250.0,
         margin_mode="isolated",
         position_mode="hedge",
     )

@@ -16,6 +16,9 @@ def _settings(**overrides) -> SimpleNamespace:
         ai_kline_limit=60,
         orderbook_depth_levels=20,
         stop_loss_pct=0.1,
+        leverage=100,
+        position_usdt=180.0,
+        taker_fee_pct=0.05,
         arena_factors_enabled=True,
         arena_flow_signals_enabled=True,
         arena_volume_spike_pct=65.0,
@@ -42,6 +45,14 @@ class _FakeClient:
         self._klines = klines
         self._fail = fail or set()
         self.open_interest = 1000.0
+
+    async def get_maintenance_margin_tiers(self, symbol):
+        if "tiers" in self._fail:
+            raise RuntimeError("tier endpoint down")
+        from bot.exchange.contracts import MaintenanceMarginTier
+        from decimal import Decimal
+
+        return [MaintenanceMarginTier(Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0"))]
 
     async def get_klines(self, symbol, interval="1m", limit=120):
         if "klines" in self._fail:
@@ -115,6 +126,7 @@ class MarketIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["factor_snapshots"])
         self.assertIn("factor_intelligence", payload["intelligence"])
         self.assertIn("market_flow_signals", payload["intelligence"])
+        self.assertIn("new_flow_signals", payload)
         self.assertIn("regime", payload["intelligence"])
 
     async def test_symbol_scores_are_computed(self) -> None:
@@ -182,6 +194,33 @@ class MarketIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         signals = _FakeSignals()
         await _intelligence(signals=signals).close()
         self.assertTrue(signals.closed)
+
+    async def test_context_contains_fail_closed_liquidation_constraints(self) -> None:
+        context = await _intelligence().build_context()
+        constraint = context.to_dict()["liquidation_constraints"]["BTC/USDT"]
+        self.assertEqual(constraint["status"], "available")
+        self.assertEqual(constraint["reference_price"], 159.5)
+        self.assertGreater(constraint["estimated_long_liquidation_price"], 0)
+        self.assertGreater(constraint["estimated_short_liquidation_price"], constraint["reference_price"])
+        self.assertGreater(constraint["max_long_stop_loss_pct"], 0)
+        self.assertGreater(constraint["max_short_stop_loss_pct"], 0)
+
+    async def test_failed_tier_lookup_is_explicitly_unavailable(self) -> None:
+        context = await _intelligence(_FakeClient(fail={"tiers"})).build_context()
+        constraint = context.to_dict()["liquidation_constraints"]["BTC/USDT"]
+        self.assertEqual(constraint["status"], "unavailable")
+        self.assertIn("error", constraint)
+
+    def test_final_tier_accepts_its_upper_notional_boundary(self) -> None:
+        from bot.exchange.contracts import MaintenanceMarginTier
+        from decimal import Decimal
+
+        tiers = [
+            MaintenanceMarginTier(Decimal("0"), Decimal("100"), Decimal("0.004"), Decimal("0")),
+            MaintenanceMarginTier(Decimal("100"), Decimal("200"), Decimal("0.005"), Decimal("1")),
+        ]
+        selected = MarketIntelligence._select_maintenance_tier(tiers, 200.0)
+        self.assertEqual(selected, tiers[-1])
 
 
 if __name__ == "__main__":

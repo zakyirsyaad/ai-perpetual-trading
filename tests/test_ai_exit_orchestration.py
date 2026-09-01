@@ -50,7 +50,7 @@ def _settings(**overrides) -> SimpleNamespace:
         maker_fee_pct=-0.02,
         leverage=100,
         position_hold_minutes=60,
-        ai_min_confidence=0.5,
+        ai_min_confidence=0.75,
         ai_kline_interval="3m",
         ai_exit_check_interval_seconds=30,
         ai_exit_price_move_threshold_pct=0.08,
@@ -154,6 +154,15 @@ class EventDrivenExitTests(unittest.IsolatedAsyncioTestCase):
         orchestrator = _orchestrator(brain, _FakeIntelligence(), _settings())
         signal = await orchestrator.exit_signal(_position(), 60000.0, 10.0)
         self.assertFalse(signal.close_now)
+
+    async def test_close_below_point_75_is_rejected_after_the_hold_period(self) -> None:
+        brain = _FakeBrain(SimpleNamespace(action="CLOSE", confidence=0.74, reason="weak"))
+        orchestrator = _orchestrator(brain, _FakeIntelligence(), _settings())
+
+        signal = await orchestrator.exit_signal(_position(), 60000.0, 3601.0)
+
+        self.assertFalse(signal.close_now)
+        self.assertEqual(signal.reason, "hold")
 
     async def test_new_trade_resets_the_exit_budget(self) -> None:
         brain = _FakeBrain()
