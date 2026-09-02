@@ -340,3 +340,85 @@ class MergedRiskReviewGateTests(unittest.TestCase):
             }
         )
         self.assertIsNone(self._orchestrator()._build_entry_candidate(decision, {"technicals": []}))
+
+
+class StopLossCeilingTests(unittest.TestCase):
+    """MAX_STOP_LOSS_PCT restores the hard loss bound that the removed
+    liquidation_guard exit used to provide implicitly.
+
+    Without a ceiling `sl_pct = max(base_sl, atr_pct * ATR_SL_MULTIPLIER)` grows
+    without limit, so a volatile entry opens with a stop far wider than the
+    profit-taking band and a single adverse move costs several winners.
+    """
+
+    def _orchestrator(self, **overrides) -> AIOrchestrator:
+        settings = _volume_run_settings()
+        for key, value in overrides.items():
+            setattr(settings, key, value)
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._settings = settings
+        orchestrator._logger = logging.getLogger("test.stop_loss_ceiling")
+        return orchestrator
+
+    def _decision(self, **overrides) -> EntryDecision:
+        base = dict(
+            symbol="BTC/USDT",
+            action="OPEN_LONG",
+            confidence=0.9,
+            market_trend="Bullish",
+            stop_loss_pct=0.08,
+            take_profit_pct=0.12,
+            risk_reward_ratio=2.0,
+            systemic_risk=1,
+            reason="ceiling test",
+            risk_review=_approved_review(),
+        )
+        base.update(overrides)
+        return EntryDecision(**base)
+
+    def _context(self, atr_14: float, *, max_stop: float = 5.0) -> dict:
+        return {
+            "technicals": [{"symbol": "BTC/USDT", "atr_14": atr_14, "last_price": 100.0}],
+            "liquidation_constraints": {
+                "BTC/USDT": {"status": "available", "max_long_stop_loss_pct": max_stop}
+            },
+        }
+
+    def test_atr_scaled_stop_is_capped(self) -> None:
+        # atr_pct 0.8% * 1.5 = 1.20%, ceiling 0.35% must win.
+        target = self._orchestrator(max_stop_loss_pct=0.35)._resolve_trade_targets(
+            self._decision(), self._context(0.8)
+        )
+        self.assertIsNotNone(target)
+        self.assertAlmostEqual(target.stop_loss_pct, 0.35, places=6)
+
+    def test_ceiling_is_disabled_by_default(self) -> None:
+        target = self._orchestrator(max_stop_loss_pct=0.0)._resolve_trade_targets(
+            self._decision(), self._context(0.8)
+        )
+        self.assertIsNotNone(target)
+        self.assertAlmostEqual(target.stop_loss_pct, 1.20, places=6)
+
+    def test_ceiling_never_widens_an_already_tighter_stop(self) -> None:
+        # atr_pct 0.1% * 1.5 = 0.15% stays 0.15%; the ceiling is a maximum, not a floor.
+        target = self._orchestrator(max_stop_loss_pct=0.35)._resolve_trade_targets(
+            self._decision(), self._context(0.1)
+        )
+        self.assertIsNotNone(target)
+        self.assertAlmostEqual(target.stop_loss_pct, 0.15, places=6)
+
+    def test_capping_improves_fee_adjusted_rr(self) -> None:
+        capped = self._orchestrator(max_stop_loss_pct=0.35)._resolve_trade_targets(
+            self._decision(), self._context(0.8)
+        )
+        uncapped = self._orchestrator(max_stop_loss_pct=0.0)._resolve_trade_targets(
+            self._decision(), self._context(0.8)
+        )
+        self.assertGreater(capped.fee_adjusted_rr, uncapped.fee_adjusted_rr)
+
+    def test_ceiling_does_not_bypass_the_liquidation_guard(self) -> None:
+        # A ceiling at or beyond the liquidation limit must still reject the entry.
+        target = self._orchestrator(max_stop_loss_pct=0.35)._resolve_trade_targets(
+            self._decision(), self._context(0.8, max_stop=0.30)
+        )
+        self.assertIsNone(target)

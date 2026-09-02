@@ -90,3 +90,76 @@ class ParityPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyExternalProviderTests(unittest.TestCase):
+    """A provider that returned no data must not reach the model at all.
+
+    `DuneProvider.fetch()` returns its skeleton `{"saved_queries": {},
+    "builtin_signals": {}}` even when every sub-request failed, and
+    `TradingViewSignalProvider.fetch()` returns `{}` when the relay is
+    unreachable. The parity payload forwards `external_signals` verbatim, so the
+    model is shown a provider that is present but carries nothing, and the entry
+    prompt then reduces confidence for a provider that is simply not configured.
+
+    Providers that did return data keep full parity.
+    """
+
+    def setUp(self) -> None:
+        self.builder = CompactDecisionContextBuilder(_settings())
+
+    def _external(self, **providers) -> dict:
+        context = _context()
+        context["external_signals"] = dict(providers)
+        return context
+
+    def _payload_external(self, context: dict) -> dict:
+        payload = self.builder.build_entry_payload(
+            market_context=context,
+            daily_state=_daily(),
+            recent_performance={},
+            trade_memory={},
+            strategy_objective={},
+            arena_reviews=[],
+        )
+        return payload["market_context"]["external_signals"]
+
+    def test_dune_skeleton_with_no_results_is_dropped(self) -> None:
+        external = self._payload_external(
+            self._external(dune={"saved_queries": {}, "builtin_signals": {}})
+        )
+        self.assertNotIn("dune", external)
+
+    def test_unreachable_tradingview_empty_dict_is_dropped(self) -> None:
+        external = self._payload_external(self._external(tradingview={}))
+        self.assertNotIn("tradingview", external)
+
+    def test_provider_with_data_keeps_full_parity(self) -> None:
+        payload = {"BTC": {"symbol": "BTC", "bias": "bullish"}, "market_regime": "risk_on"}
+        external = self._payload_external(self._external(coinmarketcap=payload))
+        self.assertEqual(external["coinmarketcap"], payload)
+
+    def test_partially_populated_provider_is_kept(self) -> None:
+        payload = {"saved_queries": {}, "builtin_signals": {"eth_dex_volume_regime": {"rows": [1]}}}
+        external = self._payload_external(self._external(dune=payload))
+        self.assertEqual(external["dune"], payload)
+
+    def test_zero_and_false_are_data_not_emptiness(self) -> None:
+        payload = {"funding_rate": 0, "is_bullish": False}
+        external = self._payload_external(self._external(coinmarketcap=payload))
+        self.assertEqual(external["coinmarketcap"], payload)
+
+    def test_deeply_nested_empty_containers_are_dropped(self) -> None:
+        external = self._payload_external(self._external(dune={"a": {"b": {"c": []}}}))
+        self.assertNotIn("dune", external)
+
+    def test_non_provider_metadata_is_never_pruned(self) -> None:
+        context = self._external(tradingview={}, collected_at="2026-09-02T14:00:00Z")
+        external = self._payload_external(context)
+        self.assertNotIn("tradingview", external)
+        self.assertEqual(external["collected_at"], "2026-09-02T14:00:00Z")
+
+    def test_source_context_is_not_mutated(self) -> None:
+        context = self._external(tradingview={})
+        self._payload_external(context)
+        self.assertIn("tradingview", context["external_signals"])

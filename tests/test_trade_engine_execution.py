@@ -1181,3 +1181,61 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AIExitAdverseCutTests(unittest.IsolatedAsyncioTestCase):
+    """AI_EXIT_ADVERSE_CUT_USDT lets the AI close a losing position.
+
+    The pre-existing `gross >= fee` guard only honours close_now once the trade
+    is already profitable, so the sole exits available to a losing trade are the
+    full stop loss and the time stop. That is what makes losses run to their
+    maximum while winners are clipped early by the neutral-exit band.
+    """
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    def _plan(self) -> TradePlan:
+        # Deliberately wide envelope so neither take profit nor stop loss fires
+        # before the AI is consulted.
+        return _plan(stop_loss_pct=10.0, take_profit_pct=10.0)
+
+    async def _run(self, **overrides) -> str:
+        settings = _settings(position_hold_minutes=60, **overrides)
+        client = FakeClient(price=100.0, price_drift=0.99)  # LONG moving against us
+        strategy = FakeStrategy(exit_after=1)  # AI says close immediately
+        engine = _engine(client, FakeStore(), strategy, FakeRisk(), settings)
+        return await engine._monitor_position(self._position(), self._plan())
+
+    async def test_ai_may_cut_a_losing_position_once_past_the_threshold(self) -> None:
+        reason = await self._run(ai_exit_adverse_cut_usdt=5.0)
+        self.assertEqual(reason, "strategy_exit:ai_close")
+
+    async def test_disabled_by_default_keeps_the_existing_hold_behaviour(self) -> None:
+        # With the cut disabled the AI is ignored while losing and the trade is
+        # only released by the full stop loss.
+        reason = await self._run(ai_exit_adverse_cut_usdt=0.0)
+        self.assertEqual(reason, "stop_loss")
+
+    async def test_small_adverse_drift_below_the_threshold_is_still_held(self) -> None:
+        # A loss smaller than the threshold must not trigger a fee-paying exit.
+        settings = _settings(position_hold_minutes=60, ai_exit_adverse_cut_usdt=10_000.0)
+        client = FakeClient(price=100.0, price_drift=0.99)
+        engine = _engine(client, FakeStore(), FakeStrategy(exit_after=1), FakeRisk(), settings)
+        reason = await engine._monitor_position(self._position(), self._plan())
+        self.assertEqual(reason, "stop_loss")
+
+    async def test_profitable_ai_exit_is_unaffected_by_the_new_threshold(self) -> None:
+        settings = _settings(position_hold_minutes=60, ai_exit_adverse_cut_usdt=5.0)
+        client = FakeClient(price=100.0, price_drift=1.01)  # LONG moving in our favour
+        engine = _engine(client, FakeStore(), FakeStrategy(exit_after=1), FakeRisk(), settings)
+        reason = await engine._monitor_position(self._position(), self._plan())
+        self.assertEqual(reason, "strategy_exit:ai_close")

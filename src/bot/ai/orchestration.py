@@ -410,6 +410,11 @@ class AIOrchestrator:
                 atr_pct = (atr_value / last_price) * 100.0
 
         sl_pct = max(base_sl, atr_pct * self._settings.atr_sl_multiplier)
+        # The ATR-scaled stop is otherwise unbounded. Clamp it before the TP floor
+        # is derived so a capped stop also tightens the reward requirement.
+        sl_ceiling = float(getattr(self._settings, "max_stop_loss_pct", 0.0) or 0.0)
+        if sl_ceiling > 0:
+            sl_pct = min(sl_pct, sl_ceiling)
         round_trip_fee_pct = self._round_trip_fee_pct
         min_tp_for_net_rr = round_trip_fee_pct + (
             (sl_pct + round_trip_fee_pct) * self._settings.ai_min_fee_adjusted_rr
