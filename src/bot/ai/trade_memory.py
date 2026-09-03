@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from typing import Any
 
@@ -24,6 +25,11 @@ def build_trade_decision_memory(records: list[dict[str, Any]]) -> dict[str, Any]
             "losing_patterns": [],
         }
 
+    # Patterns are keyed on the ENTRY setup. Keying them on the exit reason
+    # produces a tautology ("stop_loss loses") that says nothing about what to
+    # open, which is why a repeated losing entry survived this memory.
+    by_setup: dict[str, dict[str, Any]] = defaultdict(_empty_stats)
+    by_family: dict[str, dict[str, Any]] = defaultdict(_empty_stats)
     by_reason: dict[str, dict[str, Any]] = defaultdict(_empty_stats)
     by_direction: dict[str, dict[str, Any]] = defaultdict(_empty_stats)
     by_confidence: dict[str, dict[str, Any]] = defaultdict(_empty_stats)
@@ -39,15 +45,32 @@ def build_trade_decision_memory(records: list[dict[str, Any]]) -> dict[str, Any]
 
         reason = _reason_bucket(row.get("reason"))
         _add_stat(by_reason[reason], net, gross, row)
+        setup_key = _setup_field(row, "setup_key")
+        if setup_key:
+            _add_stat(by_setup[setup_key], net, gross, row)
+            if len(examples[setup_key]) < 3:
+                examples[setup_key].append(_entry_note(row.get("entry_reason")))
+        family_key = _setup_field(row, "family_key")
+        if family_key:
+            _add_stat(by_family[family_key], net, gross, row)
         _add_stat(by_direction[str(row.get("direction") or "unknown")], net, gross, row)
         _add_stat(by_confidence[_confidence_band(row.get("confidence"))], net, gross, row)
 
-        if len(examples[reason]) < 3:
-            examples[reason].append(_entry_note(row.get("entry_reason")))
-
-    losing_patterns = _top_patterns(by_reason, positive=False, examples=examples)
-    winning_patterns = _top_patterns(by_reason, positive=True, examples=examples)
-    lessons = _lessons(losing_patterns=losing_patterns, winning_patterns=winning_patterns, net_pnl=total_net)
+    losing_patterns = _top_patterns(by_setup, positive=False, examples=examples)
+    winning_patterns = _top_patterns(by_setup, positive=True, examples=examples)
+    lessons = _lessons(
+        losing_patterns=losing_patterns,
+        winning_patterns=winning_patterns,
+        exit_losing_patterns=_top_patterns(by_reason, positive=False, examples=examples),
+        net_pnl=total_net,
+    )
+    if not by_setup:
+        # Trades written before setup instrumentation carry no entry shape. Say
+        # so rather than dressing exit reasons up as entry evidence.
+        lessons.append(
+            "No entry-shape history yet: these trades predate setup instrumentation, "
+            "so judge the current setup on live evidence rather than on past patterns."
+        )
 
     return {
         "sample_size": len(records),
@@ -57,9 +80,30 @@ def build_trade_decision_memory(records: list[dict[str, Any]]) -> dict[str, Any]
         "lessons": lessons,
         "winning_patterns": winning_patterns,
         "losing_patterns": losing_patterns,
+        "family_performance": _compact_bucket_dict(by_family),
+        # Kept for observability, but deliberately not the source of the
+        # patterns above: an exit reason is a consequence, not a decision.
+        "exit_performance": _compact_bucket_dict(by_reason),
         "direction_performance": _compact_bucket_dict(by_direction),
         "confidence_performance": _compact_bucket_dict(by_confidence),
     }
+
+
+def _setup_field(row: dict[str, Any], key: str) -> str:
+    """Read factor_metadata.setup.<key>, tolerating JSON strings and old rows."""
+    raw = row.get("factor_metadata")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    setup = raw.get("setup")
+    if not isinstance(setup, dict):
+        return ""
+    value = setup.get(key)
+    return str(value).strip() if value else ""
 
 
 def _empty_stats() -> dict[str, Any]:
@@ -111,6 +155,7 @@ def _lessons(
     *,
     losing_patterns: list[dict[str, Any]],
     winning_patterns: list[dict[str, Any]],
+    exit_losing_patterns: list[dict[str, Any]],
     net_pnl: float,
 ) -> list[str]:
     lessons: list[str] = []
@@ -118,7 +163,21 @@ def _lessons(
         lessons.append(
             "Recent net PnL is negative; prefer fewer, cleaner entries whose expected gross move clearly beats round-trip taker fees."
         )
+    # Entry-shape lessons carry their own numbers instead of a hand-written
+    # phrase, so they stay accurate as the buckets change.
     for pattern in losing_patterns:
+        lessons.append(
+            f"Entry shape {pattern['pattern']} lost {pattern['net_pnl_usdt']:.2f} USDT net over "
+            f"{pattern['trades']} trades ({pattern['losses']} losing); require unusually clear "
+            "live evidence before opening that shape again."
+        )
+    for pattern in winning_patterns:
+        lessons.append(
+            f"Entry shape {pattern['pattern']} returned {pattern['net_pnl_usdt']:.2f} USDT net over "
+            f"{pattern['trades']} trades ({pattern['wins']} winning)."
+        )
+    # Exit hygiene advice still keys on the exit reason, which is what it is about.
+    for pattern in exit_losing_patterns:
         name = str(pattern["pattern"])
         if name == "stop_loss":
             lessons.append(

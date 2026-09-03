@@ -570,7 +570,7 @@ class AIOrchestrator:
             # Persisted so attribution can bucket by the *shape* of the entry,
             # not just its symbol/direction/factors.
             "setup": build_setup_profile(
-                AIOrchestrator._features_for_symbol(market_context, symbol), direction
+                AIOrchestrator._features_for_symbol(market_context, symbol), direction, top
             ),
         }
 

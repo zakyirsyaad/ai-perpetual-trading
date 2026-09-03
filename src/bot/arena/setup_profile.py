@@ -26,9 +26,19 @@ STRETCH_ATR_THRESHOLD = 0.75
 # ATR as a percentage of price, splitting calm / normal / volatile regimes.
 ATR_REGIME_MID_PCT = 0.15
 ATR_REGIME_HIGH_PCT = 0.35
+# Share of the top factors carrying category "microstructure". Retrospectively
+# microstructure-led entries looked worse on OKX (n=281) but BingX had only 5
+# such trades, so this is recorded for a prospective test, not acted on.
+MICRO_LED_SHARE = 0.6
+TREND_LED_MAX_MICRO_SHARE = 0.2
+MICROSTRUCTURE = "microstructure"
 
 
-def build_setup_profile(features: Mapping[str, Any] | None, direction: str) -> dict[str, Any]:
+def build_setup_profile(
+    features: Mapping[str, Any] | None,
+    direction: str,
+    factor_snapshots: Any = None,
+) -> dict[str, Any]:
     """Return the bucketed setup profile for one entry.
 
     Never raises: missing or unusable features degrade to `unknown` buckets so a
@@ -52,8 +62,15 @@ def build_setup_profile(features: Mapping[str, Any] | None, direction: str) -> d
 
     stretch_bucket = _stretch_bucket(stretch)
     atr_regime = _atr_regime(atr_pct)
+    micro_share = _micro_share(factor_snapshots)
+    family = _factor_family(micro_share)
     return {
+        # Three axes only. Folding the factor family in as a fourth would triple
+        # the bucket count and starve each one of sample; it is tracked separately.
         "setup_key": f"{side}|{stretch_bucket}|{atr_regime}",
+        "family_key": f"{side}|{family}",
+        "factor_family": family,
+        "micro_share": round(micro_share, 4) if micro_share is not None else None,
         "direction": side,
         "stretch_bucket": stretch_bucket,
         "atr_regime": atr_regime,
@@ -61,6 +78,30 @@ def build_setup_profile(features: Mapping[str, Any] | None, direction: str) -> d
         "atr_pct": round(atr_pct, 4) if atr_pct is not None else None,
         "rsi_14": round(rsi, 4) if rsi is not None else None,
     }
+
+
+def _micro_share(factor_snapshots: Any) -> float | None:
+    """Fraction of the recorded top factors whose category is microstructure."""
+    if not isinstance(factor_snapshots, (list, tuple)):
+        return None
+    categories = [
+        str(item.get("category")).strip().lower()
+        for item in factor_snapshots
+        if isinstance(item, Mapping) and item.get("category")
+    ]
+    if not categories:
+        return None
+    return sum(1 for c in categories if c == MICROSTRUCTURE) / len(categories)
+
+
+def _factor_family(micro_share: float | None) -> str:
+    if micro_share is None:
+        return UNKNOWN
+    if micro_share >= MICRO_LED_SHARE:
+        return "micro_led"
+    if micro_share <= TREND_LED_MAX_MICRO_SHARE:
+        return "trend_led"
+    return "mixed"
 
 
 def _stretch_bucket(stretch: float | None) -> str:

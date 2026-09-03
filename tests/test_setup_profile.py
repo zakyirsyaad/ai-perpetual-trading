@@ -65,3 +65,48 @@ class SetupProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FactorFamilyTests(unittest.TestCase):
+    """Record the category mix of the factors that triggered an entry.
+
+    Arena factors already carry a `category` (momentum / trend / volatility /
+    volume / microstructure) and it is persisted in factor_metadata.snapshots.
+    A retrospective test suggested microstructure-led entries were worse, but it
+    held on OKX (n=281) and had no usable sample on BingX (n=5), so this records
+    the axis for a prospective test rather than acting on it.
+    """
+
+    def _snaps(self, *categories: str) -> list[dict]:
+        return [{"category": c} for c in categories]
+
+    def test_microstructure_led_entry(self) -> None:
+        p = build_setup_profile(_features(), "LONG", self._snaps("microstructure", "microstructure", "microstructure", "trend", "momentum"))
+        self.assertAlmostEqual(p["micro_share"], 0.6, places=3)
+        self.assertEqual(p["factor_family"], "micro_led")
+        self.assertEqual(p["family_key"], "LONG|micro_led")
+
+    def test_trend_led_entry(self) -> None:
+        p = build_setup_profile(_features(), "SHORT", self._snaps("trend", "momentum", "volume", "trend", "trend"))
+        self.assertEqual(p["micro_share"], 0.0)
+        self.assertEqual(p["factor_family"], "trend_led")
+
+    def test_mixed_entry(self) -> None:
+        p = build_setup_profile(_features(), "LONG", self._snaps("microstructure", "microstructure", "trend", "trend", "momentum"))
+        self.assertAlmostEqual(p["micro_share"], 0.4, places=3)
+        self.assertEqual(p["factor_family"], "mixed")
+
+    def test_absent_snapshots_degrade_to_unknown(self) -> None:
+        for snaps in (None, [], [{"no_category": 1}]):
+            with self.subTest(snaps=snaps):
+                p = build_setup_profile(_features(), "LONG", snaps)
+                self.assertEqual(p["factor_family"], "unknown")
+                self.assertIsNone(p["micro_share"])
+
+    def test_family_does_not_change_the_setup_key(self) -> None:
+        # setup_key stays a 3-axis bucket; adding family as a 4th axis would
+        # triple the bucket count and starve each one of sample.
+        a = build_setup_profile(_features(), "LONG", self._snaps("microstructure") * 5)
+        b = build_setup_profile(_features(), "LONG", self._snaps("trend") * 5)
+        self.assertEqual(a["setup_key"], b["setup_key"])
+        self.assertNotEqual(a["family_key"], b["family_key"])
