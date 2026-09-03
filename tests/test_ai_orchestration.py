@@ -422,3 +422,26 @@ class StopLossCeilingTests(unittest.TestCase):
             self._decision(), self._context(0.8, max_stop=0.30)
         )
         self.assertIsNone(target)
+
+
+class SetupMetadataTests(unittest.TestCase):
+    """The setup profile must be persisted at entry, otherwise attribution can
+    never learn which *shape* of entry loses money."""
+
+    def _context(self, **overrides) -> dict:
+        features = {"symbol": "BTC/USDT", "last_price": 100.4, "ema_21": 100.0, "atr_14": 0.25, "rsi_14": 72.0}
+        features.update(overrides)
+        return {"technicals": [features], "factor_snapshots": []}
+
+    def test_entry_metadata_carries_the_setup_profile(self) -> None:
+        meta = AIOrchestrator._factor_metadata_for_symbol(self._context(), "BTC/USDT", "LONG")
+        self.assertEqual(meta["setup"]["setup_key"], "LONG|stretch_up|atr_mid")
+
+    def test_setup_profile_survives_a_symbol_with_no_factor_snapshots(self) -> None:
+        meta = AIOrchestrator._factor_metadata_for_symbol(self._context(), "BTC/USDT", "SHORT")
+        self.assertEqual(meta["top_factors"], [])
+        self.assertEqual(meta["setup"]["direction"], "SHORT")
+
+    def test_missing_technicals_still_yield_a_recorded_setup(self) -> None:
+        meta = AIOrchestrator._factor_metadata_for_symbol({"technicals": []}, "BTC/USDT", "LONG")
+        self.assertEqual(meta["setup"]["setup_key"], "LONG|unknown|unknown")

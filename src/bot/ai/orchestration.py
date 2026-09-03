@@ -11,6 +11,7 @@ from bot.ai.brain import EntryDecision, GrokBrain
 from bot.ai.compact_context import CompactDecisionContextBuilder, payload_hash
 from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.trade_memory import build_trade_decision_memory
+from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
@@ -223,7 +224,9 @@ class AIOrchestrator:
             decision_reason=reason,
             decision_payload=decision.model_dump(),
             confidence=decision.confidence,
-            factor_metadata=self._factor_metadata_for_symbol(market_context, decision.symbol),
+            factor_metadata=self._factor_metadata_for_symbol(
+                market_context, decision.symbol, direction.value
+            ),
             trigger_metadata=self._trigger_metadata_for_symbol(market_context, decision.symbol),
         )
 
@@ -552,7 +555,9 @@ class AIOrchestrator:
         return None
 
     @staticmethod
-    def _factor_metadata_for_symbol(market_context: dict[str, Any], symbol: str) -> dict[str, Any]:
+    def _factor_metadata_for_symbol(
+        market_context: dict[str, Any], symbol: str, direction: str = ""
+    ) -> dict[str, Any]:
         snapshots = [
             item
             for item in market_context.get("factor_snapshots", [])
@@ -562,6 +567,11 @@ class AIOrchestrator:
         return {
             "top_factors": [str(item.get("name")) for item in top if item.get("name")],
             "snapshots": top,
+            # Persisted so attribution can bucket by the *shape* of the entry,
+            # not just its symbol/direction/factors.
+            "setup": build_setup_profile(
+                AIOrchestrator._features_for_symbol(market_context, symbol), direction
+            ),
         }
 
     @staticmethod
