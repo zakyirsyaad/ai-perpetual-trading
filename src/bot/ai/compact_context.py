@@ -133,6 +133,17 @@ class CompactDecisionContextBuilder:
     def _deduplicated_market_context(self, market_context: dict[str, Any], symbol: str | None = None) -> dict[str, Any]:
         """Keep complete values once, removing only mirrored factor/flow arrays."""
         context = deepcopy(_as_dict(market_context))
+        # A provider whose sub-requests all failed still returns a skeleton (Dune)
+        # or an empty dict (TradingView). Forwarding those verbatim shows the model
+        # a provider that is present but carries nothing, which the entry prompt
+        # penalises as an empty provider. Providers that returned data keep full
+        # parity, and non-provider metadata such as collected_at is untouched.
+        external = _as_dict(context.get("external_signals"))
+        if external:
+            for provider in _EXTERNAL_PROVIDER_KEYS:
+                if provider in external and not _has_signal_content(external[provider]):
+                    external.pop(provider)
+            context["external_signals"] = external
         if symbol:
             context["technicals"] = [
                 item for item in _as_list(context.get("technicals")) if _as_dict(item).get("symbol") == symbol
@@ -431,6 +442,27 @@ _MAX_NESTED_ENTRIES = 5
 # Dune nests provider -> builtin_signals -> <signal> -> rows -> row, so the
 # limit must reach the row itself or the bias/confidence never arrive.
 _MAX_PROVIDER_DEPTH = 5
+
+
+_EXTERNAL_PROVIDER_KEYS = ("coinmarketcap", "dune", "tradingview")
+
+
+def _has_signal_content(payload: Any) -> bool:
+    """True when a provider payload carries at least one real value.
+
+    Containers are transparent: only what they hold counts, so a skeleton of
+    empty dicts reads as no content. Scalars count, including 0 and False, which
+    are meaningful readings rather than emptiness.
+    """
+    if isinstance(payload, dict):
+        return any(_has_signal_content(value) for value in payload.values())
+    if isinstance(payload, (list, tuple, set)):
+        return any(_has_signal_content(value) for value in payload)
+    if payload is None:
+        return False
+    if isinstance(payload, str):
+        return bool(payload.strip())
+    return True
 
 
 def _summarize_provider(payload: Any) -> Any:

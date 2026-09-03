@@ -48,6 +48,9 @@ class AttributionSummary:
     by_hour: dict[str, MetricBucket] = field(default_factory=dict)
     by_exit_reason: dict[str, MetricBucket] = field(default_factory=dict)
     by_confidence_band: dict[str, MetricBucket] = field(default_factory=dict)
+    # Entry shape (direction | stretch-from-mean | ATR regime). The bucket the
+    # other groupings cannot express: a repeated losing setup.
+    by_setup: dict[str, MetricBucket] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +63,7 @@ class AttributionSummary:
             "by_hour": _bucket_dict(self.by_hour),
             "by_exit_reason": _bucket_dict(self.by_exit_reason),
             "by_confidence_band": _bucket_dict(self.by_confidence_band),
+            "by_setup": _bucket_dict(self.by_setup),
         }
 
 
@@ -99,6 +103,7 @@ class AttributionAnalyzer:
             "by_hour": {},
             "by_exit_reason": {},
             "by_confidence_band": {},
+            "by_setup": {},
         }
         total_pnl = 0.0
         for record in records:
@@ -109,6 +114,9 @@ class AttributionAnalyzer:
             _add(groups["by_exit_reason"], str(record.get("reason") or "unknown"), pnl)
             _add(groups["by_hour"], _closed_hour(record.get("closed_at")), pnl)
             _add(groups["by_confidence_band"], _confidence_band(record.get("confidence")), pnl)
+            setup_key = _setup_key(record.get("factor_metadata"))
+            if setup_key:
+                _add(groups["by_setup"], setup_key, pnl)
             for factor in _metadata_values(record.get("factor_metadata"), "top_factors"):
                 _add(groups["by_factor"], factor, pnl)
             for trigger in _metadata_values(record.get("trigger_metadata"), "trigger_names"):
@@ -123,6 +131,7 @@ class AttributionAnalyzer:
             by_hour=groups["by_hour"],
             by_exit_reason=groups["by_exit_reason"],
             by_confidence_band=groups["by_confidence_band"],
+            by_setup=groups["by_setup"],
         )
 
     def volume_progress(
@@ -148,6 +157,10 @@ class AttributionAnalyzer:
             projected_days_remaining=projected_days,
             neutral_exit_count=sum(1 for row in records if row.get("reason") == "neutral_exit"),
         )
+
+
+# Minimum closed trades before a losing setup bucket is worth reporting.
+MIN_SETUP_SAMPLE = 5
 
 
 class DiagnosisGenerator:
@@ -181,6 +194,26 @@ class DiagnosisGenerator:
                             f"({bucket.total_pnl_usdt:.2f} USDT)."
                         ),
                         suggestion=f"Raise the threshold or require a confirming factor before trading {trigger}.",
+                    )
+                )
+        for setup, bucket in sorted(summary.by_setup.items(), key=lambda item: item[1].total_pnl_usdt):
+            # Below this sample a losing bucket is noise, and flagging it would
+            # invite acting on nothing.
+            if bucket.trade_count >= MIN_SETUP_SAMPLE and bucket.total_pnl_usdt < 0:
+                cards.append(
+                    DiagnosisCard(
+                        type="problem",
+                        title=f"Losing entry setup: {setup}",
+                        severity="high" if bucket.trade_count >= 2 * MIN_SETUP_SAMPLE else "medium",
+                        metrics=bucket.to_dict(),
+                        description=(
+                            f"Setup {setup} produced {bucket.total_pnl_usdt:.2f} USDT across "
+                            f"{bucket.trade_count} trades at {bucket.win_rate_pct:.1f}% win rate."
+                        ),
+                        suggestion=(
+                            "Candidate for a deterministic entry gate once the sample is large "
+                            "enough to act on; until then treat as an observation."
+                        ),
                     )
                 )
         if not cards and summary.total_trades:
@@ -222,6 +255,27 @@ def _metadata_values(raw: Any, key: str) -> list[str]:
         if isinstance(values, list):
             return [str(item) for item in values if str(item).strip()]
     return []
+
+
+def _setup_key(raw: Any) -> str:
+    """Pull factor_metadata.setup.setup_key, tolerating JSON strings and old rows.
+
+    Trades written before setup instrumentation carry no profile at all, so they
+    are skipped rather than lumped into an "unknown" bucket that would dilute the
+    real ones.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    setup = raw.get("setup")
+    if not isinstance(setup, dict):
+        return ""
+    key = setup.get("setup_key")
+    return str(key).strip() if key else ""
 
 
 def _closed_hour(raw: Any) -> str:

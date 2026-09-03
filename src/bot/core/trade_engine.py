@@ -855,6 +855,16 @@ class TradeEngine:
             if ai_exit.close_now:
                 if gross >= fee:
                     return f"strategy_exit:{ai_exit.reason}"
+                adverse_cut = float(getattr(self._settings, "ai_exit_adverse_cut_usdt", 0.0) or 0.0)
+                if adverse_cut > 0 and net_after_fee <= -adverse_cut:
+                    # Honour the AI on a loser too. Gating solely on `gross >= fee`
+                    # leaves the stop loss and the time stop as the only exits from
+                    # a losing trade, which lets losses run to their maximum.
+                    self._logger.info(
+                        "Strategy exit on adverse move: net_after_fee %.4f breached cut -%.4f.",
+                        net_after_fee, adverse_cut,
+                    )
+                    return f"strategy_exit:{ai_exit.reason}"
                 self._logger.debug(
                     "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
                     gross, fee,

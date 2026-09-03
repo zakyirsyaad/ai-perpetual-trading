@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     position_hold_minutes: int = Field(default=60, alias="POSITION_HOLD_MINUTES")
     stop_loss_pct: float = Field(default=0.35, alias="STOP_LOSS_PCT")
     take_profit_pct: float = Field(default=0.7, alias="TAKE_PROFIT_PCT")
+    # Hard ceiling on the ATR-scaled stop. 0 disables it. Without a ceiling the
+    # stop grows with volatility while profit taking stays pinned, so a volatile
+    # entry can lose several winners' worth in one move.
+    max_stop_loss_pct: float = Field(default=0.0, ge=0.0, alias="MAX_STOP_LOSS_PCT")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
@@ -182,6 +186,13 @@ class Settings(BaseSettings):
         ge=0,
         le=200,
         alias="AI_EXIT_MAX_CALLS_PER_TRADE",
+    )
+    # Loss beyond which an AI close_now is honoured on a losing position. 0 keeps
+    # the old behaviour where only a profitable trade may be closed by the AI.
+    ai_exit_adverse_cut_usdt: float = Field(
+        default=0.0,
+        ge=0.0,
+        alias="AI_EXIT_ADVERSE_CUT_USDT",
     )
     # Compact AI payload shaping (see bot/ai/compact_context.py).
     ai_compact_max_factors_per_symbol: int = Field(
