@@ -811,65 +811,99 @@ class TradeEngine:
 
     async def _monitor_position(self, position: OpenPosition, plan: TradePlan) -> str:
         max_hold_seconds = self._resolve_max_hold_seconds(plan)
-        while True:
-            current_price = await self._client.get_last_price(position.symbol)
-            elapsed = datetime.now(timezone.utc).timestamp() - position.opened_at.timestamp()
-            if self._hit_stop_loss(position.direction, position.entry_price, current_price, plan.stop_loss_pct):
-                return "stop_loss"
-            gross = self._estimate_gross_pnl(
-                position.direction, position.entry_price, current_price, position.quantity
-            )
-            fee = self._estimate_total_taker_fee(
-                position.entry_price, current_price, position.quantity, self._taker_fee_pct(position.symbol)
-            )
-            net_after_fee = gross - fee
-            if self._settings.volume_neutral_exit_enabled and elapsed >= self._settings.volume_neutral_exit_min_seconds:
-                min_net = self._settings.volume_neutral_exit_min_net_usdt
-                max_net = min_net + self._settings.volume_neutral_exit_band_usdt
-                if min_net <= net_after_fee <= max_net:
-                    return "neutral_exit"
-            if (
-                getattr(self._settings, "volume_breakeven_exit_enabled", False)
-                and elapsed >= getattr(self._settings, "volume_breakeven_min_seconds", 0)
-            ):
-                min_profit = float(getattr(self._settings, "volume_breakeven_min_profit_usdt", 0.0) or 0.0)
-                max_loss = float(getattr(self._settings, "volume_breakeven_max_loss_usdt", 0.0) or 0.0)
-                if net_after_fee >= min_profit:
-                    return "breakeven_exit"
-                if max_loss > 0 and -max_loss <= net_after_fee < min_profit:
+        # The model is consulted through a task rather than awaited inline. The call
+        # is a network round trip (median 3.9s, p99 78.9s, 316.9s max measured on the
+        # live VPS), and awaiting it here would leave _hit_stop_loss unevaluated for
+        # its whole duration -- the reason 12 of 19 stop losses overshot their cap.
+        exit_task: asyncio.Task | None = None
+        try:
+            while True:
+                current_price = await self._client.get_last_price(position.symbol)
+                elapsed = datetime.now(timezone.utc).timestamp() - position.opened_at.timestamp()
+                if self._hit_stop_loss(position.direction, position.entry_price, current_price, plan.stop_loss_pct):
+                    return "stop_loss"
+                gross = self._estimate_gross_pnl(
+                    position.direction, position.entry_price, current_price, position.quantity
+                )
+                fee = self._estimate_total_taker_fee(
+                    position.entry_price, current_price, position.quantity, self._taker_fee_pct(position.symbol)
+                )
+                net_after_fee = gross - fee
+                if self._settings.volume_neutral_exit_enabled and elapsed >= self._settings.volume_neutral_exit_min_seconds:
+                    min_net = self._settings.volume_neutral_exit_min_net_usdt
+                    max_net = min_net + self._settings.volume_neutral_exit_band_usdt
+                    if min_net <= net_after_fee <= max_net:
+                        return "neutral_exit"
+                if (
+                    getattr(self._settings, "volume_breakeven_exit_enabled", False)
+                    and elapsed >= getattr(self._settings, "volume_breakeven_min_seconds", 0)
+                ):
+                    min_profit = float(getattr(self._settings, "volume_breakeven_min_profit_usdt", 0.0) or 0.0)
+                    max_loss = float(getattr(self._settings, "volume_breakeven_max_loss_usdt", 0.0) or 0.0)
+                    if net_after_fee >= min_profit:
+                        return "breakeven_exit"
+                    if max_loss > 0 and -max_loss <= net_after_fee < min_profit:
+                        self._logger.debug(
+                            "Breakeven guard waiting: net_after_fee %.4f is within allowed drift %.4f.",
+                            net_after_fee,
+                            max_loss,
+                        )
+                if self._hit_take_profit(position.direction, position.entry_price, current_price, plan.take_profit_pct):
+                    if gross >= fee:
+                        return "take_profit"
                     self._logger.debug(
-                        "Breakeven guard waiting: net_after_fee %.4f is within allowed drift %.4f.",
-                        net_after_fee,
-                        max_loss,
+                        "TP hit but gross %.4f < fee %.4f; holding for better exit.",
+                        gross, fee,
                     )
-            if self._hit_take_profit(position.direction, position.entry_price, current_price, plan.take_profit_pct):
-                if gross >= fee:
-                    return "take_profit"
-                self._logger.debug(
-                    "TP hit but gross %.4f < fee %.4f; holding for better exit.",
-                    gross, fee,
-                )
-            if elapsed >= max_hold_seconds:
-                return "time_stop"
-            ai_exit = await self._strategy.exit_signal(position, current_price, elapsed)
-            if ai_exit.close_now:
-                if gross >= fee:
-                    return f"strategy_exit:{ai_exit.reason}"
-                adverse_cut = float(getattr(self._settings, "ai_exit_adverse_cut_usdt", 0.0) or 0.0)
-                if adverse_cut > 0 and net_after_fee <= -adverse_cut:
-                    # Honour the AI on a loser too. Gating solely on `gross >= fee`
-                    # leaves the stop loss and the time stop as the only exits from
-                    # a losing trade, which lets losses run to their maximum.
-                    self._logger.info(
-                        "Strategy exit on adverse move: net_after_fee %.4f breached cut -%.4f.",
-                        net_after_fee, adverse_cut,
+                if elapsed >= max_hold_seconds:
+                    return "time_stop"
+                if exit_task is None:
+                    exit_task = asyncio.create_task(
+                        self._strategy.exit_signal(position, current_price, elapsed)
                     )
-                    return f"strategy_exit:{ai_exit.reason}"
-                self._logger.debug(
-                    "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
-                    gross, fee,
-                )
-            await asyncio.sleep(self._settings.position_monitor_interval_seconds)
+                ai_exit = None
+                if exit_task.done():
+                    ai_exit = self._collect_exit_signal(exit_task)
+                    exit_task = None
+                # gross/fee above come from this iteration's price, so a decision the
+                # model made seconds ago is judged against fresh numbers.
+                if ai_exit is not None and ai_exit.close_now:
+                    if gross >= fee:
+                        return f"strategy_exit:{ai_exit.reason}"
+                    adverse_cut = float(getattr(self._settings, "ai_exit_adverse_cut_usdt", 0.0) or 0.0)
+                    if adverse_cut > 0 and net_after_fee <= -adverse_cut:
+                        # Honour the AI on a loser too. Gating solely on `gross >= fee`
+                        # leaves the stop loss and the time stop as the only exits from
+                        # a losing trade, which lets losses run to their maximum.
+                        self._logger.info(
+                            "Strategy exit on adverse move: net_after_fee %.4f breached cut -%.4f.",
+                            net_after_fee, adverse_cut,
+                        )
+                        return f"strategy_exit:{ai_exit.reason}"
+                    self._logger.debug(
+                        "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
+                        gross, fee,
+                    )
+                await asyncio.sleep(self._settings.position_monitor_interval_seconds)
+
+        finally:
+            if exit_task is not None and not exit_task.done():
+                exit_task.cancel()
+
+    def _collect_exit_signal(self, task: asyncio.Task):
+        """Read a finished exit task, swallowing provider failures.
+
+        Letting the exception escape would unwind _monitor_position through _tick
+        to run_forever and leave the open position unmanaged, which is far worse
+        than missing one AI opinion.
+        """
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            return None
+        except Exception:
+            self._logger.exception("AI exit evaluation failed; continuing to monitor the position.")
+            return None
 
     async def _refresh_exchange_fee_rates(self) -> None:
         if not self._settings.use_exchange_fee_rates:
