@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import unittest
 from dataclasses import replace
@@ -1239,3 +1240,104 @@ class AIExitAdverseCutTests(unittest.IsolatedAsyncioTestCase):
         engine = _engine(client, FakeStore(), FakeStrategy(exit_after=1), FakeRisk(), settings)
         reason = await engine._monitor_position(self._position(), self._plan())
         self.assertEqual(reason, "strategy_exit:ai_close")
+
+
+class ExitCallDoesNotBlockStopLossTests(unittest.IsolatedAsyncioTestCase):
+    """The AI exit call must not stall stop-loss detection.
+
+    `exit_signal` is a network round trip to the model provider. Measured on the
+    live VPS over 732 calls: median 3.9s, p90 17.9s, p99 78.9s, max 316.9s.
+    Awaiting it inline leaves `_hit_stop_loss` unevaluated for that whole
+    duration, so a breach is only noticed once the model answers. That is why 12
+    of 19 stop losses overshot the 0.40% cap, by 31% up to 106%, and why ETH
+    (median ATR 0.299%) was hit far harder than BTC (0.130%).
+    """
+
+    class _CountingClient(FakeClient):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.price_calls = 0
+
+        async def get_last_price(self, symbol: str) -> float:
+            self.price_calls += 1
+            return await super().get_last_price(symbol)
+
+    class _SlowStrategy:
+        """Stands in for a model call that spans many monitor intervals."""
+
+        def __init__(self, client, delay: float = 0.1) -> None:
+            self.client = client
+            self._delay = delay
+            self.calls_at_start = -1
+            self.calls_at_end = -1
+
+        async def next_trade_plan(self):
+            return None
+
+        async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+            self.calls_at_start = self.client.price_calls
+            await asyncio.sleep(self._delay)
+            self.calls_at_end = self.client.price_calls
+            self.client.price = 99.0  # breach only after the model has answered
+            return ExitSignal(close_now=False, reason="hold")
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    def _engine_for(self, strategy, client):
+        # A real, small interval: interval 0 makes the loop hot-spin for the whole
+        # simulated model call, which costs ~57s of CPU under coverage for no gain.
+        settings = _settings(position_hold_minutes=60, position_monitor_interval_seconds=0.01)
+        return _engine(client, FakeStore(), strategy, FakeRisk(), settings)
+
+    async def test_price_is_still_polled_while_the_model_is_thinking(self) -> None:
+        client = self._CountingClient(price=100.0, price_drift=1.0)
+        strategy = self._SlowStrategy(client)
+        engine = self._engine_for(strategy, client)
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
+        self.assertEqual(reason, "stop_loss")
+        self.assertGreaterEqual(strategy.calls_at_start, 1)
+        self.assertGreater(
+            strategy.calls_at_end,
+            strategy.calls_at_start,
+            "no price was fetched while exit_signal was in flight: the stop loss was unwatched",
+        )
+
+    async def test_a_breach_during_the_call_is_caught_without_waiting_for_the_model(self) -> None:
+        class _BreachesImmediately(ExitCallDoesNotBlockStopLossTests._SlowStrategy):
+            async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+                self.calls_at_start = self.client.price_calls
+                self.client.price = 99.0  # past the 0.40% stop at 99.6
+                await asyncio.sleep(self._delay)
+                self.calls_at_end = self.client.price_calls
+                return ExitSignal(close_now=False, reason="hold")
+
+        client = self._CountingClient(price=100.0, price_drift=1.0)
+        strategy = _BreachesImmediately(client, delay=0.3)
+        engine = self._engine_for(strategy, client)
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
+        self.assertEqual(reason, "stop_loss")
+        # The monitor must have returned while the model was still answering.
+        # Awaiting the call inline makes that impossible.
+        self.assertEqual(strategy.calls_at_end, -1, "the monitor waited for the model before acting on the stop")
+
+    async def test_a_failing_exit_call_does_not_abandon_the_position(self) -> None:
+        # Previously the exception propagated out of _monitor_position, up through
+        # _tick to run_forever, leaving the open position unmanaged.
+        class _Raising(ExitCallDoesNotBlockStopLossTests._SlowStrategy):
+            async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+                raise RuntimeError("provider exploded")
+
+        client = self._CountingClient(price=100.0, price_drift=0.999)
+        strategy = _Raising(client)
+        engine = self._engine_for(strategy, client)
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
+        self.assertEqual(reason, "stop_loss")
