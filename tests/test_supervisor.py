@@ -20,6 +20,7 @@ UNMATCHED = (
     "will not trade or flatten them. Close or reconcile them manually, then restart."
 )
 NORMAL = "2026-09-07 13:06:24 | INFO | volume_bot | Strategy returned HOLD; no entry opened this tick."
+STARTED = "2026-09-07 13:06:16 | INFO | volume_bot | BINGX VST trade engine started."
 
 
 class ParseBlockTests(unittest.TestCase):
@@ -41,6 +42,18 @@ class ParseBlockTests(unittest.TestCase):
         # A stale uncertain-order line must not mask a later unmatched-exposure halt.
         block = parse_block(UNCERTAIN + "\n" + NORMAL + "\n" + UNMATCHED)
         self.assertEqual(block.kind, "unmatched_exposure")
+
+    def test_a_block_before_the_last_restart_is_ignored(self) -> None:
+        # The latch lives in the process. Once it restarts the latch is gone, but
+        # the old ERROR lines stay in the log forever -- reading them would make
+        # the supervisor restart a perfectly healthy bot.
+        self.assertIsNone(parse_block("\n".join([UNCERTAIN, STARTED, NORMAL])))
+
+    def test_a_block_after_the_last_restart_is_seen(self) -> None:
+        self.assertIsNotNone(parse_block("\n".join([UNCERTAIN, STARTED, UNCERTAIN])))
+
+    def test_only_the_last_restart_counts(self) -> None:
+        self.assertIsNone(parse_block("\n".join([STARTED, UNCERTAIN, STARTED, NORMAL])))
 
     def test_empty_log_is_handled(self) -> None:
         self.assertIsNone(parse_block(""))

@@ -31,6 +31,8 @@ from pathlib import Path
 
 UNCERTAIN_RE = re.compile(r"Entries blocked: Entry order (\S+) for (\S+) could not be confirmed")
 UNMATCHED_RE = re.compile(r"Unmatched exchange exposure:")
+# The latch lives in the process, so only lines since the last start count.
+ENGINE_START_RE = re.compile(r"trade engine started")
 
 DEFAULT_STATE_PATH = Path("logs/supervisor_state.json")
 DEFAULT_LOG_TAIL_LINES = 400
@@ -55,8 +57,16 @@ def parse_block(log_text: str) -> BlockedEntry | None:
     The latest line wins: a stale uncertain-order halt must never mask a later
     unmatched-exposure halt, which is the more serious of the two.
     """
+    lines = log_text.splitlines()
+    # Restarting clears the latch, but the ERROR lines stay in the log forever.
+    # Reading them back would restart a perfectly healthy bot, so scan only what
+    # this process has written.
+    start = 0
+    for index, line in enumerate(lines):
+        if ENGINE_START_RE.search(line):
+            start = index + 1
     found: BlockedEntry | None = None
-    for line in log_text.splitlines():
+    for line in lines[start:]:
         match = UNCERTAIN_RE.search(line)
         if match:
             found = BlockedEntry(kind="uncertain_order", order_id=match.group(1), symbol=match.group(2))
