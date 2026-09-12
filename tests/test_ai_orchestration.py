@@ -445,3 +445,123 @@ class SetupMetadataTests(unittest.TestCase):
     def test_missing_technicals_still_yield_a_recorded_setup(self) -> None:
         meta = AIOrchestrator._factor_metadata_for_symbol({"technicals": []}, "BTC/USDT", "LONG")
         self.assertEqual(meta["setup"]["setup_key"], "LONG|unknown|unknown")
+
+
+class EntryPacingRecordTests(unittest.IsolatedAsyncioTestCase):
+    """Volume pacing is recorded beside each entry decision, not sent to the model.
+
+    This step is instrumentation only. The numbers a pacing prompt would need
+    must exist in history before any prompt change is allowed to touch live
+    behaviour, so the request the model receives has to stay unchanged.
+    """
+
+    async def test_pacing_state_is_recorded_without_reaching_the_model_request(self) -> None:
+        class FakeTradeStore:
+            def __init__(self) -> None:
+                self.decisions: list[dict] = []
+
+            async def recent_performance_summary(self, limit: int = 50) -> dict:
+                return {"sample_size": 0}
+
+            async def recent_closed_trade_records(self, limit: int = 100) -> list[dict]:
+                return []
+
+            async def total_volume_for_day(self, day=None) -> float:
+                return 360_000.0
+
+            async def save_ai_decision(self, **kwargs) -> None:
+                self.decisions.append(kwargs)
+
+        class FakeBrain:
+            last_call_metrics = None
+
+            def __init__(self) -> None:
+                self.payload: dict | None = None
+
+            async def entry_decisions(self, payload: dict):
+                self.payload = payload
+                return [
+                    EntryDecision(
+                        symbol="BTC/USDT",
+                        action="HOLD",
+                        confidence=0.5,
+                        market_trend="Sideways",
+                        systemic_risk=2,
+                        reason="no edge worth the fees",
+                    )
+                ]
+
+        class FakeIntelligence:
+            async def build_context(self) -> SimpleNamespace:
+                return SimpleNamespace(
+                    to_dict=lambda: {
+                        "technicals": [],
+                        "external_signals": {},
+                        "intelligence": {},
+                        "factor_snapshots": [],
+                        "active_flow_signals": [],
+                    }
+                )
+
+        store = FakeTradeStore()
+        brain = FakeBrain()
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._settings = SimpleNamespace(
+            strategy_mode="ai_volume",
+            symbols=["BTC/USDT"],
+            trade_target_per_day=28,
+            max_stop_loss_per_day=2,
+            max_consecutive_losses=3,
+            max_daily_drawdown_usdt=100.0,
+            leverage=100,
+            position_usdt=180.0,
+            ai_min_fee_adjusted_rr=0.1,
+            ai_min_confidence=0.75,
+            taker_fee_pct=0.05,
+            maker_fee_pct=-0.02,
+            ai_recent_performance_limit=12,
+            ai_trade_memory_limit=24,
+            exchange_name="bingx",
+            margin_mode="isolated",
+            position_mode="hedge",
+            trading_timezone="Asia/Jakarta",
+            ai_compact_max_factors_per_symbol=6,
+            ai_compact_max_flow_signals=5,
+            ai_compact_max_memory_lessons=3,
+            volume_profile=SimpleNamespace(
+                daily_volume_usdt=1_000_000.0,
+                as_log_fields=lambda: {"daily_volume_usdt": 1_000_000.0},
+            ),
+        )
+        orchestrator._logger = logging.getLogger("test.orchestrator")
+        orchestrator._brain = brain
+        orchestrator._trade_store = store
+        orchestrator._supabase_journal = None
+        orchestrator._intelligence = FakeIntelligence()
+        orchestrator._market_analyzer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._signal_designer = SimpleNamespace(review=lambda context: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._compact_context = CompactDecisionContextBuilder(orchestrator._settings)
+
+        plan = await orchestrator.next_trade_plan(
+            DailyRiskState(
+                day=date(2026, 9, 12),
+                stop_losses=0,
+                closed_trades=10,
+                total_pnl_usdt=-120.0,
+                consecutive_losses=0,
+                allowed_to_trade=True,
+            )
+        )
+
+        self.assertIsNone(plan)
+        pacing = store.decisions[-1]["payload"]["pacing"]
+        self.assertEqual(pacing["volume_today_usdt"], 360_000.0)
+        self.assertEqual(pacing["target_volume_per_day_usdt"], 1_000_000.0)
+        self.assertEqual(pacing["volume_completion_pct"], 36.0)
+        self.assertEqual(pacing["closed_trades_today"], 10)
+        self.assertEqual(pacing["day_pnl_usdt"], -120.0)
+        # Volume is accounted on the trading-timezone day, so the clock reported
+        # here must be that same day's, not UTC's.
+        self.assertGreaterEqual(pacing["hours_remaining_in_trading_day"], 0.0)
+        self.assertLessEqual(pacing["hours_remaining_in_trading_day"], 24.0)
+        self.assertNotIn("pacing", brain.payload)

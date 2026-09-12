@@ -18,6 +18,7 @@ def _settings(**overrides) -> SimpleNamespace:
         supabase_schema="public",
         supabase_trades_table="trades",
         supabase_ai_decisions_table="ai_decisions",
+        supabase_ai_exit_verdicts_table="ai_exit_verdicts",
         supabase_ai_call_metrics_table="ai_call_metrics",
         supabase_open_positions_table="open_position_state",
         exchange_name="bingx",
@@ -347,6 +348,33 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             await _store(_FakeHTTP(status=400)).save_closed_trade(_closed_trade())
         self.assertIn("trades", str(ctx.exception))
+
+    async def test_exit_verdict_is_persisted_with_the_exchange(self) -> None:
+        """Exit verdicts need their own table: ai_decisions is entry-only and its
+        systemic_risk column is a NOT NULL 1..5 check the exit schema cannot fill."""
+        http = _FakeHTTP()
+        await _store(http).save_exit_verdict(
+            symbol="BTC/USDT",
+            direction="LONG",
+            close_now=True,
+            reason="trend invalidated",
+            confidence=0.81,
+            honored=False,
+            skip_reason="below_fee_and_above_cut",
+            elapsed_seconds=120.0,
+            entry_price=100.0,
+            current_price=99.5,
+            gross_usdt=-50.0,
+            fee_usdt=18.0,
+            net_after_fee_usdt=-68.0,
+        )
+        self.assertIn("/rest/v1/ai_exit_verdicts", http.posts[0]["url"])
+        body = http.posts[0]["json"]
+        self.assertEqual(body["exchange"], "bingx")
+        self.assertTrue(body["close_now"])
+        self.assertFalse(body["honored"])
+        self.assertEqual(body["skip_reason"], "below_fee_and_above_cut")
+        self.assertEqual(body["net_after_fee_usdt"], -68.0)
 
 
 if __name__ == "__main__":
