@@ -10,6 +10,10 @@ from bot.models import OpenPosition, TradePlan
 class ExitSignal:
     close_now: bool
     reason: str = "hold"
+    # A verdict the model actually produced, as opposed to the exit policy's
+    # deterministic fallback. Only model verdicts are worth persisting.
+    ai_called: bool = False
+    confidence: float | None = None
 
 
 class BaseStrategy(ABC):

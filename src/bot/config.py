@@ -262,6 +262,10 @@ class Settings(BaseSettings):
         default="ai_decisions",
         alias="SUPABASE_AI_DECISIONS_TABLE",
     )
+    supabase_ai_exit_verdicts_table: str = Field(
+        default="ai_exit_verdicts",
+        alias="SUPABASE_AI_EXIT_VERDICTS_TABLE",
+    )
     supabase_ai_call_metrics_table: str = Field(
         default="ai_call_metrics",
         alias="SUPABASE_AI_CALL_METRICS_TABLE",

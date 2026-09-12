@@ -31,6 +31,24 @@ class TradeStoreProtocol(Protocol):
 
     async def save_ai_call_metrics(self, metrics: Any) -> None: ...
 
+    async def save_exit_verdict(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        close_now: bool,
+        reason: str,
+        confidence: float | None,
+        honored: bool,
+        skip_reason: str | None,
+        elapsed_seconds: float,
+        entry_price: float,
+        current_price: float,
+        gross_usdt: float,
+        fee_usdt: float,
+        net_after_fee_usdt: float,
+    ) -> None: ...
+
     async def save_learning_note(
         self,
         *,

@@ -162,7 +162,12 @@ class EventDrivenExitTests(unittest.IsolatedAsyncioTestCase):
         signal = await orchestrator.exit_signal(_position(), 60000.0, 3601.0)
 
         self.assertFalse(signal.close_now)
-        self.assertEqual(signal.reason, "hold")
+        # Labelled apart from the policy's own fallback hold: this verdict came
+        # from the model and was rejected by the confidence gate, and the record
+        # of it has to say so.
+        self.assertEqual(signal.reason, "hold_low_confidence")
+        self.assertTrue(signal.ai_called)
+        self.assertEqual(signal.confidence, 0.74)
 
     async def test_new_trade_resets_the_exit_budget(self) -> None:
         brain = _FakeBrain()

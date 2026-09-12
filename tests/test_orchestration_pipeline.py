@@ -128,6 +128,9 @@ class _FakeStore:
     async def save_learning_note(self, **kwargs) -> None:
         self.notes.append(kwargs)
 
+    async def total_volume_for_day(self, day=None) -> float:
+        return 250_000.0
+
 
 def _decision(symbol: str, action: str = "OPEN_LONG", approved: bool = True, **overrides) -> EntryDecision:
     base = dict(

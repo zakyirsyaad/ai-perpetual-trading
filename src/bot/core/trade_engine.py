@@ -867,28 +867,85 @@ class TradeEngine:
                     exit_task = None
                 # gross/fee above come from this iteration's price, so a decision the
                 # model made seconds ago is judged against fresh numbers.
-                if ai_exit is not None and ai_exit.close_now:
-                    if gross >= fee:
-                        return f"strategy_exit:{ai_exit.reason}"
-                    adverse_cut = float(getattr(self._settings, "ai_exit_adverse_cut_usdt", 0.0) or 0.0)
-                    if adverse_cut > 0 and net_after_fee <= -adverse_cut:
-                        # Honour the AI on a loser too. Gating solely on `gross >= fee`
-                        # leaves the stop loss and the time stop as the only exits from
-                        # a losing trade, which lets losses run to their maximum.
-                        self._logger.info(
-                            "Strategy exit on adverse move: net_after_fee %.4f breached cut -%.4f.",
-                            net_after_fee, adverse_cut,
+                if ai_exit is not None:
+                    honored = False
+                    skip_reason: str | None = None
+                    if ai_exit.close_now:
+                        if gross >= fee:
+                            honored = True
+                        else:
+                            adverse_cut = float(getattr(self._settings, "ai_exit_adverse_cut_usdt", 0.0) or 0.0)
+                            if adverse_cut > 0 and net_after_fee <= -adverse_cut:
+                                # Honour the AI on a loser too. Gating solely on `gross >= fee`
+                                # leaves the stop loss and the time stop as the only exits from
+                                # a losing trade, which lets losses run to their maximum.
+                                honored = True
+                                self._logger.info(
+                                    "Strategy exit on adverse move: net_after_fee %.4f breached cut -%.4f.",
+                                    net_after_fee, adverse_cut,
+                                )
+                            else:
+                                skip_reason = "below_fee_and_above_cut"
+                                self._logger.debug(
+                                    "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
+                                    gross, fee,
+                                )
+                    if ai_exit.ai_called:
+                        await self._record_exit_verdict(
+                            position,
+                            ai_exit,
+                            honored=honored,
+                            skip_reason=skip_reason,
+                            elapsed_seconds=elapsed,
+                            current_price=current_price,
+                            gross=gross,
+                            fee=fee,
+                            net_after_fee=net_after_fee,
                         )
+                    if honored:
                         return f"strategy_exit:{ai_exit.reason}"
-                    self._logger.debug(
-                        "Strategy exit but gross %.4f < fee %.4f; holding to avoid fee loss.",
-                        gross, fee,
-                    )
                 await asyncio.sleep(self._settings.position_monitor_interval_seconds)
 
         finally:
             if exit_task is not None and not exit_task.done():
                 exit_task.cancel()
+
+    async def _record_exit_verdict(
+        self,
+        position: OpenPosition,
+        signal,
+        *,
+        honored: bool,
+        skip_reason: str | None,
+        elapsed_seconds: float,
+        current_price: float,
+        gross: float,
+        fee: float,
+        net_after_fee: float,
+    ) -> None:
+        """Persist what the model asked for and whether the engine acted on it.
+
+        Instrumentation only: a storage failure must never take down the monitor
+        loop that is protecting an open position.
+        """
+        try:
+            await self._trade_store.save_exit_verdict(
+                symbol=position.symbol,
+                direction=position.direction.value,
+                close_now=bool(signal.close_now),
+                reason=str(signal.reason),
+                confidence=signal.confidence,
+                honored=honored,
+                skip_reason=skip_reason,
+                elapsed_seconds=round(float(elapsed_seconds), 1),
+                entry_price=float(position.entry_price),
+                current_price=float(current_price),
+                gross_usdt=float(gross),
+                fee_usdt=float(fee),
+                net_after_fee_usdt=float(net_after_fee),
+            )
+        except Exception as exc:  # noqa: BLE001 - never break position monitoring
+            self._logger.warning("Failed to persist AI exit verdict for %s: %s", position.symbol, exc)
 
     def _collect_exit_signal(self, task: asyncio.Task):
         """Read a finished exit task, swallowing provider failures.

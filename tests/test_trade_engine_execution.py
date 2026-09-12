@@ -219,6 +219,7 @@ class FakeStore:
         self.open_positions: list[OpenPosition] = []
         self.removed: list[str] = []
         self.daily_volume = 0.0
+        self.exit_verdicts: list[dict] = []
 
     async def initialize(self) -> None:
         return None
@@ -234,6 +235,9 @@ class FakeStore:
 
     async def save_closed_trade(self, trade: ClosedTrade) -> None:
         self.closed.append(trade)
+
+    async def save_exit_verdict(self, **verdict) -> None:
+        self.exit_verdicts.append(verdict)
 
     async def total_volume_for_day(self, day=None) -> float:
         return self.daily_volume
@@ -1341,3 +1345,80 @@ class ExitCallDoesNotBlockStopLossTests(unittest.IsolatedAsyncioTestCase):
         engine = self._engine_for(strategy, client)
         reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
         self.assertEqual(reason, "stop_loss")
+
+
+class AIExitVerdictRecordingTests(unittest.IsolatedAsyncioTestCase):
+    """Every model exit verdict is persisted, honoured or overruled.
+
+    Nothing records what the model asked for while a position is open:
+    `ai_decisions` holds entry decisions only, and the engine logs the trigger
+    rather than the verdict. Without that record the `gross >= fee` gate can
+    never be judged against the outcome it produced.
+    """
+
+    class _VerdictStrategy:
+        """Returns model-backed verdicts instead of the policy's gated fallback."""
+
+        def __init__(self, *, close_now: bool, ai_called: bool = True) -> None:
+            self._close_now = close_now
+            self._ai_called = ai_called
+
+        async def next_trade_plan(self):
+            return None
+
+        async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+            return ExitSignal(
+                close_now=self._close_now,
+                reason="ai_close" if self._close_now else "hold",
+                ai_called=self._ai_called,
+                confidence=0.81,
+            )
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    async def _run(self, strategy, *, price_drift: float, **overrides):
+        settings = _settings(position_hold_minutes=60, **overrides)
+        client = FakeClient(price=100.0, price_drift=price_drift)
+        store = FakeStore()
+        engine = _engine(client, store, strategy, FakeRisk(), settings)
+        # Wide envelope so the verdict path is reached before TP or SL.
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=10.0, take_profit_pct=10.0))
+        return reason, store
+
+    async def test_close_request_the_engine_overrules_is_recorded_with_its_pnl(self) -> None:
+        reason, store = await self._run(
+            self._VerdictStrategy(close_now=True), price_drift=0.99, ai_exit_adverse_cut_usdt=0.0
+        )
+        self.assertEqual(reason, "stop_loss")
+        overruled = [v for v in store.exit_verdicts if v["close_now"] and not v["honored"]]
+        self.assertTrue(overruled)
+        self.assertEqual(overruled[0]["symbol"], "BTC/USDT")
+        self.assertEqual(overruled[0]["skip_reason"], "below_fee_and_above_cut")
+        self.assertEqual(overruled[0]["confidence"], 0.81)
+        self.assertLess(overruled[0]["net_after_fee_usdt"], 0.0)
+
+    async def test_honoured_close_request_is_recorded_as_honoured(self) -> None:
+        reason, store = await self._run(
+            self._VerdictStrategy(close_now=True), price_drift=1.01, ai_exit_adverse_cut_usdt=5.0
+        )
+        self.assertEqual(reason, "strategy_exit:ai_close")
+        self.assertTrue(store.exit_verdicts[-1]["honored"])
+        self.assertIsNone(store.exit_verdicts[-1]["skip_reason"])
+
+    async def test_gated_fallback_without_a_model_call_is_not_recorded(self) -> None:
+        # Most monitor ticks return the exit policy's deterministic hold. Storing
+        # those would bury the handful of real verdicts under thousands of rows.
+        reason, store = await self._run(
+            self._VerdictStrategy(close_now=False, ai_called=False), price_drift=0.99
+        )
+        self.assertEqual(reason, "stop_loss")
+        self.assertEqual(store.exit_verdicts, [])

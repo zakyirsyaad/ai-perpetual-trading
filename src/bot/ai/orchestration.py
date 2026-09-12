@@ -4,6 +4,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from bot.arena.agents import MarketAnalyzer, SignalDesigner
@@ -99,9 +100,11 @@ class AIOrchestrator:
         if missing_symbols:
             self._logger.warning("Grok did not return decisions for symbols: %s", ", ".join(missing_symbols))
 
+        pacing = await self._pacing_state(daily_state)
+
         candidates: list[EntryCandidate] = []
         for decision in decisions:
-            await self._record_ai_decision(decision, payload)
+            await self._record_ai_decision(decision, payload, pacing)
             candidate = self._build_entry_candidate(decision, context_dict)
             if candidate is not None:
                 candidates.append(candidate)
@@ -370,8 +373,18 @@ class AIOrchestrator:
         if decision is None:
             return self._deterministic_exit_fallback(elapsed_seconds, ai_called=True)
         if decision.confidence < self._settings.ai_min_confidence:
-            return ExitSignal(close_now=False, reason="hold")
-        return ExitSignal(close_now=decision.action == "CLOSE", reason=decision.reason)
+            return ExitSignal(
+                close_now=False,
+                reason="hold_low_confidence",
+                ai_called=True,
+                confidence=decision.confidence,
+            )
+        return ExitSignal(
+            close_now=decision.action == "CLOSE",
+            reason=decision.reason,
+            ai_called=True,
+            confidence=decision.confidence,
+        )
 
     def _ensure_exit_trade_started(self, position: OpenPosition, now: float) -> None:
         trade_key = f"{position.symbol}:{position.exchange_order_id}"
@@ -469,7 +482,50 @@ class AIOrchestrator:
             return False
         return True
 
-    async def _record_ai_decision(self, decision: EntryDecision, request_payload: dict[str, Any]) -> None:
+    async def _pacing_state(self, daily_state: DailyRiskState) -> dict[str, Any]:
+        """How far the day is from its volume target, recorded beside the decision.
+
+        Deliberately absent from the model request: this only builds the history a
+        pacing prompt would need, so live behaviour stays unchanged until that
+        prompt has been validated offline.
+        """
+        volume_today = float(await self._trade_store.total_volume_for_day())
+        profile = getattr(self._settings, "volume_profile", None)
+        target = float(getattr(profile, "daily_volume_usdt", 0.0) or 0.0)
+        # Volume accounting keys the day on the trading timezone, so the clock that
+        # matters here is that one rather than UTC.
+        try:
+            tz = ZoneInfo(str(getattr(self._settings, "trading_timezone", "UTC")))
+        except Exception:  # noqa: BLE001 - a misconfigured zone must not stop trading
+            tz = timezone.utc
+        now = datetime.now(tz)
+        hours_remaining = 24.0 - (now.hour + now.minute / 60.0 + now.second / 3600.0)
+        completion = round(volume_today / target * 100.0, 2) if target > 0 else None
+        state: dict[str, Any] = {
+            "volume_today_usdt": round(volume_today, 2),
+            "target_volume_per_day_usdt": round(target, 2),
+            "volume_completion_pct": completion,
+            "hours_remaining_in_trading_day": round(hours_remaining, 2),
+            "closed_trades_today": int(daily_state.closed_trades),
+            "day_pnl_usdt": float(daily_state.total_pnl_usdt),
+        }
+        self._logger.info(
+            "Volume pacing: %.0f/%.0f USDT (%.1f%%), %.1fh left in the trading day, %d trades, day PnL %.2f.",
+            volume_today,
+            target,
+            completion or 0.0,
+            hours_remaining,
+            state["closed_trades_today"],
+            state["day_pnl_usdt"],
+        )
+        return state
+
+    async def _record_ai_decision(
+        self,
+        decision: EntryDecision,
+        request_payload: dict[str, Any],
+        pacing: dict[str, Any] | None = None,
+    ) -> None:
         # Link the stored decision to the provider call that produced it so token
         # spend can be attributed to individual decisions.
         call_metrics = getattr(self._brain, "last_call_metrics", None)
@@ -478,6 +534,7 @@ class AIOrchestrator:
             "decision": decision.model_dump(),
             "request": request_payload,
             "ai_call_id": ai_call_id,
+            "pacing": pacing,
         }
         await self._trade_store.save_ai_decision(
             symbol=decision.symbol,

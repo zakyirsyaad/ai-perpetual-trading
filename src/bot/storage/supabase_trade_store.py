@@ -26,6 +26,7 @@ class SupabaseTradeStore:
         self._schema = settings.supabase_schema
         self._trades_table = settings.supabase_trades_table
         self._ai_decisions_table = settings.supabase_ai_decisions_table
+        self._ai_exit_verdicts_table = settings.supabase_ai_exit_verdicts_table
         self._ai_call_metrics_table = settings.supabase_ai_call_metrics_table
         self._open_positions_table = settings.supabase_open_positions_table
         self._exchange = settings.exchange_name
@@ -159,6 +160,44 @@ class SupabaseTradeStore:
                 "payload_json": payload,
                 "exchange": self._exchange,
                 "ai_call_id": ai_call_id,
+            },
+        )
+
+    async def save_exit_verdict(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        close_now: bool,
+        reason: str,
+        confidence: float | None,
+        honored: bool,
+        skip_reason: str | None,
+        elapsed_seconds: float,
+        entry_price: float,
+        current_price: float,
+        gross_usdt: float,
+        fee_usdt: float,
+        net_after_fee_usdt: float,
+    ) -> None:
+        """Persist one model exit verdict and whether the engine acted on it."""
+        await self._insert(
+            self._ai_exit_verdicts_table,
+            {
+                "symbol": symbol,
+                "direction": direction,
+                "close_now": close_now,
+                "reason": reason,
+                "confidence": confidence,
+                "honored": honored,
+                "skip_reason": skip_reason,
+                "elapsed_seconds": elapsed_seconds,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "gross_usdt": gross_usdt,
+                "fee_usdt": fee_usdt,
+                "net_after_fee_usdt": net_after_fee_usdt,
+                "exchange": self._exchange,
             },
         )
 
