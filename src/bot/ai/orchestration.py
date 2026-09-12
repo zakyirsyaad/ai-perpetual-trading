@@ -104,8 +104,9 @@ class AIOrchestrator:
 
         candidates: list[EntryCandidate] = []
         for decision in decisions:
-            await self._record_ai_decision(decision, payload, pacing)
-            candidate = self._build_entry_candidate(decision, context_dict)
+            gate_verdict = self._stretch_gate_verdict(decision, context_dict, pacing)
+            await self._record_ai_decision(decision, payload, pacing, gate_verdict)
+            candidate = self._build_entry_candidate(decision, context_dict, gate_verdict)
             if candidate is not None:
                 candidates.append(candidate)
 
@@ -137,6 +138,7 @@ class AIOrchestrator:
         self,
         decision: EntryDecision,
         market_context: dict[str, Any],
+        gate_verdict: dict[str, Any] | None = None,
     ) -> EntryCandidate | None:
         # Volume-building run: trade-suppressing gates (HOLD handling, confidence,
         # systemic risk, RR floor, and the deterministic entry guard) are intentionally
@@ -179,6 +181,26 @@ class AIOrchestrator:
             review.confirmations,
             review.invalidation_trigger,
         )
+
+        if gate_verdict and gate_verdict.get("verdict") == "block":
+            stretch = gate_verdict.get("stretch_atr")
+            limit = gate_verdict.get("max_stretch_atr")
+            if gate_verdict.get("mode") == "enforce":
+                self._logger.info(
+                    "Entry candidate %s rejected: %.2f ATR from the mean exceeds the gate limit %.2f.",
+                    decision.symbol,
+                    float(stretch or 0.0),
+                    float(limit or 0.0),
+                )
+                return None
+            # Shadow mode records what enforcement would have cost without
+            # changing a single live decision.
+            self._logger.info(
+                "Entry stretch gate (shadow) would block %s: %.2f ATR from the mean exceeds %.2f.",
+                decision.symbol,
+                float(stretch or 0.0),
+                float(limit or 0.0),
+            )
 
         direction = PositionDirection.LONG if decision.action == "OPEN_LONG" else PositionDirection.SHORT
         target = self._resolve_trade_targets(decision, market_context)
@@ -482,6 +504,75 @@ class AIOrchestrator:
             return False
         return True
 
+    def _stretch_gate_verdict(
+        self,
+        decision: EntryDecision,
+        market_context: dict[str, Any],
+        pacing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Judge one entry by how far price sits from its own mean.
+
+        Entries opened more than `ENTRY_STRETCH_GATE_MAX_ATR` from the 21-EMA are
+        the measured loss source; keeping only near-mean entries moved gross/1M
+        from -2 to +170 in replay. The volume mandate still wins when the day is
+        behind schedule, so a stretched entry beats no entry then.
+        """
+        mode = str(getattr(self._settings, "entry_stretch_gate_mode", "off") or "off").strip().lower()
+        max_stretch = float(getattr(self._settings, "entry_stretch_gate_max_atr", 0.0) or 0.0)
+        verdict: dict[str, Any] = {
+            "mode": mode,
+            "verdict": "allow",
+            "stretch_atr": None,
+            "bucket": "unknown",
+            "max_stretch_atr": max_stretch,
+            "behind_schedule": False,
+            "entries_needed_per_hour": None,
+        }
+        if mode == "off" or max_stretch <= 0 or decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+            return verdict
+
+        features = self._features_for_symbol(market_context, decision.symbol)
+        setup = build_setup_profile(features, "LONG" if decision.action == "OPEN_LONG" else "SHORT")
+        stretch = setup.get("stretch_atr")
+        verdict["stretch_atr"] = stretch
+        verdict["bucket"] = setup.get("stretch_bucket")
+
+        needed = self._entries_needed_per_hour(pacing)
+        verdict["entries_needed_per_hour"] = needed
+        threshold = float(
+            getattr(self._settings, "entry_stretch_gate_behind_schedule_entries_per_hour", 0.0) or 0.0
+        )
+        if threshold > 0 and needed is not None and needed >= threshold:
+            verdict["behind_schedule"] = True
+            return verdict
+
+        # An unreadable setup is not evidence of a bad entry; only a measured
+        # stretch beyond the limit blocks.
+        if stretch is not None and abs(float(stretch)) > max_stretch:
+            verdict["verdict"] = "block"
+        return verdict
+
+    def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
+        if not isinstance(pacing, dict):
+            return None
+        target = float(pacing.get("target_volume_per_day_usdt") or 0.0)
+        done = float(pacing.get("volume_today_usdt") or 0.0)
+        hours = float(pacing.get("hours_remaining_in_trading_day") or 0.0)
+        profile = getattr(self._settings, "volume_profile", None)
+        per_entry = float(getattr(profile, "volume_per_entry_usdt", 0.0) or 0.0)
+        if per_entry <= 0:
+            margin = float(
+                getattr(profile, "margin_per_entry_usdt", 0.0)
+                or getattr(self._settings, "position_usdt", 0.0)
+                or 0.0
+            )
+            per_entry = margin * float(getattr(self._settings, "leverage", 0) or 0) * float(
+                getattr(self._settings, "volume_sides_per_entry", 2) or 2
+            )
+        if target <= 0 or hours <= 0 or per_entry <= 0:
+            return None
+        return max(0.0, target - done) / per_entry / hours
+
     async def _pacing_state(self, daily_state: DailyRiskState) -> dict[str, Any]:
         """How far the day is from its volume target, recorded beside the decision.
 
@@ -525,6 +616,7 @@ class AIOrchestrator:
         decision: EntryDecision,
         request_payload: dict[str, Any],
         pacing: dict[str, Any] | None = None,
+        gate: dict[str, Any] | None = None,
     ) -> None:
         # Link the stored decision to the provider call that produced it so token
         # spend can be attributed to individual decisions.
@@ -535,6 +627,7 @@ class AIOrchestrator:
             "request": request_payload,
             "ai_call_id": ai_call_id,
             "pacing": pacing,
+            "gate": gate,
         }
         await self._trade_store.save_ai_decision(
             symbol=decision.symbol,

@@ -565,3 +565,108 @@ class EntryPacingRecordTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(pacing["hours_remaining_in_trading_day"], 0.0)
         self.assertLessEqual(pacing["hours_remaining_in_trading_day"], 24.0)
         self.assertNotIn("pacing", brain.payload)
+
+
+class EntryStretchGateTests(unittest.TestCase):
+    """Entries taken far from the mean are the measured loss source.
+
+    Replay over 342 stored BTC decisions: keeping only near-mean entries moved
+    gross/1M from -2 to +170 (cadence-faithful exit model) and from -230 to +113
+    (gross-faithful). Prompt text does not move this — the pacing arm halved the
+    entry rate without changing which ticks were picked — so the gate belongs in
+    code, with a shadow mode that records what it would have blocked.
+    """
+
+    def _settings(self, **overrides) -> SimpleNamespace:
+        data = dict(vars(_volume_run_settings()))
+        # Mirrors production: Settings always exposes volume_profile in ai_volume mode.
+        data.setdefault("volume_profile", SimpleNamespace(volume_per_entry_usdt=36_000.0,
+                                                          margin_per_entry_usdt=180.0))
+        data.setdefault("volume_sides_per_entry", 2)
+        data.setdefault("entry_stretch_gate_mode", "off")
+        data.setdefault("entry_stretch_gate_max_atr", 0.75)
+        data.setdefault("entry_stretch_gate_behind_schedule_entries_per_hour", 0.0)
+        data.update(overrides)
+        return SimpleNamespace(**data)
+
+    def _orchestrator(self, **overrides) -> AIOrchestrator:
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._settings = self._settings(**overrides)
+        orchestrator._logger = logging.getLogger("test.stretch_gate")
+        return orchestrator
+
+    def _decision(self) -> EntryDecision:
+        return EntryDecision(
+            symbol="BTC/USDT",
+            action="OPEN_LONG",
+            confidence=0.8,
+            market_trend="Bullish",
+            stop_loss_pct=0.08,
+            take_profit_pct=0.12,
+            systemic_risk=2,
+            reason="clean breakout",
+            risk_review=_approved_review(),
+        )
+
+    def _context(self, *, ema_21: float) -> dict:
+        # atr_14 = 0.1 on a price of 100 keeps the ATR-scaled stop inside the
+        # liquidation limit; ema_21 alone sets how stretched the entry is.
+        return {
+            "technicals": [{"symbol": "BTC/USDT", "last_price": 100.0, "ema_21": ema_21, "atr_14": 0.1}],
+            "liquidation_constraints": {"BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5}},
+        }
+
+    STRETCHED = 99.86   # (100 - 99.86) / 0.1 = 1.4 ATR above the mean
+    NEAR_MEAN = 99.98   # 0.2 ATR
+
+    def test_enforce_blocks_an_entry_far_from_the_mean(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="enforce")
+        context = self._context(ema_21=self.STRETCHED)
+        verdict = orchestrator._stretch_gate_verdict(self._decision(), context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertAlmostEqual(verdict["stretch_atr"], 1.4, places=2)
+        self.assertIsNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))
+
+    def test_enforce_allows_an_entry_near_the_mean(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="enforce")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        verdict = orchestrator._stretch_gate_verdict(self._decision(), context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))
+
+    def test_shadow_records_the_block_without_stopping_the_entry(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="shadow")
+        context = self._context(ema_21=self.STRETCHED)
+        verdict = orchestrator._stretch_gate_verdict(self._decision(), context, None)
+
+        self.assertEqual(verdict["mode"], "shadow")
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))
+
+    def test_disabled_by_default_changes_nothing(self) -> None:
+        orchestrator = self._orchestrator()
+        context = self._context(ema_21=self.STRETCHED)
+        verdict = orchestrator._stretch_gate_verdict(self._decision(), context, None)
+
+        self.assertEqual(verdict["mode"], "off")
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))
+
+    def test_a_day_behind_schedule_relaxes_the_gate(self) -> None:
+        # Volume is the mandate: when the remaining schedule needs more entries
+        # per hour than the threshold, a stretched entry is better than no entry.
+        orchestrator = self._orchestrator(
+            entry_stretch_gate_mode="enforce",
+            entry_stretch_gate_behind_schedule_entries_per_hour=2.0,
+        )
+        context = self._context(ema_21=self.STRETCHED)
+        pacing = {"volume_today_usdt": 100_000.0, "target_volume_per_day_usdt": 1_008_000.0,
+                  "hours_remaining_in_trading_day": 6.0}
+
+        verdict = orchestrator._stretch_gate_verdict(self._decision(), context, pacing)
+
+        self.assertTrue(verdict["behind_schedule"])
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))

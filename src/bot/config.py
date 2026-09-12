@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # stop grows with volatility while profit taking stays pinned, so a volatile
     # entry can lose several winners' worth in one move.
     max_stop_loss_pct: float = Field(default=0.0, ge=0.0, alias="MAX_STOP_LOSS_PCT")
+    entry_stretch_gate_mode: str = Field(default="off", alias="ENTRY_STRETCH_GATE_MODE")
+    entry_stretch_gate_max_atr: float = Field(default=0.75, ge=0.0, alias="ENTRY_STRETCH_GATE_MAX_ATR")
+    entry_stretch_gate_behind_schedule_entries_per_hour: float = Field(
+        default=0.0,
+        ge=0.0,
+        alias="ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR",
+    )
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
@@ -300,6 +307,14 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("entry_stretch_gate_mode")
+    @classmethod
+    def normalize_entry_stretch_gate_mode(cls, value: str) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("ENTRY_STRETCH_GATE_MODE must be one of: off, shadow, enforce.")
+        return mode
 
     @field_validator("bingx_api_key", "bingx_secret_key")
     @classmethod
