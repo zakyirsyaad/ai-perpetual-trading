@@ -99,7 +99,7 @@ Retries only cover connection/timeout/429/retryable-5xx; permanent 4xx fails imm
 
 `TradeEngine._tick` logs `"Strategy returned HOLD"` whenever `next_trade_plan()` returns `None`. That `None` is usually because **the LLM itself chose `action="HOLD"`** — a soft, prompt-driven outcome — *not* because a code hard-gate rejected it. A `None`/`ValidationError` from the AI call is also collapsed into the same HOLD log, so infra failures, parse failures, and genuine vetoes all look identical there. Trace the actual cause through the per-symbol lines emitted by `AIOrchestrator._build_entry_candidate`, not the generic HOLD line.
 
-Gates inside `_build_entry_candidate`, in order, each with its own log line: AI returned `HOLD` → symbol not in `SYMBOLS` → `confidence < AI_MIN_CONFIDENCE` → `risk_review` missing (unusable, never approved) → `risk_review.approved == false` (vetoed) → `_resolve_trade_targets` could not build a target. Note the module comment there claims the confidence gate was removed for volume runs; the code still enforces it — trust the code.
+Gates inside `_build_entry_candidate`, in order, each with its own log line: AI returned `HOLD` → symbol not in `SYMBOLS` → `confidence < AI_MIN_CONFIDENCE` → `risk_review` missing (unusable, never approved) → `risk_review.approved == false` (vetoed) → **entry stretch gate** (only when `ENTRY_STRETCH_GATE_MODE=enforce`) → `_resolve_trade_targets` could not build a target. Note the module comment there claims the confidence gate was removed for volume runs; the code still enforces it — trust the code.
 
 ### The tick loop and its gates
 
@@ -125,6 +125,8 @@ After a plan exists, two more can still drop it: `PREVENT_NEW_ENTRIES_IF_EXCHANG
 **Bounding the loss side** (both default to `0` = disabled, so an unchanged `.env` keeps the old behaviour):
 - `MAX_STOP_LOSS_PCT` caps the ATR-scaled stop in `_resolve_trade_targets`, applied *before* the TP floor is derived from `sl_pct`. Without it `max(base_sl, atr_pct * ATR_SL_MULTIPLIER)` is unbounded, so a volatile entry opens with a stop far wider than the profit-taking band. It never widens an already tighter stop and never bypasses `_stop_is_strictly_before_liquidation`.
 - `AI_EXIT_ADVERSE_CUT_USDT` lets `_monitor_position` honour an AI `close_now` on a *losing* position once `net_after_fee <= -cut`. The pre-existing `gross >= fee` guard honours it only when already profitable, leaving the full stop and the time stop as the only exits from a losing trade.
+
+**Entry stretch gate** (`ENTRY_STRETCH_GATE_MODE`, default `off`): rejects entries whose price sits more than `ENTRY_STRETCH_GATE_MAX_ATR` (0.75) from the 21-EMA, measured in ATR — the shape that carries the measured losses. `shadow` records the verdict without changing any decision; `enforce` rejects. `ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR` (0 = never) relaxes the gate once the day needs more entries per hour than that to still reach the daily volume target — the volume mandate wins over selectivity on a day that is behind. Every decision carries the verdict at `ai_decisions.payload_json.gate`, so shadow mode is queryable rather than log-only.
 
 **`liquidation_guard` is a historical exit reason.** Closed trades carry it (20% of the OKX cycle, at only −18.21 average — a cheap early stop), but **no code path produces it any more**; it survives only in `_exit_allows_taker`, `trade_memory`, and prompt text. Its removal is why the average stop-loss cost roughly doubled after the BingX migration, and `MAX_STOP_LOSS_PCT` is the explicit replacement.
 
