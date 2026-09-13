@@ -340,7 +340,7 @@ class TradeEngine:
         )
         await self._trade_store.save_open_position(open_position)
 
-        await self._manage_open_position(
+        await self._manage_open_position_guarded(
             open_position,
             plan,
             entry_order_id=entry_order_id,
@@ -384,6 +384,46 @@ class TradeEngine:
             return False
         return True
 
+    async def _manage_open_position_guarded(
+        self,
+        open_position: OpenPosition,
+        plan: TradePlan,
+        **kwargs,
+    ) -> None:
+        """Manage a position without ever silently abandoning it.
+
+        Monitoring failures are retried inside `_manage_open_position`, where no
+        order has been sent yet. A failure that still escapes happened in the close
+        phase, after an exit order may already exist, so retrying automatically
+        could duplicate an order. Instead the venue decides: flat means nothing is
+        exposed and trading continues; open or unreadable latches entries until an
+        operator resolves the position.
+        """
+        try:
+            await self._manage_open_position(open_position, plan, **kwargs)
+        except Exception as exc:
+            self._logger.exception("Position management for %s failed.", open_position.symbol)
+            try:
+                still_open: bool | None = await self._client.has_open_position(open_position.symbol)
+            except Exception as check_exc:
+                still_open = None
+                self._logger.error(
+                    "Could not read the %s position after the failure: %s", open_position.symbol, check_exc
+                )
+            if still_open is False:
+                self._logger.warning(
+                    "%s is flat on the venue after the failure; entries stay enabled, "
+                    "but this trade may be missing from the trade record.",
+                    open_position.symbol,
+                )
+                return
+            state = "still open" if still_open else "unreadable"
+            self._entries_blocked_reason = (
+                f"position management for {open_position.symbol} failed ({exc}) and the venue position is "
+                f"{state}; verify and resolve it manually before resuming entries"
+            )
+            self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
+
     async def _manage_open_position(
         self,
         open_position: OpenPosition,
@@ -406,9 +446,25 @@ class TradeEngine:
         realized_qty = open_position.quantity
         exit_fill = None
         exit_reason = None
+        monitor_failures = 0
         while True:
             if exit_reason is None:
-                exit_reason = await self._monitor_position(open_position, plan)
+                try:
+                    exit_reason = await self._monitor_position(open_position, plan)
+                except Exception:
+                    # Returning from here hands control back to the entry loop while
+                    # the position is still open and nothing is watching it. No order
+                    # has been placed at this point, so monitoring again is safe.
+                    monitor_failures += 1
+                    self._logger.exception(
+                        "Position monitor for %s failed unexpectedly (%d); resuming monitoring.",
+                        open_position.symbol,
+                        monitor_failures,
+                    )
+                    await asyncio.sleep(
+                        min(self._settings.position_monitor_interval_seconds * monitor_failures, 60.0)
+                    )
+                    continue
 
             # It is possible that the exchange position was already closed or resized externally
             # (manual close, liquidation, partial close, etc.). In that case we should not try to
@@ -776,17 +832,14 @@ class TradeEngine:
             position = self._resumable_positions.pop(0)
             plan = self._plan_from_resumed_position(position)
             self._logger.info("Resumed monitoring for %s %s.", position.symbol, position.direction.value)
-            try:
-                await self._manage_open_position(
-                    position,
-                    plan,
-                    entry_order_id=position.exchange_order_id,
-                    entry_fill=None,
-                    entry_fee_usdt=0.0,
-                    record_entry_cooldown=False,
-                )
-            except Exception:
-                self._logger.exception("Failed to manage resumed position for %s.", position.symbol)
+            await self._manage_open_position_guarded(
+                position,
+                plan,
+                entry_order_id=position.exchange_order_id,
+                entry_fill=None,
+                entry_fee_usdt=0.0,
+                record_entry_cooldown=False,
+            )
 
     def _plan_from_resumed_position(self, position: OpenPosition) -> TradePlan:
         """Rebuild the trade plan for a resumed position.
@@ -816,9 +869,28 @@ class TradeEngine:
         # live VPS), and awaiting it here would leave _hit_stop_loss unevaluated for
         # its whole duration -- the reason 12 of 19 stop losses overshot their cap.
         exit_task: asyncio.Task | None = None
+        price_failures = 0
         try:
             while True:
-                current_price = await self._client.get_last_price(position.symbol)
+                try:
+                    current_price = await self._client.get_last_price(position.symbol)
+                except ExchangeAPIError as exc:
+                    # This loop is the only stop loss the position has. A transient
+                    # venue or network failure must cost one iteration, never the
+                    # monitor: on 2026-09-12 a single SSL ConnectError here ended
+                    # monitoring and left a LONG unwatched for hours.
+                    price_failures += 1
+                    log = self._logger.error if price_failures >= 3 else self._logger.warning
+                    log(
+                        "Price read failed for %s while monitoring an open position "
+                        "(%d consecutive failures); retrying: %s",
+                        position.symbol,
+                        price_failures,
+                        exc,
+                    )
+                    await asyncio.sleep(self._settings.position_monitor_interval_seconds)
+                    continue
+                price_failures = 0
                 elapsed = datetime.now(timezone.utc).timestamp() - position.opened_at.timestamp()
                 if self._hit_stop_loss(position.direction, position.entry_price, current_price, plan.stop_loss_pct):
                     return "stop_loss"

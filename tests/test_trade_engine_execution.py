@@ -1422,3 +1422,199 @@ class AIExitVerdictRecordingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(reason, "stop_loss")
         self.assertEqual(store.exit_verdicts, [])
+
+
+class MonitorSurvivesVenueErrorsTests(unittest.IsolatedAsyncioTestCase):
+    """A venue hiccup must never leave a live position unmonitored.
+
+    Observed 2026-09-12 15:03 UTC: one `quote/price` read failed with an SSL
+    `ConnectError` twelve minutes into a LONG. The exception escaped
+    `_monitor_position`, reached the catch-all in `run_forever`, and the engine
+    went back to the entry loop. The position stayed open for hours with no stop
+    loss, no time stop and no exit evaluation.
+    """
+
+    class _FlakyPriceClient(FakeClient):
+        """Fails the listed price reads, then keeps drifting against a LONG."""
+
+        def __init__(self, *, fail_on: set[int], **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._fail_on = fail_on
+            self.price_calls = 0
+
+        async def get_last_price(self, symbol: str) -> float:
+            self.price_calls += 1
+            if self.price_calls in self._fail_on:
+                raise ExchangeAPIError(
+                    "BingX request failed for /openApi/swap/v2/quote/price: ConnectError: "
+                    "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+                    venue="bingx",
+                )
+            return await super().get_last_price(symbol)
+
+    class _HoldStrategy:
+        async def next_trade_plan(self):
+            return None
+
+        async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+            return ExitSignal(close_now=False, reason="hold")
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    def _engine(self, client, store=None):
+        settings = _settings(position_hold_minutes=60)
+        return _engine(client, store or FakeStore(), self._HoldStrategy(), FakeRisk(), settings)
+
+    async def test_a_failed_price_read_does_not_abandon_the_position(self) -> None:
+        client = self._FlakyPriceClient(fail_on={2}, price=100.0, price_drift=0.999)
+        engine = self._engine(client)
+
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
+
+        self.assertEqual(reason, "stop_loss")
+        self.assertGreater(client.price_calls, 2)
+
+    async def test_repeated_price_failures_are_escalated_to_error(self) -> None:
+        client = self._FlakyPriceClient(fail_on={2, 3, 4}, price=100.0, price_drift=0.999)
+        engine = self._engine(client)
+
+        with self.assertLogs("test.engine", level="ERROR") as logs:
+            reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=0.40, take_profit_pct=10.0))
+
+        self.assertEqual(reason, "stop_loss")
+        self.assertTrue(any("consecutive" in line for line in logs.output))
+
+    async def test_unexpected_monitor_failure_keeps_managing_the_position(self) -> None:
+        client = FakeClient(price=100.0, price_drift=0.999)
+        client.position_size = 100.0
+        store = FakeStore()
+        engine = self._engine(client, store)
+        calls = {"n": 0}
+
+        async def monitor_once_broken(position, plan):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("unexpected failure inside the monitor loop")
+            return "stop_loss"
+
+        engine._monitor_position = monitor_once_broken
+        await engine._manage_open_position(
+            self._position(),
+            _plan(stop_loss_pct=0.40, take_profit_pct=10.0),
+            entry_order_id="entry-1",
+            entry_fill=None,
+            entry_fee_usdt=0.0,
+            record_entry_cooldown=False,
+        )
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(len(store.closed), 1)
+        self.assertEqual(store.closed[0].reason, "stop_loss")
+
+
+class PositionManagementFailureLatchTests(unittest.IsolatedAsyncioTestCase):
+    """A failure in the close phase must not silently hand control back to entries.
+
+    Once an exit order has been sent, retrying it automatically could duplicate an
+    order, which the order-idempotency rules forbid. What must never happen is the
+    engine returning to the entry loop as if the position were gone. So: check the
+    venue. Flat means nothing is exposed (for example a Supabase 504 after a clean
+    close) and trading continues; open or unreadable latches entries loudly.
+    """
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+            stop_loss_pct=0.40,
+            take_profit_pct=10.0,
+        )
+
+    def _engine(self, client):
+        return _engine(client, FakeStore(), FakeStrategy(), FakeRisk(), _settings())
+
+    @staticmethod
+    def _failing_manage(message: str):
+        async def manage(position, plan, **kwargs):
+            raise RuntimeError(message)
+        return manage
+
+    async def _run_guarded(self, engine) -> None:
+        await engine._manage_open_position_guarded(
+            self._position(),
+            _plan(stop_loss_pct=0.40, take_profit_pct=10.0),
+            entry_order_id="entry-1",
+            entry_fill=None,
+            entry_fee_usdt=0.0,
+            record_entry_cooldown=False,
+        )
+
+    async def test_a_failed_exit_with_the_position_still_open_blocks_new_entries(self) -> None:
+        client = FakeClient()
+        client.position_size = 100.0
+        engine = self._engine(client)
+        engine._manage_open_position = self._failing_manage("Exit order placed but position still open for BTC/USDT.")
+
+        await self._run_guarded(engine)
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+        self.assertIn("BTC/USDT", engine._entries_blocked_reason)
+
+    async def test_a_failure_after_the_venue_is_flat_does_not_block_entries(self) -> None:
+        client = FakeClient()
+        client.position_size = 0.0
+        engine = self._engine(client)
+        engine._manage_open_position = self._failing_manage("Supabase request failed for table trades: 504")
+
+        await self._run_guarded(engine)
+
+        self.assertIsNone(engine._entries_blocked_reason)
+
+    async def test_an_unreadable_venue_after_a_failure_blocks_new_entries(self) -> None:
+        class _Unreadable(FakeClient):
+            async def has_open_position(self, symbol: str) -> bool:
+                raise ExchangeAPIError("positions endpoint unreachable", venue="bingx")
+
+        engine = self._engine(_Unreadable())
+        engine._manage_open_position = self._failing_manage("exit order rejected")
+
+        await self._run_guarded(engine)
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_a_fresh_entry_whose_management_fails_blocks_new_entries(self) -> None:
+        # Wiring for the call site that had no guard at all: _execute_single_trade.
+        client = FakeClient()
+        engine = _engine(client, FakeStore(), FakeStrategy(_plan()), FakeRisk())
+        engine._manage_open_position = self._failing_manage("exit order rejected")
+
+        await engine._execute_single_trade(_plan())
+
+        self.assertGreater(client.position_size, 0.0)
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_a_resumed_position_whose_management_fails_blocks_new_entries(self) -> None:
+        # The resume path used to log the exception and move on, orphaning the position.
+        client = FakeClient()
+        client.position_size = 100.0
+        engine = self._engine(client)
+        engine._resumable_positions = [self._position()]
+        engine._manage_open_position = self._failing_manage("exit order rejected")
+
+        await engine._resume_persisted_positions()
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
