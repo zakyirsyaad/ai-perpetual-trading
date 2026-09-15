@@ -267,5 +267,27 @@ class EventDrivenExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(orchestrator.exit_policy_state()["deduplicated_calls"], 1)
 
 
+
+class ReservedBudgetSkipsContextBuildTests(unittest.IsolatedAsyncioTestCase):
+    """Once only reserved calls remain, a quiet tick must not build market context.
+
+    With the routine budget closed, a flow change can no longer earn a call, so
+    building the context just to probe for one wastes an exchange round trip on
+    every monitor tick.
+    """
+
+    async def test_no_context_is_built_when_only_reserved_calls_remain(self) -> None:
+        intelligence = _FakeIntelligence()
+        settings = _settings(ai_exit_max_calls_per_trade=4, ai_exit_event_reserve_calls=4)
+        orchestrator = _orchestrator(_FakeBrain(), intelligence, settings)
+        position = _position()
+
+        signal = await orchestrator.exit_signal(position, 60000.0, 120.0)
+
+        self.assertFalse(signal.close_now)
+        self.assertFalse(signal.ai_called)
+        self.assertEqual(intelligence.builds, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,11 +101,23 @@ class AIExitPolicy:
         if last_activity is not None and (now - last_activity) < self._min_interval_seconds:
             return ExitCallGate(False, "min_interval")
 
-        if last_closed_candle_ms is not None and last_closed_candle_ms != self._last_candle_ms:
+        # The last `event_reserve` calls of the budget are kept for price moves.
+        # Routine triggers (every closed candle, every flow change) otherwise spend
+        # the whole budget in the first minutes: trade #574 used its 25 calls by
+        # minute 20 and could not be asked when it jumped to +85 net at minute 23.
+        routine_open = self._calls_made < self._max_calls - self._event_reserve_calls
+
+        if routine_open and last_closed_candle_ms is not None and last_closed_candle_ms != self._last_candle_ms:
             return ExitCallGate(True, "new_candle")
 
         if self._adverse_move_triggered(price):
             return ExitCallGate(True, "adverse_move")
+
+        if self._favorable_move_triggered(price):
+            return ExitCallGate(True, "favorable_move")
+
+        if not routine_open:
+            return ExitCallGate(False, "routine_budget_reserved")
 
         if flow_signature is not None and self._last_flow_signature is not None:
             if flow_signature != self._last_flow_signature:
@@ -181,6 +193,22 @@ class AIExitPolicy:
         change_pct = ((float(price) - reference) / reference) * 100.0
         adverse_pct = -change_pct if self._direction == PositionDirection.LONG else change_pct
         return adverse_pct >= threshold
+
+    def _favorable_move_triggered(self, price: float) -> bool:
+        threshold = float(getattr(self._settings, "ai_exit_favorable_move_threshold_pct", 0.0) or 0.0)
+        if threshold <= 0:
+            return False
+        reference = self._last_call_price if self._last_call_price is not None else self._entry_price
+        if not reference:
+            return False
+        change_pct = ((float(price) - reference) / reference) * 100.0
+        favorable_pct = change_pct if self._direction == PositionDirection.LONG else -change_pct
+        return favorable_pct >= threshold
+
+    @property
+    def _event_reserve_calls(self) -> int:
+        value = int(getattr(self._settings, "ai_exit_event_reserve_calls", 0) or 0)
+        return max(0, min(value, self._max_calls))
 
     @property
     def _min_interval_seconds(self) -> float:

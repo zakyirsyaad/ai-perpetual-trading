@@ -139,5 +139,87 @@ class ExitPolicyTests(unittest.TestCase):
         self.assertFalse(state["budget_exhausted"])
 
 
+
+class ExitBudgetCoversTheWholeHoldTests(unittest.TestCase):
+    """The AI must still be reachable when the price moves late in a trade.
+
+    Trade #574 spent its 25 AI exit calls by minute 20 and #587 by minute 11:
+    routine triggers (each new candle, each regime or flow change) consumed the
+    whole budget early. When #574 jumped from +10 to +85 net at minute 23 and
+    #587 reached +32 net at minute 18, nothing could ask the model, and a
+    favourable move never triggered a call in the first place.
+    """
+
+    def _policy(self, **overrides) -> AIExitPolicy:
+        policy = AIExitPolicy(_settings(**overrides))
+        policy.start_trade(entry_price=100.0, direction=PositionDirection.LONG, now=0.0)
+        return policy
+
+    @staticmethod
+    def _spend_routine_calls(policy: AIExitPolicy, calls: int) -> float:
+        now = 0.0
+        for index in range(calls):
+            now = float(index * 60)
+            gate = policy.evaluate(now=now, price=100.0, last_closed_candle_ms=index * 180_000, flow_signature="a")
+            assert gate.allowed and gate.reason == "new_candle", gate
+            policy.mark_called(now=now, price=100.0, last_closed_candle_ms=index * 180_000, flow_signature="a")
+        return now
+
+    def test_a_favourable_move_triggers_a_call_when_enabled(self) -> None:
+        policy = self._policy(ai_exit_favorable_move_threshold_pct=0.10)
+        policy.mark_called(now=0.0, price=100.0, last_closed_candle_ms=0, flow_signature="a")
+
+        gate = policy.evaluate(now=60.0, price=100.2, last_closed_candle_ms=0, flow_signature="a")
+
+        self.assertTrue(gate.allowed)
+        self.assertEqual(gate.reason, "favorable_move")
+
+    def test_reserved_calls_are_not_spent_on_new_candles(self) -> None:
+        policy = self._policy(ai_exit_max_calls_per_trade=12, ai_exit_event_reserve_calls=3)
+        now = self._spend_routine_calls(policy, 9)
+
+        gate = policy.evaluate(now=now + 60, price=100.0, last_closed_candle_ms=9 * 180_000, flow_signature="a")
+
+        self.assertFalse(gate.allowed)
+        self.assertEqual(gate.reason, "routine_budget_reserved")
+
+    def test_reserved_calls_are_not_spent_on_flow_changes(self) -> None:
+        policy = self._policy(ai_exit_max_calls_per_trade=12, ai_exit_event_reserve_calls=3)
+        now = self._spend_routine_calls(policy, 9)
+
+        gate = policy.evaluate(now=now + 60, price=100.0, last_closed_candle_ms=8 * 180_000, flow_signature="volatile")
+
+        self.assertFalse(gate.allowed)
+        self.assertEqual(gate.reason, "routine_budget_reserved")
+
+    def test_reserved_calls_stay_available_for_price_moves(self) -> None:
+        policy = self._policy(
+            ai_exit_max_calls_per_trade=12, ai_exit_event_reserve_calls=3, ai_exit_favorable_move_threshold_pct=0.10
+        )
+        now = self._spend_routine_calls(policy, 9)
+
+        favourable = policy.evaluate(now=now + 60, price=100.2, last_closed_candle_ms=9 * 180_000, flow_signature="a")
+        self.assertTrue(favourable.allowed)
+        self.assertEqual(favourable.reason, "favorable_move")
+        policy.mark_called(now=now + 60, price=100.2, last_closed_candle_ms=9 * 180_000, flow_signature="a")
+
+        adverse = policy.evaluate(now=now + 120, price=100.05, last_closed_candle_ms=10 * 180_000, flow_signature="a")
+        self.assertTrue(adverse.allowed)
+        self.assertEqual(adverse.reason, "adverse_move")
+
+    def test_the_hard_budget_still_caps_event_calls(self) -> None:
+        # Characterisation guard: the reserve lives inside the budget, never on top of it.
+        policy = self._policy(
+            ai_exit_max_calls_per_trade=4, ai_exit_event_reserve_calls=2, ai_exit_favorable_move_threshold_pct=0.10
+        )
+        for index in range(4):
+            policy.mark_called(now=float(index * 60), price=100.0, last_closed_candle_ms=index * 180_000, flow_signature="a")
+
+        gate = policy.evaluate(now=600.0, price=101.0, last_closed_candle_ms=4 * 180_000, flow_signature="a")
+
+        self.assertFalse(gate.allowed)
+        self.assertEqual(gate.reason, "exit_call_budget_exhausted")
+
+
 if __name__ == "__main__":
     unittest.main()
