@@ -1618,3 +1618,125 @@ class PositionManagementFailureLatchTests(unittest.IsolatedAsyncioTestCase):
         await engine._resume_persisted_positions()
 
         self.assertIsNotNone(engine._entries_blocked_reason)
+
+
+class NeutralExitProfitLockTests(unittest.IsolatedAsyncioTestCase):
+    """The neutral exit must lock a profit that jumps over its window.
+
+    Observed on trade #574 (2026-09-14): net after fees went +10 -> +85 within
+    one minute, sat at +78..+122 for twenty minutes, then fell back to +0 within
+    one minute and closed on the time stop at -0.84. The legacy check only exits
+    while `min_net <= net <= min_net + band` on a 5 s poll, so a move that skips
+    the 20 USDT window in either direction is never taken. Every exit replay so
+    far modelled this exit as a floor, so live was quietly worse than measured.
+    """
+
+    class _ScriptedPriceClient(FakeClient):
+        def __init__(self, prices, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._prices = list(prices)
+
+        async def get_last_price(self, symbol: str) -> float:
+            if len(self._prices) > 1:
+                self.price = self._prices.pop(0)
+            else:
+                self.price = self._prices[0]
+            return self.price
+
+    class _HoldStrategy:
+        async def next_trade_plan(self):
+            return None
+
+        async def exit_signal(self, position, price, elapsed) -> ExitSignal:
+            return ExitSignal(close_now=False, reason="hold")
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    def _engine(self, prices, **overrides):
+        settings = _settings(
+            position_hold_minutes=60,
+            volume_neutral_exit_enabled=True,
+            volume_neutral_exit_min_seconds=0,
+            volume_neutral_exit_min_net_usdt=40.0,
+            volume_neutral_exit_band_usdt=20.0,
+            **overrides,
+        )
+        client = self._ScriptedPriceClient(prices, price=100.0)
+        return _engine(client, FakeStore(), self._HoldStrategy(), FakeRisk(), settings), client
+
+    def _price_for_net(self, engine, net: float) -> float:
+        # Solve with the engine's own PnL and fee model so the test never drifts from it.
+        position = self._position()
+        lo, hi = 80.0, 120.0
+        for _ in range(80):
+            mid = (lo + hi) / 2
+            value = engine._estimate_gross_pnl(position.direction, 100.0, mid, 100.0) - engine._estimate_total_taker_fee(
+                100.0, mid, 100.0, engine._taker_fee_pct("BTC/USDT")
+            )
+            lo, hi = (mid, hi) if value < net else (lo, mid)
+        return (lo + hi) / 2
+
+    async def _run(self, nets, **overrides):
+        probe, _ = self._engine([100.0], **overrides)
+        prices = [self._price_for_net(probe, n) for n in nets] + [89.0]  # 89 breaches the 10% stop
+        engine, client = self._engine(prices, **overrides)
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=10.0, take_profit_pct=10.0))
+        net_at_exit = engine._estimate_gross_pnl(PositionDirection.LONG, 100.0, client.price, 100.0) - engine._estimate_total_taker_fee(
+            100.0, client.price, 100.0, engine._taker_fee_pct("BTC/USDT")
+        )
+        return reason, net_at_exit
+
+    async def test_window_mode_keeps_the_legacy_behaviour_by_default(self) -> None:
+        # Characterisation guard: an unchanged .env must keep today's exits.
+        reason, _ = await self._run([10, 85, 100, 122, 95])
+        self.assertEqual(reason, "stop_loss")
+
+    async def test_floor_mode_takes_a_profit_that_jumped_over_the_window(self) -> None:
+        reason, net = await self._run([10, 85, 100, 122, 95], volume_neutral_exit_mode="floor")
+        self.assertEqual(reason, "neutral_exit")
+        self.assertAlmostEqual(net, 85.0, delta=0.5)
+
+    async def test_trailing_mode_rides_a_runner_and_exits_on_the_pullback(self) -> None:
+        reason, net = await self._run(
+            [10, 85, 100, 122, 95], volume_neutral_exit_mode="trailing", volume_neutral_exit_trail_usdt=20.0
+        )
+        self.assertEqual(reason, "neutral_exit")
+        self.assertAlmostEqual(net, 95.0, delta=0.5)
+
+    async def test_trailing_mode_never_lets_an_armed_profit_fall_below_the_floor(self) -> None:
+        # Peak 45 with a 20 trail would put the lock at 25; the floor keeps it at 40.
+        reason, net = await self._run(
+            [10, 45, 42, 39], volume_neutral_exit_mode="trailing", volume_neutral_exit_trail_usdt=20.0
+        )
+        self.assertEqual(reason, "neutral_exit")
+        self.assertAlmostEqual(net, 39.0, delta=0.5)
+
+
+class NeutralExitModeSettingTests(unittest.TestCase):
+    """A mistyped mode must refuse to boot instead of silently meaning `window`.
+
+    `window` is the legacy behaviour that misses profits jumping over the band, so
+    a typo such as `trail` falling back to it would quietly disable the fix.
+    """
+
+    def _settings(self, **env) -> Settings:
+        return Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", STRATEGY_MODE="volume", **env)
+
+    def test_modes_are_accepted_case_insensitively(self) -> None:
+        self.assertEqual(self._settings().volume_neutral_exit_mode, "window")
+        self.assertEqual(self._settings(VOLUME_NEUTRAL_EXIT_MODE="Trailing").volume_neutral_exit_mode, "trailing")
+        self.assertEqual(self._settings(VOLUME_NEUTRAL_EXIT_MODE=" floor ").volume_neutral_exit_mode, "floor")
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(Exception) as ctx:
+            self._settings(VOLUME_NEUTRAL_EXIT_MODE="trail")
+        self.assertIn("VOLUME_NEUTRAL_EXIT_MODE", str(ctx.exception))

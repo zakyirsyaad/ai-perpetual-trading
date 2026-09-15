@@ -870,6 +870,7 @@ class TradeEngine:
         # its whole duration -- the reason 12 of 19 stop losses overshot their cap.
         exit_task: asyncio.Task | None = None
         price_failures = 0
+        profit_peak: float | None = None
         try:
             while True:
                 try:
@@ -903,9 +904,27 @@ class TradeEngine:
                 net_after_fee = gross - fee
                 if self._settings.volume_neutral_exit_enabled and elapsed >= self._settings.volume_neutral_exit_min_seconds:
                     min_net = self._settings.volume_neutral_exit_min_net_usdt
-                    max_net = min_net + self._settings.volume_neutral_exit_band_usdt
-                    if min_net <= net_after_fee <= max_net:
-                        return "neutral_exit"
+                    mode = str(getattr(self._settings, "volume_neutral_exit_mode", "window") or "window")
+                    if mode == "floor":
+                        # Take the profit the first time it is seen at or above the
+                        # floor, however far past the floor the price has jumped.
+                        if net_after_fee >= min_net:
+                            return "neutral_exit"
+                    elif mode == "trailing":
+                        # Arm at the floor, then follow the peak: exit once net falls
+                        # back to the higher of the floor and `peak - trail`.
+                        if net_after_fee >= min_net:
+                            profit_peak = net_after_fee if profit_peak is None else max(profit_peak, net_after_fee)
+                        if profit_peak is not None:
+                            trail = float(getattr(self._settings, "volume_neutral_exit_trail_usdt", 0.0) or 0.0)
+                            if net_after_fee <= max(min_net, profit_peak - trail):
+                                return "neutral_exit"
+                    else:
+                        # Legacy window: only exits while a poll lands inside the band,
+                        # so a move that jumps the band in either direction is missed.
+                        max_net = min_net + self._settings.volume_neutral_exit_band_usdt
+                        if min_net <= net_after_fee <= max_net:
+                            return "neutral_exit"
                 if (
                     getattr(self._settings, "volume_breakeven_exit_enabled", False)
                     and elapsed >= getattr(self._settings, "volume_breakeven_min_seconds", 0)
