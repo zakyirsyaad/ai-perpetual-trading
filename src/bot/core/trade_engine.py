@@ -384,6 +384,24 @@ class TradeEngine:
             return False
         return True
 
+    def _log_position_status(self, position: OpenPosition, *, gross: float, fee: float, net: float, basis: str) -> None:
+        """One line that maps the BingX position screen onto what the exit logic sees."""
+        exit_part = ""
+        if self._settings.volume_neutral_exit_enabled:
+            threshold = float(self._settings.volume_neutral_exit_min_net_usdt)
+            as_gross = threshold if basis == "gross" else threshold + fee
+            as_net = threshold - fee if basis == "gross" else threshold
+            exit_part = f" | neutral exit at net {as_net:+.2f} = BingX {as_gross:+.2f}"
+        self._logger.info(
+            "Position %s %s | BingX unrealised (before fees) %+.2f | round-trip fee %.2f | net %+.2f%s",
+            position.symbol,
+            position.direction.value,
+            gross,
+            fee,
+            net,
+            exit_part,
+        )
+
     async def _manage_open_position_guarded(
         self,
         open_position: OpenPosition,
@@ -871,6 +889,7 @@ class TradeEngine:
         exit_task: asyncio.Task | None = None
         price_failures = 0
         profit_peak: float | None = None
+        last_status_log_at: float | None = None
         try:
             while True:
                 try:
@@ -902,28 +921,37 @@ class TradeEngine:
                     position.entry_price, current_price, position.quantity, self._taker_fee_pct(position.symbol)
                 )
                 net_after_fee = gross - fee
+                basis = str(getattr(self._settings, "volume_neutral_exit_basis", "net") or "net")
+                # BingX shows unrealised PnL before fees; exits used to be judged only
+                # on net after both taker fees, so "+50 on screen" was +32 here.
+                profit_value = gross if basis == "gross" else net_after_fee
+                status_every = float(getattr(self._settings, "position_status_log_seconds", 60.0) or 0.0)
+                now_ts = datetime.now(timezone.utc).timestamp()
+                if status_every > 0 and (last_status_log_at is None or now_ts - last_status_log_at >= status_every):
+                    last_status_log_at = now_ts
+                    self._log_position_status(position, gross=gross, fee=fee, net=net_after_fee, basis=basis)
                 if self._settings.volume_neutral_exit_enabled and elapsed >= self._settings.volume_neutral_exit_min_seconds:
                     min_net = self._settings.volume_neutral_exit_min_net_usdt
                     mode = str(getattr(self._settings, "volume_neutral_exit_mode", "window") or "window")
                     if mode == "floor":
                         # Take the profit the first time it is seen at or above the
                         # floor, however far past the floor the price has jumped.
-                        if net_after_fee >= min_net:
+                        if profit_value >= min_net:
                             return "neutral_exit"
                     elif mode == "trailing":
                         # Arm at the floor, then follow the peak: exit once net falls
                         # back to the higher of the floor and `peak - trail`.
-                        if net_after_fee >= min_net:
-                            profit_peak = net_after_fee if profit_peak is None else max(profit_peak, net_after_fee)
+                        if profit_value >= min_net:
+                            profit_peak = profit_value if profit_peak is None else max(profit_peak, profit_value)
                         if profit_peak is not None:
                             trail = float(getattr(self._settings, "volume_neutral_exit_trail_usdt", 0.0) or 0.0)
-                            if net_after_fee <= max(min_net, profit_peak - trail):
+                            if profit_value <= max(min_net, profit_peak - trail):
                                 return "neutral_exit"
                     else:
                         # Legacy window: only exits while a poll lands inside the band,
                         # so a move that jumps the band in either direction is missed.
                         max_net = min_net + self._settings.volume_neutral_exit_band_usdt
-                        if min_net <= net_after_fee <= max_net:
+                        if min_net <= profit_value <= max_net:
                             return "neutral_exit"
                 if (
                     getattr(self._settings, "volume_breakeven_exit_enabled", False)

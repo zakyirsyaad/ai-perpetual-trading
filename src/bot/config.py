@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     volume_neutral_exit_band_usdt: float = Field(default=5.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_BAND_USDT")
     volume_neutral_exit_mode: str = Field(default="window", alias="VOLUME_NEUTRAL_EXIT_MODE")
     volume_neutral_exit_trail_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_TRAIL_USDT")
+    # net: thresholds apply to PnL after both taker fees. gross: to the unrealised PnL
+    # before fees, which is the number the BingX position screen shows.
+    volume_neutral_exit_basis: str = Field(default="net", alias="VOLUME_NEUTRAL_EXIT_BASIS")
+    # Seconds between position status lines reconciling the BingX view with net. 0 = off.
+    position_status_log_seconds: float = Field(default=60.0, ge=0.0, alias="POSITION_STATUS_LOG_SECONDS")
     volume_breakeven_exit_enabled: bool = Field(default=False, alias="VOLUME_BREAKEVEN_EXIT_ENABLED")
     volume_breakeven_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_BREAKEVEN_MIN_SECONDS")
     volume_breakeven_max_loss_usdt: float = Field(default=1.0, ge=0.0, alias="VOLUME_BREAKEVEN_MAX_LOSS_USDT")
@@ -189,6 +194,21 @@ class Settings(BaseSettings):
         default=0.08,
         ge=0.0,
         alias="AI_EXIT_PRICE_MOVE_THRESHOLD_PCT",
+    )
+    # A favourable price move since the last AI exit call, in percent, that asks the
+    # model again. 0 keeps the old behaviour where only adverse moves trigger a call.
+    ai_exit_favorable_move_threshold_pct: float = Field(
+        default=0.0,
+        ge=0.0,
+        alias="AI_EXIT_FAVORABLE_MOVE_THRESHOLD_PCT",
+    )
+    # Calls at the end of each trade's budget that only price moves may spend, so
+    # routine candle and flow triggers cannot exhaust the budget early. 0 = off.
+    ai_exit_event_reserve_calls: int = Field(
+        default=0,
+        ge=0,
+        le=200,
+        alias="AI_EXIT_EVENT_RESERVE_CALLS",
     )
     ai_exit_max_calls_per_trade: int = Field(
         default=12,
@@ -317,6 +337,14 @@ class Settings(BaseSettings):
         if mode not in {"window", "floor", "trailing"}:
             raise ValueError("VOLUME_NEUTRAL_EXIT_MODE must be one of: window, floor, trailing.")
         return mode
+
+    @field_validator("volume_neutral_exit_basis")
+    @classmethod
+    def normalize_volume_neutral_exit_basis(cls, value: str) -> str:
+        basis = str(value or "net").strip().lower()
+        if basis not in {"net", "gross"}:
+            raise ValueError("VOLUME_NEUTRAL_EXIT_BASIS must be one of: net, gross.")
+        return basis
 
     @field_validator("entry_stretch_gate_mode")
     @classmethod

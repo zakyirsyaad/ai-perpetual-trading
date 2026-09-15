@@ -320,7 +320,9 @@ class AIOrchestrator:
         # and adverse price movement all resolve without any network call, so a
         # blocked monitor tick costs nothing.
         gate = self._exit_policy.evaluate(now=now, price=current_price, last_closed_candle_ms=candle_ms)
-        if not gate.allowed and gate.reason in {"exit_call_budget_exhausted", "min_interval"}:
+        # routine_budget_reserved: only price moves may spend the remaining calls,
+        # and those were already checked above, so probing flow would be wasted.
+        if not gate.allowed and gate.reason in {"exit_call_budget_exhausted", "min_interval", "routine_budget_reserved"}:
             self._logger.debug(
                 "AI exit evaluation skipped for %s (%s); deterministic protection stays active.",
                 position.symbol,

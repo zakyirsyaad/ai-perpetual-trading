@@ -1740,3 +1740,75 @@ class NeutralExitModeSettingTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             self._settings(VOLUME_NEUTRAL_EXIT_MODE="trail")
         self.assertIn("VOLUME_NEUTRAL_EXIT_MODE", str(ctx.exception))
+
+
+class BingXViewTests(unittest.IsolatedAsyncioTestCase):
+    """What BingX shows and what the bot decides on must be reconcilable.
+
+    BingX shows unrealised PnL before fees; the neutral exit used net after both
+    taker fees. On trade #587 the screen showed about +50 while the bot saw +32,
+    below its +40 floor, so the position that "looked profitable" was left open.
+    """
+
+    _Client = NeutralExitProfitLockTests._ScriptedPriceClient
+    _Hold = NeutralExitProfitLockTests._HoldStrategy
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+        )
+
+    async def _run(self, grosses, **overrides):
+        # For this position gross PnL is (price - 100) * 100, so price = 100 + gross / 100.
+        prices = [100.0 + g / 100.0 for g in grosses] + [89.0]
+        settings = _settings(
+            position_hold_minutes=60,
+            volume_neutral_exit_enabled=True,
+            volume_neutral_exit_min_seconds=0,
+            volume_neutral_exit_min_net_usdt=40.0,
+            volume_neutral_exit_band_usdt=20.0,
+            volume_neutral_exit_mode="floor",
+            **overrides,
+        )
+        client = self._Client(prices, price=100.0)
+        engine = _engine(client, FakeStore(), self._Hold(), FakeRisk(), settings)
+        reason = await engine._monitor_position(self._position(), _plan(stop_loss_pct=10.0, take_profit_pct=10.0))
+        return reason, client
+
+    async def test_net_basis_stays_the_default(self) -> None:
+        # Gross +45 is about +35 net here: below a +40 net floor, so no exit.
+        reason, _ = await self._run([10, 45])
+        self.assertEqual(reason, "stop_loss")
+
+    async def test_gross_basis_applies_the_floor_to_the_number_bingx_shows(self) -> None:
+        reason, client = await self._run([10, 45], volume_neutral_exit_basis="gross")
+        self.assertEqual(reason, "neutral_exit")
+        self.assertAlmostEqual((client.price - 100.0) * 100.0, 45.0, delta=0.01)
+
+    async def test_status_line_shows_the_bingx_view_next_to_net(self) -> None:
+        with self.assertLogs("test.engine", level="INFO") as logs:
+            await self._run([30], position_status_log_seconds=60)
+        status = [line for line in logs.output if "BingX" in line]
+        self.assertTrue(status, "no status line reconciling the BingX view")
+        self.assertIn("net", status[0])
+        self.assertIn("fee", status[0])
+
+
+class NeutralExitBasisSettingTests(unittest.TestCase):
+    def _settings(self, **env) -> Settings:
+        return Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", STRATEGY_MODE="volume", **env)
+
+    def test_basis_defaults_to_net_and_accepts_gross(self) -> None:
+        self.assertEqual(self._settings().volume_neutral_exit_basis, "net")
+        self.assertEqual(self._settings(VOLUME_NEUTRAL_EXIT_BASIS=" Gross ").volume_neutral_exit_basis, "gross")
+
+    def test_an_unknown_basis_is_rejected(self) -> None:
+        with self.assertRaises(Exception) as ctx:
+            self._settings(VOLUME_NEUTRAL_EXIT_BASIS="screen")
+        self.assertIn("VOLUME_NEUTRAL_EXIT_BASIS", str(ctx.exception))
