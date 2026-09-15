@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from bot.ai.compact_context import CompactDecisionContextBuilder
+from bot.config import Settings
 from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.orchestration import AIOrchestrator
 from bot.models import OpenPosition, PositionDirection
@@ -287,6 +288,64 @@ class ReservedBudgetSkipsContextBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(signal.close_now)
         self.assertFalse(signal.ai_called)
         self.assertEqual(intelligence.builds, 0)
+
+
+
+class MinimumHoldBeforeAIExitTests(unittest.IsolatedAsyncioTestCase):
+    """Exits the model takes in the first minutes of a trade cost money.
+
+    Cycle from 2026-09-14, 32 AI exits compared with the same trades exited by the
+    deterministic rules alone: the 8 taken within three minutes lost 98.76 more
+    (three of them would have reached the +40 floor), while the 24 taken later
+    saved 282.89. The first call fires seconds after entry, when net is already
+    about -18 from fees, so the model reads "underwater" and the -25 cut honours
+    it after a 0.04% move. Stop loss, take profit and the floor keep running.
+    """
+
+    def _brain(self) -> _FakeBrain:
+        return _FakeBrain(SimpleNamespace(action="CLOSE", confidence=0.9, reason="position is underwater"))
+
+    async def test_the_model_is_not_asked_before_the_minimum_hold(self) -> None:
+        brain, intelligence = self._brain(), _FakeIntelligence()
+        orchestrator = _orchestrator(brain, intelligence, _settings(ai_exit_min_hold_seconds=180))
+
+        signal = await orchestrator.exit_signal(_position(), 60000.0, 60.0)
+
+        self.assertFalse(signal.close_now)
+        self.assertFalse(signal.ai_called)
+        self.assertEqual(brain.calls, 0)
+        self.assertEqual(intelligence.builds, 0)
+
+    async def test_the_model_is_asked_once_the_minimum_hold_has_passed(self) -> None:
+        brain = self._brain()
+        orchestrator = _orchestrator(brain, _FakeIntelligence(), _settings(ai_exit_min_hold_seconds=180))
+
+        signal = await orchestrator.exit_signal(_position(), 60000.0, 181.0)
+
+        self.assertEqual(brain.calls, 1)
+        self.assertTrue(signal.close_now)
+
+    async def test_zero_keeps_the_previous_behaviour(self) -> None:
+        # Characterisation guard: an unchanged .env still asks the model immediately.
+        brain = self._brain()
+        orchestrator = _orchestrator(brain, _FakeIntelligence(), _settings())
+
+        await orchestrator.exit_signal(_position(), 60000.0, 5.0)
+
+        self.assertEqual(brain.calls, 1)
+
+
+class MinimumHoldSettingTests(unittest.TestCase):
+    def _settings(self, **env) -> Settings:
+        return Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", STRATEGY_MODE="volume", **env)
+
+    def test_defaults_to_off_and_reads_the_env(self) -> None:
+        self.assertEqual(self._settings().ai_exit_min_hold_seconds, 0)
+        self.assertEqual(self._settings(AI_EXIT_MIN_HOLD_SECONDS="180").ai_exit_min_hold_seconds, 180)
+
+    def test_negative_values_are_rejected(self) -> None:
+        with self.assertRaises(Exception):
+            self._settings(AI_EXIT_MIN_HOLD_SECONDS="-1")
 
 
 if __name__ == "__main__":

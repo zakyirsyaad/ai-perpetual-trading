@@ -311,6 +311,18 @@ class AIOrchestrator:
         """
         now = datetime.now(timezone.utc).timestamp()
         self._ensure_exit_trade_started(position, now)
+        # Deterministic stop loss, take profit and the neutral floor keep running in
+        # the monitor; only the model is held back until the position has had time
+        # to move past its own fee cost.
+        min_hold = float(getattr(self._settings, "ai_exit_min_hold_seconds", 0) or 0)
+        if min_hold > 0 and elapsed_seconds < min_hold:
+            self._logger.debug(
+                "AI exit evaluation deferred for %s: held %.0fs of the %.0fs minimum.",
+                position.symbol,
+                elapsed_seconds,
+                min_hold,
+            )
+            return self._deterministic_exit_fallback(elapsed_seconds, ai_called=False)
         candle_ms = AIExitPolicy.last_closed_candle_ms(
             int(now * 1000),
             str(getattr(self._settings, "ai_kline_interval", "3m")),

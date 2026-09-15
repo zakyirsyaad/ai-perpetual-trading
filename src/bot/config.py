@@ -210,6 +210,16 @@ class Settings(BaseSettings):
         le=200,
         alias="AI_EXIT_EVENT_RESERVE_CALLS",
     )
+    # Seconds a position must be held before the AI exit evaluator is consulted. In
+    # the first minutes net is already about -18 from fees, so the model reads
+    # "underwater" and cuts noise: exits within 3 minutes lost 98.76 over 8 trades
+    # versus deterministic exits, later ones saved 282.89 over 24. 0 = off.
+    ai_exit_min_hold_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        alias="AI_EXIT_MIN_HOLD_SECONDS",
+    )
     ai_exit_max_calls_per_trade: int = Field(
         default=12,
         ge=0,
