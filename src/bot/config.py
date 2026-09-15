@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     volume_neutral_exit_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_NEUTRAL_EXIT_MIN_SECONDS")
     volume_neutral_exit_min_net_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_MIN_NET_USDT")
     volume_neutral_exit_band_usdt: float = Field(default=5.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_BAND_USDT")
+    volume_neutral_exit_mode: str = Field(default="window", alias="VOLUME_NEUTRAL_EXIT_MODE")
+    volume_neutral_exit_trail_usdt: float = Field(default=0.0, ge=0.0, alias="VOLUME_NEUTRAL_EXIT_TRAIL_USDT")
     volume_breakeven_exit_enabled: bool = Field(default=False, alias="VOLUME_BREAKEVEN_EXIT_ENABLED")
     volume_breakeven_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_BREAKEVEN_MIN_SECONDS")
     volume_breakeven_max_loss_usdt: float = Field(default=1.0, ge=0.0, alias="VOLUME_BREAKEVEN_MAX_LOSS_USDT")
@@ -307,6 +309,14 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("volume_neutral_exit_mode")
+    @classmethod
+    def normalize_volume_neutral_exit_mode(cls, value: str) -> str:
+        mode = str(value or "window").strip().lower()
+        if mode not in {"window", "floor", "trailing"}:
+            raise ValueError("VOLUME_NEUTRAL_EXIT_MODE must be one of: window, floor, trailing.")
+        return mode
 
     @field_validator("entry_stretch_gate_mode")
     @classmethod
