@@ -3,7 +3,14 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from bot.ai.compact_context import COMPACT_PROMPT_VERSION, CompactDecisionContextBuilder, compact_json, payload_hash
+from bot.ai.compact_context import (
+    COMPACT_PROMPT_VERSION,
+    ENTRY_LEARNING_NOTE_MAX_CHARS,
+    ENTRY_REASON_MAX_CHARS,
+    CompactDecisionContextBuilder,
+    compact_json,
+    payload_hash,
+)
 
 
 def _settings() -> SimpleNamespace:
@@ -83,7 +90,7 @@ class ParityPayloadTests(unittest.TestCase):
         self.assertEqual(payload["risk_constraints"]["min_confidence"], 0.75)
 
     def test_prompt_version_and_hash_are_stable(self) -> None:
-        self.assertEqual(COMPACT_PROMPT_VERSION, "okx-context-parity-v2")
+        self.assertEqual(COMPACT_PROMPT_VERSION, "okx-context-parity-v3")
         self.assertEqual(payload_hash({"b": 2, "a": 1}), payload_hash({"a": 1, "b": 2}))
         self.assertEqual(compact_json({"b": 2, "a": 1}), '{"a":1,"b":2}')
 
@@ -163,3 +170,20 @@ class EmptyExternalProviderTests(unittest.TestCase):
         context = self._external(tradingview={})
         self._payload_external(context)
         self.assertIn("tradingview", context["external_signals"])
+
+
+class OutputRulesDeclareTextLimitsTests(unittest.TestCase):
+    """The model cannot respect a length limit it is never told about."""
+
+    def test_entry_output_rules_state_the_free_text_limits(self) -> None:
+        builder = CompactDecisionContextBuilder(_settings())
+        payload = builder.build_entry_payload(
+            market_context=_context(),
+            daily_state=_daily(),
+            recent_performance={},
+            trade_memory={},
+            strategy_objective={},
+        )
+        rules = payload["output_rules"]
+        self.assertEqual(rules["reason_max_characters"], ENTRY_REASON_MAX_CHARS)
+        self.assertEqual(rules["learning_note_max_characters"], ENTRY_LEARNING_NOTE_MAX_CHARS)
