@@ -9,7 +9,13 @@ from typing import Any, Awaitable, Callable, Literal, TypeVar
 import httpx
 from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
 
-from bot.ai.compact_context import COMPACT_PROMPT_VERSION, compact_json, payload_hash
+from bot.ai.compact_context import (
+    COMPACT_PROMPT_VERSION,
+    ENTRY_LEARNING_NOTE_MAX_CHARS,
+    ENTRY_REASON_MAX_CHARS,
+    compact_json,
+    payload_hash,
+)
 from bot.ai.usage import (
     AICallMetrics,
     TokenUsage,
@@ -56,12 +62,24 @@ class EntryDecision(BaseModel):
     take_profit_pct: float | None = Field(default=None, ge=0.0)
     risk_reward_ratio: float | None = Field(default=None, ge=0.0)
     systemic_risk: int = Field(ge=1, le=5)
-    reason: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1, max_length=ENTRY_REASON_MAX_CHARS)
     risk_review: RiskReview | None = Field(
         default=None,
         description="Mandatory for OPEN_LONG/OPEN_SHORT: nested skeptical risk confirmation.",
     )
-    learning_note: str = Field(default="", max_length=500)
+    learning_note: str = Field(default="", max_length=ENTRY_LEARNING_NOTE_MAX_CHARS)
+
+    @field_validator("reason", "learning_note", mode="before")
+    @classmethod
+    def _clamp_free_text(cls, value: Any, info: ValidationInfo) -> Any:
+        # Same guard as RiskReview and ExitDecision.reason: chat/messages providers
+        # cannot enforce maxLength server-side, so a verbose but otherwise valid
+        # decision must not be discarded on a length technicality and cost a repair
+        # call. Structure and numbers stay strict; only free text is trimmed.
+        if not isinstance(value, str):
+            return value
+        limit = ENTRY_REASON_MAX_CHARS if info.field_name == "reason" else ENTRY_LEARNING_NOTE_MAX_CHARS
+        return value[:limit]
 
     @field_validator("risk_review", mode="before")
     @classmethod

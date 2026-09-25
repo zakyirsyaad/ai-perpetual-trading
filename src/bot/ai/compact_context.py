@@ -10,7 +10,13 @@ from typing import Any, Iterable
 from bot.ai.usage import estimate_tokens
 
 # Prompt/contract version stamped on every AI call record.
-COMPACT_PROMPT_VERSION = "okx-context-parity-v2"
+COMPACT_PROMPT_VERSION = "okx-context-parity-v3"
+
+# The free-text length contract for an entry decision. It lives here because this
+# module builds the prompt that states the limits; `ai/brain.py` imports the same
+# numbers to enforce them, so the prompt and the validator can never drift apart.
+ENTRY_REASON_MAX_CHARS = 600
+ENTRY_LEARNING_NOTE_MAX_CHARS = 500
 
 _TECHNICAL_FIELDS: tuple[tuple[str, int], ...] = (
     ("last_price", 4),
@@ -88,6 +94,8 @@ class CompactDecisionContextBuilder:
                 "risk_review_required": True,
                 "risk_review_approved_false_vetoes_the_candidate": True,
                 "open_requires_final_stop_strictly_before_estimated_liquidation_or_hold": True,
+                "reason_max_characters": ENTRY_REASON_MAX_CHARS,
+                "learning_note_max_characters": ENTRY_LEARNING_NOTE_MAX_CHARS,
             },
         }
 

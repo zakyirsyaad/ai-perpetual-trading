@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from bot.ai.brain import EntryDecision, EntryDecisionBatch, GrokBrain, RiskReview
+from bot.ai.brain import (
+    ENTRY_LEARNING_NOTE_MAX_CHARS,
+    ENTRY_REASON_MAX_CHARS,
+    EntryDecision,
+    EntryDecisionBatch,
+    GrokBrain,
+    RiskReview,
+)
 from bot.ai.usage import ErrorCategory
 
 
@@ -359,6 +366,47 @@ class MetricsTests(unittest.TestCase):
         )
         asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
         self.assertAlmostEqual(recorded[-1].estimated_cost_usd, 0.25)
+
+
+class EntryTextLengthClampTests(unittest.TestCase):
+    """A verbose-but-valid entry decision must survive the length contract.
+
+    `RiskReview` and `ExitDecision.reason` already clamp instead of raising,
+    because chat/messages providers cannot enforce maxLength server-side. The
+    entry decision's own free text was the one place left unguarded: mimo-v2.6-pro
+    writes longer prose than v2.5, so 4 of 5 live entry calls on 2026-09-25 failed
+    on `decisions.0.reason` and burned a second repair call each time.
+    """
+
+    @staticmethod
+    def _payload(**overrides: object) -> dict:
+        decision: dict = {
+            "symbol": "BTC/USDT",
+            "action": "HOLD",
+            "confidence": 0.8,
+            "market_trend": "Sideways",
+            "systemic_risk": 2,
+            "reason": "short",
+        }
+        decision.update(overrides)
+        return {"decisions": [decision]}
+
+    def test_overlong_reason_is_clamped_not_rejected(self) -> None:
+        batch = EntryDecisionBatch.model_validate(self._payload(reason="R" * 1500))
+        self.assertEqual(len(batch.decisions[0].reason), ENTRY_REASON_MAX_CHARS)
+
+    def test_overlong_learning_note_is_clamped(self) -> None:
+        batch = EntryDecisionBatch.model_validate(self._payload(learning_note="L" * 1200))
+        self.assertEqual(len(batch.decisions[0].learning_note), ENTRY_LEARNING_NOTE_MAX_CHARS)
+
+    def test_structure_stays_strict(self) -> None:
+        # Only the length technicality is forgiven; missing or empty fields still fail.
+        with self.assertRaises(ValidationError):
+            EntryDecisionBatch.model_validate(self._payload(reason=""))
+        payload = self._payload()
+        payload["decisions"][0].pop("symbol")
+        with self.assertRaises(ValidationError):
+            EntryDecisionBatch.model_validate(payload)
 
 
 if __name__ == "__main__":
