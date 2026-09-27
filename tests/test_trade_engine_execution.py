@@ -1812,3 +1812,126 @@ class NeutralExitBasisSettingTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             self._settings(VOLUME_NEUTRAL_EXIT_BASIS="screen")
         self.assertIn("VOLUME_NEUTRAL_EXIT_BASIS", str(ctx.exception))
+
+
+class ExitRejectionKeepsThePositionManagedTests(unittest.IsolatedAsyncioTestCase):
+    """A close the venue refuses outright is not unknown exposure.
+
+    BingX answered every close with `109403 risk forbidden` from 2026-09-25 on:
+    the single refusal escaped the monitor, latched entries and killed the loop
+    that owns the stop, so two positions drifted ~1% into liquidation (about
+    −250 each) where the 0.35% stop would have cost ~−90. A refused request
+    placed no order, so re-sending it later cannot duplicate anything. Only an
+    *uncertain* submission — where an order may exist — must still latch.
+    """
+
+    def _position(self) -> OpenPosition:
+        return OpenPosition(
+            symbol="BTC/USDT",
+            direction=PositionDirection.LONG,
+            entry_price=100.0,
+            quantity=100.0,
+            exchange_size=100.0,
+            exchange_order_id="entry-1",
+            opened_at=datetime.now(timezone.utc),
+            stop_loss_pct=0.40,
+            take_profit_pct=10.0,
+        )
+
+    def _engine_for(self, client, store):
+        return _engine(client, store, FakeStrategy(), FakeRisk(), _settings(exit_rejection_retry_seconds=0))
+
+    @staticmethod
+    def _client_rejecting(error: Exception, *, times: int):
+        client = FakeClient(price=100.0, price_drift=0.999)
+        client.position_size = 100.0
+        original = client.place_market_order
+        calls = {"n": 0}
+
+        async def place_market_order(symbol, direction, size, reduce_only=False):
+            calls["n"] += 1
+            if calls["n"] <= times:
+                raise error
+            return await original(symbol, direction, size, reduce_only=reduce_only)
+
+        client.place_market_order = place_market_order
+        return client, calls
+
+    @staticmethod
+    async def _always_stop(position, plan):
+        return "stop_loss"
+
+    async def _run(self, engine) -> None:
+        await engine._manage_open_position_guarded(
+            self._position(),
+            _plan(stop_loss_pct=0.40, take_profit_pct=10.0),
+            entry_order_id="entry-1",
+            entry_fill=None,
+            entry_fee_usdt=0.0,
+            record_entry_cooldown=False,
+        )
+
+    async def test_a_refused_exit_is_retried_and_never_latches_entries(self) -> None:
+        refusal = ExchangeAPIError(
+            "BingX API error on /openApi/swap/v2/trade/order: code=109403 msg=risk forbidden",
+            code="109403",
+            retryable=False,
+            venue="bingx",
+        )
+        client, calls = self._client_rejecting(refusal, times=1)
+        store = FakeStore()
+        engine = self._engine_for(client, store)
+        engine._monitor_position = self._always_stop
+
+        await self._run(engine)
+
+        self.assertEqual(calls["n"], 2, "the refused close must be retried on the next monitor pass")
+        self.assertIsNone(engine._entries_blocked_reason)
+        self.assertEqual(len(store.closed), 1)
+        self.assertEqual(store.closed[0].reason, "stop_loss")
+
+    async def test_an_uncertain_exit_submission_still_latches_entries(self) -> None:
+        client, _ = self._client_rejecting(
+            UncertainOrderSubmissionError(
+                "exit order may have been accepted",
+                symbol="BTC/USDT",
+                client_order_id="apt-exit-1",
+                venue="bingx",
+            ),
+            times=99,
+        )
+        engine = self._engine_for(client, FakeStore())
+        engine._monitor_position = self._always_stop
+
+        await self._run(engine)
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+    async def test_a_local_validation_failure_still_latches_entries(self) -> None:
+        # No venue code: the request never reached BingX, so nothing proves the
+        # venue refused it, and an operator has to look at it.
+        client, _ = self._client_rejecting(
+            ExchangeAPIError("Order quantity 0.0 is below tradeMinQuantity", retryable=False, venue="bingx"),
+            times=99,
+        )
+        engine = self._engine_for(client, FakeStore())
+        engine._monitor_position = self._always_stop
+
+        await self._run(engine)
+
+        self.assertIsNotNone(engine._entries_blocked_reason)
+
+
+class ExitRejectionRetrySettingTests(unittest.TestCase):
+    """The retry spacing is a knob, and a negative value must refuse to boot."""
+
+    def _settings(self, **env) -> Settings:
+        return Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", STRATEGY_MODE="volume", **env)
+
+    def test_default_spaces_retries_without_disabling_them(self) -> None:
+        self.assertEqual(self._settings().exit_rejection_retry_seconds, 15.0)
+        self.assertEqual(self._settings(EXIT_REJECTION_RETRY_SECONDS="0").exit_rejection_retry_seconds, 0.0)
+
+    def test_a_negative_delay_is_refused(self) -> None:
+        with self.assertRaises(Exception):
+            self._settings(EXIT_REJECTION_RETRY_SECONDS="-1")
