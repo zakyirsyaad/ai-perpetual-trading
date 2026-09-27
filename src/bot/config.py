@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     volume_neutral_exit_basis: str = Field(default="net", alias="VOLUME_NEUTRAL_EXIT_BASIS")
     # Seconds between position status lines reconciling the BingX view with net. 0 = off.
     position_status_log_seconds: float = Field(default=60.0, ge=0.0, alias="POSITION_STATUS_LOG_SECONDS")
+    # How long to wait before offering a refused exit to the venue again. The
+    # position stays monitored throughout; this only spaces the retries.
+    exit_rejection_retry_seconds: float = Field(default=15.0, ge=0.0, alias="EXIT_REJECTION_RETRY_SECONDS")
     volume_breakeven_exit_enabled: bool = Field(default=False, alias="VOLUME_BREAKEVEN_EXIT_ENABLED")
     volume_breakeven_min_seconds: int = Field(default=5, ge=0, alias="VOLUME_BREAKEVEN_MIN_SECONDS")
     volume_breakeven_max_loss_usdt: float = Field(default=1.0, ge=0.0, alias="VOLUME_BREAKEVEN_MAX_LOSS_USDT")

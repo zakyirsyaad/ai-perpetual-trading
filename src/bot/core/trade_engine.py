@@ -61,6 +61,9 @@ class TradeEngine:
         self._taker_fee_pct_by_symbol: dict[str, float] = {}
         self._maker_fee_pct_by_symbol: dict[str, float | None] = {}
         self._entries_blocked_reason: str | None = None
+        # Consecutive exit orders the venue refused outright. Not a latch:
+        # a refused request placed nothing, so the position stays ours to manage.
+        self._exit_rejections = 0
         self._resumable_positions: list[OpenPosition] = []
 
     async def run_forever(self) -> None:
@@ -509,13 +512,38 @@ class TradeEngine:
                     exchange_size_to_close,
                 )
             if self._exit_allows_taker(exit_reason):
-                exit_resp = await self._client.place_market_order(
-                    symbol=open_position.symbol,
-                    direction=open_position.direction,
-                    size=exchange_size_to_close,
-                    reduce_only=True,
-                )
+                try:
+                    exit_resp = await self._client.place_market_order(
+                        symbol=open_position.symbol,
+                        direction=open_position.direction,
+                        size=exchange_size_to_close,
+                        reduce_only=True,
+                    )
+                except ExchangeAPIError as exc:
+                    if not self._venue_refused_the_order(exc):
+                        raise
+                    # The venue said no and placed nothing. Latching here would end
+                    # the monitor loop that owns the stop, which is how two refused
+                    # closes turned into liquidations on 2026-09-25 and 09-27. Keep
+                    # the position watched and ask again.
+                    self._exit_rejections += 1
+                    retry_seconds = float(getattr(self._settings, "exit_rejection_retry_seconds", 15.0) or 0.0)
+                    self._logger.error(
+                        "Venue refused the %s exit for %s (code=%s: %s). Refusal %d in a row; "
+                        "the position is still open, still monitored, and will be offered again in %.0fs.",
+                        exit_reason,
+                        open_position.symbol,
+                        exc.code,
+                        exc,
+                        self._exit_rejections,
+                        retry_seconds,
+                    )
+                    if retry_seconds > 0:
+                        await asyncio.sleep(retry_seconds)
+                    exit_reason = None
+                    continue
                 exit_order_id = self._extract_order_id(exit_resp)
+                self._exit_rejections = 0
             else:
                 exit_order_id = await self._place_post_only_exit(open_position, exchange_size_to_close)
                 if exit_order_id is None:
@@ -1456,6 +1484,22 @@ class TradeEngine:
 
     def _allow_taker_entry_fallback(self) -> bool:
         return (not self._maker_only_mode()) and bool(self._settings.execution_post_only_fallback_to_market)
+
+    @staticmethod
+    def _venue_refused_the_order(exc: ExchangeAPIError) -> bool:
+        """True when the venue rejected the request outright, so no order exists.
+
+        A business `code` with `retryable=False` is BingX answering "no" — the
+        order never reached the book, so sending it again later cannot duplicate
+        anything. `UncertainOrderSubmissionError` is the opposite case (an order
+        may exist) and a local validation failure carries no venue code at all;
+        both keep the old behaviour of latching entries for a human.
+        """
+        return (
+            not isinstance(exc, UncertainOrderSubmissionError)
+            and not exc.retryable
+            and bool(exc.code)
+        )
 
     def _exit_allows_taker(self, exit_reason: str) -> bool:
         if not self._maker_only_mode():
