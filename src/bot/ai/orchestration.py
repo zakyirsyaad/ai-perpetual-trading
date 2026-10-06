@@ -182,7 +182,17 @@ class AIOrchestrator:
             review.invalidation_trigger,
         )
 
-        if gate_verdict and gate_verdict.get("verdict") == "block":
+        if gate_verdict and gate_verdict.get("verdict") == "block" and gate_verdict.get("reason") == "direction":
+            allowed = gate_verdict.get("allowed_direction")
+            if gate_verdict.get("mode") == "enforce":
+                self._logger.info(
+                    "Entry candidate %s rejected: the gate lets through %s entries only.", decision.symbol, allowed
+                )
+                return None
+            self._logger.info(
+                "Entry gate (shadow) would block %s: only %s entries are let through.", decision.symbol, allowed
+            )
+        elif gate_verdict and gate_verdict.get("verdict") == "block":
             stretch = gate_verdict.get("stretch_atr")
             limit = gate_verdict.get("max_stretch_atr")
             if gate_verdict.get("mode") == "enforce":
@@ -542,7 +552,19 @@ class AIOrchestrator:
             "behind_schedule": False,
             "entries_needed_per_hour": None,
         }
-        if mode == "off" or max_stretch <= 0 or decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+        if mode == "off" or decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+            return verdict
+
+        # The side filter comes before the schedule relaxation on purpose: being behind
+        # on volume may excuse a stretched entry, never the side that has no edge.
+        allowed_side = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
+        if allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}":
+            verdict["verdict"] = "block"
+            verdict["reason"] = "direction"
+            verdict["allowed_direction"] = allowed_side
+            return verdict
+
+        if max_stretch <= 0:
             return verdict
 
         features = self._features_for_symbol(market_context, decision.symbol)
@@ -564,6 +586,7 @@ class AIOrchestrator:
         # stretch beyond the limit blocks.
         if stretch is not None and abs(float(stretch)) > max_stretch:
             verdict["verdict"] = "block"
+            verdict["reason"] = "stretch"
         return verdict
 
     def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
