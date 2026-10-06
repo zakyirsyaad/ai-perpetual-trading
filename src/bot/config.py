@@ -106,6 +106,8 @@ class Settings(BaseSettings):
         ge=0.0,
         alias="ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR",
     )
+    # Which side the entry gate lets through while it is on. "any" keeps both sides.
+    entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
@@ -366,6 +368,14 @@ class Settings(BaseSettings):
         if mode not in {"off", "shadow", "enforce"}:
             raise ValueError("ENTRY_STRETCH_GATE_MODE must be one of: off, shadow, enforce.")
         return mode
+
+    @field_validator("entry_gate_direction")
+    @classmethod
+    def normalize_entry_gate_direction(cls, value: str) -> str:
+        direction = str(value or "any").strip().lower()
+        if direction not in {"any", "long", "short"}:
+            raise ValueError("ENTRY_GATE_DIRECTION must be one of: any, long, short.")
+        return direction
 
     @field_validator("bingx_api_key", "bingx_secret_key")
     @classmethod

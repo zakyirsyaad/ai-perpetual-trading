@@ -595,10 +595,10 @@ class EntryStretchGateTests(unittest.TestCase):
         orchestrator._logger = logging.getLogger("test.stretch_gate")
         return orchestrator
 
-    def _decision(self) -> EntryDecision:
+    def _decision(self, action: str = "OPEN_LONG") -> EntryDecision:
         return EntryDecision(
             symbol="BTC/USDT",
-            action="OPEN_LONG",
+            action=action,
             confidence=0.8,
             market_trend="Bullish",
             stop_loss_pct=0.08,
@@ -613,7 +613,8 @@ class EntryStretchGateTests(unittest.TestCase):
         # liquidation limit; ema_21 alone sets how stretched the entry is.
         return {
             "technicals": [{"symbol": "BTC/USDT", "last_price": 100.0, "ema_21": ema_21, "atr_14": 0.1}],
-            "liquidation_constraints": {"BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5}},
+            "liquidation_constraints": {"BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5,
+                                                     "max_short_stop_loss_pct": 0.5}},
         }
 
     STRETCHED = 99.86   # (100 - 99.86) / 0.1 = 1.4 ATR above the mean
@@ -670,3 +671,94 @@ class EntryStretchGateTests(unittest.TestCase):
         self.assertTrue(verdict["behind_schedule"])
         self.assertEqual(verdict["verdict"], "allow")
         self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision(), context, verdict))
+
+
+class EntryDirectionFilterTests(EntryStretchGateTests):
+    """One side only: SHORT near the mean is the only bucket with positive gross.
+
+    Over 700 stored BTC decisions (31 Aug - 6 Oct) the SHORT near-mean bucket carried
+    +162 gross per 1M in both phases while every other bucket was negative. The user
+    chose lower volume over trading the buckets that lose, so the gate can restrict the
+    side as well as the stretch. Inherits the helpers; the parent's own tests re-run
+    unchanged, which doubles as the regression check that "any" changes nothing.
+    """
+
+    def test_other_side_is_blocked_even_when_it_sits_near_the_mean(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="enforce", entry_gate_direction="short")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "direction")
+        self.assertIsNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_chosen_side_near_the_mean_is_allowed(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="enforce", entry_gate_direction="short")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_SHORT")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_chosen_side_far_from_the_mean_is_still_blocked_by_stretch(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="enforce", entry_gate_direction="short")
+        context = self._context(ema_21=100.14)   # price 1.4 ATR below the mean
+        decision = self._decision("OPEN_SHORT")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertNotEqual(verdict.get("reason"), "direction")
+
+    def test_a_day_behind_schedule_cannot_bypass_the_side_filter(self) -> None:
+        orchestrator = self._orchestrator(
+            entry_stretch_gate_mode="enforce",
+            entry_gate_direction="short",
+            entry_stretch_gate_behind_schedule_entries_per_hour=2.0,
+        )
+        context = self._context(ema_21=self.NEAR_MEAN)
+        pacing = {"volume_today_usdt": 0.0, "target_volume_per_day_usdt": 1_008_000.0,
+                  "hours_remaining_in_trading_day": 6.0}
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, pacing)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "direction")
+
+    def test_shadow_mode_records_the_side_block_without_stopping_the_entry(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="shadow", entry_gate_direction="short")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "direction")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_off_mode_ignores_the_side_filter(self) -> None:
+        orchestrator = self._orchestrator(entry_stretch_gate_mode="off", entry_gate_direction="short")
+        verdict = orchestrator._stretch_gate_verdict(
+            self._decision("OPEN_LONG"), self._context(ema_21=self.NEAR_MEAN), None
+        )
+        self.assertEqual(verdict["verdict"], "allow")
+
+
+class EntryGateDirectionSettingTests(unittest.TestCase):
+    def test_default_is_any_and_value_is_normalised(self) -> None:
+        from bot.config import Settings
+
+        self.assertEqual(Settings.model_fields["entry_gate_direction"].default, "any")
+        self.assertEqual(Settings.normalize_entry_gate_direction(" SHORT "), "short")
+        self.assertEqual(Settings.normalize_entry_gate_direction(""), "any")
+
+    def test_unknown_value_is_rejected(self) -> None:
+        from bot.config import Settings
+
+        with self.assertRaises(ValueError):
+            Settings.normalize_entry_gate_direction("both")
