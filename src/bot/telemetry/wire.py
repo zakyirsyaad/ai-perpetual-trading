@@ -137,6 +137,34 @@ class Resting(_Wire):
     ask_sz: float = Field(ge=0.0)
 
 
+class PricePointFill(_Wire):
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"dir", "hash", "closedPnl", "feeUsd"})
+
+    side: Side
+    price: float = Field(gt=0.0)
+    size: float = Field(ge=0.0)
+    direction: Literal["open", "close", "flip"] | None = Field(default=None, alias="dir")
+    hash: str | None = None
+    closed_pnl: float | None = None
+    fee_usd: float | None = None
+
+
+class PricePoint(_Wire):
+    """One point on the chart tape: a candle (`bar` set) or a fill mark (`fill` set)."""
+
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"open", "high", "low", "close", "bar", "block", "fill"})
+
+    ts: int = Field(gt=0)
+    mid: float = Field(gt=0.0)
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
+    bar: Literal["1s", "1m", "15m"] | None = None
+    block: int | None = Field(default=None, ge=0)
+    fill: PricePointFill | None = None
+
+
 class BlockEvent(_Wire):
     event: ClassVar[str] = "block"
 
@@ -216,7 +244,11 @@ def to_wire(model: _Wire) -> dict[str, Any]:
     return model.model_dump(mode="json", by_alias=True)
 
 
-def sse_frame(message: WireMessage) -> bytes:
+def sse_event(event: str, payload: Any) -> bytes:
     """One Server-Sent Events frame: event name, compact JSON, blank line."""
-    data = json.dumps(to_wire(message), separators=(",", ":"))
-    return f"event: {message.event}\ndata: {data}\n\n".encode("utf-8")
+    data = json.dumps(payload, separators=(",", ":"))
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+
+def sse_frame(message: WireMessage) -> bytes:
+    return sse_event(message.event, to_wire(message))
