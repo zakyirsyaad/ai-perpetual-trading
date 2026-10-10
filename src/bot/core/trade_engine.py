@@ -4,8 +4,10 @@ import asyncio
 import logging
 import math
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from bot.config import Settings
+from bot.core.entry_window import parse_weekly_window, window_is_open
 from bot.exchange.contracts import (
     ExchangeAPIError,
     FreshOrderBookProvider,
@@ -64,6 +66,8 @@ class TradeEngine:
         # Consecutive exit orders the venue refused outright. Not a latch:
         # a refused request placed nothing, so the position stays ours to manage.
         self._exit_rejections = 0
+        # None until the first tick, so an unconfigured window never logs a transition.
+        self._entry_window_open_state: bool | None = None
         self._resumable_positions: list[OpenPosition] = []
 
     async def run_forever(self) -> None:
@@ -81,9 +85,31 @@ class TradeEngine:
                 self._logger.exception("Unhandled error in trading loop.")
             await asyncio.sleep(self._settings.entry_interval_minutes * 60)
 
+    def _now_in_trading_tz(self) -> datetime:
+        name = str(getattr(self._settings, "trading_timezone", "") or "Asia/Jakarta")
+        try:
+            zone = ZoneInfo(name)
+        except Exception:  # noqa: BLE001 - a misconfigured zone must not stop the loop
+            zone = timezone.utc
+        return datetime.now(zone)
+
+    def _entry_window_is_open(self) -> bool:
+        """Weekly entry window; logs once per open/close transition, not once per tick."""
+        window_text = getattr(self._settings, "entry_weekly_window", "") or ""
+        is_open = window_is_open(parse_weekly_window(window_text), self._now_in_trading_tz())
+        if is_open != self._entry_window_open_state:
+            if not is_open:
+                self._logger.info("Entry window closed (%s): no new entries until it opens again.", window_text)
+            elif self._entry_window_open_state is False:
+                self._logger.info("Entry window open (%s): entries resume.", window_text)
+            self._entry_window_open_state = is_open
+        return is_open
+
     async def _tick(self) -> None:
         if self._entries_blocked_reason is not None:
             self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
+            return
+        if not self._entry_window_is_open():
             return
         state = await self._risk_manager.get_daily_state()
         if isinstance(self._strategy, GrokStrategy):

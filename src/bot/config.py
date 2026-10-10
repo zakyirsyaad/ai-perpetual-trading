@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from bot.core.entry_window import format_weekly_window, parse_weekly_window
 from bot.exchange.bingx_client import (
     BINGX_VST_BASE_URL,
     BINGX_VST_FALLBACK_BASE_URL,
@@ -106,6 +107,9 @@ class Settings(BaseSettings):
         ge=0.0,
         alias="ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR",
     )
+    # Weekly window for NEW entries in the trading timezone, e.g. "mon 07:00-sat 00:00".
+    # Empty = always open. Open positions are still managed outside the window.
+    entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
@@ -368,6 +372,11 @@ class Settings(BaseSettings):
         if mode not in {"off", "shadow", "enforce"}:
             raise ValueError("ENTRY_STRETCH_GATE_MODE must be one of: off, shadow, enforce.")
         return mode
+
+    @field_validator("entry_weekly_window")
+    @classmethod
+    def normalize_entry_weekly_window(cls, value: str) -> str:
+        return format_weekly_window(parse_weekly_window(value))
 
     @field_validator("entry_gate_direction")
     @classmethod
