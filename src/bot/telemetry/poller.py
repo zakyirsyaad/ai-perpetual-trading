@@ -15,6 +15,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 
 from bot.exchange.contracts import FuturesExchangeProtocol
+from bot.telemetry.book_ticker import BookTick
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.wire import PriceMessage
 
@@ -45,6 +46,7 @@ class MarketDataPoller:
         interval_seconds: float = 5.0,
         kline_refresh_seconds: float = 60.0,
         call_timeout: float = 10.0,
+        stream_fresh_seconds: float = 3.0,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -54,10 +56,13 @@ class MarketDataPoller:
         self._interval = interval_seconds
         self._refresh = kline_refresh_seconds
         self._call_timeout = call_timeout
+        self._stream_fresh = stream_fresh_seconds
         self._clock = clock
         self._monotonic = monotonic
         self._history_loaded_at: dict[str, float] = {}
         self._failures: dict[str, int] = {}
+        self._symbol_by_pair = {pair_of(symbol): symbol for symbol in self._symbols}
+        self._stream_seen_at: dict[str, float] = {}
 
     async def run(self) -> None:
         while True:
@@ -89,7 +94,31 @@ class MarketDataPoller:
         else:
             self._failures.pop(key, None)
 
+    def on_stream_tick(self, tick: BookTick) -> None:
+        """Publish a live price from the websocket stream; polling then skips this symbol while it stays fresh."""
+        symbol = self._symbol_by_pair.get(tick.pair)
+        if symbol is None:
+            return
+        mid = (tick.bid + tick.ask) / 2
+        self._hub.record_price(
+            PriceMessage(
+                coin=coin_of(symbol),
+                ts=int(self._clock() * 1000),
+                mid=mid,
+                best_bid=tick.bid,
+                best_ask=tick.ask,
+                spread_bps=(tick.ask - tick.bid) / mid * 10_000,
+            )
+        )
+        self._stream_seen_at[symbol] = self._monotonic()
+
+    def _stream_is_fresh(self, symbol: str) -> bool:
+        seen = self._stream_seen_at.get(symbol)
+        return seen is not None and self._monotonic() - seen < self._stream_fresh
+
     async def _poll_price(self, symbol: str) -> None:
+        if self._stream_is_fresh(symbol):
+            return
         book = await self._client.get_order_book(symbol, depth=5)
         self._hub.record_price(
             PriceMessage(

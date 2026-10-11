@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from bot.config import Settings
+from bot.telemetry.book_ticker import BookTick
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.observer import NULL_OBSERVER, EngineTelemetry
@@ -34,6 +35,25 @@ class IdlePoller:
 class CrashingPoller:
     async def run(self) -> None:
         raise RuntimeError("poller exploded")
+
+
+class IdleFeed:
+    def __init__(self) -> None:
+        self.started = False
+        self.cancelled = False
+
+    async def run(self) -> None:
+        self.started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class CrashingFeed:
+    async def run(self) -> None:
+        raise RuntimeError("price stream exploded")
 
 
 class UnusedClient:
@@ -119,6 +139,30 @@ class BuildTelemetryTests(unittest.TestCase):
         runtime.observer.decided(None, latency_ms=1)
         self.assertEqual(len(runtime.hub.history_body()["BTC"]), 1)
 
+    def test_no_price_stream_is_built_unless_it_was_asked_for(self) -> None:
+        with mock.patch("bot.telemetry.runtime.BookTickerFeed") as feed_class:
+            runtime = build_telemetry(settings(TELEMETRY_ENABLED="true", SYMBOLS="BTC/USDT"), UnusedClient(), LOGGER)  # type: ignore[arg-type]
+
+        assert runtime is not None
+        feed_class.assert_not_called()
+        self.assertIsNone(runtime.stream)
+
+    def test_the_price_stream_follows_the_traded_pairs_and_feeds_the_chart(self) -> None:
+        with mock.patch("bot.telemetry.runtime.BookTickerFeed") as feed_class:
+            runtime = build_telemetry(
+                settings(TELEMETRY_ENABLED="true", TELEMETRY_PRICE_STREAM="true", SYMBOLS="BTC/USDT,ETH/USDT"),
+                UnusedClient(),  # type: ignore[arg-type]
+                LOGGER,
+            )
+
+        assert runtime is not None
+        pairs, on_tick = feed_class.call_args.args
+        self.assertEqual(list(pairs), ["BTC-USDT", "ETH-USDT"])
+        self.assertIs(runtime.stream, feed_class.return_value)
+        on_tick(BookTick("BTC-USDT", 99.0, 101.0))
+        seconds = [p for p in runtime.hub.tape_body()["BTC"] if p.get("bar") == "1s"]
+        self.assertEqual([p["close"] for p in seconds], [100.0])
+
     def test_a_runtime_built_by_hand_still_offers_a_harmless_observer(self) -> None:
         hub = TelemetryHub(META, TelemetryBus())
         server = TelemetryServer(hub, host="127.0.0.1", port=0)
@@ -129,10 +173,42 @@ class BuildTelemetryTests(unittest.TestCase):
 
 
 class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    def build(self, port: int = 0, poller: object | None = None) -> tuple[TelemetryRuntime, TelemetryServer]:
+    def build(
+        self, port: int = 0, poller: object | None = None, stream: object | None = None
+    ) -> tuple[TelemetryRuntime, TelemetryServer]:
         hub = TelemetryHub(META, TelemetryBus())
         server = TelemetryServer(hub, host="127.0.0.1", port=port)
-        return TelemetryRuntime(hub, server, poller or IdlePoller(), LOGGER), server  # type: ignore[arg-type]
+        return TelemetryRuntime(hub, server, poller or IdlePoller(), LOGGER, stream=stream), server  # type: ignore[arg-type]
+
+    async def test_the_price_stream_runs_with_the_feed_and_is_cancelled_on_stop(self) -> None:
+        feed = IdleFeed()
+        runtime, _ = self.build(stream=feed)
+
+        await runtime.start()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if feed.started:
+                break
+        await runtime.stop()
+
+        self.assertTrue(feed.started)
+        self.assertTrue(feed.cancelled)
+
+    async def test_a_crashing_price_stream_is_logged_and_the_server_and_poller_carry_on(self) -> None:
+        runtime, server = self.build(stream=CrashingFeed())
+
+        with self.assertLogs(LOGGER, level=logging.ERROR):
+            await runtime.start()
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if runtime.stream_stopped:
+                    break
+        status = await get_status(server.bound_port)
+        await runtime.stop()
+
+        self.assertEqual(status, 200)
+        self.assertTrue(runtime.stream_stopped)
+        self.assertFalse(runtime.poller_stopped)
 
     async def test_start_serves_the_feed_and_stop_releases_the_port(self) -> None:
         runtime, server = self.build()
