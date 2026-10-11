@@ -168,6 +168,15 @@ Supabase is **required** — `main.py` refuses to start without `SUPABASE_URL` +
 
 A missing/invalid persisted envelope is unknown exposure. A mismatch, an unreadable position, or exposure with no persisted record is **never auto-flattened** — it sets `_entries_blocked_reason`, which blocks every subsequent tick at gate 1 and alerts the operator until a human resolves it.
 
+### Live dashboard feed (optional, off by default)
+
+`TELEMETRY_ENABLED=true` starts a read-only, loopback-only HTTP/SSE server (`src/bot/telemetry/`) that a laptop reads through an SSH tunnel; the screen is `dashboard/` (Bun + Next.js, adapted from MIT-licensed jev-trade, see `dashboard/THIRD_PARTY_NOTICES.md`). Operator steps are in README §"Live Dashboard".
+
+- **It can never affect trading.** `main.py` builds it before the engine and starts it before `run_forever`. `TradeEngine` only *reports* through six hooks on an observer (`telemetry/observer.py`), after the safety step each one follows (the mark is after the stop-loss check, the close is last). Every hook, hub and bus method catches and logs its own errors; a server that cannot bind logs a warning and trading continues. Keep it that way: no hook may return a value an engine decision reads.
+- **`MarketDataPoller` is read-only by test.** It calls only `get_order_book` and `get_klines`; its test client raises on any other attribute. Don't add private-endpoint reads to the feed.
+- **The wire shape is the dashboard's, not ours.** `telemetry/wire.py` mirrors jev-trade's JSON; `tests/test_dashboard_contract.py` fails if `dashboard/src/lib/bot-types.ts` and the pydantic models disagree. Change both together. `probabilities` is one-hot on the action taken (the bot has no distribution); the model's certainty travels as `confidence`.
+- **Enabling it restarts the bot**, so the "never restart with an open position" rule above applies.
+
 ## Repo conventions
 
 - **TDD evidence documents.** Substantive changes land with a `.github/tdd/<feature>.tdd.md` recording the user journey, RED evidence (the actual failure output), the GREEN implementation, verification numbers (tests passed, coverage %, `compileall`, `git diff --check`, `pip check`, secret hygiene), the commit trail, and a deployment gate. See `bingx-volume-cycle.tdd.md` for the shape.

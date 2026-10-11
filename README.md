@@ -339,6 +339,90 @@ The engine will:
 8. Monitor the open position with live prices, TP/SL, AI exits, and risk guards.
 9. Save executed outcomes for future decision context.
 
+## Live Dashboard
+
+A read-only live view of the bot: decisions, orders, fills, the open position and its PnL, on a
+chart of real prices. The bot publishes the feed; the screen ([dashboard/](dashboard/)) runs on
+your laptop. It is **off by default** and changes nothing about trading while off.
+
+```
+bot (VPS, loopback :3000)  --ssh -L-->  laptop :3000  <--  dashboard (laptop :3001)
+```
+
+**What is exposed.** Only market data the bot already reads and its own trade events: no keys,
+no wallet, no account balance. The listener answers `GET` only (`/`, `/snapshot`, `/history`,
+`/tape`, `/events`), accepts only a loopback `Host` header, allows exactly one CORS origin, and
+refuses to start on any non-loopback `TELEMETRY_HOST`. Nothing is opened to the internet and no
+firewall rule is needed.
+
+### Turn it on (VPS)
+
+1. **Flatten first.** Enabling it restarts `ai-perp-volume`, and a restart with an open
+   position triggers the `set_margin_mode` crash loop (see CLAUDE.md). Wait until the venue is
+   flat, or flatten it yourself.
+2. Add one line to the VPS `.env` (the other `TELEMETRY_*` keys have safe defaults):
+
+   ```bash
+   TELEMETRY_ENABLED=true
+   ```
+
+3. Restart and confirm the listener came up:
+
+   ```bash
+   pm2 restart ai-perp-volume --update-env
+   grep "dashboard feed listening" ~/.pm2/logs/ai-perp-volume-error.log | tail -1
+   curl -s http://127.0.0.1:3000/ | head -c 200
+   ```
+
+   The bot logs to stderr, so the line is in pm2's error log. The `curl` returns the meta JSON
+   (`"venue":"bingx"`, your symbols).
+
+### Watch it (laptop)
+
+```bash
+ssh -L 3000:localhost:3000 0xAlvary2     # keep this open
+cd dashboard && bun install && bun run dev
+```
+
+Open <http://localhost:3001>. The dashboard reads `NEXT_PUBLIC_API_URL` (default
+`http://localhost:3000`, see `dashboard/.env.example`). If you open it from another origin,
+set `TELEMETRY_ALLOWED_ORIGIN` on the bot to that exact origin (`http://host:port`, no path,
+no wildcard). The `Host` check ignores the port, so any local tunnel port works.
+
+### Turn it off
+
+Set `TELEMETRY_ENABLED=false` (or delete the line) and restart, again with a flat position.
+
+### What it shows, and what it does not
+
+- Each strategy tick that reaches the model: `HOLD`, or `OPEN LONG/SHORT` with the model's
+  confidence and reason. Ticks stopped earlier (risk guard, cooldowns, daily target) are not
+  shown; the log still says why.
+- Entry quote and fill, the open position with unrealized PnL (updated at most every 5 s), and
+  the close with its reason, PnL and fees.
+- **Not shown or approximated:** account balance (not read), AI cost (shows 0), per-action
+  probabilities (the bot has none: the bar is the model's confidence). Unrealized PnL is
+  **after** estimated round-trip taker fees, so it reads lower than the BingX screen, which is
+  before fees.
+- History lives in memory. A restart empties the decision list; the chart refills from BingX
+  candles, and a resumed position reappears as soon as the first price arrives.
+- Extra load when on: one public order-book request per symbol every 5 s and two public kline
+  requests per symbol every 60 s. It never calls an order, account or position endpoint.
+
+### If something looks wrong
+
+| Symptom | Likely cause |
+|---|---|
+| Dashboard says Offline | The tunnel is closed, or the bot is down: `curl http://127.0.0.1:3000/` on the VPS. |
+| Browser console shows a CORS error | `TELEMETRY_ALLOWED_ORIGIN` does not match the page's origin. |
+| Log: `Telemetry server failed to start; trading continues` | Port 3000 is taken (change `TELEMETRY_PORT`). Trading is unaffected. |
+| Prices frozen, log: `Telemetry poller stopped unexpectedly` | The poller crashed; trades keep recording. Restart when flat. |
+| Log: `telemetry ... failed` warnings | A dashboard hook failed and was contained; trading is unaffected. Report the traceback. |
+| Another process already uses :3000 or :3001 on your laptop | Pick other local ports (`ssh -L 3010:localhost:3000`, `bunx next dev -p 3011` with `NEXT_PUBLIC_API_URL=http://localhost:3010`) and set `TELEMETRY_ALLOWED_ORIGIN=http://localhost:3011` on the bot. |
+
+The dashboard's chart, feed and state code is adapted from MIT-licensed projects; see
+[dashboard/THIRD_PARTY_NOTICES.md](dashboard/THIRD_PARTY_NOTICES.md).
+
 ## Reporting
 
 ```powershell
