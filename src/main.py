@@ -16,6 +16,7 @@ from bot.risk.risk_manager import RiskManager
 from bot.storage.supabase_trade_store import SupabaseTradeStore
 from bot.strategy.grok_strategy import GrokStrategy
 from bot.strategy.volume_strategy import VolumeStrategy
+from bot.telemetry.runtime import build_telemetry
 
 
 async def run() -> None:
@@ -98,13 +99,19 @@ async def run() -> None:
         orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
         strategy = GrokStrategy(orchestrator)
     engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal=None)
+    # Read-only dashboard feed. Off unless TELEMETRY_ENABLED; it can never block trading.
+    telemetry = build_telemetry(settings, client, logger)
 
     try:
+        if telemetry is not None:
+            await telemetry.start()
         await engine.run_forever()
     except (ExchangeAPIError, RuntimeError, ValueError) as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from None
     finally:
+        if telemetry is not None:
+            await telemetry.stop()
         strategy_close = getattr(strategy, "close", None)
         if strategy_close is not None:
             await strategy_close()

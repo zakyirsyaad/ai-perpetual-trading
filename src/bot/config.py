@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator, model_validator
@@ -112,6 +113,18 @@ class Settings(BaseSettings):
     entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
+    # Live dashboard feed (src/bot/telemetry). Read-only and off by default. The
+    # listener refuses any non-loopback host: reach it through an SSH tunnel.
+    telemetry_enabled: bool = Field(default=False, alias="TELEMETRY_ENABLED")
+    telemetry_host: str = Field(default="127.0.0.1", alias="TELEMETRY_HOST")
+    telemetry_port: int = Field(default=3000, ge=1, le=65535, alias="TELEMETRY_PORT")
+    telemetry_allowed_origin: str = Field(default="http://localhost:3001", alias="TELEMETRY_ALLOWED_ORIGIN")
+    telemetry_price_interval_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=60.0,
+        alias="TELEMETRY_PRICE_INTERVAL_SECONDS",
+    )
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
@@ -385,6 +398,37 @@ class Settings(BaseSettings):
         if direction not in {"any", "long", "short"}:
             raise ValueError("ENTRY_GATE_DIRECTION must be one of: any, long, short.")
         return direction
+
+    @field_validator("telemetry_host")
+    @classmethod
+    def require_loopback_telemetry_host(cls, value: str) -> str:
+        host = str(value or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError(
+                "TELEMETRY_HOST must be a loopback address (127.0.0.1, localhost or ::1). "
+                "Reach the dashboard feed through an SSH tunnel instead of exposing it."
+            )
+        return host
+
+    @field_validator("telemetry_allowed_origin")
+    @classmethod
+    def require_bare_telemetry_origin(cls, value: str) -> str:
+        origin = str(value or "").strip()
+        parts = urlsplit(origin)
+        bare = (
+            parts.scheme in {"http", "https"}
+            and bool(parts.netloc)
+            and not any(ch.isspace() for ch in origin)
+            and not parts.path
+            and not parts.query
+            and not parts.fragment
+        )
+        if not bare:
+            raise ValueError(
+                "TELEMETRY_ALLOWED_ORIGIN must be one bare origin such as http://localhost:3001 "
+                "(no path, no trailing slash, no wildcard)."
+            )
+        return origin
 
     @field_validator("bingx_api_key", "bingx_secret_key")
     @classmethod
