@@ -346,8 +346,12 @@ chart of real prices. The bot publishes the feed; the screen ([dashboard/](dashb
 your laptop. It is **off by default** and changes nothing about trading while off.
 
 ```
-bot (VPS, loopback :3000)  --ssh -L-->  laptop :3000  <--  dashboard (laptop :3001)
+bot (VPS, loopback :TELEMETRY_PORT)  --ssh -L-->  laptop :3000  <--  dashboard (laptop :3001)
 ```
+
+`TELEMETRY_PORT` defaults to 3000, but that port may already belong to another app on the VPS.
+The live VPS shares its host with several apps and uses **3917**; the examples below write it as
+`<port>`.
 
 **What is exposed.** Only market data the bot already reads and its own trade events: no keys,
 no wallet, no account balance. The listener answers `GET` only (`/`, `/snapshot`, `/history`,
@@ -360,18 +364,28 @@ firewall rule is needed.
 1. **Flatten first.** Enabling it restarts `ai-perp-volume`, and a restart with an open
    position triggers the `set_margin_mode` crash loop (see CLAUDE.md). Wait until the venue is
    flat, or flatten it yourself.
-2. Add one line to the VPS `.env` (the other `TELEMETRY_*` keys have safe defaults):
+2. **Pick a free port.** The feed cannot bind a port another process already holds (the bot
+   would log a warning and keep trading, but there would be no dashboard). Check, and choose a
+   free one if the default is taken:
+
+   ```bash
+   ss -ltn | awk 'NR>1 {print $4}' | grep -E ':3000$' || echo "3000 free"
+   ```
+
+3. Add to the VPS `.env` (the other `TELEMETRY_*` keys have safe defaults). Omit the second
+   line only if 3000 is free:
 
    ```bash
    TELEMETRY_ENABLED=true
+   TELEMETRY_PORT=<port>
    ```
 
-3. Restart and confirm the listener came up:
+4. Restart and confirm the listener came up:
 
    ```bash
    pm2 restart ai-perp-volume --update-env
    grep "dashboard feed listening" ~/.pm2/logs/ai-perp-volume-error.log | tail -1
-   curl -s http://127.0.0.1:3000/ | head -c 200
+   curl -s http://127.0.0.1:<port>/ | head -c 200
    ```
 
    The bot logs to stderr, so the line is in pm2's error log. The `curl` returns the meta JSON
@@ -380,12 +394,13 @@ firewall rule is needed.
 ### Watch it (laptop)
 
 ```bash
-ssh -L 3000:localhost:3000 0xAlvary2     # keep this open
+ssh -L 3000:localhost:<port> 0xAlvary2     # keep this open; <port> is the VPS TELEMETRY_PORT
 cd dashboard && bun install && bun run dev
 ```
 
-Open <http://localhost:3001>. The dashboard reads `NEXT_PUBLIC_API_URL` (default
-`http://localhost:3000`, see `dashboard/.env.example`). If you open it from another origin,
+Open <http://localhost:3001>. The left side of `-L` is the port on your laptop; the dashboard
+reads `NEXT_PUBLIC_API_URL` (default `http://localhost:3000`, see `dashboard/.env.example`), so
+keep it at 3000 unless you change that variable too. If you open it from another origin,
 set `TELEMETRY_ALLOWED_ORIGIN` on the bot to that exact origin (`http://host:port`, no path,
 no wildcard). The `Host` check ignores the port, so any local tunnel port works.
 
@@ -413,12 +428,12 @@ Set `TELEMETRY_ENABLED=false` (or delete the line) and restart, again with a fla
 
 | Symptom | Likely cause |
 |---|---|
-| Dashboard says Offline | The tunnel is closed, or the bot is down: `curl http://127.0.0.1:3000/` on the VPS. |
+| Dashboard says Offline | The tunnel is closed, or the bot is down: `curl http://127.0.0.1:<port>/` on the VPS. |
 | Browser console shows a CORS error | `TELEMETRY_ALLOWED_ORIGIN` does not match the page's origin. |
-| Log: `Telemetry server failed to start; trading continues` | Port 3000 is taken (change `TELEMETRY_PORT`). Trading is unaffected. |
+| Log: `Telemetry server failed to start; trading continues` | The port is taken by another process (check with `ss -ltn`, then set a free `TELEMETRY_PORT` and restart when flat). Trading is unaffected. |
 | Prices frozen, log: `Telemetry poller stopped unexpectedly` | The poller crashed; trades keep recording. Restart when flat. |
 | Log: `telemetry ... failed` warnings | A dashboard hook failed and was contained; trading is unaffected. Report the traceback. |
-| Another process already uses :3000 or :3001 on your laptop | Pick other local ports (`ssh -L 3010:localhost:3000`, `bunx next dev -p 3011` with `NEXT_PUBLIC_API_URL=http://localhost:3010`) and set `TELEMETRY_ALLOWED_ORIGIN=http://localhost:3011` on the bot. |
+| Another process already uses :3000 or :3001 on your laptop | Pick other local ports (`ssh -L 3010:localhost:<port>`, `bunx next dev -p 3011` with `NEXT_PUBLIC_API_URL=http://localhost:3010`) and set `TELEMETRY_ALLOWED_ORIGIN=http://localhost:3011` on the bot. |
 
 The dashboard's chart, feed and state code is adapted from MIT-licensed projects; see
 [dashboard/THIRD_PARTY_NOTICES.md](dashboard/THIRD_PARTY_NOTICES.md).
