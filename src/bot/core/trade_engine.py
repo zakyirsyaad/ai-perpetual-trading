@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from bot.storage.interfaces import TradeStoreProtocol
 from bot.storage.supabase_journal import SupabaseJournal
 from bot.strategy.base import BaseStrategy
 from bot.strategy.grok_strategy import GrokStrategy
+from bot.telemetry.observer import NULL_OBSERVER, EngineObserver
 
 
 class _UncertainEntryOrderState(RuntimeError):
@@ -41,6 +43,10 @@ class TradeEngine:
     _POSITION_MATCH_TOLERANCE = 0.02
     _POSITION_PRICE_TOLERANCE = 0.01
 
+    # Class-level default so an engine built without __init__ (as several tests do)
+    # still has a harmless observer.
+    _telemetry: EngineObserver = NULL_OBSERVER
+
     def __init__(
         self,
         settings: Settings,
@@ -50,6 +56,7 @@ class TradeEngine:
         risk_manager: RiskManager,
         trade_store: TradeStoreProtocol,
         supabase_journal: SupabaseJournal | None = None,
+        telemetry: EngineObserver | None = None,
     ) -> None:
         self._settings = settings
         self._logger = logger
@@ -58,6 +65,8 @@ class TradeEngine:
         self._risk_manager = risk_manager
         self._trade_store = trade_store
         self._supabase_journal = supabase_journal
+        # Read-only dashboard hooks. They only observe: no decision reads their result.
+        self._telemetry: EngineObserver = telemetry if telemetry is not None else NULL_OBSERVER
         self._last_entry_ts: float | None = None
         self._last_stop_loss_ts: float | None = None
         self._taker_fee_pct_by_symbol: dict[str, float] = {}
@@ -160,7 +169,9 @@ class TradeEngine:
             )
             return
 
+        strategy_started = time.monotonic()
         plan = await self._strategy.next_trade_plan()
+        self._telemetry.decided(plan, latency_ms=int((time.monotonic() - strategy_started) * 1000))
         if plan is None:
             self._logger.info("Strategy returned HOLD; no entry opened this tick.")
             return
@@ -317,6 +328,7 @@ class TradeEngine:
         entry_order_id = await self._place_entry_order(plan, exchange_size, order_book)
         if entry_order_id is None:
             return
+        self._telemetry.entry_quoted(plan, price=entry_price, size=base_quantity, order_id=entry_order_id)
         await asyncio.sleep(self._settings.order_fill_wait_seconds)
         entry_fill = await self._try_get_order_fill(plan.symbol, entry_order_id, phase="entry")
         # Verify that a position actually exists and adjust to the filled quantity.
@@ -368,6 +380,7 @@ class TradeEngine:
             take_profit_pct=plan.take_profit_pct,
         )
         await self._trade_store.save_open_position(open_position)
+        self._telemetry.entry_filled(open_position, leverage=plan.leverage, fee_usdt=entry_fee_usdt)
 
         await self._manage_open_position_guarded(
             open_position,
@@ -644,6 +657,8 @@ class TradeEngine:
 
         if exit_reason == "stop_loss":
             self._last_stop_loss_ts = closed_at.timestamp()
+        # Last, so every piece of engine state that gates the next entry is already set.
+        self._telemetry.position_closed(closed_trade, fee_usdt=total_fee)
 
         daily_volume = await self._trade_store.total_volume_for_day()
         state = await self._risk_manager.get_daily_state()
@@ -904,6 +919,7 @@ class TradeEngine:
             position = self._resumable_positions.pop(0)
             plan = self._plan_from_resumed_position(position)
             self._logger.info("Resumed monitoring for %s %s.", position.symbol, position.direction.value)
+            self._telemetry.position_resumed(position, leverage=plan.leverage)
             await self._manage_open_position_guarded(
                 position,
                 plan,
@@ -975,6 +991,8 @@ class TradeEngine:
                     position.entry_price, current_price, position.quantity, self._taker_fee_pct(position.symbol)
                 )
                 net_after_fee = gross - fee
+                # After the stop-loss check above, so the dashboard can never sit ahead of it.
+                self._telemetry.position_marked(position, net_usdt=net_after_fee)
                 basis = str(getattr(self._settings, "volume_neutral_exit_basis", "net") or "net")
                 # BingX shows unrealised PnL before fees; exits used to be judged only
                 # on net after both taker fees, so "+50 on screen" was +32 here.

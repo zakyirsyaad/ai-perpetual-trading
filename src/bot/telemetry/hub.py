@@ -38,6 +38,7 @@ class TelemetryHub:
         self._clock = clock
         self._history: dict[str, deque[BlockEvent]] = {s.coin: deque(maxlen=history_size) for s in meta.sleeves}
         self._charts: dict[str, VenueChart] = {s.coin: VenueChart() for s in meta.sleeves}
+        self._latest_price: dict[str, PriceMessage] = {}
 
     @property
     def bus(self) -> TelemetryBus:
@@ -94,9 +95,28 @@ class TelemetryHub:
             if not self._known(message.coin):
                 return
             self._charts[message.coin].add_mid(message.mid, message.ts)
+            self._latest_price[message.coin] = message
             self._bus.publish(message)
         except Exception:
             LOGGER.warning("telemetry record_price failed", exc_info=True)
+
+    def refresh_latest(self, coin: str, **update: Any) -> None:
+        """Update the newest block of `coin` in place and republish it under the same number.
+
+        The dashboard replaces a block that arrives with a number it already holds, so
+        this keeps a live position current without adding a history row per refresh.
+        """
+        try:
+            if not self._known(coin):
+                return
+            history = self._history[coin]
+            if not history:
+                return
+            refreshed = history[-1].model_copy(update=update)
+            history[-1] = refreshed
+            self._bus.publish(refreshed)
+        except Exception:
+            LOGGER.warning("telemetry refresh_latest failed", exc_info=True)
 
     def load_klines(self, coin: str, bar: Literal["1m", "15m"], rows: Iterable[Mapping[str, float]]) -> None:
         try:
@@ -106,6 +126,9 @@ class TelemetryHub:
             LOGGER.warning("telemetry load_klines failed", exc_info=True)
 
     # -- reads --------------------------------------------------------------
+
+    def latest_price(self, coin: str) -> PriceMessage | None:
+        return self._latest_price.get(coin)
 
     def root_body(self) -> dict[str, Any]:
         latest = {coin: (to_wire(h[-1]) if h else None) for coin, h in self._history.items()}

@@ -123,6 +123,50 @@ class RecordPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((point["bar"], point["high"]), ("1m", 2.0))
 
 
+class LatestPriceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_newest_price_per_coin_is_remembered(self) -> None:
+        hub, _ = make_hub()
+
+        hub.record_price(price(mid=100.0, ts=T0))
+        hub.record_price(price(mid=101.0, ts=T0 + 1000))
+
+        latest = hub.latest_price("BTC")
+        assert latest is not None
+        self.assertEqual(latest.mid, 101.0)
+        self.assertIsNone(hub.latest_price("ETH"))
+        self.assertIsNone(hub.latest_price("DOGE"))
+
+
+class RefreshLatestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_latest_block_is_updated_in_place_and_republished_under_the_same_number(self) -> None:
+        hub, bus = make_hub()
+        hub.record_block(HOLD)
+        queue = bus.subscribe()
+
+        hub.refresh_latest("BTC", mid=HOLD.mid + 5)
+
+        [stored] = hub.history_body()["BTC"]
+        self.assertEqual((stored["block"], stored["mid"]), (HOLD.block, HOLD.mid + 5))
+        republished = queue.get_nowait()
+        self.assertEqual((republished.event, republished.block, republished.mid), ("block", HOLD.block, HOLD.mid + 5))
+
+    async def test_nothing_happens_when_the_coin_has_no_block_yet(self) -> None:
+        hub, bus = make_hub()
+        queue = bus.subscribe()
+
+        hub.refresh_latest("BTC", mid=1.0)
+
+        self.assertEqual(hub.history_body()["BTC"], [])
+        self.assertTrue(queue.empty())
+
+    async def test_a_corrupt_block_is_logged_and_never_reaches_the_caller(self) -> None:
+        hub, _ = make_hub()
+        hub._history["BTC"].append(object())  # type: ignore[arg-type]
+
+        with self.assertLogs("volume_bot.telemetry", level=logging.WARNING):
+            hub.refresh_latest("BTC", mid=1.0)
+
+
 class UnknownCoinTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_kind_of_message_for_an_unknown_coin_is_dropped(self) -> None:
         hub, bus = make_hub()
@@ -131,6 +175,7 @@ class UnknownCoinTests(unittest.IsolatedAsyncioTestCase):
             lambda: hub.record_quote(QuoteMessage(coin="DOGE", block=1, quote=quote())),
             lambda: hub.record_fill(FillMessage(coin="DOGE", block=1, fill=fill_data(), ts=T0)),
             lambda: hub.record_price(price("DOGE")),
+            lambda: hub.refresh_latest("DOGE", mid=1.0),
             lambda: hub.load_klines("DOGE", "1m", []),
         )
 

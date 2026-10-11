@@ -11,9 +11,10 @@ from unittest import mock
 from bot.config import Settings
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
+from bot.telemetry.observer import NULL_OBSERVER, EngineTelemetry
 from bot.telemetry.runtime import TelemetryRuntime, build_meta, build_telemetry
 from bot.telemetry.server import TelemetryServer
-from bot.telemetry.wire import Meta, to_wire
+from bot.telemetry.wire import Meta, PriceMessage, to_wire
 
 SAMPLES = json.loads((Path(__file__).parent / "fixtures" / "jev_wire_samples.json").read_text())
 META = Meta.model_validate(SAMPLES["meta"])
@@ -106,6 +107,25 @@ class BuildTelemetryTests(unittest.TestCase):
         assert runtime is not None
         self.assertIn("BTC", runtime.hub.history_body())
         self.assertFalse(runtime.running)
+
+    def test_the_engine_gets_an_observer_that_feeds_the_same_hub(self) -> None:
+        runtime = build_telemetry(settings(TELEMETRY_ENABLED="true", SYMBOLS="BTC/USDT"), UnusedClient(), LOGGER)  # type: ignore[arg-type]
+
+        assert runtime is not None
+        self.assertIsInstance(runtime.observer, EngineTelemetry)
+        runtime.hub.record_price(
+            PriceMessage(coin="BTC", ts=NOW_MS, mid=100.0, best_bid=99.5, best_ask=100.5, spread_bps=1.0)
+        )
+        runtime.observer.decided(None, latency_ms=1)
+        self.assertEqual(len(runtime.hub.history_body()["BTC"]), 1)
+
+    def test_a_runtime_built_by_hand_still_offers_a_harmless_observer(self) -> None:
+        hub = TelemetryHub(META, TelemetryBus())
+        server = TelemetryServer(hub, host="127.0.0.1", port=0)
+
+        runtime = TelemetryRuntime(hub, server, IdlePoller(), LOGGER)  # type: ignore[arg-type]
+
+        self.assertIs(runtime.observer, NULL_OBSERVER)
 
 
 class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):

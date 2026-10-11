@@ -7,6 +7,8 @@ from unittest.mock import patch
 import main as main_module
 from bot.exchange.leverage import LeverageResolution
 
+OBSERVER = object()  # stands in for the feed's engine observer
+
 
 def _settings(**overrides) -> SimpleNamespace:
     base = dict(
@@ -78,6 +80,7 @@ class _Engine:
     def __init__(self, *args, **kwargs) -> None:
         _Engine.instances.append(self)
         self.args = args
+        self.kwargs = kwargs
 
     async def run_forever(self) -> None:
         return None
@@ -171,7 +174,7 @@ class TelemetryWiringTests(unittest.IsolatedAsyncioTestCase):
         async def stop() -> None:
             events.append("stop")
 
-        return SimpleNamespace(start=start, stop=stop)
+        return SimpleNamespace(start=start, stop=stop, observer=OBSERVER)
 
     async def test_the_feed_starts_before_trading_and_stops_after_it(self) -> None:
         events: list[str] = []
@@ -201,6 +204,20 @@ class TelemetryWiringTests(unittest.IsolatedAsyncioTestCase):
         await self._run(events, telemetry=None, enabled=False)
 
         self.assertEqual(events, ["engine"])
+
+    async def test_the_engine_receives_the_feed_observer(self) -> None:
+        events: list[str] = []
+
+        await self._run(events, telemetry=self._telemetry(events))
+
+        self.assertIs(_Engine.instances[0].kwargs["telemetry"], OBSERVER)
+
+    async def test_without_a_feed_the_engine_gets_no_observer(self) -> None:
+        events: list[str] = []
+
+        await self._run(events, telemetry=None, enabled=False)
+
+        self.assertIsNone(_Engine.instances[0].kwargs["telemetry"])
 
 
 if __name__ == "__main__":
