@@ -404,6 +404,27 @@ keep it at 3000 unless you change that variable too. If you open it from another
 set `TELEMETRY_ALLOWED_ORIGIN` on the bot to that exact origin (`http://host:port`, no path,
 no wildcard). The `Host` check ignores the port, so any local tunnel port works.
 
+### Share it with one other person (VPS, behind a login)
+
+The feed has no login of its own, so it must never be reachable from the internet directly. To
+let a second person watch, run the screen on the VPS and put an identity-aware proxy (for
+example Cloudflare Tunnel + Access, with an "allow these emails" policy) in front of it:
+
+```
+browser --> Cloudflare Access (email login) --> tunnel --> next start 127.0.0.1:3001
+                                                            `-- /feed/* --> 127.0.0.1:<port>
+```
+
+- One hostname serves both the screen and its data: the browser calls `/feed/...` on the same
+  origin and Next forwards it to the loopback feed. Build with
+  `FEED_PROXY_TARGET=http://127.0.0.1:<port> NEXT_PUBLIC_API_URL=/feed bun run build`. Both are
+  read at **build** time, so rebuild after changing either. Without `FEED_PROXY_TARGET` the
+  rewrite does not exist and the laptop workflow above is unchanged.
+- Start it with `next start -H 127.0.0.1 -p 3001`. Binding to loopback is what stops anyone
+  from skipping the login by opening `<vps-ip>:3001`; never start it on `0.0.0.0`.
+- Turn the Access policy on **before** the hostname resolves, or the screen is briefly public.
+- `compress: false` in `dashboard/next.config.ts` is deliberate: gzip buffers the SSE stream.
+
 ### Turn it off
 
 Set `TELEMETRY_ENABLED=false` (or delete the line) and restart, again with a flat position.
