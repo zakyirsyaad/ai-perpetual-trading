@@ -14,11 +14,14 @@ from bot.telemetry.wire import (
     Meta,
     Position,
     PriceMessage,
+    PricePoint,
+    PricePointFill,
     Probabilities,
     Quote,
     QuoteMessage,
     Resting,
     Totals,
+    sse_event,
     sse_frame,
     to_wire,
 )
@@ -197,6 +200,36 @@ class SseMessageTests(unittest.TestCase):
 
         self.assertNotIn("ts", to_wire(FillMessage(coin="BTC", block=0, fill=fill)))
         self.assertEqual(to_wire(FillMessage(coin="BTC", block=0, fill=fill, ts=5))["ts"], 5)
+
+
+class TapePointTests(unittest.TestCase):
+    def test_a_candle_point_dumps_with_only_the_keys_the_dashboard_reads(self) -> None:
+        point = PricePoint(ts=1_791_661_170_000, mid=10.5, open=10.0, high=11.0, low=9.5, close=10.5, bar="1m")
+
+        self.assertEqual(
+            to_wire(point),
+            {"ts": 1_791_661_170_000, "mid": 10.5, "open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5, "bar": "1m"},
+        )
+
+    def test_a_fill_point_carries_the_fill_and_omits_unset_details(self) -> None:
+        point = PricePoint(ts=1_791_661_170_000, mid=10.0, fill=PricePointFill(side="sell", price=10.0, size=2.0, direction="close"))
+
+        self.assertEqual(
+            to_wire(point)["fill"],
+            {"side": "sell", "price": 10.0, "size": 2.0, "dir": "close"},
+        )
+
+    def test_a_tape_point_rejects_unknown_fields_and_bad_bars(self) -> None:
+        with self.assertRaises(ValidationError):
+            PricePoint(ts=1, mid=1.0, bar="5m")
+        with self.assertRaises(ValidationError):
+            PricePoint(ts=1, mid=1.0, wallet="0xabc")
+
+
+class SseEventTests(unittest.TestCase):
+    def test_a_named_event_is_framed_with_compact_json(self) -> None:
+        self.assertEqual(sse_event("ping", 1234), b"event: ping\ndata: 1234\n\n")
+        self.assertEqual(sse_event("ready", {"a": 1}), b'event: ready\ndata: {"a":1}\n\n')
 
 
 if __name__ == "__main__":
