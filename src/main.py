@@ -98,9 +98,18 @@ async def run() -> None:
         brain.set_metrics_sink(store.save_ai_call_metrics)
         orchestrator = AIOrchestrator(settings, brain, intelligence, store, logger, supabase_journal=None)
         strategy = GrokStrategy(orchestrator)
-    engine = TradeEngine(settings, logger, client, strategy, risk, store, supabase_journal=None)
     # Read-only dashboard feed. Off unless TELEMETRY_ENABLED; it can never block trading.
     telemetry = build_telemetry(settings, client, logger)
+    engine = TradeEngine(
+        settings,
+        logger,
+        client,
+        strategy,
+        risk,
+        store,
+        supabase_journal=None,
+        telemetry=telemetry.observer if telemetry is not None else None,
+    )
 
     try:
         if telemetry is not None:

@@ -15,6 +15,7 @@ from bot.config import Settings
 from bot.exchange.contracts import FuturesExchangeProtocol
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
+from bot.telemetry.observer import NULL_OBSERVER, EngineObserver, EngineTelemetry
 from bot.telemetry.poller import MarketDataPoller, coin_of, pair_of
 from bot.telemetry.server import TelemetryServer
 from bot.telemetry.wire import Meta, SleeveMeta
@@ -48,11 +49,13 @@ class TelemetryRuntime:
         server: TelemetryServer,
         poller: MarketDataPoller,
         logger: logging.Logger,
+        observer: EngineObserver = NULL_OBSERVER,
     ) -> None:
         self._hub = hub
         self._server = server
         self._poller = poller
         self._logger = logger
+        self._observer = observer
         self._poller_task: asyncio.Task[None] | None = None
         self._running = False
         self._poller_crashed = False
@@ -60,6 +63,11 @@ class TelemetryRuntime:
     @property
     def hub(self) -> TelemetryHub:
         return self._hub
+
+    @property
+    def observer(self) -> EngineObserver:
+        """The hooks `TradeEngine` calls. Handing this over is the only coupling to the engine."""
+        return self._observer
 
     @property
     def running(self) -> bool:
@@ -133,7 +141,12 @@ def build_telemetry(
             settings.symbols,
             interval_seconds=settings.telemetry_price_interval_seconds,
         )
+        observer = EngineTelemetry(
+            hub,
+            settings.symbols,
+            account_balance_usdt=settings.account_balance_usdt,
+        )
     except Exception:
         logger.warning("Telemetry could not be built; trading continues without it.", exc_info=True)
         return None
-    return TelemetryRuntime(hub, server, poller, logger)
+    return TelemetryRuntime(hub, server, poller, logger, observer)
