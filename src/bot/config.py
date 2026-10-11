@@ -125,6 +125,9 @@ class Settings(BaseSettings):
         le=60.0,
         alias="TELEMETRY_PRICE_INTERVAL_SECONDS",
     )
+    # Live dashboard prices from BingX's public VST websocket, about every 0.4s instead of every
+    # TELEMETRY_PRICE_INTERVAL_SECONDS. Off by default; polling stays on as the fallback either way.
+    telemetry_price_stream: bool = Field(default=False, alias="TELEMETRY_PRICE_STREAM")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")

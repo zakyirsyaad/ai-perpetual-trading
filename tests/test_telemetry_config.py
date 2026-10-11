@@ -24,6 +24,14 @@ class TelemetryConfigTests(unittest.TestCase):
     def test_enabling_is_an_explicit_choice(self) -> None:
         self.assertTrue(settings(TELEMETRY_ENABLED="true").telemetry_enabled)
 
+    def test_the_websocket_price_stream_is_off_until_asked_for(self) -> None:
+        self.assertFalse(settings().telemetry_price_stream)
+        self.assertFalse(settings(TELEMETRY_ENABLED="true").telemetry_price_stream)
+        self.assertTrue(settings(TELEMETRY_PRICE_STREAM="true").telemetry_price_stream)
+
+    def test_the_stream_host_is_not_configurable(self) -> None:
+        self.assertFalse(any("ws" in name and "url" in name for name in Settings.model_fields if name.startswith("telemetry")))
+
     def test_a_non_loopback_host_refuses_to_boot_even_while_disabled(self) -> None:
         for host in ("0.0.0.0", "::", "192.168.1.5", "example.com", ""):
             with self.subTest(host=host):

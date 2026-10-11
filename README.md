@@ -404,6 +404,16 @@ keep it at 3000 unless you change that variable too. If you open it from another
 set `TELEMETRY_ALLOWED_ORIGIN` on the bot to that exact origin (`http://host:port`, no path,
 no wildcard). The `Host` check ignores the port, so any local tunnel port works.
 
+### Smoother prices (optional websocket)
+
+By default the chart price comes from one order-book read every `TELEMETRY_PRICE_INTERVAL_SECONDS`
+(5 s). Set `TELEMETRY_PRICE_STREAM=true` to read it from BingX's public VST market websocket
+instead, about every 0.4 s. It subscribes only to `<PAIR>@bookTicker` on
+`wss://vst-open-api-ws.bingx.com/swap-market` (a fixed host, no keys, no account stream), and
+polling keeps running underneath: if the stream goes quiet for 3 s the chart falls back to the
+5 s poll by itself. It changes the dashboard only; the engine never reads it. Like any `.env`
+change it needs a restart, so apply it with a flat position.
+
 ### Share it with one other person (VPS, behind a login)
 
 The feed has no login of its own, so it must never be reachable from the internet directly. To

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from bot.telemetry.book_ticker import BookTick
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.poller import MarketDataPoller, coin_of, pair_of
@@ -170,6 +171,68 @@ class FailureIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("volume_bot.telemetry", level=logging.WARNING):
             await asyncio.wait_for(poller.poll_once(), timeout=2.0)
+
+
+class StreamTickTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_stream_tick_publishes_a_live_price_for_its_coin(self) -> None:
+        poller, _, bus, _ = make(FakeClient())
+        queue = bus.subscribe()
+
+        poller.on_stream_tick(BookTick("BTC-USDT", 99.0, 101.0))
+
+        message = queue.get_nowait()
+        self.assertEqual((message.event, message.coin, message.mid), ("price", "BTC", 100.0))
+        self.assertEqual((message.best_bid, message.best_ask), (99.0, 101.0))
+        self.assertAlmostEqual(message.spread_bps, 200.0)  # (101 - 99) / 100 in basis points
+        self.assertEqual(message.ts, int(NOW * 1000))
+
+    async def test_a_tick_for_a_pair_the_bot_does_not_trade_is_ignored(self) -> None:
+        poller, hub, bus, _ = make(FakeClient())
+        queue = bus.subscribe()
+
+        poller.on_stream_tick(BookTick("DOGE-USDT", 1.0, 2.0))
+
+        self.assertTrue(queue.empty())
+        self.assertEqual(hub.tape_body().get("DOGE"), None)
+
+    async def test_a_fresh_stream_replaces_the_rest_price_poll_for_that_symbol_only(self) -> None:
+        client = FakeClient()
+        poller, _, _, _ = make(client, stream_fresh_seconds=3.0)
+        poller.on_stream_tick(BookTick("BTC-USDT", 99.0, 101.0))
+
+        await poller.poll_once()
+
+        self.assertEqual(client.book_calls, ["ETH/USDT"])  # BTC is streaming, ETH has no stream yet
+
+    async def test_rest_polling_resumes_when_the_stream_goes_quiet(self) -> None:
+        client = FakeClient()
+        poller, _, _, clock = make(client, stream_fresh_seconds=3.0)
+        poller.on_stream_tick(BookTick("BTC-USDT", 99.0, 101.0))
+
+        clock.now = 2.9
+        await poller.poll_once()
+        self.assertNotIn("BTC/USDT", client.book_calls)
+
+        clock.now = 3.1
+        await poller.poll_once()
+        self.assertIn("BTC/USDT", client.book_calls)
+
+    async def test_streaming_does_not_replace_loading_candle_history(self) -> None:
+        client = FakeClient()
+        poller, _, _, _ = make(client)
+        poller.on_stream_tick(BookTick("BTC-USDT", 99.0, 101.0))
+
+        await poller.poll_once()
+
+        self.assertIn(("BTC/USDT", "1m", 1000), client.kline_calls)
+
+    async def test_without_any_stream_every_symbol_is_still_polled(self) -> None:
+        client = FakeClient()
+        poller, _, _, _ = make(client)
+
+        await poller.poll_once()
+
+        self.assertEqual(sorted(client.book_calls), sorted(SYMBOLS))
 
 
 class RunLoopTests(unittest.IsolatedAsyncioTestCase):
