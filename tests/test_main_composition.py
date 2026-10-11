@@ -36,6 +36,7 @@ def _settings(**overrides) -> SimpleNamespace:
         trading_timezone="Asia/Jakarta",
         volume_profile=SimpleNamespace(as_log_fields=lambda: {}),
         venue_max_leverage=100,
+        telemetry_enabled=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -103,9 +104,9 @@ def _patched(settings, resolution=None):
 
 
 class CompositionRootTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, settings, resolution=None) -> None:
+    async def _run(self, settings, resolution=None, extra=()) -> None:
         _Engine.instances.clear()
-        patches = _patched(settings, resolution)
+        patches = _patched(settings, resolution) + list(extra)
         for item in patches:
             item.start()
         try:
@@ -135,6 +136,71 @@ class CompositionRootTests(unittest.IsolatedAsyncioTestCase):
         settings = _settings()
         await self._run(settings)
         self.assertEqual(settings.venue_max_leverage, 100)
+
+
+class TelemetryWiringTests(unittest.IsolatedAsyncioTestCase):
+    """The dashboard feed starts before trading, stops after it, and can never block it."""
+
+    async def _run(self, events: list[str], *, telemetry, engine_fails: bool = False, enabled: bool = True) -> None:
+        class RecordingEngine(_Engine):
+            async def run_forever(self) -> None:
+                events.append("engine")
+                if engine_fails:
+                    raise RuntimeError("engine failed")
+
+        _Engine.instances.clear()
+        settings = _settings(telemetry_enabled=enabled)
+        patches = _patched(settings) + [
+            patch.object(main_module, "TradeEngine", RecordingEngine),
+            patch.object(main_module, "build_telemetry", lambda s, c, l: telemetry),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            await main_module.run()
+        finally:
+            for item in patches:
+                item.stop()
+
+    @staticmethod
+    def _telemetry(events: list[str], *, started: bool = True) -> SimpleNamespace:
+        async def start() -> bool:
+            events.append("start")
+            return started
+
+        async def stop() -> None:
+            events.append("stop")
+
+        return SimpleNamespace(start=start, stop=stop)
+
+    async def test_the_feed_starts_before_trading_and_stops_after_it(self) -> None:
+        events: list[str] = []
+
+        await self._run(events, telemetry=self._telemetry(events))
+
+        self.assertEqual(events, ["start", "engine", "stop"])
+
+    async def test_the_feed_is_stopped_even_when_the_engine_fails(self) -> None:
+        events: list[str] = []
+
+        with self.assertRaises(SystemExit):
+            await self._run(events, telemetry=self._telemetry(events), engine_fails=True)
+
+        self.assertEqual(events, ["start", "engine", "stop"])
+
+    async def test_a_feed_that_cannot_start_never_stops_trading(self) -> None:
+        events: list[str] = []
+
+        await self._run(events, telemetry=self._telemetry(events, started=False))
+
+        self.assertIn("engine", events)
+
+    async def test_no_feed_means_nothing_to_start_or_stop(self) -> None:
+        events: list[str] = []
+
+        await self._run(events, telemetry=None, enabled=False)
+
+        self.assertEqual(events, ["engine"])
 
 
 if __name__ == "__main__":
