@@ -1,0 +1,148 @@
+:root {
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --panel-2: #f8f9fa;
+  --border: #000000;
+  --border-2: #000000;
+  --track: #e8e8e8;
+
+  --ink: #000000;
+  --ink-2: #333333;
+  --muted: #666666;
+  --muted-2: #666666;
+  --link-muted: #333333;
+
+  --buy: #00aa00;
+  --buy-ink: #00aa00;
+  --buy-bar: #00aa00;
+  --buy-bar-dim: #c8e6c8;
+  --sell: #cc0000;
+  --sell-ink: #cc0000;
+  --sell-bar: #cc0000;
+  --sell-bar-dim: #f0c8c8;
+
+  --late: #b8860b;
+  --late-ink: #b8860b;
+  --late-cell: #fff4d6;
+  --hold-cell: #f1f3f4;
+  --up-bar: #00aa00;
+  --down-bar: #cc0000;
+  --link: #0000aa;
+
+  --badge-jev-bg: #000000;
+  --badge-jev-fg: #ffffff;
+  --badge-standin-bg: #000000;
+  --badge-standin-fg: #ffffff;
+  --live-dot: #00aa00;
+  --pnl-pos: #00aa00;
+  --pnl-neg: #cc0000;
+  --grid: #e5e5e5;
+
+  --font-sans: var(--font-plex), "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono: var(--font-plex), "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --page-bg: #ffffff;
+  --card-radius: 0;
+  --card-max: none;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--page-bg);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.4;
+  letter-spacing: -0.02em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+figure,
+blockquote,
+dl,
+dd {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+.shell {
+  background: var(--bg);
+  max-width: var(--card-max);
+  margin: 0 auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+@media (max-width: 899.98px) {
+  .shell {
+    overflow: visible;
+    min-height: 100dvh;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+@media (min-width: 900px) {
+  body {
+    overflow: hidden;
+  }
+
+  .shell {
+    height: 100vh;
+    min-height: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

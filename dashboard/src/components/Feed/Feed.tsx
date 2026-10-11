@@ -1,0 +1,177 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { BlockEvent, Meta } from "@/lib/types";
+import { fmtClock, fmtPrice, shortTx, txUrl } from "@/lib/format";
+import { Bone } from "@/components/Skeleton/Skeleton";
+import styles from "./Feed.module.css";
+
+const ROW_H = 26;
+const MAX_ROWS = 40;
+
+type Kind = "buy" | "sell" | "hold" | "late";
+
+function kindOf(event: BlockEvent): Kind {
+  const d = event.decision;
+  if (!d || d.late) return "late";
+  if (d.intent === "hold" || d.action === "hold") return "hold";
+  if (d.bias === "short" || d.action === "sell") return "sell";
+  if (d.bias === "long" || d.action === "buy") return "buy";
+  return "late";
+}
+
+function fmtSize(size: number): string {
+  if (size > 0 && size < 0.01) {
+    return size.toLocaleString("en-US", { maximumFractionDigits: 5, minimumFractionDigits: 3 });
+  }
+  return size.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+const KIND_CLASS: Record<Kind, string> = {
+  buy: styles.kindBuy,
+  sell: styles.kindSell,
+  hold: styles.kindHold,
+  late: styles.kindLate,
+};
+
+function wordOf(event: BlockEvent, kind: Kind): string {
+  const d = event.decision;
+  if (kind === "late") return "LATE";
+  if (kind === "hold") return "HOLD";
+  if (d?.intent === "close") return "CLOSE";
+  if (d?.intent === "open") return "OPEN";
+  if (d?.action === "buy") return "BUY";
+  if (d?.action === "sell") return "SELL";
+  return "LATE";
+}
+
+function isCallRow(event: BlockEvent): boolean {
+  return Boolean(event.decision && !event.decision.late);
+}
+
+export default function Feed({
+  events,
+  meta,
+  waiting = false,
+}: {
+  events: BlockEvent[];
+  meta?: Meta | null;
+  waiting?: boolean;
+}) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const [capacity, setCapacity] = useState(MAX_ROWS);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      const fits = Math.max(1, Math.min(MAX_ROWS, Math.floor(el.clientHeight / ROW_H)));
+      setCapacity((prev) => (prev === fits ? prev : fits));
+    };
+
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const callRows = useMemo(() => events.filter(isCallRow), [events]);
+
+  return (
+    <section className={styles.feed}>
+      <div className={styles.railHead}>CALLS</div>
+      <div className={styles.list} ref={listRef}>
+        {waiting && callRows.length === 0 ? (
+          <div aria-busy="true" aria-label="Loading calls">
+            {Array.from({ length: 8 }, (_, i) => (
+              <div key={i} className={styles.row}>
+                <span className={`${styles.cell} ${styles.time}`}>
+                  <Bone w={56} h={8} />
+                </span>
+                <span className={`${styles.cell} ${styles.word}`}>
+                  <Bone w={40} h={8} />
+                </span>
+                <span className={`${styles.cell} ${styles.lat}`}>
+                  <Bone w={28} h={8} />
+                </span>
+                <span className={`${styles.cell} ${styles.detail}`}>
+                  <Bone w={i % 2 ? 88 : 120} h={8} />
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : callRows.length === 0 ? (
+          <div className={styles.empty}>no calls yet</div>
+        ) : (
+          callRows.slice(-capacity).reverse().map((event, i) => {
+            const kind = kindOf(event);
+            const decision = event.decision;
+            const quote = event.quote;
+            const fill = event.fill;
+            const decided = kind !== "late";
+            const kindClass = KIND_CLASS[kind];
+
+            // A close is the bot's own exit, not a model call, so it has no latency to show.
+            const lat = !decided || !decision || decision.latencyMs <= 0 ? "" : `${decision.latencyMs}ms`;
+
+            let detail = "";
+            let detailMuted = false;
+            if (fill && fill.size > 0) {
+              detail = `${fmtSize(fill.size)} @ ${fmtPrice(fill.price)}`;
+            } else if (decided && quote) {
+              const word = quote.taker ? "cross" : quote.side === "buy" ? "bid" : "ask";
+              const lev = quote.taker || decision?.leverage == null ? "" : ` ${decision.leverage}x`;
+              const bias = quote.taker || !decision?.bias ? "" : ` ${decision.bias}`;
+              detail = `${word} ${fmtSize(quote.size)} @ ${fmtPrice(quote.price)}${bias}${lev}${quote.reduceOnly ? " reduce" : ""}`;
+              detailMuted = quote.status === "reverted";
+            } else if (decided && kind === "hold") {
+              detail = event.position.side === "flat" ? "flat, no order" : "position held";
+              detailMuted = true;
+            } else if (decided && decision?.intent === "close" && event.position.side === "flat") {
+              detail = "already flat";
+              detailMuted = true;
+            }
+
+            const rowClass = [styles.row, kindClass, i === 0 ? styles.newest : "", fill ? styles.filled : ""]
+              .filter(Boolean)
+              .join(" ");
+
+            return (
+              <div key={event.block} className={rowClass}>
+                <span className={`${styles.cell} ${styles.time}`}>{fmtClock(event.ts, true)}</span>
+                <span className={`${styles.cell} ${styles.word}`}>{wordOf(event, kind)}</span>
+                <span className={`${styles.cell} ${styles.lat}`}>{lat}</span>
+                <span
+                  className={`${styles.cell} ${styles.detail}${detailMuted ? ` ${styles.muted}` : ""}`}
+                >
+                  {detail}
+                </span>
+                <span className={`${styles.cell} ${styles.tx}`}>
+                  {fill && !fill.simulated && fill.txHash ? (
+                    <a href={txUrl(fill.txHash, meta?.explorerTx)} target="_blank" rel="noreferrer" title="the taker's transaction">
+                      {shortTx(fill.txHash)}
+                    </a>
+                  ) : quote && quote.status === "sim" ? (
+                    <span className={styles.muted}>sim</span>
+                  ) : quote && quote.txHash ? (
+                    <a
+                      className={quote.status === "placed" ? undefined : styles.muted}
+                      title={quote.status}
+                      href={txUrl(quote.txHash, meta?.explorerTx)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {quote.status === "reverted" ? "rev" : shortTx(quote.txHash)}
+                    </a>
+                  ) : null}
+                </span>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+}

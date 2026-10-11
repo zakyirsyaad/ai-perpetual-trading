@@ -1,0 +1,178 @@
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brandLockup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand {
+  display: inline;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.tagline {
+  margin: 0;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.links {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 2px;
+}
+
+.link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--ink);
+  opacity: 0.55;
+}
+
+.link:hover {
+  opacity: 1;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.status[data-live="true"] .dot {
+  background: var(--live-dot);
+}
+
+.scores {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 16px;
+  margin-left: auto;
+  min-width: 0;
+}
+
+.score {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.scoreKey {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+
+.scoreVal {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--ink);
+}
+
+@media (max-width: 640px) {
+  .header {
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 8px;
+    padding: max(10px, env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px)) 10px
+      max(14px, env(safe-area-inset-left, 0px));
+  }
+
+  .brandLockup {
+    gap: 8px;
+  }
+
+  .brand {
+    font-size: 13px;
+  }
+
+  .tagline {
+    display: none;
+  }
+
+  .status {
+    font-size: 11px;
+    gap: 5px;
+    margin-left: auto;
+  }
+
+  .scores {
+    flex: 1 1 100%;
+    margin-left: 0;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 16px;
+    padding-top: 2px;
+  }
+
+  .score {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+
+  .score:last-child {
+    align-items: flex-end;
+    text-align: right;
+  }
+
+  .scoreKey {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .scoreVal {
+    font-size: 15px;
+    line-height: 1;
+  }
+}
+
+@media (max-width: 359px) {
+  .brand {
+    font-size: 12px;
+  }
+}

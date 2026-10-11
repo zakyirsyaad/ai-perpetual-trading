@@ -1,0 +1,349 @@
+.wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--panel);
+  border: 0;
+  overflow: hidden;
+  cursor: default;
+  touch-action: none;
+  user-select: none;
+}
+
+.dragging {
+  cursor: grabbing;
+}
+
+.panel:focus {
+  outline: none;
+}
+
+.svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.legend {
+  position: absolute;
+  right: 16px;
+  bottom: 22px;
+  z-index: 2;
+  display: flex;
+  gap: 10px;
+  font: 400 11px var(--font-mono), monospace;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.legUp::before,
+.legDown::before,
+.legBuy::before,
+.legSell::before {
+  content: "";
+  display: inline-block;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+
+.legUp::before,
+.legDown::before {
+  width: 8px;
+  height: 8px;
+  border: 1px solid #000;
+}
+
+.legUp::before {
+  background: #000;
+}
+
+.legDown::before {
+  background: #fff;
+}
+
+.legBuy::before,
+.legSell::before {
+  width: 0;
+  height: 0;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+}
+
+.legBuy::before {
+  border-bottom: 5px solid var(--buy);
+}
+
+.legSell::before {
+  border-top: 5px solid var(--sell);
+}
+
+.legEntry::before {
+  width: 10px;
+  height: 0;
+  border: 0;
+  border-top: 2px solid var(--ink);
+  vertical-align: 3px;
+}
+
+.grid {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.tick {
+  font: 400 10px var(--font-mono), monospace;
+  fill: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tag {
+  pointer-events: none;
+}
+
+.tagText {
+  font: 500 11px var(--font-mono), monospace;
+  font-variant-numeric: tabular-nums;
+  fill: #ffffff;
+}
+
+.cross {
+  stroke: var(--ink);
+  stroke-width: 1;
+  opacity: 0.18;
+}
+
+.crossDot {
+  fill: var(--bg);
+  stroke: var(--ink);
+  stroke-width: 1.6;
+}
+
+.tip {
+  fill: var(--bg);
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.tipBlock {
+  font: 400 10px var(--font-mono), monospace;
+  font-variant-numeric: tabular-nums;
+  fill: var(--muted);
+}
+
+.tipPrice {
+  font: 500 14px var(--font-mono), monospace;
+  font-variant-numeric: tabular-nums;
+  fill: var(--ink);
+}
+
+.tipSide {
+  font: 500 11px var(--font-mono), monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.tl {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  pointer-events: none;
+}
+
+.tr {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  text-align: right;
+  pointer-events: none;
+}
+
+.price {
+  font: 700 28px var(--font-mono), monospace;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 4px;
+  font: 400 12px var(--font-mono), monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.word {
+  font: 700 22px var(--font-mono), monospace;
+  letter-spacing: 0.02em;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.wordMobile {
+  display: none;
+  font-weight: 700;
+}
+
+.skel {
+  position: absolute;
+  inset: 0;
+}
+
+.skelPrice {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skelSub {
+  display: flex;
+  gap: 12px;
+}
+
+.skelCandles {
+  position: absolute;
+  left: 16px;
+  right: 48px;
+  top: 76px;
+  bottom: 48px;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.skelCandle,
+.skelCandleOn {
+  flex: 1 1 0;
+  min-width: 0;
+  border: 1px solid var(--grid);
+  background: var(--bg);
+}
+
+.skelCandleOn {
+  background: var(--track);
+  border-color: var(--track);
+}
+
+.tools {
+  position: absolute;
+  left: 16px;
+  bottom: 22px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  max-width: calc(100% - 140px);
+}
+
+.tool {
+  height: 22px;
+  min-width: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 700 11px var(--font-mono), monospace;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tools .tool:last-child {
+  border-right: 1px solid var(--border);
+}
+
+.toolOn {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+}
+
+@media (max-width: 899.98px) {
+  .skelPrice {
+    top: 8px;
+    left: 8px;
+  }
+
+  .skelCandles {
+    top: 56px;
+    bottom: 12px;
+    left: 8px;
+    right: 8px;
+  }
+
+  .tl {
+    top: 8px;
+    left: 8px;
+  }
+
+  .tr {
+    display: none;
+  }
+
+  .price {
+    font-size: 18px;
+  }
+
+  .sub {
+    gap: 6px 10px;
+    margin-top: 2px;
+    font-size: 11px;
+  }
+
+  .wordMobile {
+    display: inline;
+  }
+
+  .legend,
+  .tag {
+    display: none;
+  }
+
+  .tools {
+    position: relative;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    z-index: 1;
+    flex: none;
+    max-width: none;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+  }
+
+  .tools::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tool {
+    height: 32px;
+    min-width: 36px;
+    padding: 0 8px;
+    font-size: 11px;
+    flex: 1 0 auto;
+  }
+}
