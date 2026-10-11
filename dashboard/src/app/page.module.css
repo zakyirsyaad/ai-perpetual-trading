@@ -1,0 +1,74 @@
+/* Desktop (>= 900px): the shell is a fixed-height flex column
+   and this row is its only flexible child. */
+
+.main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.left {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.chartWrap {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.right {
+  width: 380px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.right > :first-child {
+  flex: none;
+}
+
+.right > :last-child {
+  flex: 1;
+  min-height: 0;
+}
+
+@media (min-width: 900px) {
+  .main {
+    flex: 1 1 0;
+  }
+}
+
+@media (max-width: 899.98px) {
+  .main {
+    flex: none;
+    flex-direction: column;
+  }
+
+  .left {
+    flex: none;
+  }
+
+  .chartWrap {
+    flex: none;
+    height: min(38vh, 320px);
+    min-height: 240px;
+  }
+
+  .right {
+    width: 100%;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+}

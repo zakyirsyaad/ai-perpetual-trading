@@ -1,0 +1,167 @@
+.panel {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.section {
+  border-bottom: 1px solid var(--border);
+}
+
+.railHead {
+  background: var(--ink);
+  color: var(--bg);
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  padding: 8px 12px;
+}
+
+.body {
+  padding: 12px 14px 14px;
+}
+
+.headline {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.headlineWord {
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1.1;
+  letter-spacing: 0.02em;
+}
+
+.metaLine {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.bookLine {
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.bookSub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.reason {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+}
+
+.label {
+  width: 48px;
+  flex: none;
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.track {
+  flex: 1;
+  min-width: 0;
+  height: 10px;
+  border-radius: 0;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  border-radius: 0;
+  transition: width 0.25s linear, background 0.25s;
+}
+
+.pct {
+  width: 40px;
+  flex: none;
+  text-align: right;
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 1.2;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fill {
+    transition: none;
+  }
+}
+
+@media (max-width: 899.98px) {
+  .body {
+    padding: 8px 12px 10px;
+  }
+
+  .headline {
+    margin-bottom: 0;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .headlineWord {
+    font-size: 16px;
+  }
+
+  .metaLine {
+    margin: 0;
+    font-size: 11px;
+  }
+
+  .bars {
+    display: none;
+  }
+
+  .bookLine {
+    font-size: 12px;
+  }
+
+  .bookSub {
+    font-size: 11px;
+  }
+
+  .stats {
+    margin-top: 6px;
+    gap: 6px 12px;
+    font-size: 10px;
+  }
+}
