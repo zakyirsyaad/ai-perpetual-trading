@@ -65,3 +65,27 @@ After the Python side was done the contract test still failed on purpose until t
 - The cumulative series starts at `VOLUME_CYCLE_STARTED_AT` and does not distinguish accounts.
 - Days without trades (weekends) are not listed, only days that carry volume plus today.
 - After midnight the panel's "today" row flips on the next tick (up to one tick, about 4 minutes).
+
+## Follow-up fix: timestamp parsing on Python 3.10 (found on the first deploy)
+
+Right after PR #26 went live, `GET /volume` returned only today with 0 volume while `total_volume_all_time()` read
+9,242,929 from the same 202 rows. `daily_volume_series()` returned `[]`.
+
+**Cause.** `_parse_timestamp` collected *every* digit after the first dot, including the digits of the UTC offset
+(`+00:00`), then sliced the string with that length, producing a malformed fraction. Python 3.11 (the laptop) is
+lenient and parsed it; Python 3.10 (the VPS) raised `ValueError`, every row was skipped, and the series was empty.
+The tests passed locally because they only compared the final grouped days, and 3.11 hid the malformed string.
+
+**RED.** `tests/test_dashboard_volume.py::TimestampNormalisationTests` asserts the exact string handed to
+`fromisoformat` (`_normalise_iso`), so the bug cannot hide behind a lenient interpreter:
+
+```
+ImportError: cannot import name '_normalise_iso' from 'bot.storage.supabase_trade_store'
+Ran 1 test ... FAILED (errors=1)
+```
+
+**GREEN.** `_normalise_iso` rewrites only the fraction (padded or truncated to 6 digits) and leaves the offset alone;
+`_parse_timestamp` uses it.
+
+**Verification.** 847 tests pass on Python 3.11 **and** on Python 3.10 (`uv run --python 3.10 ...`), coverage 84%.
+Lesson: run the suite on the runtime that production uses, not only on the laptop's interpreter.
