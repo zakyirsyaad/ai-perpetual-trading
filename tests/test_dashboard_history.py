@@ -16,7 +16,7 @@ from bot.storage.supabase_trade_store import SupabaseTradeStore
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.observer import NULL_OBSERVER, EngineTelemetry
-from bot.telemetry.wire import Meta, PricePointFill
+from bot.telemetry.wire import Meta, PricePointFill, PriceMessage
 
 try:  # `python -m unittest tests.x` (package) and `discover -s tests` (top-level) both work
     from tests.test_trade_engine_execution import FakeClient, FakeRisk, FakeStore, FakeStrategy, _engine, _plan, _settings
@@ -95,6 +95,16 @@ class ObserverHistoryTests(unittest.TestCase):
         observer.history_loaded([bad, good])
         self.assertEqual(len(_fills(hub)), 2)
 
+    def test_the_stored_realized_pnl_shows_in_the_totals_of_the_next_block(self) -> None:
+        # The header reads realized/pnl from the latest block's totals, which restart from zero with the process.
+        observer, hub = _observer()
+        hub.record_price(PriceMessage(coin="BTC", ts=1_000, mid=100.0, best_bid=99.5, best_ask=100.5, spread_bps=1.0))
+        observer.history_loaded([], realized_usd=86.76)
+        observer.decided(None, latency_ms=1)                     # the first tick publishes a block
+        totals = hub.root_body()["latestByCoin"]["BTC"]["totals"]
+        self.assertAlmostEqual(totals["realizedUsd"], 86.76)
+        self.assertAlmostEqual(totals["pnlUsd"], 86.76)
+
     def test_garbage_input_never_raises(self) -> None:
         observer, _ = _observer()
         observer.history_loaded(None)  # type: ignore[arg-type]
@@ -105,6 +115,7 @@ class StoreRecentClosedTradesTests(unittest.IsolatedAsyncioTestCase):
         store = object.__new__(SupabaseTradeStore)
         import logging
         store._logger = logging.getLogger("test.store")
+        store._volume_cycle_started_at = None
 
         async def records(limit: int):
             self.limit = limit
@@ -127,12 +138,57 @@ class StoreRecentClosedTradesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trades[1].exchange_entry_order_id, "")
 
 
+class StoreRealizedPnlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sums_the_net_pnl_of_every_trade_since_the_cycle_start(self) -> None:
+        store = object.__new__(SupabaseTradeStore)
+
+        async def rows(select: str):
+            self.selected = select
+            return [{"pnl_usdt": -51.83}, {"pnl_usdt": 68.09}, {"pnl_usdt": 70.5}, {"pnl_usdt": None}]
+
+        store._all_closed_trade_rows = rows  # type: ignore[method-assign]
+        self.assertAlmostEqual(await store.realized_pnl_since_cycle(), 86.76)
+        self.assertEqual(self.selected, "pnl_usdt")
+
+
+class StoreCycleStartTests(unittest.IsolatedAsyncioTestCase):
+    """The dashboard starts where the volume cycle starts: older trades are not shown."""
+
+    def _store(self, cycle_start):
+        import logging
+        store = object.__new__(SupabaseTradeStore)
+        store._logger = logging.getLogger("test.store")
+        store._volume_cycle_started_at = cycle_start
+
+        async def records(limit: int):
+            return [
+                {"symbol": "BTC/USDT", "direction": "SHORT", "entry_price": 100.0, "exit_price": 99.0, "quantity": 1.0,
+                 "pnl_usdt": 1.0, "opened_at": "2026-10-12T02:00:00+00:00", "closed_at": "2026-10-12T02:20:00+00:00"},
+                {"symbol": "BTC/USDT", "direction": "SHORT", "entry_price": 100.0, "exit_price": 99.0, "quantity": 1.0,
+                 "pnl_usdt": 1.0, "opened_at": "2026-10-10T02:00:00+00:00", "closed_at": "2026-10-10T02:20:00+00:00"},
+            ]
+
+        store.recent_closed_trade_records = records  # type: ignore[method-assign]
+        return store
+
+    async def test_trades_closed_before_the_cycle_start_are_left_out(self) -> None:
+        start = datetime(2026, 10, 11, 17, 0, tzinfo=UTC)          # 12 Oct 00:00 WIB
+        trades = await self._store(start).recent_closed_trades(60)
+        self.assertEqual([t.closed_at.day for t in trades], [12])
+
+    async def test_without_a_cycle_start_every_stored_trade_is_kept(self) -> None:
+        trades = await self._store(None).recent_closed_trades(60)
+        self.assertEqual(len(trades), 2)
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.loaded: list = []
+        self.realized: list = []
 
-    def history_loaded(self, trades) -> None:
+    def history_loaded(self, trades, *, realized_usd: float = 0.0) -> None:
         self.loaded.append(list(trades))
+        self.realized.append(realized_usd)
 
     def __getattr__(self, name: str):
         return lambda *a, **k: None
@@ -142,6 +198,11 @@ class _HistoryStore(FakeStore):
     def __init__(self, trades=None, error: Exception | None = None) -> None:
         super().__init__()
         self.trades, self.error, self.reads = trades or [], error, 0
+
+    realized = 0.0
+
+    async def realized_pnl_since_cycle(self) -> float:
+        return self.realized
 
     async def recent_closed_trades(self, limit: int = 100):
         self.reads += 1
@@ -164,6 +225,13 @@ class EngineSeedsHistoryTests(unittest.IsolatedAsyncioTestCase):
         await engine._seed_dashboard_history()
         self.assertEqual(engine._telemetry.loaded, [[trade]])
         self.assertGreaterEqual(store.limit, 30)
+
+    async def test_also_hands_over_the_realized_pnl_since_the_cycle_start(self) -> None:
+        store = _HistoryStore([])
+        store.realized = 86.76
+        engine = self._engine(store)
+        await engine._seed_dashboard_history()
+        self.assertEqual(engine._telemetry.realized, [86.76])
 
     async def test_costs_nothing_when_the_dashboard_feed_is_off(self) -> None:
         store = _HistoryStore([])

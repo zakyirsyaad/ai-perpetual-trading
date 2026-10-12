@@ -130,7 +130,8 @@ class TradeEngine:
             return
         try:
             trades = await self._trade_store.recent_closed_trades(DASHBOARD_HISTORY_TRADES)
-            self._telemetry.history_loaded(trades)
+            realized = await self._trade_store.realized_pnl_since_cycle()
+            self._telemetry.history_loaded(trades, realized_usd=realized)
         except Exception:  # noqa: BLE001 - a dashboard figure must never stop the trading loop
             self._logger.warning("Could not seed the dashboard history.", exc_info=True)
 
@@ -778,13 +779,8 @@ class TradeEngine:
             and daily_volume >= daily_target
         ):
             return "daily_volume_target_reached"
-        target = float(getattr(self._settings, "volume_target_usdt", 0.0) or 0.0)
-        if (
-            getattr(self._settings, "volume_stop_at_target_enabled", True)
-            and target > 0
-            and await self._trade_store.total_volume_all_time() >= target
-        ):
-            return "volume_target_reached"
+        # No cumulative-volume stop: only the daily target and the daily fee budget pause entries.
+        # `VOLUME_TARGET_USDT` stays as a planning figure for the volume profile, not a gate.
         fee_budget = float(getattr(self._settings, "volume_daily_fee_budget_usdt", 0.0) or 0.0)
         estimated_fee = daily_volume * (float(getattr(self._settings, "taker_fee_pct", 0.0) or 0.0) / 100.0)
         if fee_budget > 0 and estimated_fee >= fee_budget:

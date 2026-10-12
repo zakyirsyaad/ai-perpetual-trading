@@ -68,7 +68,7 @@ class EngineObserver(Protocol):
 
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None: ...
 
-    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None: ...
+    def history_loaded(self, trades: Sequence[ClosedTrade], *, realized_usd: float = 0.0) -> None: ...
 
 
 class NullObserver:
@@ -95,7 +95,7 @@ class NullObserver:
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None:
         return None
 
-    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None:
+    def history_loaded(self, trades: Sequence[ClosedTrade], *, realized_usd: float = 0.0) -> None:
         return None
 
 
@@ -327,7 +327,7 @@ class EngineTelemetry:
         )
 
     @_never_raises
-    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None:
+    def history_loaded(self, trades: Sequence[ClosedTrade], *, realized_usd: float = 0.0) -> None:
         """Rebuild the two fills the live path would have produced for trades already in the store.
 
         The close fill carries the net PnL and the total fee, exactly as `position_closed` does;
@@ -362,6 +362,9 @@ class EngineTelemetry:
                 LOGGER.warning("telemetry skipped an unreadable stored trade", exc_info=True)
         for coin, items in by_coin.items():
             self._hub.seed_fills(coin, items)
+        # The header reads realized and total PnL from the next block's totals, whose counters restart
+        # from zero with the process. Assigned, not added: this runs once, before any live trade.
+        self._realized_usd = float(realized_usd)
 
     # -- internals ----------------------------------------------------------
 

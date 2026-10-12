@@ -76,7 +76,9 @@ class ArenaVolumeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(float(profile.volume_per_entry_usdt), 36_000.0)
         self.assertEqual(float(profile.daily_volume_usdt), 1_008_000.0)
 
-    async def test_volume_target_guard_blocks_entries_after_target_reached(self) -> None:
+    async def test_the_cumulative_volume_target_no_longer_stops_the_bot(self) -> None:
+        # The operator dropped the 10M cycle stop: only the daily target and the daily fee budget pause entries.
+        # VOLUME_TARGET_USDT survives as a planning figure for the volume profile, not as a gate.
         engine = object.__new__(TradeEngine)
         engine._settings = SimpleNamespace(
             strategy_mode="ai_volume",
@@ -88,25 +90,7 @@ class ArenaVolumeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         engine._trade_store = _Store(volume=1_000, total_volume=10_500)
 
-        reason = await engine._volume_runtime_pause_reason()
-
-        self.assertEqual(reason, "volume_target_reached")
-
-    async def test_total_volume_target_does_not_use_only_today_volume(self) -> None:
-        engine = object.__new__(TradeEngine)
-        engine._settings = SimpleNamespace(
-            strategy_mode="ai_volume",
-            volume_stop_at_target_enabled=True,
-            volume_daily_target_usdt=0,
-            volume_target_usdt=10_000,
-            volume_daily_fee_budget_usdt=0,
-            taker_fee_pct=0.05,
-        )
-        engine._trade_store = _Store(volume=9_999, total_volume=9_999)
-
-        reason = await engine._volume_runtime_pause_reason()
-
-        self.assertIsNone(reason)
+        self.assertIsNone(await engine._volume_runtime_pause_reason())
 
     async def test_volume_fee_budget_blocks_entries_when_estimated_fee_spent(self) -> None:
         engine = object.__new__(TradeEngine)
