@@ -1,10 +1,22 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import type { BlockEvent, Meta, PricePoint, SleeveMeta } from "@/lib/types";
-import { closedLots, tapeFills } from "@/lib/fills";
+import { closedLots, dayKey, groupByDay, lotVolume, tapeFills } from "@/lib/fills";
 import { roePct } from "@/lib/pnl";
-import { displayCoin, fmtClock, fmtCoin, fmtPct, fmtPrice, fmtSignedUsd, fmtUsd, shortTx, txUrl } from "@/lib/format";
+import {
+  displayCoin,
+  fmtClock,
+  fmtCoin,
+  fmtCompact,
+  fmtDay,
+  fmtPct,
+  fmtPrice,
+  fmtSignedUsd,
+  fmtUsd,
+  shortTx,
+  txUrl,
+} from "@/lib/format";
 import { Bone } from "@/components/Skeleton/Skeleton";
 import styles from "./Book.module.css";
 
@@ -64,6 +76,10 @@ export default function Book({
     rows.sort((a, b) => b.ts - a.ts);
     return rows.slice(0, TRADE_CAP);
   }, [allMarkets, selected, sleeves, tapeByCoin]);
+
+  const historyDays = useMemo(() => groupByDay(history), [history]);
+  const tradeDays = useMemo(() => groupByDay(trades), [trades]);
+  const today = dayKey(Date.now());
 
   return (
     <section className={styles.wrap}>
@@ -239,20 +255,40 @@ export default function Book({
                 </tr>
               </thead>
               <tbody>
-                {history.map((lot) => {
-                  const sideColor = lot.side === "long" ? "var(--buy-ink)" : "var(--sell-ink)";
-                  const pnlColor = lot.pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)";
+                {historyDays.map((group) => {
+                  const net = group.rows.reduce((sum, lot) => sum + lot.pnl, 0);
+                  const fees = group.rows.reduce((sum, lot) => sum + lot.fee, 0);
+                  const volume = group.rows.reduce((sum, lot) => sum + lotVolume(lot), 0);
                   return (
-                    <tr key={`${lot.coin}|${lot.key}`} onClick={() => onSelect(lot.coin)}>
-                      <td>{fmtClock(lot.ts, true)}</td>
-                      <td>{displayCoin(lot.coin)}</td>
-                      <td style={{ color: sideColor }}>{lot.side.toUpperCase()}</td>
-                      <td>{fmtSize(lot.size)}</td>
-                      <td>{lot.entry != null ? fmtPrice(lot.entry) : "-"}</td>
-                      <td>{fmtPrice(lot.exit)}</td>
-                      <td style={{ color: pnlColor }}>{fmtSignedUsd(lot.pnl, 2)}</td>
-                      <td>{lot.fee ? fmtUsd(lot.fee, 2) : "-"}</td>
-                    </tr>
+                    <Fragment key={group.day}>
+                      <tr className={styles.dayRow}>
+                        <td colSpan={8}>
+                          <span className={styles.dayName}>{fmtDay(group.day)}</span>
+                          {group.day === today ? <span className={styles.dayTag}>today</span> : null}
+                          <span className={styles.daySum}>
+                            {group.rows.length} {group.rows.length === 1 ? "trade" : "trades"} · net{" "}
+                            <span style={{ color: net >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>{fmtSignedUsd(net, 2)}</span>
+                            {" "}· fees {fmtUsd(fees, 2)} · volume {fmtCompact(volume)}
+                          </span>
+                        </td>
+                      </tr>
+                      {group.rows.map((lot) => {
+                        const sideColor = lot.side === "long" ? "var(--buy-ink)" : "var(--sell-ink)";
+                        const pnlColor = lot.pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)";
+                        return (
+                          <tr key={`${lot.coin}|${lot.key}`} onClick={() => onSelect(lot.coin)}>
+                            <td>{fmtClock(lot.ts, true)}</td>
+                            <td>{displayCoin(lot.coin)}</td>
+                            <td style={{ color: sideColor }}>{lot.side.toUpperCase()}</td>
+                            <td>{fmtSize(lot.size)}</td>
+                            <td>{lot.entry != null ? fmtPrice(lot.entry) : "-"}</td>
+                            <td>{fmtPrice(lot.exit)}</td>
+                            <td style={{ color: pnlColor }}>{fmtSignedUsd(lot.pnl, 2)}</td>
+                            <td>{lot.fee ? fmtUsd(lot.fee, 2) : "-"}</td>
+                          </tr>
+                        );
+                      })}
+                    </Fragment>
                   );
                 })}
               </tbody>
@@ -305,27 +341,43 @@ export default function Book({
               </tr>
             </thead>
             <tbody>
-              {trades.map((fill) => {
-                const sideColor = fill.side === "buy" ? "var(--buy-ink)" : "var(--sell-ink)";
-                const action = fill.dir === "open" ? "OPEN" : fill.dir === "close" ? "CLOSE" : fill.dir === "flip" ? "FLIP" : "FILL";
+              {tradeDays.map((group) => {
+                const volume = group.rows.reduce((sum, fill) => sum + fill.size * fill.price, 0);
                 return (
-                  <tr key={`${fill.coin}|${fill.key}`} onClick={() => onSelect(fill.coin)}>
-                    <td>{fmtClock(fill.ts, true)}</td>
-                    <td>{displayCoin(fill.coin)}</td>
-                    <td style={{ color: sideColor }}>{fill.side.toUpperCase()}</td>
-                    <td style={{ color: sideColor }}>{action}</td>
-                    <td>{fmtPrice(fill.price)}</td>
-                    <td>{fmtSize(fill.size)}</td>
-                    <td>
-                      {fill.hash ? (
-                        <a href={txUrl(fill.hash, meta?.explorerTx)} target="_blank" rel="noreferrer">
-                          {shortTx(fill.hash)}
-                        </a>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
-                  </tr>
+                  <Fragment key={group.day}>
+                    <tr className={styles.dayRow}>
+                      <td colSpan={7}>
+                        <span className={styles.dayName}>{fmtDay(group.day)}</span>
+                        {group.day === today ? <span className={styles.dayTag}>today</span> : null}
+                        <span className={styles.daySum}>
+                          {group.rows.length} {group.rows.length === 1 ? "fill" : "fills"} · volume {fmtCompact(volume)}
+                        </span>
+                      </td>
+                    </tr>
+                    {group.rows.map((fill) => {
+                      const sideColor = fill.side === "buy" ? "var(--buy-ink)" : "var(--sell-ink)";
+                      const action = fill.dir === "open" ? "OPEN" : fill.dir === "close" ? "CLOSE" : fill.dir === "flip" ? "FLIP" : "FILL";
+                      return (
+                        <tr key={`${fill.coin}|${fill.key}`} onClick={() => onSelect(fill.coin)}>
+                          <td>{fmtClock(fill.ts, true)}</td>
+                          <td>{displayCoin(fill.coin)}</td>
+                          <td style={{ color: sideColor }}>{fill.side.toUpperCase()}</td>
+                          <td style={{ color: sideColor }}>{action}</td>
+                          <td>{fmtPrice(fill.price)}</td>
+                          <td>{fmtSize(fill.size)}</td>
+                          <td>
+                            {fill.hash ? (
+                              <a href={txUrl(fill.hash, meta?.explorerTx)} target="_blank" rel="noreferrer">
+                                {shortTx(fill.hash)}
+                              </a>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </Fragment>
                 );
               })}
             </tbody>

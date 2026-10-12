@@ -129,3 +129,40 @@ export function closedLots(fills: TapeFill[]): ClosedLot[] {
 
   return out;
 }
+
+const DAY_FORMAT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Jakarta",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/**
+ * The trading day of a timestamp as "YYYY-MM-DD". Always WIB, whatever the browser's timezone:
+ * the bot's day, the volume series and this grouping must all cut at the same midnight.
+ */
+export function dayKey(ts: number): string {
+  return DAY_FORMAT.format(new Date(ts));
+}
+
+export interface DayGroup<T> {
+  day: string;
+  rows: T[];
+}
+
+/** Splits rows into trading days and keeps their order, so newest-first input stays newest-first. */
+export function groupByDay<T extends { ts: number }>(rows: T[]): DayGroup<T>[] {
+  const out: DayGroup<T>[] = [];
+  for (const row of rows) {
+    const day = dayKey(row.ts);
+    const last = out[out.length - 1];
+    if (last && last.day === day) last.rows.push(row);
+    else out.push({ day, rows: [row] });
+  }
+  return out;
+}
+
+/** Traded volume of a closed lot: its entry leg plus its exit leg (the exit twice when the entry is unknown). */
+export function lotVolume(lot: { size: number; entry: number | null; exit: number }): number {
+  return lot.size * ((lot.entry ?? lot.exit) + lot.exit);
+}

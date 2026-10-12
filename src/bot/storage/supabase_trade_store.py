@@ -343,6 +343,11 @@ class SupabaseTradeStore:
             ],
         )
 
+    async def realized_pnl_since_cycle(self) -> float:
+        """Net PnL of every closed trade since the volume cycle started (dashboard header only)."""
+        rows = await self._all_closed_trade_rows("pnl_usdt")
+        return sum(float(row.get("pnl_usdt") or 0.0) for row in rows)
+
     async def recent_closed_trades(self, limit: int = 100) -> list[ClosedTrade]:
         """The newest `limit` closed trades, oldest first, for seeding the dashboard history."""
         trades: list[ClosedTrade] = []
@@ -371,6 +376,10 @@ class SupabaseTradeStore:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self._logger.warning("Skipping unreadable closed trade row: %s", exc)
+        # The dashboard starts where the volume cycle starts, so older trades are not shown.
+        if self._volume_cycle_started_at is not None:
+            cutoff = self._volume_cycle_started_at.astimezone(timezone.utc)
+            trades = [trade for trade in trades if trade.closed_at >= cutoff]
         trades.sort(key=lambda trade: trade.closed_at)
         return trades
 
