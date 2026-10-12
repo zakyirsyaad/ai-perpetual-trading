@@ -38,6 +38,7 @@ from bot.telemetry.wire import (
     Resting,
     Side,
     Totals,
+    PricePointFill,
     VolumeDay,
     VolumeSummary,
 )
@@ -67,6 +68,8 @@ class EngineObserver(Protocol):
 
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None: ...
 
+    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None: ...
+
 
 class NullObserver:
     """What the engine uses when the dashboard feed is off."""
@@ -90,6 +93,9 @@ class NullObserver:
         return None
 
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None:
+        return None
+
+    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None:
         return None
 
 
@@ -319,6 +325,43 @@ class EngineTelemetry:
                 days=days,
             )
         )
+
+    @_never_raises
+    def history_loaded(self, trades: Sequence[ClosedTrade]) -> None:
+        """Rebuild the two fills the live path would have produced for trades already in the store.
+
+        The close fill carries the net PnL and the total fee, exactly as `position_closed` does;
+        the fee is recovered as gross minus net because the store keeps only the net figure.
+        """
+        by_coin: dict[str, list[tuple[int, PricePointFill]]] = {}
+        for trade in trades:
+            try:
+                if not (trade.entry_price > 0 and trade.exit_price > 0 and trade.quantity > 0):
+                    continue
+                move = (
+                    trade.exit_price - trade.entry_price
+                    if trade.direction is PositionDirection.LONG
+                    else trade.entry_price - trade.exit_price
+                )
+                fee = max(move * trade.quantity - trade.pnl_usdt, 0.0)
+                opened = PricePointFill(
+                    side=_open_side(trade.direction), price=trade.entry_price, size=trade.quantity, direction="open"
+                )
+                closed = PricePointFill(
+                    side=_close_side(trade.direction),
+                    price=trade.exit_price,
+                    size=trade.quantity,
+                    direction="close",
+                    closed_pnl=trade.pnl_usdt,
+                    fee_usd=fee,
+                )
+                items = by_coin.setdefault(coin_of(trade.symbol), [])
+                items.append((int(trade.opened_at.timestamp() * 1000), opened))
+                items.append((int(trade.closed_at.timestamp() * 1000), closed))
+            except Exception:  # one unreadable trade must not hide the others
+                LOGGER.warning("telemetry skipped an unreadable stored trade", exc_info=True)
+        for coin, items in by_coin.items():
+            self._hub.seed_fills(coin, items)
 
     # -- internals ----------------------------------------------------------
 

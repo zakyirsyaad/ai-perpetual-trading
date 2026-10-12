@@ -17,7 +17,16 @@ from typing import Any, Literal
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.chart import VenueChart
 from bot.telemetry.clip import clip_history, clip_snapshot_tape, clip_tape
-from bot.telemetry.wire import BlockEvent, FillMessage, Meta, PriceMessage, QuoteMessage, VolumeSummary, to_wire
+from bot.telemetry.wire import (
+    BlockEvent,
+    FillMessage,
+    Meta,
+    PriceMessage,
+    PricePointFill,
+    QuoteMessage,
+    VolumeSummary,
+    to_wire,
+)
 
 LOGGER = logging.getLogger("volume_bot.telemetry")
 
@@ -118,6 +127,30 @@ class TelemetryHub:
             self._bus.publish(refreshed)
         except Exception:
             LOGGER.warning("telemetry refresh_latest failed", exc_info=True)
+
+    def seed_fills(self, coin: str, fills: Iterable[tuple[int, PricePointFill]]) -> None:
+        """Put past fills on the tape so History and Trades survive a restart.
+
+        Quiet on purpose: no block is touched and nothing is published, because no client has
+        anything to replace yet. A client that connects later receives these through /tape.
+        """
+        try:
+            if not self._known(coin):
+                return
+            chart = self._charts[coin]
+            for ts, fill in fills:
+                chart.add_fill(
+                    ts=ts,
+                    side=fill.side,
+                    price=fill.price,
+                    size=fill.size,
+                    direction=fill.direction,
+                    hash=fill.hash,
+                    closed_pnl=fill.closed_pnl,
+                    fee_usd=fill.fee_usd,
+                )
+        except Exception:
+            LOGGER.warning("telemetry seed_fills failed", exc_info=True)
 
     def record_volume(self, summary: VolumeSummary) -> None:
         try:

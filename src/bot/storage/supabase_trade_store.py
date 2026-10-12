@@ -343,6 +343,37 @@ class SupabaseTradeStore:
             ],
         )
 
+    async def recent_closed_trades(self, limit: int = 100) -> list[ClosedTrade]:
+        """The newest `limit` closed trades, oldest first, for seeding the dashboard history."""
+        trades: list[ClosedTrade] = []
+        for row in await self.recent_closed_trade_records(limit):
+            try:
+                opened = _parse_timestamp(row.get("opened_at"))
+                closed = _parse_timestamp(row.get("closed_at"))
+                if opened is None or closed is None:
+                    raise ValueError("unreadable timestamp")
+                trades.append(
+                    ClosedTrade(
+                        symbol=str(row["symbol"]),
+                        direction=PositionDirection(str(row["direction"]).upper()),
+                        entry_price=float(row.get("entry_price") or 0.0),
+                        exit_price=float(row.get("exit_price") or 0.0),
+                        quantity=float(row.get("quantity") or 0.0),
+                        pnl_usdt=float(row.get("pnl_usdt") or 0.0),
+                        reason=str(row.get("reason") or ""),
+                        entry_reason=str(row.get("entry_reason") or ""),
+                        opened_at=opened,
+                        closed_at=closed,
+                        exchange_entry_order_id=str(row.get("exchange_entry_order_id") or ""),
+                        exchange_exit_order_id=str(row.get("exchange_exit_order_id") or ""),
+                        confidence=float(row.get("confidence") or 0.0),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self._logger.warning("Skipping unreadable closed trade row: %s", exc)
+        trades.sort(key=lambda trade: trade.closed_at)
+        return trades
+
     async def _closed_trade_rows_for_day(
         self,
         day: date | None,

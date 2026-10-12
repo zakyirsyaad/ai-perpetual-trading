@@ -36,6 +36,10 @@ class _UncertainEntryOrderState(RuntimeError):
         super().__init__(f"Prior entry order {order_id} cannot be confirmed canceled or filled.")
 
 
+# How many of the newest closed trades the dashboard shows after a restart.
+DASHBOARD_HISTORY_TRADES = 60
+
+
 class TradeEngine:
     # Restart matching tolerances: partial fills and mark-price rounding produce
     # small legitimate drift, but anything larger means the exchange position is
@@ -85,6 +89,8 @@ class TradeEngine:
         await self._refresh_exchange_fee_rates()
         await self._initialize_leverage()
         self._logger.info("%s VST trade engine started.", self._venue_label.upper())
+        # Before the resumed position is watched: that call blocks until the position closes.
+        await self._seed_dashboard_history()
         await self._resume_persisted_positions()
 
         while True:
@@ -113,6 +119,20 @@ class TradeEngine:
                 self._logger.info("Entry window open (%s): entries resume.", window_text)
             self._entry_window_open_state = is_open
         return is_open
+
+    async def _seed_dashboard_history(self) -> None:
+        """Fill the dashboard's History and Trades from the store once at startup.
+
+        The tape lives in memory, so without this a restart empties both tabs. Display only: it does nothing
+        when the feed is off, and a failing read is logged and swallowed.
+        """
+        if self._telemetry is NULL_OBSERVER:
+            return
+        try:
+            trades = await self._trade_store.recent_closed_trades(DASHBOARD_HISTORY_TRADES)
+            self._telemetry.history_loaded(trades)
+        except Exception:  # noqa: BLE001 - a dashboard figure must never stop the trading loop
+            self._logger.warning("Could not seed the dashboard history.", exc_info=True)
 
     async def _publish_volume(self) -> None:
         """Hand the dashboard the volume figures. Display only: it never raises and nothing reads it back."""
