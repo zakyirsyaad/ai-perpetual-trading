@@ -32,6 +32,8 @@ INTERFACES = {
     "SleeveMeta": wire.SleeveMeta,
     "Meta": wire.Meta,
     "PricePoint": wire.PricePoint,
+    "VolumeSummary": wire.VolumeSummary,
+    "VolumeDay": wire.VolumeDay,
 }
 # (interface, property holding an inline object type) -> pydantic model.
 NESTED = {

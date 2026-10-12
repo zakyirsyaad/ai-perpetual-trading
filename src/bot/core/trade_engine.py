@@ -114,7 +114,22 @@ class TradeEngine:
             self._entry_window_open_state = is_open
         return is_open
 
+    async def _publish_volume(self) -> None:
+        """Hand the dashboard the volume figures. Display only: it never raises and nothing reads it back."""
+        if self._telemetry is NULL_OBSERVER:
+            return
+        try:
+            daily = await self._trade_store.daily_volume_series()
+            self._telemetry.volume_updated(
+                today=self._now_in_trading_tz().date().isoformat(),
+                daily=daily,
+                daily_target_usdt=float(getattr(self._settings, "volume_daily_target_usdt", 0.0) or 0.0),
+            )
+        except Exception:  # noqa: BLE001 - a dashboard figure must never stop the trading loop
+            self._logger.warning("Could not publish volume to the dashboard.", exc_info=True)
+
     async def _tick(self) -> None:
+        await self._publish_volume()
         if self._entries_blocked_reason is not None:
             self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
             return
@@ -659,6 +674,7 @@ class TradeEngine:
             self._last_stop_loss_ts = closed_at.timestamp()
         # Last, so every piece of engine state that gates the next entry is already set.
         self._telemetry.position_closed(closed_trade, fee_usdt=total_fee)
+        await self._publish_volume()
 
         daily_volume = await self._trade_store.total_volume_for_day()
         state = await self._risk_manager.get_daily_state()

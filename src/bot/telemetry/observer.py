@@ -38,6 +38,8 @@ from bot.telemetry.wire import (
     Resting,
     Side,
     Totals,
+    VolumeDay,
+    VolumeSummary,
 )
 
 LOGGER = logging.getLogger("volume_bot.telemetry")
@@ -63,6 +65,8 @@ class EngineObserver(Protocol):
 
     def position_closed(self, trade: ClosedTrade, *, fee_usdt: float) -> None: ...
 
+    def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None: ...
+
 
 class NullObserver:
     """What the engine uses when the dashboard feed is off."""
@@ -83,6 +87,9 @@ class NullObserver:
         return None
 
     def position_closed(self, trade: ClosedTrade, *, fee_usdt: float) -> None:
+        return None
+
+    def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None:
         return None
 
 
@@ -292,6 +299,26 @@ class EngineTelemetry:
             direction="close",
         )
         self._hub.record_fill(FillMessage(coin=coin, block=number, fill=fill, ts=self._now_ms()))
+
+    @_never_raises
+    def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None:
+        """Turn the store's per-day volumes into the dashboard's series with a running total."""
+        by_day = {str(day): float(volume) for day, volume in daily}
+        by_day.setdefault(today, 0.0)  # today is always listed, even before its first trade
+        running = 0.0
+        days: list[VolumeDay] = []
+        for day in sorted(by_day):
+            running += by_day[day]
+            days.append(VolumeDay(day=day, volume_usd=round(by_day[day], 2), cumulative_usd=round(running, 2)))
+        self._hub.record_volume(
+            VolumeSummary(
+                today=today,
+                today_usd=round(by_day[today], 2),
+                daily_target_usd=max(float(daily_target_usdt), 0.0),
+                total_usd=round(running, 2),
+                days=days,
+            )
+        )
 
     # -- internals ----------------------------------------------------------
 

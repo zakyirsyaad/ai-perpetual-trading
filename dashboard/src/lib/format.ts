@@ -156,3 +156,22 @@ export function shortTx(h: string | null | undefined): string {
 export function txUrl(h: string, explorerTx?: string): string {
   return explorerTx ? `${explorerTx}${h}` : "#";
 }
+
+/** 399962 -> "400K", 5344558 -> "5.34M", 812 -> "812". */
+export function fmtCompact(n: number | null | undefined): string {
+  const v = safe(n);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `${Math.round(v / 1_000)}K`;
+  return `${Math.round(v)}`;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "2026-10-12" -> "Mon 12 Oct". Built from UTC parts so the browser's timezone cannot shift the date. */
+export function fmtDay(day: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day ?? "");
+  if (!m) return "-";
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+}
