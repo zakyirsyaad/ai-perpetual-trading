@@ -13,6 +13,23 @@ from bot.config import Settings
 from bot.models import ClosedTrade, OpenPosition, PositionDirection
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Supabase writes 5- or 6-digit fractions, which Python 3.10's fromisoformat rejects."""
+    text = str(value or "").replace("Z", "+00:00")
+    if not text:
+        return None
+    head, dot, rest = text.partition(".")
+    if dot:
+        digits = "".join(ch for ch in rest if ch.isdigit())
+        tail = rest[len(digits):]
+        text = f"{head}.{(digits + '000000')[:6]}{tail}"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 class SupabaseTradeStore:
     """Primary trade store backed by Supabase REST.
 
@@ -264,6 +281,17 @@ class SupabaseTradeStore:
             apply_cycle_start=True,
         )
         return self._sum_trade_volume(rows)
+
+    async def daily_volume_series(self) -> list[tuple[str, float]]:
+        """Traded volume per trading-timezone day since the cycle start, oldest first (dashboard only)."""
+        rows = await self._all_closed_trade_rows("closed_at,entry_price,exit_price,quantity")
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            closed = _parse_timestamp(row.get("closed_at"))
+            if closed is None:
+                continue
+            by_day.setdefault(closed.astimezone(self._trading_tz).date().isoformat(), []).append(row)
+        return [(day, self._sum_trade_volume(group)) for day, group in sorted(by_day.items())]
 
     async def total_volume_all_time(self) -> float:
         rows = await self._all_closed_trade_rows("entry_price,exit_price,quantity")

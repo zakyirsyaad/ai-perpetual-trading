@@ -1,0 +1,148 @@
+.panel {
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(240px, 330px) minmax(0, 1fr);
+  border-bottom: 1px solid var(--border);
+}
+
+.today {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 20px;
+  border-right: 1px solid var(--border);
+}
+
+.history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 20px;
+}
+
+.historyHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.label {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.big {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ink);
+}
+
+.of {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.track,
+.dayTrack {
+  display: block;
+  position: relative;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.track {
+  height: 10px;
+}
+
+.dayTrack {
+  height: 8px;
+}
+
+.fill,
+.dayFill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--ink);
+}
+
+.fill[data-done="true"] {
+  background: var(--buy-bar);
+}
+
+.dayFill {
+  background: var(--ink-2);
+}
+
+.sub {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 124px;
+  overflow-y: auto;
+  padding-right: 10px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 96px minmax(60px, 1fr) 56px 76px;
+  align-items: center;
+  gap: 12px;
+  padding: 3px 0;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+
+.row[data-today="true"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.row[data-today="true"] .dayFill {
+  background: var(--ink);
+}
+
+.num,
+.cum {
+  text-align: right;
+}
+
+.cum {
+  color: var(--muted);
+}
+
+@media (max-width: 760px) {
+  .panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .today {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .row {
+    grid-template-columns: 88px minmax(40px, 1fr) 52px 70px;
+    gap: 8px;
+  }
+}

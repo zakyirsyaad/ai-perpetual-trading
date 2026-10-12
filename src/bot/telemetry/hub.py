@@ -17,7 +17,7 @@ from typing import Any, Literal
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.chart import VenueChart
 from bot.telemetry.clip import clip_history, clip_snapshot_tape, clip_tape
-from bot.telemetry.wire import BlockEvent, FillMessage, Meta, PriceMessage, QuoteMessage, to_wire
+from bot.telemetry.wire import BlockEvent, FillMessage, Meta, PriceMessage, QuoteMessage, VolumeSummary, to_wire
 
 LOGGER = logging.getLogger("volume_bot.telemetry")
 
@@ -39,6 +39,7 @@ class TelemetryHub:
         self._history: dict[str, deque[BlockEvent]] = {s.coin: deque(maxlen=history_size) for s in meta.sleeves}
         self._charts: dict[str, VenueChart] = {s.coin: VenueChart() for s in meta.sleeves}
         self._latest_price: dict[str, PriceMessage] = {}
+        self._volume: VolumeSummary | None = None
 
     @property
     def bus(self) -> TelemetryBus:
@@ -118,6 +119,12 @@ class TelemetryHub:
         except Exception:
             LOGGER.warning("telemetry refresh_latest failed", exc_info=True)
 
+    def record_volume(self, summary: VolumeSummary) -> None:
+        try:
+            self._volume = summary
+        except Exception:
+            LOGGER.warning("telemetry record_volume failed", exc_info=True)
+
     def load_klines(self, coin: str, bar: Literal["1m", "15m"], rows: Iterable[Mapping[str, float]]) -> None:
         try:
             if self._known(coin):
@@ -133,6 +140,10 @@ class TelemetryHub:
     def root_body(self) -> dict[str, Any]:
         latest = {coin: (to_wire(h[-1]) if h else None) for coin, h in self._history.items()}
         return {**to_wire(self._meta), "latestByCoin": latest}
+
+    def volume_body(self) -> dict[str, Any]:
+        """Volume figures for `GET /volume`; `{}` until the engine has published the first set."""
+        return to_wire(self._volume) if self._volume is not None else {}
 
     def snapshot_body(self) -> dict[str, Any]:
         history = {coin: [to_wire(e) for e in clip_history(list(h))] for coin, h in self._history.items()}

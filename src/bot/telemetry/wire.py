@@ -132,6 +132,24 @@ class Totals(_Wire):
     pnl_pct: float
 
 
+class VolumeDay(_Wire):
+    """One trading day's traded volume and the running total up to and including it."""
+
+    day: str
+    volume_usd: float = Field(ge=0.0)
+    cumulative_usd: float = Field(ge=0.0)
+
+
+class VolumeSummary(_Wire):
+    """Volume figures the dashboard reads from `/volume`. Sourced from the trade store, not from memory."""
+
+    today: str
+    today_usd: float = Field(ge=0.0)
+    daily_target_usd: float = Field(ge=0.0)
+    total_usd: float = Field(ge=0.0)
+    days: list[VolumeDay]
+
+
 class Resting(_Wire):
     bid_sz: float = Field(ge=0.0)
     ask_sz: float = Field(ge=0.0)

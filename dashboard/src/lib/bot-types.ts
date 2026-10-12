@@ -122,6 +122,23 @@ export interface Totals {
   pnlPct: number;
 }
 
+/** One trading day's traded volume and the running total up to and including that day. */
+export interface VolumeDay {
+  /** Trading-timezone date, YYYY-MM-DD. */
+  day: string;
+  volumeUsd: number;
+  cumulativeUsd: number;
+}
+
+/** `GET /volume`. Read from the trade store, so it survives a bot restart; `{}` until the first update. */
+export interface VolumeSummary {
+  today: string;
+  todayUsd: number;
+  dailyTargetUsd: number;
+  totalUsd: number;
+  days: VolumeDay[];
+}
+
 export interface BlockEvent {
   coin: string;
   block: number;
