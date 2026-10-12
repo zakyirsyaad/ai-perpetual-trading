@@ -24,6 +24,7 @@ from bot.telemetry.wire import (
     PriceMessage,
     PricePointFill,
     QuoteMessage,
+    UsageSummary,
     VolumeSummary,
     to_wire,
 )
@@ -49,6 +50,7 @@ class TelemetryHub:
         self._charts: dict[str, VenueChart] = {s.coin: VenueChart() for s in meta.sleeves}
         self._latest_price: dict[str, PriceMessage] = {}
         self._volume: VolumeSummary | None = None
+        self._usage: UsageSummary | None = None
 
     @property
     def bus(self) -> TelemetryBus:
@@ -158,6 +160,12 @@ class TelemetryHub:
         except Exception:
             LOGGER.warning("telemetry record_volume failed", exc_info=True)
 
+    def record_usage(self, summary: UsageSummary) -> None:
+        try:
+            self._usage = summary
+        except Exception:
+            LOGGER.warning("telemetry record_usage failed", exc_info=True)
+
     def load_klines(self, coin: str, bar: Literal["1m", "15m"], rows: Iterable[Mapping[str, float]]) -> None:
         try:
             if self._known(coin):
@@ -177,6 +185,10 @@ class TelemetryHub:
     def volume_body(self) -> dict[str, Any]:
         """Volume figures for `GET /volume`; `{}` until the engine has published the first set."""
         return to_wire(self._volume) if self._volume is not None else {}
+
+    def usage_body(self) -> dict[str, Any]:
+        """Model token figures for `GET /usage`; `{}` until the engine has published the first set."""
+        return to_wire(self._usage) if self._usage is not None else {}
 
     def snapshot_body(self) -> dict[str, Any]:
         history = {coin: [to_wire(e) for e in clip_history(list(h))] for coin, h in self._history.items()}

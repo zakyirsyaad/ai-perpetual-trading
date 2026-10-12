@@ -1,0 +1,229 @@
+.panel {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  min-height: 32px;
+  padding: 0 0 0 20px;
+}
+
+.label {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.big {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.unit {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.facts {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.facts [data-failed="true"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.stripMix {
+  display: block;
+  width: 120px;
+  height: 8px;
+  background: var(--track);
+}
+
+.toggle {
+  margin-left: auto;
+  align-self: stretch;
+  min-height: 32px;
+  padding: 0 20px 0 12px;
+  background: none;
+  border: 0;
+  border-left: 1px solid var(--border);
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.toggle:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
+.toggle:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -2px;
+}
+
+.toggle:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* Input is solid black, reasoning solid grey, output hatched: three shapes, not three colours. */
+.mix {
+  display: flex;
+  height: 100%;
+  min-width: 0;
+}
+
+.segInput,
+.swatchInput {
+  background: var(--ink);
+}
+
+.segReasoning,
+.swatchReasoning {
+  background: var(--muted);
+}
+
+.segAnswer,
+.swatchAnswer {
+  background: repeating-linear-gradient(45deg, var(--ink-2) 0 2px, transparent 2px 4px);
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 20px 10px;
+  border-top: 1px solid var(--track);
+}
+
+.detail[hidden] {
+  display: none;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+
+.legendTitle {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.swatchInput,
+.swatchReasoning,
+.swatchAnswer {
+  display: inline-block;
+  width: 12px;
+  height: 8px;
+}
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px 0 0;
+  max-height: 92px; /* four days; older ones scroll, so opening it never takes the chart's height */
+  overflow-y: auto;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 96px minmax(80px, 1fr) 56px 150px 190px 84px;
+  align-items: center;
+  gap: 12px;
+  padding: 3px 0;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+
+.row[data-today="true"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.rowTrack {
+  display: block;
+  height: 8px;
+  background: var(--track);
+}
+
+.num,
+.perTrade {
+  text-align: right;
+}
+
+.calls,
+.split,
+.perTrade {
+  color: var(--muted);
+}
+
+.row[data-today="true"] .calls,
+.row[data-today="true"] .split,
+.row[data-today="true"] .perTrade {
+  color: var(--ink-2);
+}
+
+.sum {
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+@media (max-width: 760px) {
+  .strip {
+    padding-left: 16px;
+  }
+
+  .stripMix {
+    display: none;
+  }
+
+  .detail {
+    padding: 8px 16px 10px;
+  }
+
+  .row {
+    grid-template-columns: 88px minmax(40px, 1fr) 52px 78px;
+    gap: 8px;
+  }
+
+  .calls,
+  .split {
+    display: none;
+  }
+}

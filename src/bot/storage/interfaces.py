@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Protocol
 
+from bot.ai.usage import DailyAiUsage
 from bot.models import ClosedTrade, OpenPosition
 
 
@@ -68,6 +69,8 @@ class TradeStoreProtocol(Protocol):
     async def total_volume_all_time(self) -> float: ...
 
     async def daily_volume_series(self) -> list[tuple[str, float]]: ...
+
+    async def daily_ai_usage_series(self) -> list[DailyAiUsage]: ...
 
     async def recent_closed_trades(self, limit: int = 100) -> list[ClosedTrade]: ...
 

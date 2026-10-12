@@ -150,6 +150,28 @@ class VolumeSummary(_Wire):
     days: list[VolumeDay]
 
 
+class UsageDay(_Wire):
+    """One trading day of model token spend and the trades it closed (tokens per trade is derived on screen)."""
+
+    day: str
+    calls: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    reasoning_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    entry_tokens: int = Field(ge=0)
+    exit_tokens: int = Field(ge=0)
+    closed_trades: int = Field(ge=0)
+
+
+class UsageSummary(_Wire):
+    """Token figures the dashboard reads from `/usage`. Sourced from the trade store, not from memory."""
+
+    today: str
+    days: list[UsageDay]
+
+
 class Resting(_Wire):
     bid_sz: float = Field(ge=0.0)
     ask_sz: float = Field(ge=0.0)

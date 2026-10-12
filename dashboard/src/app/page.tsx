@@ -7,10 +7,12 @@ import Feed from "@/components/Feed/Feed";
 import FlowChart from "@/components/FlowChart/FlowChart";
 import Header from "@/components/Header/Header";
 import SleeveStrip from "@/components/SleeveStrip/SleeveStrip";
+import UsagePanel from "@/components/UsagePanel/UsagePanel";
 import VolumePanel from "@/components/VolumePanel/VolumePanel";
 import { lastMeaningfulCall } from "@/lib/format";
 import { portfolioPnl } from "@/lib/pnl";
 import { useFeed } from "@/lib/useFeed";
+import { useUsage } from "@/lib/useUsage";
 import { useVolume } from "@/lib/useVolume";
 import type { BlockEvent, Meta, SleeveFeed } from "@/lib/types";
 import styles from "./page.module.css";
@@ -34,6 +36,7 @@ function viewMeta(meta: Meta | null, coin: string): Meta | null {
 export default function Page() {
   const feed = useFeed(API_URL);
   const volume = useVolume(API_URL);
+  const usage = useUsage(API_URL);
   const [picked, setPicked] = useState<string | null>(null);
 
   const coins = useMemo(() => {
@@ -78,6 +81,7 @@ export default function Page() {
         realized={hasBooks ? pnl.realized : null}
       />
       <VolumePanel volume={volume} />
+      <UsagePanel usage={usage} />
       <SleeveStrip
         sleeves={feed.meta?.sleeves ?? []}
         latestByCoin={latestByCoin}

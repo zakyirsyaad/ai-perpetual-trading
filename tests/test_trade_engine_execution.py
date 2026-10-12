@@ -224,6 +224,12 @@ class FakeStore:
     async def initialize(self) -> None:
         return None
 
+    async def daily_volume_series(self) -> list:
+        return []
+
+    async def daily_ai_usage_series(self) -> list:
+        return []
+
     async def save_open_position(self, position: OpenPosition) -> None:
         self.open_positions.append(position)
 

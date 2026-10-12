@@ -139,6 +139,30 @@ export interface VolumeSummary {
   days: VolumeDay[];
 }
 
+/** One trading day of model token spend. `outputTokens` includes `reasoningTokens`; failed calls count too. */
+export interface UsageDay {
+  /** Trading-timezone date, YYYY-MM-DD. */
+  day: string;
+  calls: number;
+  failed: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  /** Share of `totalTokens` spent on entry decisions. */
+  entryTokens: number;
+  /** Share of `totalTokens` spent on exit checks. */
+  exitTokens: number;
+  /** Trades closed that day, the denominator of tokens per trade. */
+  closedTrades: number;
+}
+
+/** `GET /usage`. Read from the trade store, so it survives a bot restart; `{}` until the first update. */
+export interface UsageSummary {
+  today: string;
+  days: UsageDay[];
+}
+
 export interface BlockEvent {
   coin: string;
   block: number;
