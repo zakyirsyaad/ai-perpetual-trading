@@ -22,6 +22,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, Protocol
 
+from bot.ai.usage import DailyAiUsage
 from bot.models import ClosedTrade, OpenPosition, PositionDirection, TradePlan
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.poller import coin_of
@@ -39,6 +40,8 @@ from bot.telemetry.wire import (
     Side,
     Totals,
     PricePointFill,
+    UsageDay,
+    UsageSummary,
     VolumeDay,
     VolumeSummary,
 )
@@ -68,6 +71,8 @@ class EngineObserver(Protocol):
 
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None: ...
 
+    def usage_updated(self, *, today: str, daily: Sequence[DailyAiUsage]) -> None: ...
+
     def history_loaded(self, trades: Sequence[ClosedTrade], *, realized_usd: float = 0.0) -> None: ...
 
 
@@ -93,6 +98,9 @@ class NullObserver:
         return None
 
     def volume_updated(self, *, today: str, daily: Sequence[tuple[str, float]], daily_target_usdt: float) -> None:
+        return None
+
+    def usage_updated(self, *, today: str, daily: Sequence[DailyAiUsage]) -> None:
         return None
 
     def history_loaded(self, trades: Sequence[ClosedTrade], *, realized_usd: float = 0.0) -> None:
@@ -323,6 +331,33 @@ class EngineTelemetry:
                 daily_target_usd=max(float(daily_target_usdt), 0.0),
                 total_usd=round(running, 2),
                 days=days,
+            )
+        )
+
+    @_never_raises
+    def usage_updated(self, *, today: str, daily: Sequence[DailyAiUsage]) -> None:
+        """Turn the store's per-day token spend into the dashboard's series, oldest day first."""
+        by_day = {usage.day: usage for usage in daily}
+        # Today is always listed, even before its first model call, so the panel never starts empty.
+        by_day.setdefault(today, DailyAiUsage(today, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        self._hub.record_usage(
+            UsageSummary(
+                today=today,
+                days=[
+                    UsageDay(
+                        day=usage.day,
+                        calls=usage.calls,
+                        failed=usage.failed,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        reasoning_tokens=usage.reasoning_tokens,
+                        total_tokens=usage.total_tokens,
+                        entry_tokens=usage.entry_tokens,
+                        exit_tokens=usage.exit_tokens,
+                        closed_trades=usage.closed_trades,
+                    )
+                    for usage in (by_day[day] for day in sorted(by_day))
+                ],
             )
         )
 

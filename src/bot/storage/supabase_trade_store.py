@@ -9,12 +9,19 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from bot.ai.usage import AICallMetrics
+from bot.ai.usage import AICallMetrics, DailyAiUsage
 from bot.config import Settings
 from bot.models import ClosedTrade, OpenPosition, PositionDirection
 
 
 _FRACTION = re.compile(r"\.(\d+)")
+
+# The only `ai_call_metrics` columns the dashboard sums, and the per-day counters built from them.
+_USAGE_COLUMNS = "created_at,purpose,success,input_tokens,output_tokens,reasoning_tokens,total_tokens"
+_USAGE_FIELDS = (
+    "calls", "failed", "input_tokens", "output_tokens", "reasoning_tokens",
+    "total_tokens", "entry_tokens", "exit_tokens", "closed_trades",
+)
 
 
 def _normalise_iso(value: Any) -> str:
@@ -301,6 +308,40 @@ class SupabaseTradeStore:
             by_day.setdefault(closed.astimezone(self._trading_tz).date().isoformat(), []).append(row)
         return [(day, self._sum_trade_volume(group)) for day, group in sorted(by_day.items())]
 
+    async def daily_ai_usage_series(self) -> list[DailyAiUsage]:
+        """Model token spend and closed trades per trading-timezone day since the cycle start (dashboard only)."""
+        calls = await self._all_cycle_rows(self._ai_call_metrics_table, _USAGE_COLUMNS, "created_at")
+        closed = await self._all_cycle_rows(self._trades_table, "closed_at", "closed_at")
+        days: dict[str, dict[str, int]] = {}
+
+        def bucket(stamp: Any) -> dict[str, int] | None:
+            moment = _parse_timestamp(stamp)
+            if moment is None:  # an unreadable row costs that row, not the whole series
+                return None
+            return days.setdefault(moment.astimezone(self._trading_tz).date().isoformat(), dict.fromkeys(_USAGE_FIELDS, 0))
+
+        for row in calls:
+            day = bucket(row.get("created_at"))
+            if day is None:
+                continue
+            input_tokens, output_tokens = int(row.get("input_tokens") or 0), int(row.get("output_tokens") or 0)
+            total = int(row.get("total_tokens") or 0) or input_tokens + output_tokens
+            day["calls"] += 1
+            day["failed"] += 0 if row.get("success") else 1
+            day["input_tokens"] += input_tokens
+            day["output_tokens"] += output_tokens
+            day["reasoning_tokens"] += int(row.get("reasoning_tokens") or 0)
+            day["total_tokens"] += total
+            if row.get("purpose") == "entry":
+                day["entry_tokens"] += total
+            elif row.get("purpose") == "exit":
+                day["exit_tokens"] += total
+        for row in closed:
+            day = bucket(row.get("closed_at"))
+            if day is not None:
+                day["closed_trades"] += 1
+        return [DailyAiUsage(day=name, **figures) for name, figures in sorted(days.items())]
+
     async def total_volume_all_time(self) -> float:
         rows = await self._all_closed_trade_rows("entry_price,exit_price,quantity")
         return self._sum_trade_volume(rows)
@@ -411,6 +452,10 @@ class SupabaseTradeStore:
         )
 
     async def _all_closed_trade_rows(self, select: str) -> list[dict[str, Any]]:
+        return await self._all_cycle_rows(self._trades_table, select, "closed_at")
+
+    async def _all_cycle_rows(self, table: str, select: str, time_column: str) -> list[dict[str, Any]]:
+        """Every row of `table` since the cycle start, oldest first, paged past PostgREST's 1000-row cap."""
         rows: list[dict[str, Any]] = []
         page_size = 1000
         offset = 0
@@ -418,17 +463,14 @@ class SupabaseTradeStore:
             params = [
                 ("select", select),
                 ("exchange", f"eq.{self._exchange}"),
-                ("order", "closed_at.asc"),
+                ("order", f"{time_column}.asc"),
                 ("limit", str(page_size)),
                 ("offset", str(offset)),
             ]
             if self._volume_cycle_started_at is not None:
                 cycle_start = self._volume_cycle_started_at.astimezone(timezone.utc).isoformat()
-                params.insert(2, ("closed_at", f"gte.{cycle_start}"))
-            page = await self._get_rows(
-                self._trades_table,
-                params,
-            )
+                params.insert(2, (time_column, f"gte.{cycle_start}"))
+            page = await self._get_rows(table, params)
             rows.extend(page)
             if len(page) < page_size:
                 return rows

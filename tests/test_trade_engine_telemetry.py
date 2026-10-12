@@ -184,6 +184,12 @@ class FakeStore:
         self.closed: list[ClosedTrade] = []
         self.open_positions: list[OpenPosition] = []
 
+    async def daily_volume_series(self) -> list:
+        return []
+
+    async def daily_ai_usage_series(self) -> list:
+        return []
+
     async def save_open_position(self, position: OpenPosition) -> None:
         self.open_positions.append(position)
 
@@ -255,6 +261,12 @@ class RecordingObserver:
     def _record(self, name: str, **fields) -> None:
         orders = len(self._client.orders) if self._client is not None else 0
         self.calls.append((name, {**fields, "orders_so_far": orders}))
+
+    def volume_updated(self, **fields):  # display-only feeds: not part of the ordering these tests assert
+        return None
+
+    def usage_updated(self, **fields):
+        return None
 
     def decided(self, plan, *, latency_ms):
         self._record("decided", plan=plan, latency_ms=latency_ms)

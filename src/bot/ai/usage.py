@@ -75,6 +75,27 @@ class TokenUsage:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class DailyAiUsage:
+    """One trading day of model spend, read from `ai_call_metrics` for the dashboard.
+
+    `output_tokens` includes `reasoning_tokens` (the provider reports reasoning as a part of the
+    completion). `entry_tokens`/`exit_tokens` split `total_tokens` by purpose; other purposes such as
+    the arena review count only in the total. Failed calls count too: they spent the tokens.
+    """
+
+    day: str
+    calls: int
+    failed: int
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+    entry_tokens: int
+    exit_tokens: int
+    closed_trades: int
+
+
 @dataclass(slots=True)
 class AICallMetrics:
     purpose: str
