@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -13,16 +14,23 @@ from bot.config import Settings
 from bot.models import ClosedTrade, OpenPosition, PositionDirection
 
 
+_FRACTION = re.compile(r"\.(\d+)")
+
+
+def _normalise_iso(value: Any) -> str:
+    """Make a Supabase timestamp parseable on Python 3.10, which wants fractions of 3 or 6 digits.
+
+    Supabase writes 5 or 6 digits. Only the fraction is rewritten (padded or truncated to 6); the
+    UTC offset after it is left alone, and a `Z` suffix becomes `+00:00`.
+    """
+    text = str(value or "").strip().replace("Z", "+00:00")
+    return _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
-    """Supabase writes 5- or 6-digit fractions, which Python 3.10's fromisoformat rejects."""
-    text = str(value or "").replace("Z", "+00:00")
+    text = _normalise_iso(value)
     if not text:
         return None
-    head, dot, rest = text.partition(".")
-    if dot:
-        digits = "".join(ch for ch in rest if ch.isdigit())
-        tail = rest[len(digits):]
-        text = f"{head}.{(digits + '000000')[:6]}{tail}"
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from bot.storage.supabase_trade_store import SupabaseTradeStore
+from bot.storage.supabase_trade_store import SupabaseTradeStore, _normalise_iso, _parse_timestamp
 from bot.telemetry.bus import TelemetryBus
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.observer import NULL_OBSERVER, EngineTelemetry
@@ -99,6 +99,37 @@ class HubAndServerVolumeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(body)["todayUsd"], 9.0)
         finally:
             await server.stop()
+
+
+class TimestampNormalisationTests(unittest.TestCase):
+    """Python 3.10 (the VPS) only parses fractions of exactly 3 or 6 digits; Supabase writes 5 or 6.
+
+    These tests check the *string* handed to fromisoformat, because Python 3.11 is lenient and would
+    hide a malformed one: the first version of this parser also swallowed the digits of the UTC offset,
+    which made every row unparseable on the VPS while every test passed on a 3.11 laptop.
+    """
+
+    def test_five_digit_fraction_is_padded_and_the_offset_is_left_alone(self) -> None:
+        self.assertEqual(_normalise_iso("2026-10-05T17:30:00.23315+00:00"), "2026-10-05T17:30:00.233150+00:00")
+
+    def test_six_digit_fraction_is_unchanged(self) -> None:
+        self.assertEqual(_normalise_iso("2026-09-14T04:27:17.838941+00:00"), "2026-09-14T04:27:17.838941+00:00")
+
+    def test_longer_fractions_are_truncated_to_six_digits(self) -> None:
+        self.assertEqual(_normalise_iso("2026-09-14T04:27:17.8389419+00:00"), "2026-09-14T04:27:17.838941+00:00")
+
+    def test_no_fraction_and_z_suffix(self) -> None:
+        self.assertEqual(_normalise_iso("2026-10-05T16:59:59+00:00"), "2026-10-05T16:59:59+00:00")
+        self.assertEqual(_normalise_iso("2026-10-05T16:59:59Z"), "2026-10-05T16:59:59+00:00")
+
+    def test_parse_returns_the_exact_aware_instant(self) -> None:
+        parsed = _parse_timestamp("2026-10-05T17:30:00.23315+00:00")
+        self.assertEqual(parsed.utcoffset().total_seconds(), 0)
+        self.assertEqual((parsed.hour, parsed.minute, parsed.microsecond), (17, 30, 233150))
+
+    def test_garbage_is_none_not_an_exception(self) -> None:
+        self.assertIsNone(_parse_timestamp("not a time"))
+        self.assertIsNone(_parse_timestamp(None))
 
 
 class DailyVolumeSeriesTests(unittest.IsolatedAsyncioTestCase):
