@@ -94,22 +94,24 @@ outcome is WR 50–55% and "no change, K2 continues" is the most likely result.
 
 ## 5. Phase 1 — offline evaluation (no bot change)
 
-All research code runs on the VPS under `~/replay/` with `nice -n 19` and the bot's venv. No
-orders, no private endpoints, no restart. The only repository change in Phase 1 is the unwired
-indicator module (5.4).
+Research code lives in the repository under `src/research/pine_gate/` (tested, never imported by
+`bot`), is synced to `~/replay/pine_gate_repo/` on the VPS, and runs there with `nice -n 19` and
+the bot's venv; data goes to `~/replay/pine_gate/data/` and outputs to `~/replay/out/`. No orders,
+no private endpoints, no restart. Apart from the research package and the unwired indicator module
+(5.4), nothing in the repository changes; the bot's runtime behaviour does not change.
 
 ### 5.1 Pre-registration and the holdout lock
 
-- `~/replay/pine_gate_spec_20261014.json` holds every choice below (grids, boundaries, selection
-  rules, contenders, model settings, controls, pass criteria). Its sha256 is written to project
-  memory **before** any outcome is computed. This document, committed to git, is the
-  human-readable copy.
-- `~/replay/pine_gate_edge.py` has two stages:
-  - `--stage train` loads data only up to the training boundary (plus 60 minutes for trades to
+- `~/replay/pine_gate_spec_20261014.json`, written by `python -m research.pine_gate.cli spec`,
+  holds every choice below (grids, boundaries, selection rules, contenders, model settings,
+  controls, pass criteria). Its sha256 is written to project memory **before** any outcome is
+  computed. This document, committed to git, is the human-readable copy.
+- `python -m research.pine_gate.cli` has two evaluation stages:
+  - `train` loads data only up to the training boundary (plus 60 minutes for trades to
     resolve), runs both selection stages and the model fit, and writes
     `~/replay/out/pine_gate_selection_<date>.json` with the chosen rule, the frozen model
     (coefficients, scaler, threshold), the training metrics and the spec sha256.
-  - `--stage test` refuses to run unless that selection file exists and its recorded spec sha256
+  - `test` refuses to run unless that selection file exists and its recorded spec sha256
     matches the current spec. Only then does it load holdout outcomes, once.
 - A bug found after the test stage is fixed in a new script version, everything is rerun, and the
   change is documented in the report.
@@ -124,8 +126,12 @@ indicator module (5.4).
   - All 5m/1h/4h bars are aggregated from 1m (BingX native 5m history is only about six weeks; the
     native bars that exist are used to check the aggregation).
 - **VST data:** the existing BTC 3m/1m cache (`~/replay/edge_klines.json`, OHLC only).
+- **Indicator warm-up for 1h/4h:** native BingX 1h and 4h klines from 2025-02-01 to 2025-08-01
+  (features only, never outcomes); from 2025-08-01 the 1h/4h bars are aggregated from 1m, and the
+  native bars of the overlap are used to check the aggregation.
 - **New daily collector** (its own cron line; the existing `kline_keeper.py` is not modified):
-  VST ETH 1m/3m with volume, production BTC/ETH 1m. This is the forward dataset.
+  VST ETH 1m with volume (3m is aggregated from it), production BTC/ETH 1m. This is the forward
+  dataset.
 - **Supabase (read-only):** `ai_decisions` (BTC, `exchange=bingx`, since 2026-08-31, including HOLD),
   `trades` (BingX, including old ETH trades), `ai_call_metrics` (entry latency since 2026-09-25).
 - VST volume is **not** real market volume (2026-10-14: VST hourly BTC volume was 1.6×–6.3×
@@ -154,7 +160,9 @@ before any block or segment boundary (purge), and the model's validation folds a
     2/(n+1)), Wilder RSI, Wilder ATR, DMI/ADX matching Pine v5 `ta.dmi`, rolling highest/lowest,
     and percentile rank (share of the previous `length` values ≤ the current value, as Pine
     `ta.percentrank`).
-  - Returns `None` when there are fewer than 8 × period bars.
+  - Recursive smoothers (RMA, EMA and everything built on them) return `None` before 8 × period
+    bars; window functions (highest, lowest, percentile rank) return `None` until their window is
+    full.
 - `src/bot/strategy/indicators.py` is not touched: the live stretch gate depends on its simple-mean
   RSI/ATR and on its `ema` (which returns the last close when data is short).
 - No look-ahead: a feature at time t uses only bars whose open + interval ≤ t. A truncation test at
