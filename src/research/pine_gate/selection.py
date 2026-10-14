@@ -43,7 +43,7 @@ class RuleResult:
     rule: RuleSpec
     trades: Tuple[Trade, ...]
     block_counts: Counts  # (tp, sl) per block B1-B4
-    block_exit_days: Tuple[int, ...]  # WIB days with a TP or SL exit, per block B1-B4
+    block_exit_days: Tuple[int, ...]  # WIB entry days with TP/SL trades, per block B1-B4
     cscv_counts: Counts  # (tp, sl) per CSCV block
     n_tp_sl: int
     supply_per_day: float
@@ -128,7 +128,7 @@ def _sample_ok(r: RuleResult, cfg: SelectionConfig) -> bool:
 
 def _thick_blocks(r: RuleResult, cfg: SelectionConfig) -> Tuple[bool, ...]:
     """Per block: at least ``block_min_tp_sl`` TP+SL trades on at least
-    ``block_min_exit_days`` WIB days with a TP or SL exit."""
+    ``block_min_exit_days`` days with TP/SL trades (WIB entry day, the SE clusters)."""
     return tuple(tp + sl >= cfg.block_min_tp_sl and days >= cfg.block_min_exit_days
                  for (tp, sl), days in zip(r.block_counts, r.block_exit_days))
 

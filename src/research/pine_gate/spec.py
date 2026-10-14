@@ -311,8 +311,9 @@ def _policies() -> Dict[str, Any]:
                        "if no rule is eligible, drop the supply condition and report supply-limited",
         "selection_rank": "median over B1-B4 of WR - 2 * SE (SE clustered by WIB day); "
                           "WR > 50 in at least 3 of 4 blocks; a block with fewer than "
-                          "block_min_tp_sl TP+SL trades or fewer than block_min_exit_days WIB "
-                          "days with a TP or SL exit counts as failing (no WR vote, lower "
+                          "block_min_tp_sl TP+SL trades or fewer than block_min_exit_days days "
+                          "with TP/SL trades, keyed by the trade's WIB entry day (the SE "
+                          "clusters), counts as failing (no WR vote, lower "
                           "bound -inf)",
         "stage_flow": "stage 1 -> 5 best base rules -> stage 2 variants -> best variant by the same ranking",
         "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "

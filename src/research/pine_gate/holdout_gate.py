@@ -20,8 +20,9 @@ _CONTROLS = spec_document()["controls"]
 C0_CENTRE_WR = 50.0
 C0_WR_TOLERANCE_PTS: float = _CONTROLS["c0_wr_tolerance_pts"]
 C0_GROSS_TOLERANCE_BPS: float = _CONTROLS["c0_gross_tolerance_bps"]
-# Spec 5.11 criterion 9: "contender 1's training PBO was < 0.5" binds contender 1
-# and contender 3, whose primary rule comes from the same grid; contender 2 is fixed.
+# Spec 5.11 criterion 9: "Controls behave as expected, and the training PBO was < 0.5
+# — this binds contenders 1 and 3 (contender 3's primary rule comes from the same
+# grid; contender 2 is fixed), and an undefined PBO (5.6) fails it."
 PBO_CONTENDERS = ("c1", "c3")
 # A contender without trades on the comparison symbols is compared to a coin flip.
 C2_WR_WITHOUT_TRADES = 50.0

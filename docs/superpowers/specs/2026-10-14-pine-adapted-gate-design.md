@@ -113,12 +113,22 @@ no private endpoints, no restart. Apart from the research package and the unwire
     (coefficients, scaler, threshold), the training metrics and the spec sha256.
   - `test` refuses to run unless that selection file exists and its recorded spec sha256
     matches the current spec. Only then does it load holdout outcomes, once. Under the spec
-    sha256 it also requires the code sha256 and the training-data hash the selection recorded,
-    and writes the holdout file next to the selection file (its real folder, links resolved);
-    any earlier holdout file there or in the output folder refuses the run. Before any holdout
-    data is read it writes the run marker `<data dir>/holdout_runs/<spec sha256>.json` (spec,
-    selection-file and code sha256, time, output folder) exclusively; an existing marker refuses
-    the run, whatever folder the selection file was copied to.
+    sha256 it also requires the code sha256, the training-data hash and the Python major.minor
+    (`python_version`; float sums can differ between versions) the selection recorded, and
+    writes the holdout file next to the selection file (its real folder, links resolved); any
+    earlier holdout file there or in the output folder refuses the run. An existing run marker
+    `<data dir>/holdout_runs/<spec sha256>.json` refuses the run before any data is read,
+    whatever folder the selection file was copied to. Every data check that can refuse comes
+    next, so a refusal leaves no marker: the holdout files are checked (present, whole WIB
+    days, warm-ups readable, funding at the cadence of 5.2) without computing anything, and a
+    training-only load (cut at the training end + 60 minutes) must hash to the selection's
+    training data. Only then is the marker (spec, selection-file and code sha256, time, output
+    folder) written exclusively and the holdout loaded.
+  - Every random draw of a spec run uses seed 0, recorded in the spec document; `train` and
+    `test` refuse any other seed under the spec sha256.
+  - `vst-check` and `decisions` (5.12, 5.13) run only after `test`: the holdout file next to
+    the selection file (its real folder and name) must record the current spec and code
+    sha256 and the selection file's sha256.
   - Runbook: the spec JSON, its sha256 and the selection file's sha256 are committed before
     `test` runs; no local lock can stop a run on a second machine.
 - A bug found after the test stage is fixed in a new script version, everything is rerun, and the
@@ -131,12 +141,21 @@ no private endpoints, no restart. Apart from the research package and the unwire
   (2025-07-31 has only 60 bars).
   - Fixed windows `startTime` + `endTime` of 1,440 bars; ≤ 1 request/second; every window must
     return exactly 1,440 consecutive bars or it is retried; never paginate on `startTime` alone.
+    `fetch` refuses an end day that is not over yet (WIB), so no forming bar is stored. A stored
+    day file must hold exactly its own WIB day's 1,440 bars; every load and `check-data` check
+    it.
+  - Funding times (production, public): a list is stored only when it covers the requested
+    range with no gap wider than 8 h + 10 minutes (a capped or partial answer is never
+    stored); every load checks the same cadence over the loaded range, and `check-data` over
+    the training start to the holdout end.
   - All 5m/1h/4h bars are aggregated from 1m (BingX native 5m history is only about six weeks; the
     native bars that exist are used to check the aggregation).
 - **VST data:** the existing BTC 3m/1m cache (`~/replay/edge_klines.json`, OHLC only).
 - **Indicator warm-up for 1h/4h:** native BingX 1h and 4h klines from 2025-02-01 to 2025-08-01
   (features only, never outcomes); from 2025-08-01 the 1h/4h bars are aggregated from 1m, and the
-  native bars of the overlap are used to check the aggregation.
+  native bars of the overlap are used to check the aggregation. A warm-up that is missing, or
+  starts at or after the first aggregated bar (so it adds nothing), is recorded as missing, and
+  a spec `train` run refuses missing warm-ups (the H4 EMA50 would stay undefined for weeks).
 - **New daily collector** (its own cron line; the existing `kline_keeper.py` is not modified):
   VST ETH 1m with volume (3m is aggregated from it), production BTC/ETH 1m. This is the forward
   dataset.
@@ -207,8 +226,9 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
    supply condition and the result is reported as supply-limited.
 3. **Rank** by the median over B1–B4 of WR − 2 × SE (SE clustered by WIB day); a rule must also show
    WR > 50% in at least 3 of the 4 blocks. A block with fewer than 60 take-profit + stop-loss
-   trades, or fewer than 10 WIB days with a take-profit or stop-loss exit, counts as failing: it
-   has no WR vote and its lower bound is −∞ (a thin block's day-clustered SE is near zero).
+   trades, or fewer than 10 days with TP/SL trades, keyed by the trade's WIB entry day (the SE
+   clusters), counts as failing: it has no WR vote and its lower bound is −∞ (a thin block's
+   day-clustered SE is near zero).
 4. Stage 1 → the 5 best base rules → Stage 2 variants → the best variant by the same ranking.
 5. **Stable area:** at least 4 of the 7 Stage-1 neighbours of the chosen base rule (one dimension
    changed) have a training WR no more than 3 points below the chosen base rule's; otherwise move
@@ -247,7 +267,9 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
   by uniqueness (the inverse of their average concurrency). The fit minimises
   Σ w·logloss / Σ w + ‖β‖² / (2C), intercept unpenalised: the data term is the weighted mean
   log-loss, so C regularises a one-block fold and the four-block refit alike. The penalty
-  C ∈ {0.01, 0.1, 1} is chosen by expanding-window validation over B1–B4 (fit on B1…Bk, validate
+  C ∈ {10, 100, 1000} (the mean data term makes C ≈ C_sum × Σw, so this grid sits about 1,000×
+  above the sum-objective grid {0.01, 0.1, 1}) is chosen by expanding-window validation over
+  B1–B4 (fit on B1…Bk, validate
   on Bk+1) with the 5.3 purge and embargo, on mean log-loss.
 - **Threshold:** the highest probability p\* at which the one-position simulation on the
   out-of-fold predictions (B2–B4) still delivers ≥ 10 trades per trading day; if none does,
@@ -285,7 +307,11 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
   1m close − 0.25 bps. s\* is the median stop overshoot of live `stop_loss` exits opened from
   2026-09-12 to 2026-10-14 00:00 WIB (exclusive), each stop level reconstructed from its stored decision (AI stop, ATR at decision, 0.4% cap),
   rounded up to 0.5 bp. If fewer than 15 stops can be reconstructed, s\* = 1 bp. Sensitivity
-  0/1/2 bps.
+  0/1/2 bps. The calibration file records the rebuild parameters (1.5 × ATR, 0.4% cap) and
+  the rebuilt and skipped stop counts; `calibrate` fails when more stops are skipped than
+  rebuilt. That the live `MAX_STOP_LOSS_PCT` / `ATR_SL_MULTIPLIER` matched these since
+  2026-09-12 is confirmed by the operator, not by code. An empty latency sample is refused
+  (zero latency is allowed only for the cadence sensitivity).
 - **Fees:** 0.035% per side; sensitivity 0.05%.
 - **Portfolio:** one position across BTC and ETH; BTC first when both signal (ETH-first as a
   sensitivity check; co-signal frequency reported).
@@ -323,6 +349,9 @@ Choosing what moves on:
 - Contender 1 or 3 is used only if it beats contender 2 on the holdout.
 - If nothing passes, the bot is not changed, K2 continues, and the manager receives the WR-vs-supply
   table per contender and symbol.
+
+Criterion 2 is also reported, never gated, under a circular block bootstrap of 5 consecutive
+days (trend regimes last weeks, so independent days overstate the evidence).
 
 Passing the gate means "an edge is present and consistent with the target", not "WR 60% proven":
 with about 250–500 holdout trades per symbol, a true 60% has a 95% interval of roughly 54–66%.
@@ -374,7 +403,13 @@ report skips it with a warning when either differs from the holdout's choice and
 - Contents: both training stages, PBO and SPA, the model's validation log-loss and calibration,
   holdout results per contender and symbol, controls, permutation, cadence cost, guard/supply grid,
   VST divergence, fill calibration, decision-level buckets; the VST and decision tables name the
-  contender they were scored on.
+  contender they were scored on, and the VST table shows the counts behind each share.
+- A spec or code sha256 mismatch between the files and the current code starts the report with
+  a warning. A WR or share within one point of a gate threshold shows two decimals. The
+  simulation caveats are listed: the 8 CSCV boundaries are not purged (at most about 7
+  straddling trades per rule); the funding blackout is checked at the tick and the daily guards
+  count on the entry day, where live checks after the AI call and counts on `closed_at`; the
+  decision view may place ticks slightly late (latency is timed after the context build).
 - Results recorded in project memory.
 
 ### 5.15 TradingView visual aid
