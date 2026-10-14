@@ -468,6 +468,15 @@ def _build_shared():
     if _Shared.built:
         return
     _Shared.tmp = Path(tempfile.mkdtemp(prefix="pine_holdout_"))
+    try:
+        _fill_shared()
+    except BaseException:
+        shutil.rmtree(_Shared.tmp, ignore_errors=True)  # no temp dir left behind
+        raise
+    _Shared.built = True
+
+
+def _fill_shared():
     write_data_dir(_Shared.tmp / "data")
     _Shared.dataset = load_dataset(_Shared.tmp / "data", until_ms=None, start_day=FIRST_DAY)
     _Shared.selection_path = write_selection(_Shared.tmp / "sel" / "selection.json", DUMMY_SHA)
@@ -477,7 +486,6 @@ def _build_shared():
         period=TEST_PERIOD, guard_cfg=NO_GUARDS, **SMALL,
     )
     _Shared.doc = json.loads(_Shared.path.read_text())
-    _Shared.built = True
 
 
 def tearDownModule():
@@ -789,6 +797,14 @@ class TestStageTests(StageFixture):
             self.assertIn("combined_supply", sens["guards_off"][name])
             self.assertEqual(sorted(sens["cadence"][name]), sorted(SYMBOLS))
         self.assertEqual(sorted(sens["reference"]), sorted(SYMBOLS))
+        for name in ("c1", "c2", "c3"):  # overshoot sensitivity 0 and 1 bps (report only)
+            self.assertEqual(sorted(sens["overshoot"][name]), ["0.0", "1.0"])
+            for runs in sens["overshoot"][name].values():
+                self.assertEqual(sorted(runs), sorted(SYMBOLS))
+                self.assertEqual(set(runs[BTC]), {"n", "wr", "gross_bps", "supply"})
+        zero = sens["overshoot"]["c2"]["0.0"][BTC]["gross_bps"]
+        one = sens["overshoot"]["c2"]["1.0"][BTC]["gross_bps"]
+        self.assertGreaterEqual(zero, one)  # a cheaper stop never lowers gross
         row = self.doc["contenders"]["c2"]["symbols"][BTC]
         self.assertIn("both_touch_share", row)
         self.assertAlmostEqual(row["net_per_1m_fee_sensitivity"] - row["net_per_1m"],

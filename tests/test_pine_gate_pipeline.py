@@ -6,7 +6,6 @@ import random
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -196,6 +195,15 @@ def _build_shared():
     if _Shared.built:
         return
     _Shared.tmp = Path(tempfile.mkdtemp(prefix="pine_pipeline_"))
+    try:
+        _fill_shared()
+    except BaseException:
+        shutil.rmtree(_Shared.tmp, ignore_errors=True)  # no temp dir left behind
+        raise
+    _Shared.built = True
+
+
+def _fill_shared():
     _Shared.data_dir = _Shared.tmp / "data"
     write_data_dir(_Shared.data_dir)
     _Shared.dataset = load_dataset(
@@ -210,7 +218,6 @@ def _build_shared():
         meta_trainer=_Shared.trainer,
     )
     _Shared.selection = json.loads(_Shared.selection_path.read_text())
-    _Shared.built = True
 
 
 def tearDownModule():

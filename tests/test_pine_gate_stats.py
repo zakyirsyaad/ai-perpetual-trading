@@ -293,6 +293,11 @@ class SPATests(unittest.TestCase):
         p = spa_pvalue({"a": [1.0, -0.5], "b": [0.2, 0.1]}, n=100, seed=0)
         self.assertTrue(0.0 <= p <= 1.0)
 
+    def test_spa_p_is_never_zero(self):
+        rng = random.Random(3)
+        edge = {"edge": [5.0 + rng.gauss(0.0, 0.1) for _ in range(100)]}
+        self.assertEqual(spa_pvalue(edge, n=200, seed=0), 1 / 201)
+
     def test_spa_validates_input(self):
         with self.assertRaises(ValueError):
             spa_pvalue({}, n=10)

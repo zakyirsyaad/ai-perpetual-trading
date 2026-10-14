@@ -150,6 +150,7 @@ class FillConfig:
     stop_cap_pct: float = 0.4
     overshoot_statistic: str = "median"
     round_up_bps: float = 0.5
+    floor_bps: float = 0.0  # after rounding: a stop never fills better than its level
     min_samples: int = 15
     fallback_bps: float = 1.0
     overshoot_sensitivity_bps: Tuple[float, ...] = (0.0, 1.0, 2.0)
@@ -161,6 +162,9 @@ class FillConfig:
     latency_purpose: str = "entry"
     latency_success_only: bool = True
     latency_since: str = "2026-09-25"
+    # overshoot_since and latency_since are WIB calendar days (midnight at this offset),
+    # like the decision-level view's 2026-08-31
+    since_utc_offset: str = "+07:00"
 
 
 TRENDS = ("E200", "H1", "H4")
@@ -204,7 +208,7 @@ VOL_PARAMS = _freeze({
     "NOT_HIGH": {"enabled": True, "timeframe": "1h", "measure": "ATR14 / close",
                  "atr_len": 14, "rank": "percent rank over previous closed bars",
                  "lookback_1h": _SEL.vol_lookback_1h,
-             "percentile": _SEL.vol_high_pct, "comparison": "<"},
+                 "percentile": _SEL.vol_high_pct, "comparison": "<"},
 })
 VP_PARAMS = _freeze({
     "OFF": {"enabled": False},
@@ -275,73 +279,55 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def spec_document() -> Dict[str, Any]:
-    """Every pre-registered constant as plain JSON data; a fresh dict per call."""
-    doc = {
-        "version": SPEC_VERSION,
-        "exec": asdict(ExecConfig()),
-        "guards": asdict(GuardConfig()),
-        "selection": asdict(SelectionConfig()),
-        "model": asdict(ModelConfig()),
-        "gate": asdict(GateConfig()),
-        "fill": asdict(FillConfig()),
-        "rules": {
-            "signal_timeframe": SIGNAL_TIMEFRAME,
-            "entry": ENTRY_PARAMS,
-            "strength": STRENGTH_PARAMS,
-            "trend": TREND_PARAMS,
-            "vol": VOL_PARAMS,
-            "vp": VP_PARAMS,
-        },
-        "policies": {
-            "eligibility": "at least min_tp_sl take-profit + stop-loss trades over training and "
-                           "combined supply of at least min_supply_per_day per trading day; "
-                           "if no rule is eligible, drop the supply condition and report supply-limited",
-            "selection_rank": "median over B1-B4 of WR - 2 * SE (SE clustered by WIB day); "
-                              "WR > 50 in at least 3 of 4 blocks",
-            "stage_flow": "stage 1 -> 5 best base rules -> stage 2 variants -> best variant by the same ranking",
-            "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "
-                           "base rule, else the next in rank",
-            "overfitting": "PBO by CSCV on 8 CSCV blocks over all evaluated rules must be < 0.5; "
-                           "Hansen SPA of each evaluated rule's direction value is reported: per "
-                           "training trading day the mean over its trades of gross bps (rule side) "
-                           "minus gross bps (seeded random side, one draw per trade, same entry "
-                           "bar and bracket), 0 on a day without trades",
-            "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
-                               "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
-            "contender_choice_order": ["most symbols passed", "higher pooled WR lower bound",
-                                       "simpler (c2, c1, c3)"],
-            "c1_c3_must_beat_c2_holdout_wr": True,
-            "holm": "Holm correction across the 3 contenders within each symbol; an absent "
-                    "contender counts with p = 1",
-            "c0_training": "always long and always short per symbol on training (same clock, "
-                           "offset 0); outside c0 tolerances the test stage refuses to run",
-            "holdout_lock": "under the spec sha256 the test runs once, next to its selection file, "
-                            "on the code (code_sha256) and the training data (train_data_sha256) "
-                            "the selection was made with",
-            "eth_first_sensitivity": True,
-        },
-        "grid": {
-            "trends": list(TRENDS),
-            "entries": list(ENTRIES),
-            "strengths": list(STRENGTHS),
-            "vols": list(VOLS),
-            "vps": list(VPS),
-            "stage1_rules": len(stage1_rules()),
-            "stage2_variants_per_base": len(VOLS) * len(VPS),
-        },
-        "segments": {
-            "train_start": _iso(TRAIN_START),
-            "train_end": _iso(TRAIN_END),
-            "blocks": [[_iso(a), _iso(b)] for a, b in BLOCKS],
-            "cscv_blocks": CSCV_BLOCKS,
-            "holdout_start": _iso(HOLDOUT_START),
-            "holdout_end": _iso(HOLDOUT_END),
-            "last20_start": _iso(LAST20_START),
-            "last20_end": _iso(LAST20_END),
-            "purge_minutes": PURGE_MINUTES,
-            "embargo_minutes": EMBARGO_MINUTES,
-        },
+def _policies() -> Dict[str, Any]:
+    return {
+        "eligibility": "at least min_tp_sl take-profit + stop-loss trades over training and "
+                       "combined supply of at least min_supply_per_day per trading day; "
+                       "if no rule is eligible, drop the supply condition and report supply-limited",
+        "selection_rank": "median over B1-B4 of WR - 2 * SE (SE clustered by WIB day); "
+                          "WR > 50 in at least 3 of 4 blocks",
+        "stage_flow": "stage 1 -> 5 best base rules -> stage 2 variants -> best variant by the same ranking",
+        "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "
+                       "base rule, else the next in rank",
+        "overfitting": "PBO by CSCV on 8 CSCV blocks over all evaluated rules must be < 0.5; "
+                       "Hansen SPA of each evaluated rule's direction value is reported: per "
+                       "training trading day the mean over its trades of gross bps (rule side) "
+                       "minus gross bps (seeded random side, one draw per trade, same entry "
+                       "bar and bracket), 0 on a day without trades",
+        "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
+                           "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
+        "contender_choice_order": ["most symbols passed", "higher pooled WR lower bound",
+                                   "simpler (c2, c1, c3)"],
+        "c1_c3_must_beat_c2_holdout_wr": True,
+        "holm": "Holm correction across the 3 contenders within each symbol; an absent "
+                "contender counts with p = 1",
+        "c0_training": "always long and always short per symbol on training (same clock, "
+                       "offset 0); outside c0 tolerances the test stage refuses to run",
+        "holdout_lock": "under the spec sha256 the test runs once, next to its selection file, "
+                        "on the code (code_sha256) and the training data (train_data_sha256) "
+                        "the selection was made with",
+        "eth_first_sensitivity": True,
+    }
+
+
+def _segments() -> Dict[str, Any]:
+    return {
+        "train_start": _iso(TRAIN_START),
+        "train_end": _iso(TRAIN_END),
+        "blocks": [[_iso(a), _iso(b)] for a, b in BLOCKS],
+        "cscv_blocks": CSCV_BLOCKS,
+        "holdout_start": _iso(HOLDOUT_START),
+        "holdout_end": _iso(HOLDOUT_END),
+        "last20_start": _iso(LAST20_START),
+        "last20_end": _iso(LAST20_END),
+        "purge_minutes": PURGE_MINUTES,
+        "embargo_minutes": EMBARGO_MINUTES,
+    }
+
+
+def _contenders_and_controls() -> Dict[str, Any]:
+    """The contender 2 / 3, reference and control sections of the document."""
+    return {
         "contender2": {
             "near_mean_max_abs_stretch_atr": 0.75,
             "closed_3m_bars": 39,
@@ -383,6 +369,39 @@ def spec_document() -> Dict[str, Any]:
             "permutation_k_min": 7,
             "permutation_k_max": "D - 7",
         },
+    }
+
+
+def spec_document() -> Dict[str, Any]:
+    """Every pre-registered constant as plain JSON data; a fresh dict per call."""
+    doc = {
+        "version": SPEC_VERSION,
+        "exec": asdict(ExecConfig()),
+        "guards": asdict(GuardConfig()),
+        "selection": asdict(SelectionConfig()),
+        "model": asdict(ModelConfig()),
+        "gate": asdict(GateConfig()),
+        "fill": asdict(FillConfig()),
+        "rules": {
+            "signal_timeframe": SIGNAL_TIMEFRAME,
+            "entry": ENTRY_PARAMS,
+            "strength": STRENGTH_PARAMS,
+            "trend": TREND_PARAMS,
+            "vol": VOL_PARAMS,
+            "vp": VP_PARAMS,
+        },
+        "policies": _policies(),
+        "grid": {
+            "trends": list(TRENDS),
+            "entries": list(ENTRIES),
+            "strengths": list(STRENGTHS),
+            "vols": list(VOLS),
+            "vps": list(VPS),
+            "stage1_rules": len(stage1_rules()),
+            "stage2_variants_per_base": len(VOLS) * len(VPS),
+        },
+        "segments": _segments(),
+        **_contenders_and_controls(),
     }
     return _plain(doc)
 

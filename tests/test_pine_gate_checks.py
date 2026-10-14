@@ -259,6 +259,9 @@ class ParseDecisionTests(unittest.TestCase):
         self.assertIsNone(parse_decision(row(created="yesterday")))
         self.assertIsNone(parse_decision({"symbol": "BTC/USDT"}))
         self.assertIsNone(parse_decision(row(symbol=None)))
+        for action in (["OPEN_LONG"], {"a": 1}, 1, None):
+            with self.subTest(action=action):
+                self.assertIsNone(parse_decision(row(action=action)))
 
     def test_timestamps_accept_z_and_odd_fraction_lengths(self):
         base = parse_decision(row(created="2026-09-01T03:00:00+00:00")).created_ms

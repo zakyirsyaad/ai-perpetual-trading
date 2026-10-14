@@ -108,7 +108,11 @@ def _wib_iso(t_ms: int) -> str:
 
 
 def covered(times: Sequence[int], unit: str) -> str:
-    """``covers <first> .. <last>, N <unit>`` (WIB) for a file being skipped."""
+    """``covers <first> .. <last>, N <unit>`` (WIB) for a file being skipped; anything
+    but a list of integer milliseconds is a ``ValueError``."""
+    if not isinstance(times, (list, tuple)) or any(
+            isinstance(t, bool) or not isinstance(t, int) for t in times):
+        raise ValueError(f"expected a list of integer milliseconds, got {str(times)[:80]}")
     if not times:
         return f"covers nothing, 0 {unit}"
     return f"covers {_wib_iso(times[0])} .. {_wib_iso(times[-1])}, {len(times)} {unit}"
@@ -161,8 +165,11 @@ def cmd_funding(args: argparse.Namespace) -> int:
         path = funding_path(args.data_dir, symbol)
         if path.exists():
             saved = json.loads(path.read_text(encoding="utf-8"))
-            times = saved if isinstance(saved, list) else []
-            print(f"{label}: skipped, file exists ({covered(times, 'times')})")
+            try:
+                coverage = covered(saved, "times")
+            except ValueError as exc:
+                raise ValueError(f"{path}: {exc}") from None
+            print(f"{label}: skipped, file exists ({coverage})")
             continue
         pace()
         try:

@@ -275,6 +275,16 @@ class ModelTests(unittest.TestCase):
                       threshold=0.5, C=1.0)
 
 
+class BestCTests(unittest.TestCase):
+    def test_lowest_pooled_loss_wins_and_non_finite_scores_are_refused(self):
+        self.assertEqual(metalabel._best_C({0.1: [0.6, 0.6], 1.0: [0.7, 0.5]}, [10, 30]), 1.0)
+        self.assertEqual(metalabel._best_C({0.1: [0.5], 1.0: [0.5]}, [5]), 0.1)  # tie: smaller
+        for losses in ({0.1: [math.nan], 1.0: [math.inf]}, {}):
+            with self.subTest(losses=losses):
+                with self.assertRaises(ValueError):
+                    metalabel._best_C(losses, [5])
+
+
 class ReliabilityTests(unittest.TestCase):
     def test_reliability_bins_non_empty_deciles(self):
         rows = reliability([0.05, 0.08, 0.55, 0.59, 1.0], [0, 1, 1, 1, 1])

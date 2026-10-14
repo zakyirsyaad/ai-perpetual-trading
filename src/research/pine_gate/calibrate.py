@@ -55,7 +55,8 @@ _FILL = FillConfig()
 
 
 def _day_start_iso(day: str) -> str:
-    return f"{day}T00:00:00+00:00"
+    """Midnight of a ``FillConfig`` date in its offset (WIB)."""
+    return f"{day}T00:00:00{_FILL.since_utc_offset}"
 
 
 DEFAULT_LATENCY_SINCE = _day_start_iso(_FILL.latency_since)
@@ -298,11 +299,12 @@ def s_star(
     min_samples: int = _FILL.min_samples,
     fallback: float = _FILL.fallback_bps,
 ) -> float:
-    """Median overshoot rounded UP to the next 0.5 bp; ``fallback`` below ``min_samples``."""
+    """Median overshoot rounded UP to the next 0.5 bp, never below ``FillConfig.floor_bps``
+    (0: a stop never fills better than its level); ``fallback`` below ``min_samples``."""
     if len(samples) < min_samples:
         return fallback
     step = _FILL.round_up_bps
-    return math.ceil(statistics.median(samples) / step) * step
+    return max(_FILL.floor_bps, math.ceil(statistics.median(samples) / step) * step)
 
 
 async def load_calibration(

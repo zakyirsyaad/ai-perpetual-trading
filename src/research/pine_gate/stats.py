@@ -296,6 +296,42 @@ def _validate_spa(daily_diff: Mapping[str, Sequence[float]], n: int, mean_block:
     return t
 
 
+def _boot_means(series: Sequence[Sequence[float]], n: int, mean_block: float,
+                seed: int) -> List[List[float]]:
+    """``n`` stationary-bootstrap means per series, one shared index path per draw."""
+    t = len(series[0])
+    prefixes = []
+    for x in series:
+        acc = [0.0]
+        for v in list(x) + list(x):
+            acc.append(acc[-1] + v)
+        prefixes.append(acc)
+    rng = random.Random(seed)
+    boot = [[0.0] * n for _ in series]
+    for b in range(n):
+        path = _stationary_path(rng, t, mean_block)
+        for k, pre in enumerate(prefixes):
+            boot[k][b] = sum(pre[s + length] - pre[s] for s, length in path) / t
+    return boot
+
+
+def _spa_active(series: Sequence[Sequence[float]], means: Sequence[float],
+                boot: Sequence[Sequence[float]]) -> List[Tuple[int, float, float]]:
+    """(k, omega_k, g_k) of every rule that is not numerically constant."""
+    t, n = len(series[0]), len(boot[0])
+    root_t = math.sqrt(t)
+    threshold = math.sqrt(2 * math.log(math.log(t))) if t >= 3 else 0.0
+    active = []
+    for k, x in enumerate(series):
+        omega = math.sqrt(sum((root_t * (v - means[k])) ** 2 for v in boot[k]) / n)
+        scale = root_t * max(1.0, max(abs(v) for v in x))
+        if omega <= _OMEGA_REL_TOL * scale:
+            continue
+        g = means[k] if root_t * means[k] / omega >= -threshold else 0.0
+        active.append((k, omega, g))
+    return active
+
+
 def spa_pvalue(
     daily_diff: Mapping[str, Sequence[float]],
     n: int = 2000,
@@ -313,57 +349,25 @@ def spa_pvalue(
       1994; mean block ``mean_block``, wrap-around) draws n index paths with
       ``random.Random(seed)``, the same path applied to every rule.
     - omega_k^2 = (1/n) * sum_b (sqrt(T) * (d*_kb - d_k))^2, Hansen's bootstrap
-      variance estimator (E*[d*_k] = d_k under the circular stationary
-      bootstrap). A rule with omega_k numerically zero (a constant series) is
-      excluded from the maxima.
+      variance estimator. A rule with omega_k numerically zero (a constant
+      series) is excluded from the maxima.
     - T_SPA = max(0, max_k sqrt(T) * d_k / omega_k).
     - Consistent recentring: g_k = d_k * 1{sqrt(T) * d_k / omega_k >=
-      -sqrt(2 ln ln T)} (threshold 0 when T < 3, where ln ln T <= 0), and the
-      null draw is Z*_kb = d*_kb - g_k. A rule that is not clearly below the
-      benchmark is centred at zero (d* - d); a clearly worse one keeps its
-      negative mean (d*) and so drops out of the max. This is Hansen's
-      d* - d + mu^c with mu^c = d * 1{sqrt(T) d / omega < -sqrt(2 ln ln T)}.
-      (Adding g_k to d* - d instead would keep a winner's own mean in the null
-      distribution and leave the test without power.)
+      -sqrt(2 ln ln T)} (threshold 0 when T < 3), null draw Z*_kb = d*_kb - g_k:
+      Hansen's d* - d + mu^c with mu^c = d * 1{sqrt(T) d / omega < -sqrt(2 ln ln T)}.
     - T*_b = max(0, max_k sqrt(T) * (d*_kb - g_k) / omega_k);
-      p = #{T*_b >= T_SPA} / n.
+      p = (1 + #{T*_b >= T_SPA}) / (1 + n), never 0, like every other p here.
     """
     t = _validate_spa(daily_diff, n, mean_block)
-    keys = sorted(daily_diff)
-    series = [list(map(float, daily_diff[k])) for k in keys]
+    series = [list(map(float, daily_diff[k])) for k in sorted(daily_diff)]
     means = [sum(x) / t for x in series]
-    prefixes = []
-    for x in series:
-        acc = [0.0]
-        for v in x + x:
-            acc.append(acc[-1] + v)
-        prefixes.append(acc)
-
-    rng = random.Random(seed)
-    boot = [[0.0] * n for _ in keys]
-    for b in range(n):
-        path = _stationary_path(rng, t, mean_block)
-        for k, pre in enumerate(prefixes):
-            boot[k][b] = sum(pre[s + length] - pre[s] for s, length in path) / t
-
+    boot = _boot_means(series, n, mean_block, seed)
+    active = _spa_active(series, means, boot)
     root_t = math.sqrt(t)
-    threshold = math.sqrt(2 * math.log(math.log(t))) if t >= 3 else 0.0
-    active = []  # (k, omega_k, g_k)
-    for k, x in enumerate(series):
-        omega = math.sqrt(sum((root_t * (v - means[k])) ** 2 for v in boot[k]) / n)
-        scale = root_t * max(1.0, max(abs(v) for v in x))
-        if omega <= _OMEGA_REL_TOL * scale:
-            continue
-        g = means[k] if root_t * means[k] / omega >= -threshold else 0.0
-        active.append((k, omega, g))
-
     observed = max([0.0] + [root_t * means[k] / omega for k, omega, _ in active])
     hits = 0
     for b in range(n):
-        stat = max(
-            [0.0]
-            + [root_t * (boot[k][b] - g) / omega for k, omega, g in active]
-        )
+        stat = max([0.0] + [root_t * (boot[k][b] - g) / omega for k, omega, g in active])
         if stat >= observed:
             hits += 1
-    return hits / n
+    return (1 + hits) / (1 + n)

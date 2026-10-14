@@ -1,7 +1,5 @@
 import argparse
-import asyncio
 import contextlib
-import gzip
 import hashlib
 import io
 import json
@@ -425,6 +423,55 @@ class FundingCommandTest(Dirs):
         self.assertEqual(code, 0)
         self.assertIn("prod/BTC-USDT funding: skipped, file exists (covers "
                       "2026-07-01T00:00:00+07:00 .. 2026-07-01T16:00:00+07:00, 3 times)", out)
+
+
+class CoveredTest(unittest.TestCase):
+    def test_covered_refuses_anything_but_integer_milliseconds(self):
+        from research.pine_gate import cli_data
+
+        self.assertEqual(cli_data.covered([], "times"), "covers nothing, 0 times")
+        for times in (["a"], [1.5], [True], [None], [[1]]):
+            with self.subTest(times=times):
+                with self.assertRaises(ValueError):
+                    cli_data.covered(times, "times")
+
+    def test_a_corrupt_funding_file_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            path = funding_path(data, "BTC-USDT")
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(["x"]), encoding="utf-8")
+            code, _, err = run_cli(["--data-dir", str(data), "--out-dir", str(data / "o"),
+                                    "funding", "--start", "2026-07-01", "--end", "2026-07-02"])
+        self.assertEqual(code, 1)
+        self.assertIn("integer", err)
+        self.assertNotIn("Traceback", err)
+
+
+class DebugTracebackTest(Dirs):
+    def test_pine_gate_debug_prints_the_traceback_of_an_expected_error(self):
+        path = self.root / "keep.json"
+        path.write_text("keep", encoding="utf-8")
+        code, _, err = run_cli(["spec", "--write", str(path)])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        with mock.patch.dict("os.environ", {"PINE_GATE_DEBUG": "1"}):
+            code, _, err = run_cli(["spec", "--write", str(path)])
+        self.assertEqual(code, 1)
+        self.assertIn("Traceback", err)
+        self.assertIn("FileExistsError", err)
+
+    def test_live_steps_stay_type_only_even_in_debug_mode(self):
+        def broken():
+            raise RuntimeError("SECRET_VALUE_xyz must be set")
+
+        with mock.patch.dict("os.environ", {"PINE_GATE_DEBUG": "1"}), \
+                mock.patch.object(cli_common, "make_settings", broken):
+            code, _, err = run_cli(self.base_args() + ["calibrate"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("SECRET_VALUE_xyz", err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("RuntimeError", err)
 
 
 class CollectCommandTest(Dirs):

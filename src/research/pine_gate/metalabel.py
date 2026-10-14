@@ -381,13 +381,16 @@ def _validated_grid(c_grid: Sequence[float]) -> Tuple[float, ...]:
 
 
 def _best_C(losses: Mapping[float, Sequence[float]], sizes: Sequence[int]) -> float:
-    """Lowest pooled (size-weighted) log-loss; ties go to the smaller C."""
+    """Lowest pooled (size-weighted) log-loss; ties go to the smaller C. ``ValueError``
+    when no C has a finite score."""
     total = sum(sizes)
     best, best_score = None, math.inf
     for C in sorted(losses):
         score = sum(n * v for n, v in zip(sizes, losses[C])) / total
-        if score < best_score:
+        if math.isfinite(score) and score < best_score:
             best, best_score = C, score
+    if best is None:
+        raise ValueError(f"no penalty C has a finite validation log-loss: {dict(losses)!r}")
     return best
 
 
@@ -456,6 +459,7 @@ def train_meta(
     model = replace(_fit_candidates(list(candidates), chosen), threshold=threshold)
     diagnostics = {
         "cv_logloss": losses,
+        "fold_sizes": list(sizes),
         "chosen_C": chosen,
         "oof": [[c.symbol, c.t_ms, p, c.label] for c, p in pairs],
         "reliability": reliability([p for _, p in pairs], [c.label for c, _ in pairs]),

@@ -476,18 +476,29 @@ def _metalabel(selection: Any) -> Lines:
         return ["Tidak ada model meta-labeling (aturan primer tidak tersedia atau data belum "
                 f"tersedia): {NOT_AVAILABLE}.", ""]
     losses = _mapping(sel.get("cv_logloss"))
-    loss_rows = [[c, ", ".join(fmt_dec(x, 4) for x in v),
-                  fmt_dec(sum(v) / len(v), 4) if v else NA]
+    sizes = sel.get("cv_fold_sizes")
+    loss_rows = [[c, ", ".join(fmt_dec(x, 4) for x in v), fmt_dec(_pooled_loss(v, sizes), 4)]
                  for c, v in sorted(losses.items(), key=lambda kv: float(kv[0]))]
     rel_rows = [[fmt_dec(r[0], 3), fmt_dec(r[1], 3), fmt_int(r[2])]
                 for r in (sel.get("reliability") or []) if len(r) == 3]
     head = [f"- C terpilih: {fmt_dec(sel.get('chosen_C'), 3)}; ambang probabilitas: "
             f"{fmt_dec(_get(sel, 'meta_model', 'threshold'), 2)}; kandidat: "
             f"{fmt_int(sel.get('n_candidates'))}; prediksi di luar sampel: {fmt_int(sel.get('n_oof'))}.",
-            "", "Log-loss validasi per lipatan (jendela memanjang B1–B4):", ""]
+            "", "Log-loss validasi per lipatan (jendela memanjang B1–B4); rata-rata dibobot "
+            "ukuran lipatan, sama dengan pemilihan C:", ""]
     return (head + _table(["C", "log-loss per lipatan", "rata-rata"], loss_rows)
             + ["Kalibrasi (prediksi vs frekuensi teramati):", ""]
             + _table(["rata-rata prediksi", "frekuensi teramati", "n"], rel_rows))
+
+
+def _pooled_loss(losses: Any, sizes: Any) -> Optional[float]:
+    """Fold-size weighted mean log-loss (as ``metalabel._best_C``); ``None`` without sizes."""
+    if not isinstance(sizes, list) or not isinstance(losses, list) or len(sizes) != len(losses):
+        return None
+    if (not sizes or any(_num(n) is None or n <= 0 for n in sizes)
+            or any(_num(x) is None for x in losses)):
+        return None
+    return sum(n * x for n, x in zip(sizes, losses)) / sum(sizes)
 
 
 # --------------------------------------------------------------------------- holdout
@@ -523,7 +534,9 @@ def _holdout_section(holdout: Any) -> Lines:
                "net/1M", "net/1M (fee 0.05%)", "WR separuh 1 / 2", "transaksi/hari",
                "transaksi/hari 20 hari", "gerbang"]
     lines = ["WR = TP / (TP + SL); time stop dilaporkan terpisah. Gross dihitung atas semua "
-             f"transaksi. Acuan bot live: {LIVE_BASELINE_PER_1M} per 1M.", ""]
+             f"transaksi. Acuan bot live: {LIVE_BASELINE_PER_1M} per 1M. Entri diisi pada "
+             "harga penutupan bar 1m yang memuat waktu order (tick + latensi AI + 5 detik, "
+             "spec 5.10), bukan pada harga saat order dikirim.", ""]
     lines += _table(headers, rows)
     ref = _reference_rows(holdout)
     if ref:
@@ -702,8 +715,19 @@ def _cadence_section(holdout: Any) -> Lines:
     lines += _table(["Kontender", "pasokan tanpa guard", "sinyal kedua simbol",
                      "tick sinyal ganda"], guards)
     lines += ["Per simbol dengan guard dimatikan:", ""]
-    return lines + _table(["Kontender", "Simbol", "n", "WR", "gross bps", "transaksi/hari"],
-                          _guard_symbol_rows(holdout))
+    lines += _table(["Kontender", "Simbol", "n", "WR", "gross bps", "transaksi/hari"],
+                    _guard_symbol_rows(holdout))
+    lines += ["Sensitivitas overshoot stop (hanya dilaporkan; 2 bps ada di kriteria 6):", ""]
+    return lines + _table(["Kontender", "overshoot bps", "Simbol", "WR", "gross bps", "net/1M"],
+                          _overshoot_rows(holdout))
+
+
+def _overshoot_rows(holdout: Any) -> List[List[Any]]:
+    runs = _mapping(_get(holdout, "sensitivities", "overshoot"))
+    return [[_label(name), bps, s, fmt_wr(_get(m, "wr")), fmt_bps(_get(m, "gross_bps")),
+             fmt_money(_net(_get(m, "gross_bps")))]
+            for name in sorted(runs) for bps, symbols in sorted(_mapping(runs[name]).items())
+            for s, m in sorted(_mapping(symbols).items())]
 
 
 def _kesimpulan(verdict: str) -> Lines:
@@ -724,7 +748,7 @@ def _render(results: Mapping[str, Any], verdict: str) -> str:
         _kesimpulan(verdict),
     )
     lines = _sha_header(results)
-    for title, body in zip(SECTION_TITLES, bodies):
+    for title, body in zip(SECTION_TITLES, bodies, strict=True):
         lines += _section(title, body)
     return "\n".join(lines).rstrip("\n") + "\n"
 

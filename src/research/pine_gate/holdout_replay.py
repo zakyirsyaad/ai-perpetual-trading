@@ -52,6 +52,10 @@ PERMUTATION_K_MIN: int = spec_document()["controls"]["permutation_k_min"]  # k i
 LB_Z = SelectionConfig().z
 _FILL = FillConfig()
 FEE_SENSITIVITY_PCT = _FILL.fee_sensitivity_pct
+# Spec 5.10 "sensitivity 0/1/2 bps": 2 bps is criterion 6's rerun; 0 and 1 are reported.
+OVERSHOOT_SENSITIVITY_BPS: Tuple[float, ...] = tuple(
+    b for b in _FILL.overshoot_sensitivity_bps if b != GateConfig().robust_overshoot_bps
+)
 BOTH_TOUCH_REPORT_PCT = _FILL.both_touch_report_pct
 
 

@@ -1,7 +1,7 @@
 import unittest
 
 from research.pine_gate.bars import bars_from_rows
-from research.pine_gate.outcomes import Outcome, OutcomeCache, bracket_outcome, gross_bps
+from research.pine_gate.outcomes import OutcomeCache, bracket_outcome, gross_bps
 from research.pine_gate.spec import ExecConfig
 
 MIN = 60_000

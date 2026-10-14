@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from research.pine_gate import calibrate
+from research.pine_gate.spec import FillConfig
+from research.pine_gate.timeparse import parse_iso_datetime
 from research.pine_gate.calibrate import (
     MAX_PAGES,
     PAGE_SIZE,
@@ -51,7 +53,9 @@ class FakeRows:
                 want = value[3:]
                 rows = [r for r in rows if str(r.get(key)).lower() == want]
             elif value.startswith("gte."):
-                rows = [r for r in rows if str(r.get(key)) >= value[4:]]
+                bound = parse_iso_datetime(value[4:])
+                rows = [r for r in rows if parse_iso_datetime(r.get(key)) is not None
+                        and parse_iso_datetime(r.get(key)) >= bound]
             elif value.startswith("in.("):
                 allowed = value[4:-1].split(",")
                 rows = [r for r in rows if r.get(key) in allowed]
@@ -108,7 +112,8 @@ class LatencyTests(unittest.TestCase):
         rows = [
             metric("2026-09-26T00:00:00+00:00", 1500.0, idx=1),
             metric("2026-09-27T00:00:00+00:00", 2500.5, idx=2),
-            metric("2026-09-24T23:59:59+00:00", 999.0, idx=3),  # before since
+            metric("2026-09-24T16:59:59+00:00", 999.0, idx=3),  # before 2026-09-25 00:00 WIB
+            metric("2026-09-24T17:00:00+00:00", 1000.0, idx=9),  # 2026-09-25 00:00 WIB
             metric("2026-09-28T00:00:00+00:00", 700.0, purpose="exit", idx=4),
             metric("2026-09-28T00:00:00+00:00", 800.0, success=False, idx=5),
             metric("2026-09-29T00:00:00+00:00", float("nan"), idx=6),
@@ -119,11 +124,11 @@ class LatencyTests(unittest.TestCase):
 
         result = asyncio.run(load_entry_latencies_ms(fake, "ai_call_metrics"))
 
-        self.assertEqual(result, [1500.0, 2500.5])
+        self.assertEqual(result, [1000.0, 1500.0, 2500.5])
         params = dict(fake.calls[0][1])
         self.assertEqual(params["purpose"], "eq.entry")
         self.assertEqual(params["success"], "eq.true")
-        self.assertEqual(params["created_at"], "gte.2026-09-25T00:00:00+00:00")
+        self.assertEqual(params["created_at"], "gte.2026-09-25T00:00:00+07:00")
 
     def test_paging_returns_all_rows_across_pages(self):
         rows = [
@@ -175,10 +180,10 @@ class StopReconstructionTests(unittest.TestCase):
         trade_params = dict(fake.calls[0][1])
         self.assertEqual(trade_params["reason"], "eq.stop_loss")
         self.assertEqual(trade_params["exchange"], "eq.bingx")
-        self.assertEqual(trade_params["opened_at"], "gte.2026-09-12T00:00:00+00:00")
+        self.assertEqual(trade_params["opened_at"], "gte.2026-09-12T00:00:00+07:00")
         decision_params = dict(fake.calls[1][1])
         self.assertEqual(decision_params["action"], "in.(OPEN_LONG,OPEN_SHORT)")
-        self.assertEqual(decision_params["created_at"], "gte.2026-09-11T00:00:00+00:00")
+        self.assertEqual(decision_params["created_at"], "gte.2026-09-11T00:00:00+07:00")
 
     def test_latest_matching_decision_in_window_is_used(self):
         trades = [stop_trade(1, "LONG", 100.0, 99.5, T0)]
@@ -364,12 +369,23 @@ class ReadOnlyReaderTests(unittest.TestCase):
         self.assertTrue(store.closed)
 
 
+class CalibrationPolicyTests(unittest.TestCase):
+    def test_floor_and_wib_dates_live_in_the_hashed_fill_policy(self):
+        fill = FillConfig()
+        self.assertEqual(fill.floor_bps, 0.0)
+        self.assertEqual(fill.since_utc_offset, "+07:00")
+        self.assertEqual(calibrate.DEFAULT_OVERSHOOT_SINCE, "2026-09-12T00:00:00+07:00")
+        self.assertEqual(calibrate.DEFAULT_LATENCY_SINCE, "2026-09-25T00:00:00+07:00")
+
+
 class SStarTests(unittest.TestCase):
     def test_s_star_rounds_up_to_half_bp(self):
         self.assertEqual(s_star([1.2] * 15), 1.5)
         self.assertEqual(s_star([1.5] * 15), 1.5)
         self.assertEqual(s_star([1.51] * 15), 2.0)
-        self.assertEqual(s_star([-0.7] * 15), -0.5)
+        self.assertEqual(s_star([-0.7] * 15), 0.0)  # never better than the stop level
+        self.assertEqual(s_star([-3.0] * 15), 0.0)
+        self.assertEqual(s_star([0.2] * 15), 0.5)
         self.assertEqual(s_star(list(range(1, 17))), 8.5)  # median 8.5
 
     def test_s_star_falls_back_below_15_samples(self):

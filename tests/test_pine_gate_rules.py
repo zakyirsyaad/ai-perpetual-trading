@@ -259,9 +259,6 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(reference_signal(snap(rsi5_5m=30.0, close_5m=100.0, ema125_5m=None, adx11_5m=25.0)), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 _LONG_VALUES = {
     "close_5m": 110.0, "ema200_5m": 100.0, "ema125_5m": 100.0, "atr14_5m": 1.0,
@@ -330,3 +327,7 @@ class RequiredFieldsTests(unittest.TestCase):
             for name in fields:
                 self.assertEqual(signal(replace(only(fields), **{name: None})), 0,
                                  f"{signal.__name__} without {name}")
+
+
+if __name__ == "__main__":
+    unittest.main()

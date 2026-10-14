@@ -90,6 +90,8 @@ def make_holdout(passed=True, c0_ok=True, tp=120, sl=80):
                                "combined_supply": 11.0} for n in names},
             "reference": {s: symbol_block("ref", s, False) for s in (BTC, ETH)},
             "fee_pct": 0.05,
+            "overshoot": {n: {b: {s: dict(brief, wr=wr) for s in (BTC, ETH)}
+                              for b, wr in (("0.0", 53.5), ("1.0", 52.7))} for n in names},
         },
         "chosen": "c2" if passed else None, "symbols_to_trade": winners,
         "period": {"start_ms": 1, "end_ms": 2, "last20_start_ms": 1, "last20_end_ms": 2},
@@ -123,7 +125,8 @@ def make_selection():
         "regime_counts": {s: {t: {"2025-08": regime_cell(), "2025-09": regime_cell(40)}
                               for t in ("E200", "H1", "H4")} for s in (BTC, ETH)},
         "meta_model": {"threshold": 0.6, "C": 0.1}, "chosen_C": 0.1,
-        "cv_logloss": {"0.1": [0.69, 0.68, 0.67, 0.69], "1.0": [0.70, 0.69, 0.68, 0.70]},
+        "cv_logloss": {"0.1": [0.69, 0.68, 0.67], "1.0": [0.70, 0.69, 0.60]},
+        "cv_fold_sizes": [100, 100, 200],
         "reliability": [[0.52, 0.50, 100], [0.61, 0.58, 80]], "n_oof": 180,
         "n_candidates": 200, "spec_sha256": SHA["spec"], "code_sha256": SHA["code"],
         "c0_training": {s: {"long": {"n": 900, "wr": 50.4, "gross_bps": -0.6},
@@ -254,6 +257,30 @@ class RenderMarkdownTests(unittest.TestCase):
     def test_decision_supply_is_labelled_uncorrected(self, _):
         text = section(render_markdown(make_results()), "Keputusan AI")
         self.assertIn("belum dikoreksi untuk tick saat posisi terbuka", text)
+
+    def test_logloss_summary_is_the_fold_size_weighted_mean(self, _):
+        meta = section(render_markdown(make_results()), "Model meta-labeling")
+        self.assertIn("| 0.1 | 0.6900, 0.6800, 0.6700 | 0.6775 |", meta)  # (69+68+2*67)/4
+        self.assertIn("| 1.0 | 0.7000, 0.6900, 0.6000 | 0.6475 |", meta)
+        results = make_results()
+        del results["selection"]["cv_fold_sizes"]
+        meta = section(render_markdown(results), "Model meta-labeling")
+        self.assertIn("| 0.1 | 0.6900, 0.6800, 0.6700 | – |", meta)
+
+    def test_overshoot_sensitivity_is_reported(self, _):
+        text = section(render_markdown(make_results()), "Biaya kadens dan guard")
+        self.assertIn("overshoot stop", text)
+        self.assertIn("53.5%", text)
+        self.assertIn("52.7%", text)
+
+    def test_fill_caveat_names_the_bar_containing_the_order(self, _):
+        text = section(render_markdown(make_results()), "Periode uji")
+        self.assertIn("penutupan bar 1m yang memuat waktu order", text)
+
+    def test_sections_and_titles_must_line_up(self, _):
+        with mock.patch.object(report, "SECTION_TITLES", SECTION_TITLES[:-1]):
+            with self.assertRaises(ValueError):
+                render_markdown(make_results())
 
     def test_results_without_any_key_still_render(self, _):
         self.assertEqual(headings(render_markdown({})), list(SECTION_TITLES))

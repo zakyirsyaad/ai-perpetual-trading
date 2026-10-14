@@ -7,16 +7,19 @@ check-data), ``cli_stages`` (calibrate, train, test, report) and ``cli_checks``
 errors to exit codes.
 
 Exit codes: 0 success, 1 an expected failure (one ``error:`` line on stderr),
-2 a usage error or a holdout-lock refusal. Expected errors never print a
-traceback, and nothing ever prints secrets or environment values. Output files
-are never overwritten.
+2 a usage error or a holdout-lock refusal. Expected errors print no traceback
+unless ``PINE_GATE_DEBUG=1``; steps that touch the bot's settings or Supabase
+(``cli_common.call_live``) stay type-only even then, and nothing ever prints
+secrets or environment values. Output files are never overwritten.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import traceback
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -77,7 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+DEBUG_ENV = "PINE_GATE_DEBUG"
+
+
 def _fail(prefix: str, exc: BaseException) -> None:
+    """One line; with ``PINE_GATE_DEBUG=1`` the traceback first, except for ``CliError``
+    (call_live failures carry only the exception type, by design)."""
+    if os.environ.get(DEBUG_ENV) == "1" and not isinstance(exc, common.CliError):
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
     print(f"{prefix}: {common.one_line(exc)}", file=sys.stderr)
 
 

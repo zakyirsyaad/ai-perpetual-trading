@@ -93,73 +93,60 @@ def _wr(kinds: Sequence[str]) -> Optional[float]:
     return 100.0 * tp / (tp + sl) if tp + sl else None
 
 
+def _outcome_kinds(
+    prod: FeatureFrame, vst: FeatureFrame, prod_side: int, t: int, cfg: ExecConfig,
+    caches: Tuple[OutcomeCache, OutcomeCache],
+) -> Optional[Tuple[str, str]]:
+    """Bracket outcome kinds on production and VST for an order at ``t`` + order delay
+    (no latency) on the production side; ``None`` when either is unresolved."""
+    order_ms = t + cfg.order_delay_s * _MS_PER_SECOND
+    i_prod = entry_index_for(prod.bars_1m, order_ms)
+    i_vst = entry_index_for(vst.bars_1m, order_ms)
+    if i_prod is None or i_vst is None:
+        return None
+    o_prod = caches[0].get(i_prod, prod_side)
+    o_vst = caches[1].get(i_vst, prod_side)
+    if o_prod is None or o_vst is None:
+        return None
+    return o_prod.kind, o_vst.kind
+
+
 def vst_agreement(
     prod: FeatureFrame,
     vst: FeatureFrame,
     signal_for: Callable[[FeatureFrame, FeatureFrame, int], int],
     times: Sequence[int],
     cfg: ExecConfig,
-    *,
-    overshoot_bps: float = 1.0,
 ) -> Agreement:
     """Compare signal sides and bracket outcomes on VST and production data.
 
     ``signal_for(features, poc_frame, t)`` is called as ``(prod, prod, t)`` and
     ``(vst, prod, t)`` so volume-profile rules read the production POC on both
-    sides. Outcomes are compared at times where the production side is not 0:
-    the order is placed at ``t + cfg.order_delay_s`` (no latency), enters on the
-    1m bar containing it on each data set, and both walk the production side.
-    A time is skipped when either outcome is unresolved; the win rates use the
-    same compared entries. ``overshoot_bps`` is accepted for call-site symmetry
-    with the simulator and does not affect outcome kinds.
+    sides. Outcomes are compared where the production side is not 0
+    (``_outcome_kinds``); the win rates use the same compared entries. Outcome
+    kinds do not depend on the stop overshoot.
     """
-    del overshoot_bps
-    prod_cache = OutcomeCache(prod.bars_1m, cfg)
-    vst_cache = OutcomeCache(vst.bars_1m, cfg)
+    caches = (OutcomeCache(prod.bars_1m, cfg), OutcomeCache(vst.bars_1m, cfg))
     same_side = 0
-    prod_kinds: List[str] = []
-    vst_kinds: List[str] = []
+    kinds: List[Tuple[str, str]] = []
     for t in times:
         side_prod = signal_for(prod, prod, t)
-        side_vst = signal_for(vst, prod, t)
-        if side_prod == side_vst:
-            same_side += 1
-        if side_prod == 0:
-            continue
-        order_ms = t + cfg.order_delay_s * _MS_PER_SECOND
-        i_prod = entry_index_for(prod.bars_1m, order_ms)
-        i_vst = entry_index_for(vst.bars_1m, order_ms)
-        if i_prod is None or i_vst is None:
-            continue
-        o_prod = prod_cache.get(i_prod, side_prod)
-        o_vst = vst_cache.get(i_vst, side_prod)
-        if o_prod is None or o_vst is None:
-            continue
-        prod_kinds.append(o_prod.kind)
-        vst_kinds.append(o_vst.kind)
-
-    n = len(times)
-    compared = len(prod_kinds)
-    same_kind = sum(1 for a, b in zip(prod_kinds, vst_kinds) if a == b)
-    wr_prod = _wr(prod_kinds)
-    wr_vst = _wr(vst_kinds)
+        same_side += side_prod == signal_for(vst, prod, t)
+        pair = _outcome_kinds(prod, vst, side_prod, t, cfg, caches) if side_prod else None
+        if pair is not None:
+            kinds.append(pair)
+    n, compared = len(times), len(kinds)
+    same_kind = sum(1 for a, b in kinds if a == b)
+    wr_prod, wr_vst = _wr([a for a, _ in kinds]), _wr([b for _, b in kinds])
     passed = (
-        n > 0
-        and compared > 0
-        and wr_prod is not None
-        and wr_vst is not None
+        n > 0 and compared > 0 and wr_prod is not None and wr_vst is not None
         and same_side * 100 >= SIDE_AGREE_MIN * 100 * n - _EPS
         and same_kind * 100 >= OUTCOME_AGREE_MIN * 100 * compared - _EPS
         and abs(wr_prod - wr_vst) <= WR_DIFF_MAX_PTS + _EPS
     )
-    return Agreement(
-        n=n,
-        side_agree=same_side / n if n else None,
-        outcome_agree=same_kind / compared if compared else None,
-        wr_prod=wr_prod,
-        wr_vst=wr_vst,
-        passed=passed,
-    )
+    return Agreement(n=n, side_agree=same_side / n if n else None,
+                     outcome_agree=same_kind / compared if compared else None,
+                     wr_prod=wr_prod, wr_vst=wr_vst, passed=passed)
 
 
 # --- AI decisions ----------------------------------------------------------
@@ -183,7 +170,8 @@ def parse_decision(row: Dict[str, Any]) -> Optional[DecisionRow]:
     if not isinstance(row, dict):
         return None
     symbol = row.get("symbol")
-    side = _SIDES.get(row.get("action"))
+    action = row.get("action")
+    side = _SIDES.get(action) if isinstance(action, str) else None
     created_ms = parse_iso_ms(row.get("created_at"))
     confidence = row.get("confidence")
     if not isinstance(symbol, str) or not symbol or side is None or created_ms is None:

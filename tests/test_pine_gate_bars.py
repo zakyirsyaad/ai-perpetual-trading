@@ -5,7 +5,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from research.pine_gate.bars import (
-    Bars,
     BarGapError,
     MissingDayError,
     aggregate,

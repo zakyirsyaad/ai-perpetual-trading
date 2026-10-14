@@ -81,6 +81,57 @@ class ExclusiveWriterTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / "nan.json").exists())
 
 
+BOT = SRC / "bot"
+FORBIDDEN_IN_RESEARCH = ("bingx_client", "_signed_request", "X-BX-APIKEY", "listenKey")
+
+
+def _imports(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            yield from (alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            yield node.module
+
+
+class IsolationTests(unittest.TestCase):
+    """The bot never imports research; research never touches private venue code (E8)."""
+
+    def test_no_bot_module_or_main_imports_research(self):
+        paths = sorted(BOT.rglob("*.py")) + [SRC / "main.py"]
+        self.assertGreater(len(paths), 20)
+        offenders = [f"{p.relative_to(SRC)}: {name}" for p in paths
+                     for name in _imports(_tree(p))
+                     if name == "research" or name.startswith("research.")]
+        self.assertEqual(offenders, [])
+
+    def test_research_never_references_private_venue_code(self):
+        paths = sorted((SRC / "research").rglob("*.py"))
+        self.assertGreater(len(paths), 20)
+        offenders = [f"{p.relative_to(SRC)}: {word}" for p in paths
+                     for word in FORBIDDEN_IN_RESEARCH
+                     if word in p.read_text(encoding="utf-8")]
+        self.assertEqual(offenders, [])
+
+
+class TestLayoutTests(unittest.TestCase):
+    def test_the_main_guard_is_the_last_statement_of_every_pine_test_module(self):
+        late = []
+        for path in sorted(Path(__file__).resolve().parent.glob("test_pine*.py")):
+            body = _tree(path).body
+            guards = [i for i, node in enumerate(body) if isinstance(node, ast.If)
+                      and "__main__" in ast.dump(node.test)]
+            if guards and guards[-1] != len(body) - 1:
+                late.append(path.name)
+        self.assertEqual(late, [])
+
+    def test_vst_agreement_has_no_dead_overshoot_parameter(self):
+        import inspect
+
+        from research.pine_gate.checks import vst_agreement
+
+        self.assertNotIn("overshoot_bps", inspect.signature(vst_agreement).parameters)
+
+
 class LockModuleTests(unittest.TestCase):
     def test_lock_names_are_public_and_shared(self):
         from research.pine_gate import holdout, lock, pipeline

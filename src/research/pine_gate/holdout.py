@@ -41,6 +41,7 @@ from .holdout_gate import GateVerdict, choose_contender, gate_symbol, traded_sym
 from .holdout_replay import (
     FEE_SENSITIVITY_PCT,
     LB_Z,
+    OVERSHOOT_SENSITIVITY_BPS,
     Contender,
     Holdout,
     HoldoutPeriod,
@@ -339,6 +340,15 @@ def _guards_off(h: Holdout, c: Contender) -> Dict[str, Any]:
             "combined_supply": len(trades) / len(h.days)}
 
 
+def _overshoot(h: Holdout, c: Contender) -> Dict[str, Dict[str, Any]]:
+    """The main run again with each sensitivity stop overshoot (spec 5.10)."""
+    out = {}
+    for bps in OVERSHOOT_SENSITIVITY_BPS:
+        trades = h.run(c.signal, overshoot_bps=bps)
+        out[str(float(bps))] = {s: brief_metrics(trades_of(trades, s), h) for s in SYMBOLS}
+    return out
+
+
 def _sensitivities(h: Holdout, contenders: Sequence[Contender]) -> Dict[str, Any]:
     """Reported only; none of these numbers reaches the gate."""
     frames = h.frames
@@ -347,6 +357,7 @@ def _sensitivities(h: Holdout, contenders: Sequence[Contender]) -> Dict[str, Any
         "eth_first": {c.name: _eth_first(h, c) for c in contenders},
         "cadence": {c.name: _cadence(h, c) for c in contenders},
         "guards_off": {c.name: _guards_off(h, c) for c in contenders},
+        "overshoot": {c.name: _overshoot(h, c) for c in contenders},
         "reference": {s: symbol_metrics(trades_of(reference, s), h) for s in SYMBOLS},
         "fee_pct": FEE_SENSITIVITY_PCT,
     }
