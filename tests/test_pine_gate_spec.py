@@ -1,11 +1,14 @@
+import dataclasses
 import json
 import unittest
 from datetime import datetime, timedelta
 
 from research.pine_gate.spec import (
     BLOCKS,
+    CONTENDER_PREFERENCE,
     CSCV_BLOCKS,
     ENTRIES,
+    ENTRY_PARAMS,
     HOLDOUT_END,
     HOLDOUT_START,
     LAST20_END,
@@ -14,10 +17,15 @@ from research.pine_gate.spec import (
     TRAIN_END,
     TRAIN_START,
     TRENDS,
+    STRENGTH_PARAMS,
+    TREND_PARAMS,
+    VOL_PARAMS,
     VOLS,
+    VP_PARAMS,
     VPS,
     WIB,
     ExecConfig,
+    FillConfig,
     GateConfig,
     GuardConfig,
     ModelConfig,
@@ -41,8 +49,6 @@ class SegmentTests(unittest.TestCase):
         self.assertTrue(all(a[1] == b[0] for a, b in zip(BLOCKS, BLOCKS[1:])))
         self.assertEqual(HOLDOUT_START, TRAIN_END)
         self.assertEqual(HOLDOUT_END, datetime(2026, 10, 14, tzinfo=WIB))
-        self.assertEqual(LAST20_START, datetime(2026, 9, 16, tzinfo=WIB))
-        self.assertEqual(LAST20_END, datetime(2026, 10, 13, tzinfo=WIB))
         self.assertEqual(CSCV_BLOCKS, 8)
         for edge in (TRAIN_START, TRAIN_END, HOLDOUT_END, *[b[1] for b in BLOCKS]):
             self.assertEqual(edge.utcoffset(), timedelta(hours=7))
@@ -52,6 +58,19 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual((TRAIN_END - TRAIN_START).days, 369)
         self.assertEqual((HOLDOUT_END - HOLDOUT_START).days, 70)
 
+    def test_last20_window_is_half_open_and_holds_20_weekdays(self):
+        self.assertEqual(LAST20_START, datetime(2026, 9, 16, tzinfo=WIB))
+        self.assertEqual(LAST20_END, HOLDOUT_END)
+        day, weekdays = LAST20_START, 0
+        while day < LAST20_END:
+            weekdays += day.weekday() < 5
+            day += timedelta(days=1)
+        self.assertEqual(weekdays, 20)
+
+    def test_ms_is_exact_for_sub_second_values(self):
+        dt = datetime(2025, 8, 1, 0, 0, 0, 999000, tzinfo=WIB)
+        self.assertEqual(ms(dt), 1753981200999)
+
     def test_ms_is_utc_epoch_milliseconds(self):
         self.assertEqual(ms(datetime(2025, 8, 1, tzinfo=WIB)), 1753981200000)
         self.assertIsInstance(ms(TRAIN_START), int)
@@ -59,21 +78,79 @@ class SegmentTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_defaults_match_the_spec(self):
-        e = ExecConfig()
-        self.assertEqual((e.bracket_pct, e.fee_pct, e.time_stop_min), (0.20, 0.035, 60))
-        self.assertEqual((e.tick_s, e.idle_tick_s, e.order_delay_s), (180, 2, 5))
-        self.assertEqual(e.notional_usdt, 25_000.0)
-        g = GuardConfig()
-        self.assertEqual((g.max_stops, g.max_entries, g.max_volume_usdt), (12, 34, 1_000_000.0))
-        s = SelectionConfig()
-        self.assertEqual((s.min_tp_sl, s.top_n, s.neighbour_min), (1000, 5, 4))
-        self.assertEqual(ModelConfig().c_grid, (0.01, 0.1, 1.0))
-        gate = GateConfig()
-        self.assertEqual((gate.min_wr, gate.offsets, gate.bootstrap_n), (57.0, 20, 10_000))
+        self.assertEqual(dataclasses.asdict(ExecConfig()), dict(
+            bracket_pct=0.20, entry_slip_bps=0.25, tp_slip_bps=0.25, time_stop_min=60,
+            fee_pct=0.035, tick_s=180, idle_tick_s=2, order_delay_s=5, cooldown_min=5,
+            notional_usdt=25_000.0, funding_blackout_s=600))
+        self.assertEqual(dataclasses.asdict(GuardConfig()), dict(
+            max_stops=12, max_consecutive_losses=15, max_drawdown_usdt=1500.0,
+            max_entries=34, max_volume_usdt=1_000_000.0))
+        self.assertEqual(dataclasses.asdict(SelectionConfig()), dict(
+            min_tp_sl=1000, min_supply_per_day=10.0, z=2.0, blocks_above_half=3,
+            block_min_wr=50.0, top_n=5, neighbour_min=4, neighbour_tolerance_pts=3.0,
+            pbo_max=0.5, vol_high_pct=67.0, vol_lookback_1h=720, vp_bin_bps=5.0,
+            trend_band_atr=0.25))
+        self.assertEqual(dataclasses.asdict(ModelConfig()), dict(
+            c_grid=(0.01, 0.1, 1.0), threshold_hi=0.70, threshold_lo=0.50,
+            threshold_step=0.01, fallback_threshold=0.5, threshold_min_supply_per_day=10.0))
+        self.assertEqual(dataclasses.asdict(GateConfig()), dict(
+            min_tp_sl=60, alpha=0.05, min_wr=57.0, half_min_wr=50.0,
+            robust_overshoot_bps=2.0, robust_min_wr=55.0, offsets=20, offsets_min_pass=15,
+            min_supply_per_day=10.0, bootstrap_n=10_000, permutation_shifts=1000,
+            c1_seeds=200, holm_family=3))
+        fill = FillConfig()
+        self.assertEqual(
+            (fill.overshoot_since, fill.min_samples, fill.fallback_bps, fill.round_up_bps),
+            ("2026-09-12", 15, 1.0, 0.5))
+        self.assertEqual(fill.overshoot_sensitivity_bps, (0.0, 1.0, 2.0))
+        self.assertEqual((fill.stop_atr_multiple, fill.stop_cap_pct), (1.5, 0.4))
+        self.assertEqual((fill.fee_sensitivity_pct, fill.both_touch_report_pct), (0.05, 2.0))
+        self.assertEqual((fill.latency_purpose, fill.latency_since), ("entry", "2026-09-25"))
 
     def test_configs_are_frozen(self):
-        with self.assertRaises(Exception):
-            ExecConfig().bracket_pct = 1.0
+        for config in (ExecConfig(), GuardConfig(), SelectionConfig(), ModelConfig(),
+                       GateConfig(), FillConfig()):
+            field = dataclasses.fields(config)[0].name
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                setattr(config, field, 0)
+
+
+class RuleParamTests(unittest.TestCase):
+    def test_every_rule_label_has_parameters(self):
+        self.assertEqual(set(ENTRY_PARAMS), set(ENTRIES))
+        self.assertEqual(set(STRENGTH_PARAMS), set(STRENGTHS))
+        self.assertEqual(set(TREND_PARAMS), set(TRENDS))
+        self.assertEqual(set(VOL_PARAMS), set(VOLS))
+        self.assertEqual(set(VP_PARAMS), set(VPS))
+
+    def test_entry_parameters(self):
+        self.assertEqual(dict(ENTRY_PARAMS["P35"]),
+                         {"kind": "pullback", "rsi_len": 14, "lower": 35, "upper": 65})
+        self.assertEqual(dict(ENTRY_PARAMS["P40"]),
+                         {"kind": "pullback", "rsi_len": 14, "lower": 40, "upper": 60})
+        self.assertEqual(ENTRY_PARAMS["B12"]["bars"], 12)
+        self.assertEqual(ENTRY_PARAMS["B24"]["bars"], 24)
+        self.assertEqual(ENTRY_PARAMS["B24"]["kind"], "breakout")
+
+    def test_parameter_mappings_are_immutable(self):
+        for mapping in (ENTRY_PARAMS, STRENGTH_PARAMS, TREND_PARAMS, VOL_PARAMS, VP_PARAMS):
+            with self.assertRaises(TypeError):
+                mapping["X"] = {}
+        with self.assertRaises(TypeError):
+            ENTRY_PARAMS["P35"]["lower"] = 1
+
+    def test_trend_strength_and_filter_parameters(self):
+        self.assertEqual(STRENGTH_PARAMS["ADX_DI"]["adx_min"], 20)
+        self.assertTrue(STRENGTH_PARAMS["ADX_DI"]["di_agrees"])
+        self.assertEqual((STRENGTH_PARAMS["ADX"]["dmi_len"], STRENGTH_PARAMS["ADX"]["adx_smoothing"]), (14, 14))
+        self.assertEqual(TREND_PARAMS["E200"]["band_atr"], 0.0)
+        self.assertEqual(TREND_PARAMS["H1"]["timeframe"], "1h")
+        self.assertEqual(TREND_PARAMS["H4"]["timeframe"], "4h")
+        self.assertEqual(TREND_PARAMS["H4"]["band_atr"], 0.25)
+        self.assertEqual(VOL_PARAMS["HIGH"]["comparison"], ">=")
+        self.assertEqual(VOL_PARAMS["NOT_HIGH"]["comparison"], "<")
+        self.assertEqual(VP_PARAMS["ON"]["window_hours"], 24)
+        self.assertEqual(VP_PARAMS["ON"]["bin_bps"], SelectionConfig().vp_bin_bps)
 
 
 class RuleGridTests(unittest.TestCase):
@@ -134,6 +211,41 @@ class SpecDocumentTests(unittest.TestCase):
             "vol_pct", "poc_dist_side", "hour_sin", "hour_cos"])
         self.assertEqual(doc["controls"]["c1_seeds"], 200)
         self.assertEqual(doc["controls"]["permutation_shifts"], 1000)
+
+    def test_document_is_json_native(self):
+        doc = spec_document()
+        self.assertEqual(json.loads(json.dumps(doc)), doc)
+
+    def test_document_hashes_rule_semantics(self):
+        rules = spec_document()["rules"]
+        self.assertEqual(rules["signal_timeframe"], "5m")
+        self.assertEqual(rules["entry"]["P40"]["upper"], 60)
+        self.assertEqual(rules["entry"]["B24"]["bars"], 24)
+        self.assertEqual(rules["strength"]["ADX"]["adx_min"], 20)
+        self.assertEqual(rules["trend"]["E200"]["ema_len"], 200)
+        self.assertEqual(rules["trend"]["H1"]["band_atr"], 0.25)
+        self.assertEqual(rules["vol"]["HIGH"]["lookback_1h"], 720)
+        self.assertEqual(rules["vol"]["HIGH"]["percentile"], 67.0)
+        self.assertEqual(rules["vp"]["ON"]["poc_ties"], "nearest bin to price")
+        self.assertEqual(rules["vp"]["ON"]["pullback"], {"long": "price <= POC", "short": "price >= POC"})
+        self.assertEqual(rules["vp"]["ON"]["breakout"], {"long": "price >= POC", "short": "price <= POC"})
+
+    def test_document_hashes_policies_and_sensitivities(self):
+        doc = spec_document()
+        self.assertEqual(doc["fill"]["overshoot_sensitivity_bps"], [0.0, 1.0, 2.0])
+        self.assertEqual(doc["fill"]["fallback_bps"], 1.0)
+        self.assertEqual(doc["fill"]["min_samples"], 15)
+        self.assertEqual(doc["fill"]["latency_table"], "ai_call_metrics")
+        self.assertEqual(doc["gate"]["holm_family"], 3)
+        self.assertEqual(doc["model"]["threshold_min_supply_per_day"], 10.0)
+        policies = doc["policies"]
+        self.assertEqual(policies["contender_choice_order"], [
+            "most symbols passed", "higher pooled WR lower bound", "simpler (c2, c1, c3)"])
+        self.assertEqual(CONTENDER_PREFERENCE, ("c2", "c1", "c3"))
+        self.assertTrue(policies["c1_c3_must_beat_c2_holdout_wr"])
+        self.assertTrue(policies["eth_first_sensitivity"])
+        self.assertIn("WR - 2 * SE", policies["selection_rank"])
+        self.assertIn("8 CSCV blocks", policies["overfitting"])
 
     def test_each_call_returns_a_fresh_document(self):
         first = spec_document()

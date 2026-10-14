@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import Any, Dict, Optional, Tuple
 
 SPEC_VERSION = "pine-gate-phase1-v1"
@@ -23,11 +25,34 @@ def _wib(year: int, month: int, day: int) -> datetime:
     return datetime(year, month, day, tzinfo=WIB)
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def ms(dt: datetime) -> int:
-    """UTC epoch milliseconds of a timezone-aware datetime."""
-    return int(dt.timestamp() * 1000)
+    """UTC epoch milliseconds of a timezone-aware datetime (exact integer arithmetic)."""
+    return (dt - _EPOCH) // timedelta(milliseconds=1)
 
 
+def _freeze(value: Any) -> Any:
+    """Recursively wrap mappings read-only and lists as tuples."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _plain(value: Any) -> Any:
+    """Recursively convert to JSON-native dicts and lists (a fresh copy)."""
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+# Segment convention: every [start, end) range is half-open. A trade belongs to
+# a segment when its entry is >= start and < end; each end is the next start.
 TRAIN_START = _wib(2025, 8, 1)
 TRAIN_END = _wib(2026, 8, 5)
 BLOCKS: Tuple[Tuple[datetime, datetime], ...] = (
@@ -39,8 +64,9 @@ BLOCKS: Tuple[Tuple[datetime, datetime], ...] = (
 CSCV_BLOCKS = 8
 HOLDOUT_START = TRAIN_END
 HOLDOUT_END = _wib(2026, 10, 14)
+# Wed 2026-09-16 .. Tue 2026-10-13 inclusive = 20 Mon-Fri WIB days.
 LAST20_START = _wib(2026, 9, 16)
-LAST20_END = _wib(2026, 10, 13)
+LAST20_END = HOLDOUT_END
 PURGE_MINUTES = 60
 EMBARGO_MINUTES = 60
 
@@ -75,6 +101,7 @@ class SelectionConfig:
     min_supply_per_day: float = 10.0
     z: float = 2.0
     blocks_above_half: int = 3
+    block_min_wr: float = 50.0
     top_n: int = 5
     neighbour_min: int = 4
     neighbour_tolerance_pts: float = 3.0
@@ -92,6 +119,7 @@ class ModelConfig:
     threshold_lo: float = 0.50
     threshold_step: float = 0.01
     fallback_threshold: float = 0.5
+    threshold_min_supply_per_day: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -108,6 +136,31 @@ class GateConfig:
     bootstrap_n: int = 10_000
     permutation_shifts: int = 1000
     c1_seeds: int = 200
+    holm_family: int = 3
+
+
+@dataclass(frozen=True)
+class FillConfig:
+    """Fill-calibration, latency and sensitivity policy (spec 5.10, 5.2)."""
+
+    overshoot_source: str = "live stop_loss exits"
+    overshoot_since: str = "2026-09-12"
+    stop_level_inputs: Tuple[str, ...] = ("ai_stop", "atr_at_decision", "cap")
+    stop_atr_multiple: float = 1.5
+    stop_cap_pct: float = 0.4
+    overshoot_statistic: str = "median"
+    round_up_bps: float = 0.5
+    min_samples: int = 15
+    fallback_bps: float = 1.0
+    overshoot_sensitivity_bps: Tuple[float, ...] = (0.0, 1.0, 2.0)
+    fee_sensitivity_pct: float = 0.05
+    both_touch_report_pct: float = 2.0
+    both_touch_upper_bound: str = "report with both-touch trades as wins when above threshold"
+    eth_first_sensitivity: bool = True
+    latency_table: str = "ai_call_metrics"
+    latency_purpose: str = "entry"
+    latency_success_only: bool = True
+    latency_since: str = "2026-09-25"
 
 
 TRENDS = ("E200", "H1", "H4")
@@ -115,6 +168,56 @@ ENTRIES = ("P35", "P40", "B12", "B24")
 STRENGTHS = ("OFF", "ADX", "ADX_DI")
 VOLS = ("OFF", "HIGH", "NOT_HIGH")
 VPS = ("OFF", "ON")
+
+# What each rule label means. Rule and feature code reads these values; they
+# are hashed through spec_document() so a changed parameter changes the spec.
+SIGNAL_TIMEFRAME = "5m"
+
+_SEL = SelectionConfig()
+
+ENTRY_PARAMS = _freeze({
+    "P35": {"kind": "pullback", "rsi_len": 14, "lower": 35, "upper": 65},
+    "P40": {"kind": "pullback", "rsi_len": 14, "lower": 40, "upper": 60},
+    "B12": {"kind": "breakout", "bars": 12},
+    "B24": {"kind": "breakout", "bars": 24},
+})
+STRENGTH_PARAMS = _freeze({
+    "OFF": {"enabled": False},
+    "ADX": {"enabled": True, "dmi_len": 14, "adx_smoothing": 14, "adx_min": 20,
+            "di_agrees": False},
+    "ADX_DI": {"enabled": True, "dmi_len": 14, "adx_smoothing": 14, "adx_min": 20,
+               "di_agrees": True},
+})
+TREND_PARAMS = _freeze({
+    "E200": {"timeframe": "5m", "kind": "close_vs_ema", "ema_len": 200, "band_atr": 0.0},
+    "H1": {"timeframe": "1h", "kind": "ema_cross", "ema_fast": 20, "ema_slow": 50,
+           "atr_len": 14, "band_atr": _SEL.trend_band_atr},
+    "H4": {"timeframe": "4h", "kind": "ema_cross", "ema_fast": 20, "ema_slow": 50,
+           "atr_len": 14, "band_atr": _SEL.trend_band_atr},
+})
+VOL_PARAMS = _freeze({
+    "OFF": {"enabled": False},
+    "HIGH": {"enabled": True, "timeframe": "1h", "measure": "ATR14 / close",
+             "atr_len": 14, "rank": "percent rank over previous closed bars",
+             "lookback_1h": _SEL.vol_lookback_1h,
+             "percentile": _SEL.vol_high_pct, "comparison": ">="},
+    "NOT_HIGH": {"enabled": True, "timeframe": "1h", "measure": "ATR14 / close",
+                 "atr_len": 14, "rank": "percent rank over previous closed bars",
+                 "lookback_1h": _SEL.vol_lookback_1h,
+             "percentile": _SEL.vol_high_pct, "comparison": "<"},
+})
+VP_PARAMS = _freeze({
+    "OFF": {"enabled": False},
+    "ON": {"enabled": True, "window_hours": 24, "source": "production 1m volume",
+           "bin_bps": _SEL.vp_bin_bps,
+           "volume_spread": "evenly over the bins the bar's high-low range covers",
+           "poc": "busiest bin", "poc_ties": "nearest bin to price",
+           "price": "last closed 5m close",
+           "pullback": {"long": "price <= POC", "short": "price >= POC"},
+           "breakout": {"long": "price >= POC", "short": "price <= POC"}},
+})
+
+CONTENDER_PREFERENCE = ("c2", "c1", "c3")
 
 CONTENDER3_FEATURES = (
     "trend_strength", "rsi_side", "adx", "di_diff_side",
@@ -174,13 +277,41 @@ def _iso(dt: datetime) -> str:
 
 def spec_document() -> Dict[str, Any]:
     """Every pre-registered constant as plain JSON data; a fresh dict per call."""
-    return {
+    doc = {
         "version": SPEC_VERSION,
         "exec": asdict(ExecConfig()),
         "guards": asdict(GuardConfig()),
         "selection": asdict(SelectionConfig()),
         "model": asdict(ModelConfig()),
         "gate": asdict(GateConfig()),
+        "fill": asdict(FillConfig()),
+        "rules": {
+            "signal_timeframe": SIGNAL_TIMEFRAME,
+            "entry": ENTRY_PARAMS,
+            "strength": STRENGTH_PARAMS,
+            "trend": TREND_PARAMS,
+            "vol": VOL_PARAMS,
+            "vp": VP_PARAMS,
+        },
+        "policies": {
+            "eligibility": "at least min_tp_sl take-profit + stop-loss trades over training and "
+                           "combined supply of at least min_supply_per_day per trading day; "
+                           "if no rule is eligible, drop the supply condition and report supply-limited",
+            "selection_rank": "median over B1-B4 of WR - 2 * SE (SE clustered by WIB day); "
+                              "WR > 50 in at least 3 of 4 blocks",
+            "stage_flow": "stage 1 -> 5 best base rules -> stage 2 variants -> best variant by the same ranking",
+            "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "
+                           "base rule, else the next in rank",
+            "overfitting": "PBO by CSCV on 8 CSCV blocks over all evaluated rules must be < 0.5; "
+                           "Hansen SPA against a random-entry benchmark with the same bracket is reported",
+            "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
+                               "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
+            "contender_choice_order": ["most symbols passed", "higher pooled WR lower bound",
+                                       "simpler (c2, c1, c3)"],
+            "c1_c3_must_beat_c2_holdout_wr": True,
+            "holm": "Holm correction across the 3 contenders within each symbol",
+            "eth_first_sensitivity": True,
+        },
         "grid": {
             "trends": list(TRENDS),
             "entries": list(ENTRIES),
@@ -244,6 +375,7 @@ def spec_document() -> Dict[str, Any]:
             "permutation_k_max": "D - 7",
         },
     }
+    return _plain(doc)
 
 
 def spec_sha256(doc: Optional[Dict[str, Any]] = None) -> str:
