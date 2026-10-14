@@ -27,8 +27,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from .checks import OUTCOME_AGREE_MIN, SIDE_AGREE_MIN, WR_DIFF_MAX_PTS
 from .holdout_gate import C0_CENTRE_WR, C0_GROSS_TOLERANCE_BPS, C0_WR_TOLERANCE_PTS
-from .pipeline import SYMBOLS
+from .pipeline import REGIME_MIN_N, SYMBOLS
 from .spec import WIB, GateConfig
 from .stats import net_per_1m
 
@@ -38,7 +39,6 @@ NOT_AVAILABLE = "belum tersedia"
 LIVE_BASELINE_PER_1M = -190  # spec section 2, "Money"
 MIN_TP_SL = GateConfig().min_tp_sl
 TOP_RULES = 5
-VST_SIDE_MIN, VST_OUTCOME_MIN, VST_WR_MAX_DIFF = 0.97, 0.95, 2.0  # spec 5.12
 
 SECTION_TITLES: Tuple[str, ...] = (
     "Ringkasan",
@@ -323,13 +323,19 @@ def _summary_table(holdout: Mapping[str, Any]) -> Lines:
     return _table(headers, rows) if rows else []
 
 
-def _summary_outcome(holdout: Mapping[str, Any]) -> Lines:
-    chosen = holdout.get("chosen")
-    if chosen is None:
-        return ["Tidak ada kontender yang lulus gerbang; bot tidak diubah dan tabel WR "
-                "terhadap pasokan per kontender dan simbol ada di bawah.", ""]
-    trade = ", ".join(holdout.get("symbols_to_trade") or []) or NA
-    return [f"Kontender terpilih: {_label(chosen)}; simbol yang lolos: {trade}.", ""]
+def _summary_outcome(summary: Mapping[str, Any]) -> Lines:
+    """The Ringkasan outcome line, from the same summary the Kesimpulan sentence gets."""
+    if not summary["per_contender"]:
+        return [f"Hasil kontender {NOT_AVAILABLE}.", ""]
+    if summary["outcome"] == "passed":
+        trade = ", ".join(summary["symbols"]) or NA
+        return [f"Kontender terpilih: {_label(summary['contender'])}; simbol yang lolos: {trade}.",
+                ""]
+    if summary["outcome"] == "insufficient":
+        return [f"Data belum cukup untuk menilai gerbang (kurang dari {MIN_TP_SL} transaksi "
+                "TP+SL pada setiap kontender dan simbol); bot tidak diubah.", ""]
+    return ["Tidak ada kontender yang lulus gerbang; bot tidak diubah dan tabel WR "
+            "terhadap pasokan per kontender dan simbol ada di bawah.", ""]
 
 
 def _honesty_lines() -> Lines:
@@ -344,7 +350,7 @@ def _ringkasan(results: Mapping[str, Any]) -> Lines:
     lines = _c0_warning(holdout)
     if not isinstance(holdout, Mapping) or not holdout:
         return lines + _unavailable("Hasil periode uji") + _economics_lines() + _honesty_lines()
-    outcome = [] if lines else _summary_outcome(holdout)  # a failed C0 voids the results
+    outcome = [] if lines else _summary_outcome(summarize_for_verdict(results))  # a failed C0 voids the results
     return lines + outcome + _economics_lines() + _summary_table(holdout) + _honesty_lines()
 
 
@@ -393,8 +399,8 @@ def _regime_rows(counts: Mapping[str, Any]) -> List[List[Any]]:
         for trend in sorted(_mapping(counts[symbol])):
             for month, c in sorted(_mapping(counts[symbol][trend]).items()):
                 n = _num(_get(c, "n"))
-                status = ("tidak cukup (n kurang dari 60)" if _get(c, "insufficient") is True
-                          or (n is not None and n < 60) else "cukup")
+                short = _get(c, "insufficient") is True or (n is not None and n < REGIME_MIN_N)
+                status = f"tidak cukup (n kurang dari {REGIME_MIN_N})" if short else "cukup"
                 rows.append([symbol, trend, month, fmt_share(_get(c, "share_up")),
                              fmt_share(_get(c, "share_down")), fmt_share(_get(c, "share_neutral")),
                              fmt_int(n), status])
@@ -406,7 +412,7 @@ def _regime(selection: Any) -> Lines:
     if not rows:
         return _unavailable()
     note = ["Sebaran naik/turun/netral per sumber tren dan bulan WIB, dicuplik di tiap penutupan "
-            "bar 5m. Sel dengan n kurang dari 60 ditandai \"tidak cukup\", bukan \"gagal\".", ""]
+            f"bar 5m. Sel dengan n kurang dari {REGIME_MIN_N} ditandai \"tidak cukup\", bukan \"gagal\".", ""]
     return note + _table(["Simbol", "Tren", "Bulan", "naik", "turun", "netral", "n", "Status"], rows)
 
 
@@ -424,8 +430,8 @@ def _training(selection: Any) -> Lines:
     rules = _mapping(sel.get("rules"))
     rows = [_rule_row(key, _mapping(rules.get(key))) for key in list(sel.get("top") or [])[:TOP_RULES]]
     facts = [
-        f"- Kontender 1 terpilih: `{_cell(sel.get('contender1') or NA)}`; aturan primer kontender 3: "
-        f"`{_cell(sel.get('primary_rule') or NA)}`.",
+        f"- Kontender 1 terpilih: `{sel.get('contender1') or NA}`; aturan primer kontender 3: "
+        f"`{sel.get('primary_rule') or NA}`.",
         f"- Aturan dinilai: {len(rules)}; stabil: {_yes_no(sel.get('stable'))}; pasokan "
         f"membatasi: {_yes_no(sel.get('supply_limited'))}.",
         f"- PBO (CSCV): {fmt_dec(sel.get('pbo'), 2)} (lulus jika < 0.5: {_yes_no(sel.get('pbo_pass'))}).",
@@ -485,8 +491,10 @@ def _reference_rows(holdout: Mapping[str, Any]) -> List[List[Any]]:
 
 def _holdout_section(holdout: Any) -> Lines:
     rows = _holdout_rows(holdout) if isinstance(holdout, Mapping) else []
+    skipped = _get(holdout, "skipped")
+    skipped_line = [f"Kontender dilewati: {', '.join(map(str, skipped))}.", ""] if skipped else []
     if not rows:
-        return _unavailable()
+        return skipped_line + _unavailable("Hasil kontender") if skipped else _unavailable()
     headers = ["Kontender", "Simbol", "TP", "SL", "time stop", "WR", "batas bawah", "gross bps",
                "net/1M", "net/1M (fee 0.05%)", "WR separuh 1 / 2", "transaksi/hari",
                "transaksi/hari 20 hari", "gerbang"]
@@ -497,8 +505,7 @@ def _holdout_section(holdout: Any) -> Lines:
     if ref:
         lines += ["Referensi (skrip Pine apa adanya, hanya dilaporkan):", ""]
         lines += _table(["Simbol", "n", "WR", "gross bps", "net/1M"], ref)
-    skipped = holdout.get("skipped")
-    return lines + ([f"Kontender dilewati: {', '.join(map(str, skipped))}.", ""] if skipped else [])
+    return lines + skipped_line
 
 
 def _gate_cell(verdict: Mapping[str, Any]) -> str:
@@ -592,8 +599,8 @@ def _vst_section(vst: Any) -> Lines:
                      fmt_wr(_get(a, "wr_vst")), fmt_dec(diff), _yes_no(_get(a, "passed"))])
     if not rows:
         return _unavailable()
-    note = [f"Ambang (spec 5.12): arah sinyal sama ≥ {VST_SIDE_MIN:.0%}, hasil bracket sama "
-            f"≥ {VST_OUTCOME_MIN:.0%}, selisih WR ≤ {VST_WR_MAX_DIFF:.0f} poin. Jika gagal, "
+    note = [f"Ambang (spec 5.12): arah sinyal sama ≥ {SIDE_AGREE_MIN:.0%}, hasil bracket sama "
+            f"≥ {OUTCOME_AGREE_MIN:.0%}, selisih WR ≤ {WR_DIFF_MAX_PTS:.0f} poin. Jika gagal, "
             "pembacaan maju di VST yang menentukan.", ""]
     headers = ["Simbol", "tick", "arah sama", "hasil sama", "WR produksi", "WR VST",
                "selisih WR (poin)", "lulus"]
@@ -650,6 +657,13 @@ def _guard_rows(holdout: Any) -> List[List[Any]]:
     return rows
 
 
+def _guard_symbol_rows(holdout: Any) -> List[List[Any]]:
+    off = _mapping(_get(holdout, "sensitivities", "guards_off"))
+    return [[_label(name), s, fmt_int(_get(m, "n")), fmt_wr(_get(m, "wr")),
+             fmt_bps(_get(m, "gross_bps")), fmt_dec(_get(m, "supply"))]
+            for name in sorted(off) for s, m in sorted(_mapping(_get(off, name, "symbols")).items())]
+
+
 def _cadence_section(holdout: Any) -> Lines:
     cad, guards = _cadence_rows(holdout), _guard_rows(holdout)
     if not (cad or guards):
@@ -660,8 +674,11 @@ def _cadence_section(holdout: Any) -> Lines:
                      "transaksi/hari"], cad)
     lines += ["Guard dimatikan (pasokan tanpa batas harian) dan urutan ETH lebih dulu "
               "(bagian tick dengan sinyal di kedua simbol):", ""]
-    return lines + _table(["Kontender", "pasokan tanpa guard", "sinyal kedua simbol",
-                           "tick sinyal ganda"], guards)
+    lines += _table(["Kontender", "pasokan tanpa guard", "sinyal kedua simbol",
+                     "tick sinyal ganda"], guards)
+    lines += ["Per simbol dengan guard dimatikan:", ""]
+    return lines + _table(["Kontender", "Simbol", "n", "WR", "gross bps", "transaksi/hari"],
+                          _guard_symbol_rows(holdout))
 
 
 def _kesimpulan(verdict: str) -> Lines:

@@ -322,11 +322,73 @@ class RenderMarkdownTests(unittest.TestCase):
 
     def test_non_finite_numbers_render_as_dash(self, _):
         results = make_results()
-        results["holdout"]["contenders"]["c1"]["symbols"][BTC]["wr"] = float("nan")
+        block = results["holdout"]["contenders"]["c1"]["symbols"][BTC]
+        block["verdict"]["wr"] = float("nan")
+        block["gross_bps"] = float("inf")
+        block["net_per_1m"] = float("-inf")
+        block["lower_bound"] = float("nan")
 
         text = render_markdown(results)
 
-        self.assertIsNone(re.search(r"\bnan\b", text.lower()))
+        for title in ("Ringkasan", "Periode uji"):
+            row = next(line for line in section(text, title).splitlines()
+                       if line.startswith("| Kontender 1") and BTC in line)
+            cells = [c.strip() for c in row.strip("|").split("|")]
+            self.assertIn("–", cells, title)
+            self.assertNotIn("nan", row.lower().replace("kontender", ""), title)
+            self.assertNotIn("inf", row.lower(), title)
+        row = next(line for line in section(text, "Periode uji").splitlines()
+                   if line.startswith("| Kontender 1") and BTC in line)
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        # WR, batas bawah, gross bps, net/1M
+        self.assertEqual([cells[5], cells[6], cells[7], cells[8]], ["–", "–", "–", "–"])
+
+    def test_ringkasan_outcome_agrees_with_the_summary_for_each_outcome(self, _):
+        passed = section(render_markdown(make_results(passed=True)), "Ringkasan")
+        failed = section(render_markdown(make_results(passed=False)), "Ringkasan")
+        thin = make_results(passed=False)
+        thin["holdout"] = make_holdout(passed=False, tp=20, sl=15)
+        insufficient = section(render_markdown(thin), "Ringkasan")
+
+        self.assertIn("Kontender terpilih: Kontender 2", passed)
+        self.assertIn("Tidak ada kontender yang lulus gerbang", failed)
+        self.assertNotIn("Tidak ada kontender yang lulus gerbang", insufficient)
+        self.assertIn("Data belum cukup", insufficient)
+        self.assertIn("bot tidak diubah", insufficient)
+
+    def test_ringkasan_says_not_available_when_there_are_no_contender_rows(self, _):
+        results = make_results()
+        results["holdout"] = {"contenders": {}, "chosen": None, "symbols_to_trade": []}
+
+        ringkasan = section(render_markdown(results), "Ringkasan")
+
+        self.assertIn(f"Hasil kontender {NOT_AVAILABLE}", ringkasan)
+        self.assertNotIn("Tidak ada kontender yang lulus gerbang", ringkasan)
+
+    def test_skipped_contenders_are_shown_even_without_contender_rows(self, _):
+        results = make_results()
+        results["holdout"] = {"contenders": {}, "skipped": ["c1 (tidak ada aturan)"]}
+
+        uji = section(render_markdown(results), "Periode uji")
+
+        self.assertIn("Kontender dilewati: c1 (tidak ada aturan)", uji)
+        self.assertIn(NOT_AVAILABLE, uji)
+
+    def test_rule_keys_in_backticked_prose_keep_their_pipes(self, _):
+        tahap = section(render_markdown(make_results()), "Tahap latih")
+
+        self.assertIn(f"`{RULE}`", tahap)
+
+    def test_guards_off_supply_is_listed_per_symbol(self, _):
+        results = make_results()
+        guards = results["holdout"]["sensitivities"]["guards_off"]["c2"]["symbols"]
+        guards[BTC]["supply"], guards[ETH]["supply"] = 7.7, 3.3
+
+        biaya = section(render_markdown(results), "Biaya kadens dan guard")
+
+        row = next(l for l in biaya.splitlines() if l.startswith("| Kontender 2") and "7.7" in l)
+        self.assertIn(BTC, row)
+        self.assertTrue(any(ETH in l and "3.3" in l for l in biaya.splitlines()))
 
 
 class FormatTests(unittest.TestCase):
