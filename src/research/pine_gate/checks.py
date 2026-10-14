@@ -79,7 +79,7 @@ class Agreement:
     passed: bool
 
 
-def _entry_index(bars: Bars, order_ms: int) -> Optional[int]:
+def entry_index(bars: Bars, order_ms: int) -> Optional[int]:
     """Index of the 1m bar containing ``order_ms``; ``None`` when not covered."""
     i = bisect_right(bars.open_ms, order_ms) - 1
     if i < 0 or order_ms >= bars.open_ms[i] + bars.interval_ms:
@@ -127,8 +127,8 @@ def vst_agreement(
         if side_prod == 0:
             continue
         order_ms = t + cfg.order_delay_s * _MS_PER_SECOND
-        i_prod = _entry_index(prod.bars_1m, order_ms)
-        i_vst = _entry_index(vst.bars_1m, order_ms)
+        i_prod = entry_index(prod.bars_1m, order_ms)
+        i_vst = entry_index(vst.bars_1m, order_ms)
         if i_prod is None or i_vst is None:
             continue
         o_prod = prod_cache.get(i_prod, side_prod)

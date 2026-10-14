@@ -85,7 +85,7 @@ def _positive_finite(value: Any) -> Optional[float]:
     return number if math.isfinite(number) and number > 0 else None
 
 
-async def _fetch_all(
+async def fetch_all(
     get_rows: GetRows, table: str, params: Sequence[Tuple[str, str]]
 ) -> List[dict]:
     """Page with limit/offset until a page returns fewer than ``PAGE_SIZE`` rows."""
@@ -108,7 +108,7 @@ async def load_entry_latencies_ms(
     since_iso: str = DEFAULT_LATENCY_SINCE,
 ) -> List[float]:
     """Successful entry-call latencies in ms (finite and >= 0) since ``since_iso``."""
-    rows = await _fetch_all(
+    rows = await fetch_all(
         get_rows,
         table,
         [
@@ -208,7 +208,7 @@ async def stop_overshoot_detail(
     since_iso: str = DEFAULT_OVERSHOOT_SINCE,
 ) -> StopOvershootDetail:
     """Overshoot (bps) of every reconstructable live stop-loss exit, plus the skipped count."""
-    trades = await _fetch_all(
+    trades = await fetch_all(
         get_rows,
         trades_table,
         [
@@ -220,7 +220,7 @@ async def stop_overshoot_detail(
     )
     since = _parse_ts(since_iso)
     lookback_iso = (since - _DECISION_LOOKBACK).isoformat() if since else since_iso
-    decisions = await _fetch_all(
+    decisions = await fetch_all(
         get_rows,
         decisions_table,
         [

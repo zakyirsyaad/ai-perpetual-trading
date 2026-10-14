@@ -1,11 +1,14 @@
-"""Data subcommands of the Pine gate CLI: fetch, warmup, funding, collect, check-data.
+"""Data subcommands of the Pine gate CLI: fetch, warmup, native-check-fetch, funding,
+collect and check-data.
 
-Research code; the bot never imports it. Standard library only. Network access
+Research code; the bot never imports it. Standard library plus ``httpx`` (only
+for its transport error type; requests go through ``fetch``). Network access
 goes through ``cli_common.http_get`` (public BingX market data, no keys) and
 every pause through ``cli_common.sleep``; the library throttles the requests
 of one call, and the CLI sleeps one second between two library calls so the
 gap also holds across symbols and jobs. Existing files are never overwritten:
-day files and warm-up or funding files that exist are skipped.
+day files and warm-up, native-check or funding files that exist are skipped,
+and a skipped file's covered range is printed so the operator can confirm it.
 """
 
 from __future__ import annotations
@@ -13,9 +16,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 
 import httpx
 
@@ -48,10 +51,12 @@ from .fetch import (
     sync_warmup,
 )
 from .pipeline import SYMBOLS, TRAIN_DATA_UNTIL_MS
-from .spec import HOLDOUT_END, TRAIN_END, TRAIN_START, ms
+from .spec import HOLDOUT_END, TRAIN_END, TRAIN_START, WIB, ms
 
 HOSTS = {"prod": PROD_HOST, "vst": VST_HOST}
 WARMUP_INTERVALS = ("1h", "4h")
+NATIVE_CHECK_FILE = "native_check.csv.gz"
+NATIVE_CHECK_DEFAULT = (date(2025, 8, 1), date(2025, 9, 1))  # inside training
 NATIVE_AGREEMENT_MIN = 0.999
 _NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.TransportError)
 _MS_1M = 60_000
@@ -93,15 +98,33 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 1 if failed_any else 0
 
 
-def cmd_warmup(args: argparse.Namespace) -> int:
+def native_check_path(data_dir: Path, symbol: str, interval: str) -> Path:
+    """Native production bars fetched only to check the 1m aggregation (never features)."""
+    return Path(data_dir) / "prod" / symbol / interval / NATIVE_CHECK_FILE
+
+
+def _wib_iso(t_ms: int) -> str:
+    return datetime.fromtimestamp(t_ms / 1000, WIB).isoformat()
+
+
+def covered(times: Sequence[int], unit: str) -> str:
+    """``covers <first> .. <last>, N <unit>`` (WIB) for a file being skipped."""
+    if not times:
+        return f"covers nothing, 0 {unit}"
+    return f"covers {_wib_iso(times[0])} .. {_wib_iso(times[-1])}, {len(times)} {unit}"
+
+
+def _sync_native(args: argparse.Namespace, kind: str,
+                 path_for: Callable[[Path, str, str], Path]) -> int:
     """Native 1h/4h bars whose open time lies in [WIB midnight of --start, of --end)."""
     pace, failed_any = _Pacer(), False
     for symbol in SYMBOLS:
         for interval in WARMUP_INTERVALS:
-            label = f"prod/{symbol}/{interval} warmup"
-            path = warmup_path(args.data_dir, symbol, interval)
+            label = f"prod/{symbol}/{interval} {kind}"
+            path = path_for(args.data_dir, symbol, interval)
             if path.exists():
-                print(f"{label}: skipped, file exists")
+                opens = [row[0] for row in read_day(path)]
+                print(f"{label}: skipped, file exists ({covered(opens, 'bars')})")
                 continue
             step = interval_to_ms(interval)
             start_ms = _ceil_to(wib_day_start_ms(args.start), step)
@@ -118,6 +141,14 @@ def cmd_warmup(args: argparse.Namespace) -> int:
     return 1 if failed_any else 0
 
 
+def cmd_warmup(args: argparse.Namespace) -> int:
+    return _sync_native(args, "warmup", warmup_path)
+
+
+def cmd_native_check_fetch(args: argparse.Namespace) -> int:
+    return _sync_native(args, "native check", native_check_path)
+
+
 def cmd_funding(args: argparse.Namespace) -> int:
     """Funding times in [WIB midnight of --start, of --end) per symbol."""
     start_ms = wib_day_start_ms(args.start)
@@ -129,7 +160,9 @@ def cmd_funding(args: argparse.Namespace) -> int:
         label = f"prod/{symbol} funding"
         path = funding_path(args.data_dir, symbol)
         if path.exists():
-            print(f"{label}: skipped, file exists")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            times = saved if isinstance(saved, list) else []
+            print(f"{label}: skipped, file exists ({covered(times, 'times')})")
             continue
         pace()
         try:
@@ -184,28 +217,33 @@ def read_warmups(data_dir: Path, symbol: str) -> Tuple[Optional[Bars], Optional[
     return out[0], out[1]
 
 
-def native_check(data_dir: Path, symbol: str, interval: str, days: int) -> Tuple[str, bool]:
-    """Native warm-up bars vs bars aggregated from the first ``days`` 1m days.
+def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[str, bool]:
+    """Native bars of ``native-check-fetch`` vs the bars aggregated from 1m day files.
 
-    Nothing is fetched: only native bars already in the warm-up file are used.
-    When none of them overlaps the aggregated range the check is SKIP, not PASS.
+    Compared over their overlap; at least 99.9% must agree. A missing or empty
+    native file, missing 1m days or no overlap all FAIL: the aggregation is
+    unchecked then, which is never a pass.
     """
     label = f"native vs aggregated prod/{symbol}/{interval}"
-    path = warmup_path(data_dir, symbol, interval)
+    path = native_check_path(data_dir, symbol, interval)
     if not path.exists():
-        return f"FAIL {label}: warm-up file missing", False
+        return f"FAIL {label}: {path.name} missing; run native-check-fetch", False
     step = interval_to_ms(interval)
     native = bars_from_rows(read_day(path), step)
-    first = wib_day(ms(TRAIN_START))
+    if not len(native):
+        return f"FAIL {label}: {path.name} holds no bars", False
+    first = max(wib_day(native.open_ms[0]), wib_day(ms(TRAIN_START)))
+    last = wib_day(native.open_ms[-1] + step - 1)
+    if last < first:
+        return f"FAIL {label}: no overlap with the 1m data (native bars precede it)", False
     try:
-        bars = load_days(data_dir, "prod", symbol, "1m", first, first + timedelta(days=days - 1))
+        bars = load_days(data_dir, "prod", symbol, "1m", first, last)
     except MissingDayError as exc:
         return f"FAIL {label}: {common.one_line(exc)}", False
     aggregated = aggregate(bars, step)
     shared = set(native.open_ms) & set(aggregated.open_ms)
     if not shared:
-        return (f"SKIP {label}: no overlap between the native bars and the first {days} "
-                "aggregated days"), True
+        return f"FAIL {label}: no overlap between the native and the aggregated bars", False
     share = htf_agreement(native, aggregated)
     ok = share >= NATIVE_AGREEMENT_MIN
     return (f"{'PASS' if ok else 'FAIL'} {label}: {share:.4%} of {len(shared)} bars agree "
@@ -255,7 +293,7 @@ def cmd_check_data(args: argparse.Namespace) -> int:
     lines, all_ok = days_check(args.data_dir)
     for symbol in SYMBOLS:
         for interval in WARMUP_INTERVALS:
-            line, ok = native_check(args.data_dir, symbol, interval, args.native_check_days)
+            line, ok = native_check(args.data_dir, symbol, interval)
             lines.append(line)
             all_ok = all_ok and ok
     try:
@@ -287,6 +325,13 @@ def add_parsers(sub: Any, date_type: Callable[[str], date],
     p.add_argument("--end", type=date_type, required=True, help="exclusive (WIB midnight)")
     p.set_defaults(handler=cmd_warmup)
 
+    p = sub.add_parser("native-check-fetch",
+                       help="native 1h/4h bars inside training, to check the 1m aggregation")
+    p.add_argument("--start", type=date_type, default=NATIVE_CHECK_DEFAULT[0])
+    p.add_argument("--end", type=date_type, default=NATIVE_CHECK_DEFAULT[1],
+                   help="exclusive (WIB midnight)")
+    p.set_defaults(handler=cmd_native_check_fetch)
+
     p = sub.add_parser("funding", help="production funding times")
     p.add_argument("--start", type=date_type, required=True)
     p.add_argument("--end", type=date_type, required=True, help="exclusive (WIB midnight)")
@@ -296,8 +341,6 @@ def add_parsers(sub: Any, date_type: Callable[[str], date],
     p.set_defaults(handler=cmd_collect)
 
     p = sub.add_parser("check-data", help="complete days, native agreement, truncation test")
-    p.add_argument("--native-check-days", type=int, default=7,
-                   help="1m days from the training start aggregated for the native check")
-    p.add_argument("--truncation-times", type=int, default=500)
+    p.add_argument("--truncation-times", type=common.positive_int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(handler=cmd_check_data)

@@ -453,7 +453,7 @@ def _check_spec_run(
         raise ValueError(f"a spec run must use the selection's seed {recorded!r}, got {seed!r}")
 
 
-def _check_calibration(path: Path, selection: Mapping[str, Any], calib: Calibration) -> None:
+def check_calibration(path: Path, selection: Mapping[str, Any], calib: Calibration) -> None:
     """The holdout must run on the s* and latency sample the selection was made with."""
     if (selection.get("s_star_bps") != calib.s_star_bps
             or selection.get("n_latencies") != len(calib.latencies_ms)):
@@ -489,7 +489,7 @@ def _check_holdout_dataset(dataset: Dataset, period: HoldoutPeriod) -> None:
             raise ValueError(f"dataset lacks {symbol}")
 
 
-def _refuse_any_holdout(out_dir: Path) -> None:
+def refuse_any_holdout(out_dir: Path) -> None:
     """The holdout runs once: any earlier holdout file, of any date, refuses the run."""
     existing = sorted(Path(out_dir).glob(f"{HOLDOUT_PREFIX}*.json"))
     if existing:
@@ -552,13 +552,13 @@ def test_stage(
     ``pine_gate_holdout_*.json`` in ``out_dir`` refuses the run.
     """
     selection = load_selection_checked(selection_path, spec_sha)
-    _check_calibration(selection_path, selection, calib)
+    check_calibration(selection_path, selection, calib)
     _check_spec_sha(spec_sha)
     counts = {"offsets": offsets, "permutation_shifts": permutation_shifts,
               "c1_seeds": c1_seeds, "bootstrap_n": bootstrap_n}
     settings = _settings(period, exec_cfg, guard_cfg, gate_cfg, counts)
     _check_spec_run(spec_sha, settings, selection, seed)
-    _refuse_any_holdout(out_dir)
+    refuse_any_holdout(out_dir)
     _check_holdout_dataset(dataset, settings.period)
     _check_purge_covers(calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
@@ -569,6 +569,6 @@ def test_stage(
     doc.update(_provenance(dataset, calib, settings, seed))
     doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).name,
                 "selection_sha256": selection_sha, "created_at": created.isoformat()})
-    _refuse_any_holdout(out_dir)  # again after the work: a concurrent run may have written
+    refuse_any_holdout(out_dir)  # again after the work: a concurrent run may have written
     _write_json_atomic(path, doc, label="holdout")
     return path

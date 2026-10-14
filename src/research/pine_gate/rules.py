@@ -11,7 +11,7 @@ both the spec hash and the rule.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from .features import Snapshot
 from .spec import (
@@ -163,6 +163,55 @@ def rule_signal(
         return 0
     return side
 
+
+
+_TREND_FIELDS = {
+    "E200": ("close_5m", "ema200_5m"),
+    "H1": ("h1_ema20", "h1_ema50", "h1_atr14"),
+    "H4": ("h4_ema20", "h4_ema50", "h4_atr14"),
+}
+
+
+def _dedupe(fields: Tuple[str, ...]) -> Tuple[str, ...]:
+    return tuple(dict.fromkeys(fields))
+
+
+def required_fields(rule: RuleSpec) -> Tuple[str, ...]:
+    """Snapshot fields ``rule_signal(rule, ...)`` may read, for either side.
+
+    With all of them set the rule can signal; each one is read on at least one
+    side, where ``None`` makes the signal 0 (a breakout reads the prior high when
+    long and the prior low when short). A volume-profile rule also needs the
+    POC, which is not a snapshot field.
+    """
+    entry = ENTRY_PARAMS[rule.entry]
+    fields = _TREND_FIELDS[rule.trend]
+    if entry["kind"] == "pullback":
+        fields += ("rsi14_5m",)
+    elif entry["bars"] == ENTRY_PARAMS["B12"]["bars"]:
+        fields += ("close_5m", "high12_prev", "low12_prev")
+    else:
+        fields += ("close_5m", "high24_prev", "low24_prev")
+    strength = STRENGTH_PARAMS[rule.strength]
+    if strength["enabled"]:
+        fields += ("adx14_5m",)
+        if strength["di_agrees"]:
+            fields += ("di_plus14_5m", "di_minus14_5m")
+    if VOL_PARAMS[rule.vol]["enabled"]:
+        fields += ("h1_vol_pct",)
+    if VP_PARAMS[rule.vp]["enabled"]:
+        fields += ("close_5m",)
+    return _dedupe(fields)
+
+
+def contender2_required_fields() -> Tuple[str, ...]:
+    """Snapshot fields ``contender2_signal`` reads (no trend override)."""
+    return _TREND_FIELDS["H1"] + ("stretch_3m",)
+
+
+def reference_required_fields() -> Tuple[str, ...]:
+    """Snapshot fields ``reference_signal`` reads."""
+    return ("close_5m", "ema125_5m", "rsi5_5m", "adx11_5m")
 
 
 def contender2_signal(s: Snapshot, trend_override: Optional[int] = None) -> int:

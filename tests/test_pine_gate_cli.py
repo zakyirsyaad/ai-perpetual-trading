@@ -346,8 +346,39 @@ class WarmupCommandTest(Dirs):
             code, out, _ = run_cli(self.base_args() + [
                 "warmup", "--start", "2025-07-30", "--end", "2025-08-01"])
         self.assertEqual(code, 0)
-        self.assertIn("prod/BTC-USDT/1h warmup: skipped, file exists", out)
+        self.assertIn("prod/BTC-USDT/1h warmup: skipped, file exists (covers "
+                      "1970-01-01T07:00:00+07:00 .. 1970-01-01T07:00:00+07:00, 1 bars)", out)
         self.assertEqual(read_day(path), [(0, 1.0, 1.0, 1.0, 1.0, 0.0)])
+
+
+class NativeCheckFetchCommandTest(Dirs):
+    def test_native_check_fetch_writes_native_bars_and_skips_with_coverage(self):
+        from research.pine_gate import cli_data
+
+        with mock.patch.object(cli_common, "http_get", FakeHttp()), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, err = run_cli(self.base_args() + [
+                "native-check-fetch", "--start", "2025-08-01", "--end", "2025-08-03"])
+        self.assertEqual(code, 0, err)
+        start = wib_day_start_ms(date(2025, 8, 1))
+        end = wib_day_start_ms(date(2025, 8, 3))
+        for symbol in ("BTC-USDT", "ETH-USDT"):
+            rows = read_day(cli_data.native_check_path(self.data, symbol, "1h"))
+            self.assertEqual((rows[0][0], rows[-1][0]), (start, end - HOUR))
+            self.assertTrue(cli_data.native_check_path(self.data, symbol, "4h").exists())
+        self.assertFalse(warmup_path(self.data, "BTC-USDT", "1h").exists())
+        with mock.patch.object(cli_common, "http_get", FakeHttp()), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, _ = run_cli(self.base_args() + ["native-check-fetch"])
+        self.assertEqual(code, 0)
+        self.assertIn("prod/BTC-USDT/1h native check: skipped, file exists (covers "
+                      "2025-08-01T00:00:00+07:00 .. 2025-08-02T23:00:00+07:00, 48 bars)", out)
+
+    def test_native_check_fetch_defaults_to_august_2025(self):
+        from research.pine_gate import cli
+
+        args = cli.build_parser().parse_args(["native-check-fetch"])
+        self.assertEqual((args.start, args.end), (date(2025, 8, 1), date(2025, 9, 1)))
 
 
 class FundingCommandTest(Dirs):
@@ -368,7 +399,8 @@ class FundingCommandTest(Dirs):
             code, out, _ = run_cli(self.base_args() + [
                 "funding", "--start", "2026-07-01", "--end", "2026-07-03"])
         self.assertEqual(code, 0)
-        self.assertIn("skipped, file exists", out)
+        self.assertIn("prod/BTC-USDT funding: skipped, file exists (covers "
+                      "2026-07-01T00:00:00+07:00 .. 2026-07-01T16:00:00+07:00, 3 times)", out)
 
 
 class CollectCommandTest(Dirs):
@@ -393,17 +425,27 @@ class CheckDataCommandTest(Dirs):
         self.assertIn("prod/BTC-USDT/1m missing 439 days", out)
         self.assertIn("2025-08-01", out)
 
-    def test_native_check_without_overlap_is_skip_not_pass(self):
-        warm = [(wib_day_start_ms(FIRST_DAY) - HOUR, 1.0, 1.0, 1.0, 1.0, 1.0)]
+    def test_native_check_fails_without_the_native_check_file(self):
         write_prod_days(self.data, "BTC-USDT",
                         synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
-        write_day(warmup_path(self.data, "BTC-USDT", "1h"), warm)
         from research.pine_gate import cli_data
 
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h", 2)
-        self.assertTrue(ok)
-        self.assertTrue(line.startswith("SKIP"), line)
-        self.assertIn("no overlap", line)
+        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertTrue(line.startswith("FAIL"), line)
+        self.assertIn("native-check-fetch", line)
+
+    def test_native_check_without_overlap_fails(self):
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
+        from research.pine_gate import cli_data
+
+        start = wib_day_start_ms(FIRST_DAY) + 5 * DAY  # no 1m day file covers it
+        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"),
+                  [(start, 1.0, 1.0, 1.0, 1.0, 1.0)])
+        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertTrue(line.startswith("FAIL"), line)
 
     def test_native_check_passes_when_native_bars_match(self):
         rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
@@ -413,11 +455,32 @@ class CheckDataCommandTest(Dirs):
 
         agg = aggregate(bars_from_rows(rows, MIN), HOUR)
         native = [(agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i], agg.close[i],
-                   agg.volume[i]) for i in range(3)]
-        write_day(warmup_path(self.data, "BTC-USDT", "1h"), native)
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h", 2)
-        self.assertTrue(ok)
+                   agg.volume[i]) for i in range(len(agg))]
+        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
+        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertTrue(ok, line)
         self.assertTrue(line.startswith("PASS"), line)
+        self.assertIn(f"of {len(agg)} bars", line)
+
+    def test_native_check_fails_when_a_native_bar_differs(self):
+        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
+        write_prod_days(self.data, "BTC-USDT", rows)
+        from research.pine_gate import cli_data
+        from research.pine_gate.bars import aggregate, bars_from_rows
+
+        agg = aggregate(bars_from_rows(rows, MIN), HOUR)
+        native = [(agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i], agg.close[i],
+                   agg.volume[i] * (2.0 if i == 0 else 1.0)) for i in range(len(agg))]
+        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
+        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertTrue(line.startswith("FAIL"), line)
+
+    def test_truncation_times_must_be_positive(self):
+        for value in ("0", "-3"):
+            code, _, err = run_cli(self.base_args() + ["check-data", "--truncation-times", value])
+            self.assertEqual(code, 2, err)
+            self.assertIn("positive", err)
 
     def test_truncation_check_on_real_files(self):
         rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
@@ -501,11 +564,76 @@ SELECTION = {"spec_sha256": "x", "contender1": "E200|P35|OFF|OFF|OFF", "s_star_b
              "primary_rule": None, "meta_model": None}
 
 
+def write_lock_files(test, chosen="c1", **overrides):
+    """A selection file ``s.json`` and a holdout file made from it under the current spec."""
+    selection = test.out / "s.json"
+    selection.write_text(json.dumps(SELECTION), encoding="utf-8")
+    holdout = {"chosen": chosen, "spec_sha256": spec_sha256(), "selection_file": "s.json",
+               "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest()}
+    holdout.update(overrides)
+    (test.out / "pine_gate_holdout_20261014.json").write_text(json.dumps(holdout),
+                                                               encoding="utf-8")
+    return selection
+
+
+class CheckLockTest(Dirs):
+    """vst-check and decisions score holdout-period outcomes: only after ``test`` ran."""
+
+    def patches(self):
+        from research.pine_gate import cli_checks
+
+        no_data = AssertionError("data loaded")
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(cli_checks, "load_selection_checked",
+                                              lambda p, s: SELECTION))
+        self.prod_bars = stack.enter_context(
+            mock.patch.object(cli_checks, "prod_bars", side_effect=no_data))
+        self.edge = stack.enter_context(
+            mock.patch.object(cli_checks, "load_edge_klines_vst", side_effect=no_data))
+        self.settings = stack.enter_context(
+            mock.patch.object(cli_common, "make_settings", side_effect=no_data))
+        return stack
+
+    def run_both(self, extra=()):
+        selection = str(self.out / "s.json")
+        results = []
+        with self.patches():
+            for argv in (["vst-check", "--symbol", "BTC-USDT", "--selection", selection],
+                         ["decisions", "--selection", selection]):
+                results.append(run_cli(self.base_args() + argv + list(extra)))
+            self.prod_bars.assert_not_called()
+            self.edge.assert_not_called()
+            self.settings.assert_not_called()
+        return results
+
+    def assert_refused(self, results, text):
+        for code, out, err in results:
+            self.assertEqual(code, 2, err)
+            self.assertEqual(len(err.strip().splitlines()), 1, err)
+            self.assertIn(text, err)
+            self.assertNotIn("Traceback", err)
+
+    def test_contender_flag_without_a_holdout_file_is_refused(self):
+        (self.out / "s.json").write_text(json.dumps(SELECTION), encoding="utf-8")
+        self.assert_refused(self.run_both(["--contender", "c1"]), "no holdout file")
+
+    def test_holdout_of_another_spec_is_refused(self):
+        write_lock_files(self, spec_sha256="0" * 64)
+        self.assert_refused(self.run_both(["--contender", "c1"]), "spec_sha256")
+
+    def test_holdout_of_another_selection_file_is_refused(self):
+        write_lock_files(self, selection_file="pine_gate_selection_20260101.json")
+        self.assert_refused(self.run_both(), "selection_file")
+
+    def test_holdout_of_a_changed_selection_file_is_refused(self):
+        write_lock_files(self, selection_sha256="f" * 64)
+        self.assert_refused(self.run_both(), "selection_sha256")
+
+
 class VstCheckCommandTest(Dirs):
     def test_vst_check_writes_the_agreement_for_the_chosen_contender(self):
         _, edge = prod_and_vst(self)
-        (self.out / "pine_gate_holdout_20261014.json").write_text(
-            json.dumps({"chosen": "c1"}), encoding="utf-8")
+        write_lock_files(self, chosen="c1")
         from research.pine_gate import cli_checks
 
         with mock.patch.object(cli_checks, "load_selection_checked", lambda p, s: SELECTION):
@@ -522,8 +650,7 @@ class VstCheckCommandTest(Dirs):
         self.assertIn("contender c1", out)
 
     def test_vst_check_needs_a_contender_when_the_holdout_chose_none(self):
-        (self.out / "pine_gate_holdout_20261014.json").write_text(
-            json.dumps({"chosen": None}), encoding="utf-8")
+        write_lock_files(self, chosen=None)
         from research.pine_gate import cli_checks
 
         with mock.patch.object(cli_checks, "load_selection_checked", lambda p, s: SELECTION):
@@ -556,8 +683,7 @@ class DecisionsCommandTest(Dirs):
                    {"call_id": "call-2", "latency_ms": 10_000.0, "purpose": "entry",
                     "success": True}]
         fake = FakeRows({"ai_decisions": decisions, "ai_call_metrics": metrics})
-        (self.out / "pine_gate_holdout_20261014.json").write_text(
-            json.dumps({"chosen": "c2"}), encoding="utf-8")
+        write_lock_files(self, chosen="c2")
         from research.pine_gate import cli_checks
 
         with mock.patch.object(cli_checks, "load_selection_checked", lambda p, s: SELECTION), \
@@ -583,6 +709,7 @@ class DecisionsCommandTest(Dirs):
 
 class ReportCommandTest(Dirs):
     def test_report_surfaces_not_implemented_as_one_line(self):
+        write_lock_files(self)
         code, out, err = run_cli(self.base_args() + ["report"])
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
@@ -590,13 +717,46 @@ class ReportCommandTest(Dirs):
         self.assertIn("verdict_sentence", err)
         self.assertNotIn("Traceback", err)
 
+    def test_report_refuses_without_a_holdout_file(self):
+        (self.out / "pine_gate_selection_20261014.json").write_text("{}", encoding="utf-8")
+        code, _, err = run_cli(self.base_args() + ["report"])
+        self.assertEqual(code, 1)
+        self.assertIn("no holdout file", err)
+
+    def test_report_refuses_when_the_holdout_selection_file_is_missing(self):
+        (self.out / "pine_gate_holdout_20261014.json").write_text(
+            json.dumps({"selection_file": "pine_gate_selection_20261001.json"}), encoding="utf-8")
+        code, _, err = run_cli(self.base_args() + ["report"])
+        self.assertEqual(code, 1)
+        self.assertIn("pine_gate_selection_20261001.json", err)
+
+    def test_report_defaults_to_the_selection_the_holdout_used(self):
+        used = self.out / "pine_gate_selection_20261001.json"
+        used.write_text(json.dumps({"data_sha256": "used"}), encoding="utf-8")
+        (self.out / "pine_gate_selection_20261014.json").write_text(
+            json.dumps({"data_sha256": "newer"}), encoding="utf-8")
+        (self.out / "pine_gate_holdout_20261014.json").write_text(
+            json.dumps({"selection_file": used.name}), encoding="utf-8")
+        captured = {}
+
+        def fake_write(results, out_dir):
+            captured["results"] = results
+            return Path(out_dir) / "r.md", Path(out_dir) / "r.json"
+
+        with mock.patch.object(cli_stages, "write_report", fake_write):
+            code, _, err = run_cli(self.base_args() + ["report"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(captured["results"]["selection"], {"data_sha256": "used"})
+        self.assertEqual(captured["results"]["sha256"]["data"], "used")
+
     def test_report_gathers_the_newest_files_and_their_hashes(self):
         older = self.out / "pine_gate_selection_20261001.json"
         older.write_text(json.dumps({"data_sha256": "old"}), encoding="utf-8")
         newest = self.out / "pine_gate_selection_20261014.json"
         newest.write_text(json.dumps({"data_sha256": "abc"}), encoding="utf-8")
         holdout = self.out / "pine_gate_holdout_20261014.json"
-        holdout.write_text(json.dumps({"chosen": "c2"}), encoding="utf-8")
+        holdout.write_text(json.dumps({"chosen": "c2", "selection_file": newest.name}),
+                           encoding="utf-8")
         (self.out / "pine_gate_vst_BTC-USDT_20261014.json").write_text(
             json.dumps({"n": 5, "passed": True}), encoding="utf-8")
         (self.out / "pine_gate_decisions_20261014.json").write_text(
@@ -612,7 +772,7 @@ class ReportCommandTest(Dirs):
         self.assertEqual(code, 0, err)
         results = captured["results"]
         self.assertEqual(results["selection"], {"data_sha256": "abc"})
-        self.assertEqual(results["holdout"], {"chosen": "c2"})
+        self.assertEqual(results["holdout"], {"chosen": "c2", "selection_file": newest.name})
         self.assertEqual(results["vst"], {"BTC-USDT": {"n": 5, "passed": True}})
         self.assertEqual(results["decisions"], {"A": {"n": 1}})
         sha = results["sha256"]
@@ -634,6 +794,16 @@ class CodeHashTest(unittest.TestCase):
         self.assertEqual(names, sorted(names))
         self.assertFalse(any(n.startswith("bot/") and n != "bot/strategy/pine_indicators.py"
                              for n in names))
+
+
+class PublicHelperNamesTest(unittest.TestCase):
+    def test_helpers_shared_with_the_cli_are_public(self):
+        from research.pine_gate import calibrate, checks, features, holdout
+
+        for module, name in ((holdout, "check_calibration"), (holdout, "refuse_any_holdout"),
+                             (features, "htf_bars"), (checks, "entry_index"),
+                             (calibrate, "fetch_all")):
+            self.assertTrue(callable(getattr(module, name, None)), f"{module.__name__}.{name}")
 
 
 class UsageTest(unittest.TestCase):

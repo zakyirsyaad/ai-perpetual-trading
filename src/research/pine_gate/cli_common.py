@@ -13,6 +13,7 @@ BingX market data), ``sleep``, ``now`` (the clock that dates output files),
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -66,6 +67,17 @@ def check_symbol(symbol: str) -> str:
     if not SYMBOL_PATTERN.match(symbol):
         raise ValueError(f"not a BingX USDT symbol: {symbol!r}")
     return symbol
+
+
+def positive_int(text: str) -> int:
+    """argparse type for counts: 0 or less is a usage error, never a vacuous pass."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text!r}")
+    return value
 
 
 def wib_today() -> date:

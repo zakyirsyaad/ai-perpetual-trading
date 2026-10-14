@@ -261,3 +261,72 @@ class ReferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_LONG_VALUES = {
+    "close_5m": 110.0, "ema200_5m": 100.0, "ema125_5m": 100.0, "atr14_5m": 1.0,
+    "rsi14_5m": 10.0, "rsi5_5m": 10.0, "adx14_5m": 50.0, "di_plus14_5m": 30.0,
+    "di_minus14_5m": 10.0, "adx11_5m": 50.0,
+    "high12_prev": 105.0, "low12_prev": 90.0, "high24_prev": 105.0, "low24_prev": 90.0,
+    "h1_ema20": 110.0, "h1_ema50": 100.0, "h1_atr14": 1.0,
+    "h4_ema20": 110.0, "h4_ema50": 100.0, "h4_atr14": 1.0, "stretch_3m": 0.1,
+}
+_SHORT_VALUES = {
+    **_LONG_VALUES,
+    "close_5m": 90.0, "rsi14_5m": 90.0, "rsi5_5m": 90.0, "di_plus14_5m": 10.0,
+    "di_minus14_5m": 30.0, "high12_prev": 110.0, "low12_prev": 95.0, "high24_prev": 110.0,
+    "low24_prev": 95.0, "h1_ema20": 90.0, "h4_ema20": 90.0,
+}
+_ALL_FIELDS = tuple(f for f in Snapshot.__dataclass_fields__ if f != "t_ms")
+
+
+def only(fields, values=_LONG_VALUES, **extra) -> Snapshot:
+    """A snapshot with only ``fields`` set (from ``values``); every other field is None."""
+    snapshot = {f: None for f in _ALL_FIELDS}
+    snapshot.update({f: values.get(f) for f in fields})
+    snapshot.update(extra)
+    return Snapshot(t_ms=0, **snapshot)
+
+
+class RequiredFieldsTests(unittest.TestCase):
+    def all_rules(self):
+        from itertools import product
+
+        from research.pine_gate.spec import ENTRIES, STRENGTHS, TRENDS, VOLS, VPS
+
+        return [RuleSpec(*combo) for combo in product(TRENDS, ENTRIES, STRENGTHS, VOLS, VPS)]
+
+    def test_rule_signal_needs_exactly_the_required_fields(self):
+        from research.pine_gate.rules import required_fields
+        from research.pine_gate.spec import ENTRY_PARAMS
+
+        rules = self.all_rules()
+        self.assertEqual(len(rules), 216)
+        for r in rules:
+            fields = required_fields(r)
+            pullback = ENTRY_PARAMS[r.entry]["kind"] == "pullback"
+            vol = {"HIGH": 99.0, "NOT_HIGH": 1.0}.get(r.vol)
+            extra = {"h1_vol_pct": vol} if "h1_vol_pct" in fields else {}
+            setups = ((1, _LONG_VALUES, 200.0 if pullback else 50.0),
+                      (-1, _SHORT_VALUES, 50.0 if pullback else 200.0))
+            matters = set()
+            for side, values, poc in setups:
+                s = only(fields, values, **extra)
+                self.assertEqual(rule_signal(r, s, lambda: poc), side, f"{r.key()} {side}")
+                for name in fields:
+                    if rule_signal(r, replace(s, **{name: None}), lambda: poc) == 0:
+                        matters.add(name)
+            self.assertEqual(matters, set(fields), r.key())
+
+    def test_contender2_and_reference_need_exactly_their_fields(self):
+        from research.pine_gate.rules import (
+            contender2_required_fields,
+            reference_required_fields,
+        )
+
+        for signal, fields in ((contender2_signal, contender2_required_fields()),
+                               (reference_signal, reference_required_fields())):
+            self.assertEqual(signal(only(fields)), 1, signal.__name__)
+            for name in fields:
+                self.assertEqual(signal(replace(only(fields), **{name: None})), 0,
+                                 f"{signal.__name__} without {name}")

@@ -18,9 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import cli_common as common
 from .cli_checks import DECISIONS_PREFIX, VST_PREFIX
 from .calibrate import load_entry_latencies_ms, s_star, stop_overshoot_detail
-from .holdout import HOLDOUT_PREFIX, _check_calibration, _refuse_any_holdout, test_stage
+from .holdout import HOLDOUT_PREFIX, check_calibration, refuse_any_holdout, test_stage
 from .pipeline import (
-    SELECTION_PREFIX,
     TRAIN_DATA_UNTIL_MS,
     latencies_sha256,
     load_dataset,
@@ -86,8 +85,8 @@ def cmd_test(args: argparse.Namespace) -> int:
     spec_sha = spec_sha256()
     selection = load_selection_checked(selection_path, spec_sha)  # the lock comes first
     calib = common.load_calibration_file(Path(args.calibration).expanduser())
-    _check_calibration(selection_path, selection, calib)
-    _refuse_any_holdout(args.out_dir)
+    check_calibration(selection_path, selection, calib)
+    refuse_any_holdout(args.out_dir)
     dataset = load_dataset(args.data_dir, None)
     print(test_stage(dataset, selection_path, calib, args.out_dir, spec_sha,
                      seed=selection.get("seed", 0)))
@@ -130,23 +129,38 @@ def _pick(explicit: Optional[str], out_dir: Path, prefix: str) -> Optional[Path]
     return common.newest(out_dir, f"{prefix}*.json")
 
 
-def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
-    sel_path = _pick(args.selection, args.out_dir, SELECTION_PREFIX)
+def _report_inputs(args: argparse.Namespace) -> Tuple[Path, Dict[str, Any], Path]:
+    """The holdout file and the selection file it was made from; both must exist."""
     hold_path = _pick(args.holdout, args.out_dir, HOLDOUT_PREFIX)
-    dec_path = _pick(args.decisions, args.out_dir, DECISIONS_PREFIX)
+    if hold_path is None:
+        raise common.CliError(f"no holdout file in {args.out_dir}; run the test stage first")
+    holdout = common.json_doc(hold_path)
+    if args.selection:
+        sel_path = Path(args.selection).expanduser()
+    elif isinstance(holdout.get("selection_file"), str):
+        sel_path = Path(args.out_dir) / Path(holdout["selection_file"]).name
+    else:
+        raise common.CliError(f"{hold_path}: records no selection_file; pass --selection")
+    if not sel_path.exists():
+        raise common.CliError(f"selection file {sel_path} not found")
+    return hold_path, holdout, sel_path
+
+
+def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
+    hold_path, holdout, sel_path = _report_inputs(args)
     selection = common.json_doc(sel_path)
-    decisions = common.json_doc(dec_path)
+    decisions = common.json_doc(_pick(args.decisions, args.out_dir, DECISIONS_PREFIX))
     vst = {symbol: common.json_doc(p) for symbol, p in _vst_paths(args.out_dir, args.vst).items()}
     return {
         "selection": selection,
-        "holdout": common.json_doc(hold_path),
+        "holdout": holdout,
         "vst": vst,
         "decisions": common.as_mapping(decisions).get("buckets"),
         "sha256": {
             "spec": spec_sha256(),
             "data": common.as_mapping(selection).get("data_sha256"),
-            "selection": common.file_sha256(sel_path) if sel_path else None,
-            "holdout": common.file_sha256(hold_path) if hold_path else None,
+            "selection": common.file_sha256(sel_path),
+            "holdout": common.file_sha256(hold_path),
             "code": code_sha256(),
         },
     }
@@ -177,8 +191,8 @@ def add_parsers(sub: Any) -> None:
     p.set_defaults(handler=cmd_test)
 
     p = sub.add_parser("report", help="the Indonesian report from the newest output files")
-    p.add_argument("--selection")
-    p.add_argument("--holdout")
+    p.add_argument("--selection", help="default: the selection file the holdout was made from")
+    p.add_argument("--holdout", help="default: the newest holdout file in --out-dir")
     p.add_argument("--decisions")
     p.add_argument("--vst", action="append", help="repeatable; default: newest per symbol")
     p.set_defaults(handler=cmd_report)

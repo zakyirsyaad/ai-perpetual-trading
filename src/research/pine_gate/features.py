@@ -198,7 +198,7 @@ def _head(bars: Bars, end: int) -> Bars:
     )
 
 
-def _htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
+def htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
     """Native warm-up bars before the first aggregated bar, then the aggregated bars.
 
     ``aggregate`` drops a partial leading bucket (1m data starting mid-bucket), so
@@ -265,8 +265,8 @@ class FeatureFrame:
             raise ValueError(f"expected 1m bars, got {bars_1m.interval_ms} ms")
         bars_3m = aggregate(bars_1m, INTERVAL_3M)
         bars_5m = aggregate(bars_1m, INTERVAL_5M)
-        bars_1h = _htf_bars(bars_1m, warmup_1h, INTERVAL_1H)
-        bars_4h = _htf_bars(bars_1m, warmup_4h, INTERVAL_4H)
+        bars_1h = htf_bars(bars_1m, warmup_1h, INTERVAL_1H)
+        bars_4h = htf_bars(bars_1m, warmup_4h, INTERVAL_4H)
         tables = (
             _Table(bars_5m, _columns_5m(bars_5m)),
             _Table(bars_1h, _columns_htf(bars_1h, "h1", with_vol_pct=True)),
