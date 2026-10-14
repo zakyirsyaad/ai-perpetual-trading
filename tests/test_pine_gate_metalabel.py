@@ -398,7 +398,7 @@ class CrossValidationTests(unittest.TestCase):
             return {c: list(fake[c]) for c in c_grid}, sizes, {c: [] for c in c_grid}
 
         with mock.patch.object(metalabel, "_cross_validate", side_effect=fake_cv):
-            chosen, losses = choose_C(cands, CFG.c_grid)
+            chosen, losses = choose_C(cands, tuple(fake))  # a grid of its own, not the spec's
         self.assertEqual(chosen, 0.01)
         self.assertEqual(losses, fake)
 

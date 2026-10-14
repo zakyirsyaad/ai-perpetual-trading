@@ -198,12 +198,17 @@ def simulate(
     offset_s: int = 0,
     blocked_entry_windows: Iterable[Tuple[int, int]] = (),
     fee_pct: Optional[float] = None,
+    allow_zero_latency: bool = False,
 ) -> List[Trade]:
     """Replay ticks in [start_ms + offset_s, end_ms) and return the closed trades.
 
-    The run stops early, returning the trades so far, when the order bar does
-    not exist or the data ends before the bracket resolves.
+    An empty latency sample would mean zero AI latency, so it is refused
+    (``ValueError``) unless ``allow_zero_latency`` says so (tests, the cadence
+    sensitivity). The run stops early, returning the trades so far, when the order
+    bar does not exist or the data ends before the bracket resolves.
     """
+    if not latencies_ms and not allow_zero_latency:
+        raise ValueError("empty latency sample: zero AI latency needs allow_zero_latency=True")
     rng = random.Random(seed)
     blocked_starts, blocked_ends = _merge_windows(blocked_entry_windows)
     fee = exec_cfg.fee_pct if fee_pct is None else fee_pct

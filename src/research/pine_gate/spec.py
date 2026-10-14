@@ -121,7 +121,9 @@ class SelectionConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    c_grid: Tuple[float, ...] = (0.01, 0.1, 1.0)
+    # C of the mean-log-loss objective (spec 5.8): C_mean ~ C_sum * sum(w), so the grid
+    # sits about 1,000x above the old sum-objective grid (0.01, 0.1, 1).
+    c_grid: Tuple[float, ...] = (10.0, 100.0, 1000.0)
     threshold_hi: float = 0.70
     threshold_lo: float = 0.50
     threshold_step: float = 0.01

@@ -710,10 +710,26 @@ class CalibrateCommandTest(Dirs):
             self.assertEqual(doc["latencies_ms"], [1500.0, 2500.0])
             self.assertEqual(doc["latencies_sha256"], latencies_sha256([1500.0, 2500.0]))
             self.assertEqual((doc["n_stops"], doc["n_skipped"]), (0, 0))
+            self.assertEqual((doc["n_rebuilt"], doc["stop_atr_multiple"], doc["stop_cap_pct"]),
+                             (0, 1.5, 0.4))
             self.assertIn("n_latencies 2", out)
             code, _, err = run_cli(self.base_args() + ["calibrate"])
         self.assertEqual(code, 1)
         self.assertIn("already exists", err)
+
+    def test_calibrate_fails_when_more_stops_are_skipped_than_rebuilt(self):
+        trade = {"id": 1, "created_at": "2026-09-20T00:30:00Z", "symbol": "BTC/USDT",
+                 "direction": "LONG", "entry_price": 100.0, "exit_price": 99.7,
+                 "opened_at": "2026-09-20T00:00:00Z"}  # no stored decision: not rebuilt
+        rows = FakeRows({"trades": [trade],
+                         "ai_call_metrics": [{"created_at": "2026-09-26T00:00:00Z",
+                                              "latency_ms": 1500.0}]})
+        with mock.patch.object(cli_common, "make_settings", FakeSettings), \
+                mock.patch.object(cli_common, "make_get_rows", reader(rows)):
+            code, _, err = run_cli(self.base_args() + ["calibrate"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("skipped 1", err)
+        self.assertFalse((self.out / "pine_gate_calibration_20261014.json").exists())
 
     def test_settings_failure_prints_only_the_error_type(self):
         def broken():

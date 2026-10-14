@@ -25,9 +25,10 @@ from .lock import code_files, code_sha256, latencies_sha256, load_selection_chec
 from .dataset import DataSource
 from .pipeline import TRAIN_DATA_UNTIL_MS, load_dataset, train_stage
 from .report import write_report
-from .spec import spec_sha256
+from .spec import FillConfig, spec_sha256
 
 CALIBRATION_PREFIX = "pine_gate_calibration_"
+_FILL = FillConfig()
 # code_files / code_sha256 live in ``lock`` (the selection and holdout files record
 # the code sha256) and stay importable from here.
 
@@ -55,10 +56,19 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     detail, latencies = common.call_live(
         "reading Supabase", lambda: asyncio.run(_read_calibration(settings))
     )
+    if detail.skipped > len(detail.samples):
+        raise common.CliError(
+            f"stop levels rebuilt {len(detail.samples)}, skipped {detail.skipped}: more live "
+            "stops could not be rebuilt than could, so s* would not represent them")
     doc = {
         "s_star_bps": s_star(detail.samples),
         "n_stops": len(detail.samples),
+        "n_rebuilt": len(detail.samples),
         "n_skipped": detail.skipped,
+        # how each live stop level was rebuilt (spec 5.10); the live settings since
+        # overshoot_since are confirmed by the operator, not by code
+        "stop_atr_multiple": _FILL.stop_atr_multiple,
+        "stop_cap_pct": _FILL.stop_cap_pct,
         "latencies_ms": [float(x) for x in latencies],
         "latencies_sha256": latencies_sha256(latencies),
         "created_at": common.now().isoformat(),

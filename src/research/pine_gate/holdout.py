@@ -339,7 +339,8 @@ def _cadence(h: Holdout, c: Contender) -> Dict[str, Any]:
     def signal(symbol: str, t: int) -> int:
         return c.signal(symbol, t) if t % _BAR_5M_MS == 0 else 0
 
-    trades = h.run(signal, markets=markets, exec_cfg=cfg, latencies_ms=())
+    trades = h.run(signal, markets=markets, exec_cfg=cfg, latencies_ms=(),
+                   allow_zero_latency=True)
     return {s: brief_metrics(trades_of(trades, s), h) for s in SYMBOLS}
 
 

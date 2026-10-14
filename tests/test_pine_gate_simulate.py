@@ -57,11 +57,25 @@ def run(signal, markets, start, end, **kw):
         exec_cfg=CFG,
         guard_cfg=GUARDS,
         latencies_ms=(),
+        allow_zero_latency=True,
         seed=1,
         overshoot_bps=1.0,
     )
     params.update(kw)
     return simulate(signal, markets, start, end, **params)
+
+
+class LatencySampleTests(unittest.TestCase):
+    def test_an_empty_latency_sample_is_refused_unless_zero_latency_is_explicit(self):
+        start = TUE_0800
+        btc = make_market(BTC, start - HOUR, start + 2 * HOUR)
+        with self.assertRaises(ValueError) as ctx:
+            run(always({BTC: 1}), [btc], start, start + HOUR, allow_zero_latency=False)
+        self.assertIn("latenc", str(ctx.exception))
+        trades = run(always({BTC: 1}), [btc], start, start + HOUR)  # explicit: allowed
+        self.assertTrue(trades)
+        self.assertTrue(run(always({BTC: 1}), [btc], start, start + HOUR,
+                            latencies_ms=(1000,), allow_zero_latency=False))
 
 
 class TickClockTests(unittest.TestCase):

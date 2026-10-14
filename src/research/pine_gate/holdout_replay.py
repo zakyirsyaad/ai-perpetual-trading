@@ -138,6 +138,7 @@ def simulate_holdout(
     overshoot_bps: Optional[float] = None,
     offset_s: int = 0,
     latencies_ms: Optional[Sequence[float]] = None,
+    allow_zero_latency: bool = False,
 ) -> List[Trade]:
     """The one-position replay over the holdout with the final-65-minute block."""
     return simulate(
@@ -147,6 +148,7 @@ def simulate_holdout(
         seed=seed,
         overshoot_bps=calib.s_star_bps if overshoot_bps is None else overshoot_bps,
         offset_s=offset_s, blocked_entry_windows=period.blocked_windows(),
+        allow_zero_latency=allow_zero_latency,
     )
 
 

@@ -94,7 +94,7 @@ class ConfigTests(unittest.TestCase):
             pbo_max=0.5, vol_high_pct=67.0, vol_lookback_1h=720, vp_bin_bps=5.0,
             trend_band_atr=0.25))
         self.assertEqual(dataclasses.asdict(ModelConfig()), dict(
-            c_grid=(0.01, 0.1, 1.0), threshold_hi=0.70, threshold_lo=0.50,
+            c_grid=(10.0, 100.0, 1000.0), threshold_hi=0.70, threshold_lo=0.50,
             threshold_step=0.01, fallback_threshold=0.5, threshold_min_supply_per_day=10.0))
         self.assertEqual(dataclasses.asdict(GateConfig()), dict(
             min_tp_sl=60, alpha=0.05, min_wr=57.0, half_min_wr=50.0,
