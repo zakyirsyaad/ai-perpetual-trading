@@ -489,6 +489,9 @@ def _metalabel(selection: Any) -> Lines:
     head = [f"- C terpilih: {fmt_dec(sel.get('chosen_C'), 3)}; ambang probabilitas: "
             f"{fmt_dec(_get(sel, 'meta_model', 'threshold'), 2)}; kandidat: "
             f"{fmt_int(sel.get('n_candidates'))}; prediksi di luar sampel: {fmt_int(sel.get('n_oof'))}.",
+            f"- pasokan pada ambang (trade/hari, B2–B4): luar sampel "
+            f"{fmt_dec(sel.get('supply_oof_at_threshold'))}; model akhir "
+            f"{fmt_dec(sel.get('supply_final_at_threshold'))}.",
             "", "Log-loss validasi per lipatan (jendela memanjang B1–B4); rata-rata dibobot "
             "ukuran lipatan, sama dengan pemilihan C:", ""]
     return (head + _table(["C", "log-loss per lipatan", "rata-rata"], loss_rows)

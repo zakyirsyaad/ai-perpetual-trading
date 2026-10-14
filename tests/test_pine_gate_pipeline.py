@@ -184,6 +184,8 @@ class FakeMetaTrainer:
             "chosen_C": 0.1,
             "oof": [["BTC-USDT", 0, 0.5, 1]],
             "reliability": [(0.5, 0.5, 1)],
+            "supply_oof_at_threshold": 11.5,
+            "supply_final_at_threshold": 12.25,
         }
         return model, diagnostics
 
@@ -411,6 +413,8 @@ class TrainStageTests(PipelineFixture):
         self.assertEqual(sel["cv_logloss"], {"0.1": [0.69, 0.69, 0.69]})
         self.assertEqual(sel["chosen_C"], 0.1)
         self.assertEqual(sel["reliability"], [[0.5, 0.5, 1]])
+        self.assertEqual(sel["supply_oof_at_threshold"], 11.5)
+        self.assertEqual(sel["supply_final_at_threshold"], 12.25)
         self.assertEqual(sel["configs"]["selection"]["min_tp_sl"], 1)
         self.assertEqual(sel["segments"]["train_end_ms"], ms(TRAIN_END))
         self.assertIn("created_at", sel)

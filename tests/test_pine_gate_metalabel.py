@@ -58,16 +58,26 @@ def make_candidates(per_block=120, seed=3, hold_min=30):
 
 
 def logistic_gradient(X, y, w, C, coef, intercept):
+    """Gradient of sum(w * logloss) / sum(w) + |beta|^2 / (2C)."""
     grad = [0.0] * (len(coef) + 1)
+    total = sum(w)
     for xi, yi, wi in zip(X, y, w):
         z = intercept + sum(b * v for b, v in zip(coef, xi))
-        r = wi * (1.0 / (1.0 + math.exp(-z)) - yi)
+        r = wi * (1.0 / (1.0 + math.exp(-z)) - yi) / total
         for j, v in enumerate(xi):
             grad[j] += r * v
         grad[-1] += r
     for j, b in enumerate(coef):
         grad[j] += b / C
     return grad
+
+
+def stationary_sample(n, seed):
+    """Two features; the label follows feature 0 with the same law at every size."""
+    rng = random.Random(seed)
+    X = [(rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.0)) for _ in range(n)]
+    y = [1 if rng.random() < 1.0 / (1.0 + math.exp(-x[0])) else 0 for x in X]
+    return X, y
 
 
 class FeatureTests(unittest.TestCase):
@@ -202,6 +212,30 @@ class LogisticTests(unittest.TestCase):
         grad = logistic_gradient(self.X, self.y, self.w, C, coef, intercept)
         for g in grad:
             self.assertAlmostEqual(g, 0.0, places=6)
+
+    def test_the_penalty_means_the_same_at_every_weight_scale(self):
+        base = fit_logistic(self.X, self.y, self.w, 0.5)
+        scaled = fit_logistic(self.X, self.y, [10.0 * v for v in self.w], 0.5)
+        for a, b in zip(base[0] + (base[1],), scaled[0] + (scaled[1],)):
+            self.assertAlmostEqual(a, b, places=6)
+
+    def test_share_above_a_threshold_is_stable_from_fold_to_full_size(self):
+        """A fold-sized fit and a full-sized fit on stationary data select about the
+        same share of candidates at p >= 0.55 (the meta-model's p* is scanned on fold
+        models and applied to the full refit)."""
+        X, y = stationary_sample(4000, seed=1)
+        X_eval, _ = stationary_sample(4000, seed=99)
+        C, w = 1.0, 0.001  # small uniqueness weights, as with overlapping candidates
+
+        def share(n):
+            coef, b0 = fit_logistic(X[:n], y[:n], [w] * n, C)
+            probs = [1.0 / (1.0 + math.exp(-(b0 + sum(c * v for c, v in zip(coef, x)))))
+                     for x in X_eval]
+            return sum(1 for p in probs if p >= 0.55) / len(probs)
+
+        fold, full = share(1000), share(4000)
+        self.assertGreater(min(fold, full), 0.05)
+        self.assertLess(abs(fold - full), 0.03, (fold, full))
 
     def test_stronger_penalty_shrinks_coefficients(self):
         weak = fit_logistic(self.X, self.y, self.w, 1.0)[0]
@@ -419,6 +453,21 @@ class TrainMetaTests(unittest.TestCase):
         for row in diag["oof"]:
             self.assertTrue(0.0 < row[2] < 1.0)
             self.assertIn(row[3], (0, 1))
+
+    def test_train_meta_records_the_final_model_supply_at_the_threshold(self):
+        cands = make_candidates(per_block=120)
+        calls = []
+
+        def supply_for(probs, p):
+            calls.append((dict(probs), p))
+            return sum(1 for v in probs.values() if v >= p) / 10.0
+
+        model, diag = train_meta(cands, supply_for, CFG)
+        oof = {(r[0], r[1]): r[2] for r in diag["oof"]}
+        final = {(c.symbol, c.t_ms): model.prob(c.x) for c in cands}
+        self.assertEqual(diag["supply_oof_at_threshold"], supply_for(oof, model.threshold))
+        self.assertEqual(diag["supply_final_at_threshold"], supply_for(final, model.threshold))
+        self.assertIn((final, model.threshold), calls[:-2])  # computed inside train_meta
 
     def test_train_meta_falls_back_when_supply_is_short(self):
         cands = make_candidates(per_block=60)

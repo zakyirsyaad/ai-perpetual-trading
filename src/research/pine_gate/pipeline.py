@@ -629,7 +629,8 @@ def _contender3(
     ctx: _Context, primary: Optional[RuleSpec], trainer: MetaTrainer
 ) -> Dict[str, Any]:
     empty = {"meta_model": None, "cv_logloss": None, "cv_fold_sizes": None, "chosen_C": None,
-             "reliability": None, "n_oof": 0, "n_candidates": 0}
+             "reliability": None, "n_oof": 0, "n_candidates": 0,
+             "supply_oof_at_threshold": None, "supply_final_at_threshold": None}
     if primary is None:
         return empty
     candidates = meta_candidates(ctx, primary)
@@ -642,6 +643,10 @@ def _contender3(
         "reliability": [list(row) for row in diag["reliability"]],
         "n_oof": len(diag["oof"]),
         "n_candidates": len(candidates),
+        # Trades per B2-B4 day at the threshold: validated (out-of-fold) and the
+        # final refit's own (no labels), to show whether the refit keeps the supply.
+        "supply_oof_at_threshold": diag.get("supply_oof_at_threshold"),
+        "supply_final_at_threshold": diag.get("supply_final_at_threshold"),
     }
 
 

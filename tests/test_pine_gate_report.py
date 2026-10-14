@@ -128,6 +128,7 @@ def make_selection():
         "cv_logloss": {"0.1": [0.69, 0.68, 0.67], "1.0": [0.70, 0.69, 0.60]},
         "cv_fold_sizes": [100, 100, 200],
         "reliability": [[0.52, 0.50, 100], [0.61, 0.58, 80]], "n_oof": 180,
+        "supply_oof_at_threshold": 11.4, "supply_final_at_threshold": 13.2,
         "n_candidates": 200, "spec_sha256": SHA["spec"], "code_sha256": SHA["code"],
         "c0_training": {s: {"long": {"n": 900, "wr": 50.4, "gross_bps": -0.6},
                             "short": {"n": 900, "wr": 49.1, "gross_bps": -0.9}}
@@ -274,6 +275,11 @@ class RenderMarkdownTests(unittest.TestCase):
         del results["selection"]["cv_fold_sizes"]
         meta = section(render_markdown(results), "Model meta-labeling")
         self.assertIn("| 0.1 | 0.6900, 0.6800, 0.6700 | – |", meta)
+
+    def test_meta_section_shows_oof_and_final_supply_at_the_threshold(self, _):
+        meta = section(render_markdown(make_results()), "Model meta-labeling")
+        self.assertIn("pasokan pada ambang (trade/hari, B2–B4): luar sampel 11.4; "
+                      "model akhir 13.2", meta)
 
     def test_overshoot_sensitivity_is_reported(self, _):
         text = section(render_markdown(make_results()), "Biaya kadens dan guard")

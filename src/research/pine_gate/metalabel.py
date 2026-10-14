@@ -171,13 +171,17 @@ def _dot(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _objective(rows, y, w, C, theta) -> float:
-    """sum w * logloss + |beta|^2 / (2C); the intercept (last) is unpenalised."""
+    """sum(w * logloss) / sum(w) + |beta|^2 / (2C); the intercept (last) is unpenalised.
+
+    The data term is a weighted mean, so C regularises a fold-sized and a full-sized
+    fit alike (``w`` holds the weights pre-divided by their sum, see ``fit_logistic``)."""
     data = sum(wi * (_softplus(z) - yi * z)
                for z, yi, wi in ((_dot(r, theta), yi, wi) for r, yi, wi in zip(rows, y, w)))
     return data + sum(b * b for b in theta[:-1]) / (2.0 * C)
 
 
 def _gradient_and_hessian(rows, y, w, C, theta):
+    """Gradient and Hessian of ``_objective`` (``w`` already divided by its sum)."""
     n = len(theta)
     grad = [0.0] * n
     hess = [[0.0] * n for _ in range(n)]
@@ -231,9 +235,10 @@ def fit_logistic(
 ) -> Tuple[Tuple[float, ...], float]:
     """Newton (IRLS) fit of an L2 logistic regression; returns (coef, intercept).
 
-    Minimises sum w * logloss + |beta|^2 / (2C) with the intercept unpenalised.
-    Each Newton step is halved until the objective does not increase; the fit
-    stops when the largest parameter change is below ``tol``.
+    Minimises sum(w * logloss) / sum(w) + |beta|^2 / (2C) with the intercept
+    unpenalised, so C means the same at every sample size and weight scale. Each
+    Newton step is halved until the objective does not increase; the fit stops when
+    the largest parameter change is below ``tol``.
     """
     if not X:
         raise ValueError("no samples")
@@ -244,6 +249,10 @@ def fit_logistic(
     width = len(X[0])
     if any(len(row) != width for row in X):
         raise ValueError("every row of X needs the same number of features")
+    total = sum(w)
+    if not (total > 0 and math.isfinite(total)) or any(not wi >= 0 for wi in w):
+        raise ValueError("weights must be non-negative with a positive finite sum")
+    w = [wi / total for wi in w]  # the data term becomes the weighted mean log-loss
     rows = [tuple(float(v) for v in row) + (1.0,) for row in X]
     theta = [0.0] * (width + 1)
     current = _objective(rows, y, w, C, theta)
@@ -445,7 +454,9 @@ def train_meta(
 
     ``supply_for(oof_probs, p)`` returns the trades per trading day of the
     caller's one-position simulation when only out-of-fold candidates with
-    probability >= p may enter.
+    probability >= p may enter. The diagnostics also record that supply at the
+    chosen threshold for the final model's own probabilities on its training
+    candidates (no labels), so the refit's supply sits next to the validated one.
     """
     grid = _validated_grid(cfg.c_grid)
     keys = [(c.symbol, c.t_ms) for c in candidates]
@@ -457,11 +468,14 @@ def train_meta(
     oof = MappingProxyType({(c.symbol, c.t_ms): p for c, p in pairs})
     threshold = choose_threshold(lambda p: supply_for(oof, p), cfg)
     model = replace(_fit_candidates(list(candidates), chosen), threshold=threshold)
+    final = MappingProxyType({(c.symbol, c.t_ms): model.prob(c.x) for c in candidates})
     diagnostics = {
         "cv_logloss": losses,
         "fold_sizes": list(sizes),
         "chosen_C": chosen,
         "oof": [[c.symbol, c.t_ms, p, c.label] for c, p in pairs],
         "reliability": reliability([p for _, p in pairs], [c.label for c, _ in pairs]),
+        "supply_oof_at_threshold": supply_for(oof, threshold),
+        "supply_final_at_threshold": supply_for(final, threshold),
     }
     return model, diagnostics
