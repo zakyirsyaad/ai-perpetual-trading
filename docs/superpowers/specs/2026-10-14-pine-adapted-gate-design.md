@@ -244,12 +244,17 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
   DI+ − DI−; the volatility percentile of 5.5; distance to the 24-hour POC in 5m ATR14 units; hour of day
   (WIB) as sine and cosine. Standardised with training means and standard deviations.
 - **Model:** L2-regularised logistic regression. Candidates overlap in time, so samples are weighted
-  by uniqueness (the inverse of their average concurrency). The penalty C ∈ {0.01, 0.1, 1} is chosen
-  by expanding-window validation over B1–B4 (fit on B1…Bk, validate on Bk+1) with the 5.3 purge and
-  embargo, on mean log-loss.
+  by uniqueness (the inverse of their average concurrency). The fit minimises
+  Σ w·logloss / Σ w + ‖β‖² / (2C), intercept unpenalised: the data term is the weighted mean
+  log-loss, so C regularises a one-block fold and the four-block refit alike. The penalty
+  C ∈ {0.01, 0.1, 1} is chosen by expanding-window validation over B1–B4 (fit on B1…Bk, validate
+  on Bk+1) with the 5.3 purge and embargo, on mean log-loss.
 - **Threshold:** the highest probability p\* at which the one-position simulation on the
   out-of-fold predictions (B2–B4) still delivers ≥ 10 trades per trading day; if none does,
   p\* = 0.5. The final model is refitted on all training data and frozen with its scaler and p\*.
+  The selection file records, next to the out-of-fold supply at p\*, the supply at p\* of the
+  final model's own probabilities on its training candidates (no labels are used), so a refit
+  that selects a different share of candidates is visible.
 - In the bot this is a dot product and a sigmoid; no ML library.
 
 ### 5.9 Reference and controls
@@ -285,8 +290,8 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
 - **Portfolio:** one position across BTC and ETH; BTC first when both signal (ETH-first as a
   sensitivity check; co-signal frequency reported).
 - **Guards and limits as live:** entry window, 12 stops/day, 15 consecutive losses, drawdown
-  1,500 USDT at 25,000 notional, 34 attempts/day, 1M daily volume cap, funding blackout 10 minutes
-  around actual funding times.
+  1,500 USDT at 25,000 notional, 34 attempts/day, 1M daily volume cap, funding blackout in the
+  10 minutes before each actual funding time (0–600 s before it, as live; no blackout after it).
 
 ### 5.11 Holdout gate
 
@@ -294,8 +299,9 @@ The three contenders are each run once on the holdout. Within each symbol, p-val
 Holm-corrected for the three (an absent contender counts with p = 1). A contender **passes the gate for a symbol** when all of these hold:
 
 1. At least 60 take-profit + stop-loss trades for that symbol.
-2. Holm-adjusted p < 0.05, one-sided, WR above C0's WR (the mean of always-long and always-short over
-   the same period; day-block bootstrap, 10,000 resamples) — the edge is present.
+2. Holm-adjusted p < 0.05, one-sided, WR above C0's WR (the always-long and always-short trades of
+   that symbol over the same period, their take-profit and stop-loss counts pooled per day — not
+   the mean of the two WRs; paired day-block bootstrap, 10,000 resamples) — the edge is present.
 3. WR ≥ 57%.
 4. Gross > 0 (after modelled slippage, before fees).
 5. WR > 50% in each half of the holdout.
@@ -305,7 +311,9 @@ Holm-corrected for the three (an absent contender counts with p = 1). A contende
    own over the same period (day-block bootstrap p < 0.05).
 8. Supply of the passing symbols combined: ≥ 10 trades per trading day on average, over the
    holdout and over its last 20 trading days.
-9. Controls behave as expected, and contender 1's training PBO was < 0.5.
+9. Controls behave as expected, and the training PBO was < 0.5 — this binds contenders 1 and 3
+   (contender 3's primary rule comes from the same grid; contender 2 is fixed), and an undefined
+   PBO (5.6) fails it.
 
 Choosing what moves on:
 
@@ -338,6 +346,10 @@ BTC is checked on the VST cache since 2026-09-09. ETH is checked once the collec
 of VST ETH data; until then ETH cannot move to enforce. If the check fails, the forward read on VST
 decides.
 
+The check runs on the contender the holdout chose. Its output records that `contender` and the
+selection file's sha256; the report skips (with a warning at the top) an output whose contender is
+not the holdout's choice or whose selection sha256 is not the report's selection file.
+
 ### 5.13 AI decision-level view
 
 On the stored BTC decisions since 2026-08-31, with the chosen contender and the 0.20%/0.20%
@@ -352,7 +364,8 @@ bracket:
 
 This answers whether the gate raises the WR of the AI's own entries, whether the AI adds anything
 over the rule, and what supply design X would get (corrected for ticks not stored while a position
-was open).
+was open). As in 5.12, the output records the `contender` and the selection file's sha256, and the
+report skips it with a warning when either differs from the holdout's choice and selection file.
 
 ### 5.14 Outputs
 
@@ -360,7 +373,8 @@ was open).
   spec, the data files, the selection file and the script at the top.
 - Contents: both training stages, PBO and SPA, the model's validation log-loss and calibration,
   holdout results per contender and symbol, controls, permutation, cadence cost, guard/supply grid,
-  VST divergence, fill calibration, decision-level buckets.
+  VST divergence, fill calibration, decision-level buckets; the VST and decision tables name the
+  contender they were scored on.
 - Results recorded in project memory.
 
 ### 5.15 TradingView visual aid
