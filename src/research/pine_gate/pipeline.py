@@ -20,7 +20,9 @@ import math
 import os
 import random
 import statistics
+import sys
 import tempfile
+from array import array
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -63,6 +65,7 @@ from .spec import (
     RuleSpec,
     SelectionConfig,
     ms,
+    spec_sha256,
     stage1_rules,
 )
 from .stats import mean_gross_bps, spa_pvalue, trades_per_trading_day
@@ -174,6 +177,8 @@ class Dataset:
     data_sha256: str  # sha256 over the sorted "relative_path:sha256" of every file read
     loaded_until_ms: int  # nothing at or after this time was kept
     missing_warmups: Tuple[str, ...] = ()
+    # sha256 over the arrays actually kept after the cut: 1m bars, warm-ups, funding times
+    train_data_sha256: str = ""
 
 
 def _file_sha256(path: Path) -> str:
@@ -184,18 +189,51 @@ def _file_line(data_dir: Path, path: Path) -> str:
     return f"{Path(path).relative_to(data_dir).as_posix()}:{_file_sha256(path)}"
 
 
+_BAR_FIELDS = ("open_ms", "open", "high", "low", "close", "volume")
+
+
+def _array_bytes(values: array) -> bytes:
+    """Little-endian bytes of an array, whatever the platform."""
+    if sys.byteorder == "little":
+        return values.tobytes()
+    swapped = array(values.typecode, values)
+    swapped.byteswap()
+    return swapped.tobytes()
+
+
+def _content_sha256(
+    bars: Bars, warmups: Mapping[str, Optional[Bars]], funding: Sequence[int]
+) -> str:
+    """sha256 over one symbol's kept arrays, each section labelled with its length."""
+    h = hashlib.sha256()
+    sections = [("1m", bars)] + [(k, warmups[k]) for k in _WARMUP_INTERVALS]
+    for label, part in sections:
+        if part is None:
+            h.update(f"{label}:absent\n".encode("ascii"))
+            continue
+        for field in _BAR_FIELDS:
+            values = getattr(part, field)
+            h.update(f"{label}/{field}:{len(values)}\n".encode("ascii"))
+            h.update(_array_bytes(values))
+    h.update(f"funding:{len(funding)}\n".encode("ascii"))
+    h.update(_array_bytes(array("q", funding)))
+    return h.hexdigest()
+
+
 def _read_warmup(path: Path, interval: str, until_ms: Optional[int]) -> Bars:
     bars = bars_from_rows(read_day(path), interval_to_ms(interval))
     return bars if until_ms is None else slice_until(bars, until_ms)
 
 
 def _read_funding(path: Path, until_ms: Optional[int]) -> Tuple[int, ...]:
-    """Funding times from JSON (required); kept below ``until_ms`` + 1 day."""
+    """Funding times from JSON (required); kept below ``until_ms``.
+
+    A tick never runs at or after ``until_ms``, so a later funding time can never
+    start a blackout."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, list) or any(type(t) is not int for t in raw):
         raise ValueError(f"{path}: expected a JSON list of integer milliseconds")
-    limit = None if until_ms is None else until_ms + _MS_PER_DAY
-    return tuple(sorted(t for t in raw if limit is None or t < limit))
+    return tuple(sorted(t for t in raw if until_ms is None or t < until_ms))
 
 
 def _load_symbol(
@@ -204,8 +242,9 @@ def _load_symbol(
     days: Tuple[date, date],
     until_ms: Optional[int],
     exec_cfg: ExecConfig,
-) -> Tuple[FeatureFrame, Market, List[str], List[str]]:
-    """One symbol's frame and market, plus its file hash lines and missing warm-ups."""
+) -> Tuple[FeatureFrame, Market, List[str], List[str], str]:
+    """One symbol's frame and market, its file hash lines, missing warm-ups and the
+    sha256 of the arrays kept after the cut."""
     start_day, end_day = days
     bars = load_days(data_dir, "prod", symbol, "1m", start_day, end_day)
     if until_ms is not None:
@@ -229,7 +268,7 @@ def _load_symbol(
     lines.append(_file_line(data_dir, fpath))
     frame = FeatureFrame.build(symbol, bars, warmups["1h"], warmups["4h"])
     market = Market(symbol, bars, OutcomeCache(bars, exec_cfg), funding)
-    return frame, market, lines, missing
+    return frame, market, lines, missing, _content_sha256(bars, warmups, funding)
 
 
 def load_dataset(
@@ -254,14 +293,17 @@ def load_dataset(
     markets: Dict[str, Market] = {}
     lines: List[str] = []
     missing: List[str] = []
+    contents: List[str] = []
     for symbol in SYMBOLS:
-        frame, market, sym_lines, sym_missing = _load_symbol(
+        frame, market, sym_lines, sym_missing, content = _load_symbol(
             data_dir, symbol, (first, last), until_ms, cfg
         )
         frames[symbol], markets[symbol] = frame, market
         lines.extend(sym_lines)
         missing.extend(sym_missing)
+        contents.append(f"{symbol}:{content}")
     digest = hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
+    content_digest = hashlib.sha256("\n".join(contents).encode("utf-8")).hexdigest()
     loaded_until = until_ms if until_ms is not None else wib_day_start_ms(last + timedelta(1))
     return Dataset(
         frames=MappingProxyType(frames),
@@ -269,6 +311,7 @@ def load_dataset(
         data_sha256=digest,
         loaded_until_ms=loaded_until,
         missing_warmups=tuple(missing),
+        train_data_sha256=content_digest,
     )
 
 
@@ -411,9 +454,20 @@ def _check_dataset(dataset: Dataset, segments: Segments) -> None:
     for symbol in SYMBOLS:
         if symbol not in dataset.markets or symbol not in dataset.frames:
             raise ValueError(f"dataset lacks {symbol}")
-        for bars in (dataset.markets[symbol].bars_1m, dataset.frames[symbol].bars_1m):
+        for bars in (dataset.markets[symbol].bars_1m, *_frame_series(dataset.frames[symbol])):
             if len(bars) and bars.open_ms[-1] + bars.interval_ms > limit:
-                raise ValueError(f"{symbol} holds a bar closing after the training limit {limit}")
+                raise ValueError(
+                    f"{symbol} holds a {bars.interval_ms // _MS_PER_MIN}-minute bar closing "
+                    f"after the training limit {limit}"
+                )
+
+
+def _frame_series(frame: FeatureFrame) -> Tuple[Bars, ...]:
+    """Every bar series a frame reads: 1m plus its 5m, 1h, 4h and 3m tables.
+
+    FeatureFrame exposes only ``bars_1m``; the derived tables are read through its
+    private ``_tables`` so a frame carrying later 1h/4h warm-up bars is refused too."""
+    return (frame.bars_1m, *(table.bars for table in frame._tables))
 
 
 def _check_purge_covers(calib: Calibration, exec_cfg: ExecConfig) -> None:
@@ -472,7 +526,8 @@ def _spa(ctx: _Context, results: Mapping[str, RuleResult], spa_n: int) -> float:
 
 
 def _primary_rule(sel: Selection, cfg: SelectionConfig) -> Optional[RuleSpec]:
-    """Contender 1's trend and entry with strength off; else the best Stage-1 rule."""
+    """Trend and entry of contender 1, else of the best-ranked Stage-1 rule, with
+    strength off and no filters (ruling: the fallback is a primary rule too)."""
     if sel.choice is not None:
         return RuleSpec(sel.choice.trend, sel.choice.entry, "OFF")
     best: Optional[RuleSpec] = None
@@ -481,7 +536,7 @@ def _primary_rule(sel: Selection, cfg: SelectionConfig) -> Optional[RuleSpec]:
         value = rank_value(sel.results[rule.key()], cfg)
         if value > best_value:
             best, best_value = rule, value
-    return best
+    return None if best is None else RuleSpec(best.trend, best.entry, "OFF")
 
 
 # --------------------------------------------------------------------------- contender 3
@@ -614,39 +669,124 @@ def _selection_document(
         "n_stops": ctx.calib.n_stops,
         "n_latencies": len(ctx.calib.latencies_ms),
         "seed": ctx.seed,
-        "segments": ctx.segments.to_dict(),
-        "configs": {
-            "exec": asdict(ctx.exec_cfg),
-            "guard": asdict(ctx.guard_cfg),
-            "selection": asdict(ctx.sel_cfg),
-            "model": asdict(ctx.model_cfg),
-        },
         "rules": {k: _rule_metrics(r, ctx.sel_cfg) for k, r in sorted(sel.results.items())},
     }
     doc.update(extra)
     return doc
 
 
+def _refuse_existing(path: Path) -> None:
+    if path.exists():
+        raise FileExistsError(
+            f"{path}: selection file already exists; remove it deliberately to train again"
+        )
+
+
 def _write_json_atomic(path: Path, doc: Mapping[str, Any]) -> None:
+    """Write the complete file under a temp name, then hard-link it into place.
+
+    ``os.link`` fails when ``path`` exists, so an existing file is never replaced,
+    not even by a concurrent run."""
     text = json.dumps(doc, sort_keys=True, indent=1, allow_nan=False)
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_existing(path)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.replace(tmp, path)
-    except BaseException:
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            _refuse_existing(path)
+            raise
+    finally:
         try:
             os.unlink(tmp)
         except FileNotFoundError:
             pass
-        raise
+
+
+@dataclass(frozen=True)
+class _RunSettings:
+    """Everything a caller may inject; a spec run uses the defaults for all of it."""
+
+    segments: Segments
+    exec_cfg: ExecConfig
+    guard_cfg: GuardConfig
+    sel_cfg: SelectionConfig
+    model_cfg: ModelConfig
+    meta_trainer: MetaTrainer
+
+    @classmethod
+    def spec(cls) -> "_RunSettings":
+        return cls(Segments.spec(), ExecConfig(), GuardConfig(), SelectionConfig(),
+                   ModelConfig(), train_meta)
+
+    def record(self) -> Dict[str, Any]:
+        """``configs``, ``segments`` and ``meta_trainer`` as JSON-native values."""
+        record = {
+            "configs": {
+                "exec": asdict(self.exec_cfg),
+                "guard": asdict(self.guard_cfg),
+                "selection": asdict(self.sel_cfg),
+                "model": asdict(self.model_cfg),
+            },
+            "segments": self.segments.to_dict(),
+            "meta_trainer": "train_meta" if self.meta_trainer is train_meta else "<injected>",
+        }
+        return json.loads(json.dumps(record, allow_nan=False))
+
+    def non_spec_fields(self) -> List[str]:
+        mine, spec = self.record(), _RunSettings.spec().record()
+        fields = [name for name in spec["configs"]
+                  if mine["configs"][name] != spec["configs"][name]]
+        fields += [name for name in ("segments", "meta_trainer") if mine[name] != spec[name]]
+        return fields
+
+
+def _settings(
+    segments: Optional[Segments],
+    exec_cfg: Optional[ExecConfig],
+    guard_cfg: Optional[GuardConfig],
+    sel_cfg: Optional[SelectionConfig],
+    model_cfg: Optional[ModelConfig],
+    meta_trainer: MetaTrainer,
+) -> _RunSettings:
+    """Defaults filled in; refuses injected segments with the real ``train_meta``,
+    whose folds always use the dates of ``spec.BLOCKS``."""
+    spec = _RunSettings.spec()
+    settings = _RunSettings(
+        segments if segments is not None else spec.segments,
+        exec_cfg if exec_cfg is not None else spec.exec_cfg,
+        guard_cfg if guard_cfg is not None else spec.guard_cfg,
+        sel_cfg if sel_cfg is not None else spec.sel_cfg,
+        model_cfg if model_cfg is not None else spec.model_cfg,
+        meta_trainer,
+    )
+    if meta_trainer is train_meta and settings.segments != spec.segments:
+        raise ValueError(
+            "train_meta validates on spec.BLOCKS; injected segments need a meta_trainer"
+        )
+    return settings
 
 
 def _check_spec_sha(spec_sha: str) -> None:
     if (not isinstance(spec_sha, str) or len(spec_sha) != SHA256_HEX_LEN
             or any(ch not in "0123456789abcdef" for ch in spec_sha)):
         raise ValueError(f"spec_sha must be a lowercase sha256 hex digest, got {spec_sha!r}")
+
+
+def _check_spec_run(spec_sha: str, settings: _RunSettings) -> None:
+    """The real spec sha256 may only label a run with every spec default."""
+    if spec_sha != spec_sha256():
+        return
+    fields = settings.non_spec_fields()
+    if fields:
+        raise ValueError(
+            "the current spec sha256 may only label a spec run; non-spec settings: "
+            + ", ".join(fields)
+        )
 
 
 def train_stage(
@@ -666,47 +806,48 @@ def train_stage(
 ) -> Path:
     """Select contender 1, fit contender 3 and write the selection file; returns its path.
 
-    ``train_meta`` validates on the dates of ``spec.BLOCKS``, so injected segments
-    need an injected ``meta_trainer`` (tests only).
+    Injected segments, configs or ``meta_trainer`` are for tests: they are recorded
+    in the file, refused under the current spec sha256, and the holdout lock refuses
+    their file. ``train_meta`` validates on the dates of ``spec.BLOCKS``, so injected
+    segments also need an injected ``meta_trainer``. An existing selection file of
+    the same day is never overwritten (``FileExistsError``).
     """
     _check_spec_sha(spec_sha)
-    seg = segments if segments is not None else Segments.spec()
-    if meta_trainer is train_meta and seg != Segments.spec():
-        raise ValueError(
-            "train_meta validates on spec.BLOCKS; injected segments need a meta_trainer"
-        )
+    settings = _settings(segments, exec_cfg, guard_cfg, sel_cfg, model_cfg, meta_trainer)
+    _check_spec_run(spec_sha, settings)
+    seg = settings.segments
     _check_dataset(dataset, seg)
-    cfg = exec_cfg if exec_cfg is not None else ExecConfig()
-    _check_purge_covers(calib, cfg)
+    _check_purge_covers(calib, settings.exec_cfg)
+    created = datetime.now(timezone.utc)
+    path = Path(out_dir) / f"{SELECTION_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
+    _refuse_existing(path)  # fail before hours of work; the final write checks again
     ctx = _Context(
-        frames=dataset.frames, markets=_training_markets(dataset, cfg), segments=seg,
-        calib=calib, seed=seed, exec_cfg=cfg,
-        guard_cfg=guard_cfg if guard_cfg is not None else GuardConfig(),
-        sel_cfg=sel_cfg if sel_cfg is not None else SelectionConfig(),
-        model_cfg=model_cfg if model_cfg is not None else ModelConfig(),
+        frames=dataset.frames, markets=_training_markets(dataset, settings.exec_cfg),
+        segments=seg, calib=calib, seed=seed, exec_cfg=settings.exec_cfg,
+        guard_cfg=settings.guard_cfg, sel_cfg=settings.sel_cfg, model_cfg=settings.model_cfg,
     )
     sel = select(_evaluator(ctx), ctx.sel_cfg)
     primary = _primary_rule(sel, ctx.sel_cfg)
-    created = datetime.now(timezone.utc)
     extra = {
         "spec_sha256": spec_sha,
         "data_sha256": dataset.data_sha256,
+        "train_data_sha256": dataset.train_data_sha256,
         "data_loaded_until_ms": dataset.loaded_until_ms,
         "missing_warmups": list(dataset.missing_warmups),
         "created_at": created.isoformat(),
         "spa_p": _spa(ctx, sel.results, spa_n),
         "spa_n": spa_n,
         "regime_counts": regime_counts(ctx.frames, seg.train_start_ms, seg.train_end_ms),
-        **_contender3(ctx, primary, meta_trainer),
+        **settings.record(),
+        **_contender3(ctx, primary, settings.meta_trainer),
     }
-    doc = _selection_document(ctx, sel, primary, extra)
-    path = Path(out_dir) / f"{SELECTION_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
-    _write_json_atomic(path, doc)
+    _write_json_atomic(path, _selection_document(ctx, sel, primary, extra))
     return path
 
 
 def load_selection_checked(path: Path, spec_sha: str) -> Dict[str, Any]:
-    """The holdout lock: the selection document, only if it was made under ``spec_sha``."""
+    """The holdout lock: the selection document, only if it was made under ``spec_sha``
+    by a spec run (spec configs and segments, the real ``train_meta``)."""
     path = Path(path)
     try:
         raw = path.read_bytes()
@@ -724,4 +865,19 @@ def load_selection_checked(path: Path, spec_sha: str) -> Dict[str, Any]:
         raise HoldoutLockError(
             f"{path}: spec_sha256 {doc['spec_sha256']} does not match the current spec {spec_sha}"
         )
+    _check_spec_record(path, doc)
     return doc
+
+
+def _check_spec_record(path: Path, doc: Mapping[str, Any]) -> None:
+    """The file must record the spec's own configs, segments and ``train_meta``."""
+    spec = _RunSettings.spec().record()
+    configs = doc.get("configs")
+    if not isinstance(configs, dict) or sorted(configs) != sorted(spec["configs"]):
+        raise HoldoutLockError(f"{path}: configs missing or incomplete; not a spec run")
+    for name, expected in spec["configs"].items():
+        if configs[name] != expected:
+            raise HoldoutLockError(f"{path}: configs.{name} differ from the spec; not a spec run")
+    for name in ("segments", "meta_trainer"):
+        if doc.get(name) != spec[name]:
+            raise HoldoutLockError(f"{path}: {name} differ from the spec; not a spec run")

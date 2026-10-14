@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import asdict
 import random
 import shutil
 import tempfile
@@ -12,11 +13,13 @@ from research.pine_gate import pipeline
 from research.pine_gate.bars import (
     day_path,
     funding_path,
+    read_day,
     wib_day_start_ms,
     warmup_path,
     write_day,
 )
 from research.pine_gate.calibrate import Calibration
+from research.pine_gate.features import FeatureFrame
 from research.pine_gate.metalabel import FEATURES, MetaModel
 from research.pine_gate.outcomes import bracket_outcome
 from research.pine_gate.pipeline import (
@@ -42,6 +45,7 @@ from research.pine_gate.spec import (
     WIB,
     ExecConfig,
     GuardConfig,
+    ModelConfig,
     RuleSpec,
     SelectionConfig,
     ms,
@@ -89,6 +93,26 @@ NO_GUARDS = GuardConfig(
     max_stops=10_000, max_consecutive_losses=10_000, max_drawdown_usdt=1e12,
     max_entries=10_000, max_volume_usdt=1e12,
 )
+# Non-spec runs (test segments, lenient selection, fake trainer) must not carry the
+# real spec sha256; train_stage refuses that combination.
+DUMMY_SHA = "0" * 64
+
+
+def spec_run_record():
+    """configs / segments / meta_trainer as a spec run records them (JSON-normalised)."""
+    record = {
+        "configs": {
+            "exec": asdict(ExecConfig()),
+            "guard": asdict(GuardConfig()),
+            "selection": asdict(SelectionConfig()),
+            "model": asdict(ModelConfig()),
+        },
+        "segments": Segments.spec().to_dict(),
+        "meta_trainer": "train_meta",
+    }
+    return json.loads(json.dumps(record))
+
+
 CALIB = Calibration(s_star_bps=1.0, n_stops=20, latencies_ms=(20_000.0, 30_000.0, 40_000.0))
 
 
@@ -141,6 +165,10 @@ class FakeMetaTrainer:
         everyone = {(c.symbol, c.t_ms): 1.0 for c in self.candidates}
         self.supply["all"] = supply_for(everyone, 0.5)
         self.supply["none"] = supply_for({}, 0.5)
+        at = {k: 0.5 for k in everyone}
+        below = {k: math.nextafter(0.5, 0.0) for k in everyone}
+        self.supply["at"] = supply_for(at, 0.5)
+        self.supply["below"] = supply_for(below, 0.5)
         model = MetaModel(
             coef=(0.0,) * len(FEATURES), intercept=0.0, means=(0.0,) * len(FEATURES),
             stds=(1.0,) * len(FEATURES), threshold=0.6, C=0.1,
@@ -170,7 +198,7 @@ def _build_shared():
         _Shared.data_dir, until_ms=TRAIN_DATA_UNTIL_MS, start_day=FIRST_DAY
     )
     _Shared.trainer = FakeMetaTrainer()
-    _Shared.sha = spec_sha256()
+    _Shared.sha = DUMMY_SHA
     _Shared.out_dir = _Shared.tmp / "out"
     _Shared.selection_path = train_stage(
         _Shared.dataset, CALIB, _Shared.out_dir, _Shared.sha, seed=3,
@@ -213,7 +241,7 @@ class LoadDatasetTests(PipelineFixture):
             self.assertEqual(market.bars_1m.open_ms[-1] + MIN, TRAIN_DATA_UNTIL_MS)
             self.assertEqual(market.bars_1m.open_ms[0], wib_day_start_ms(FIRST_DAY))
             self.assertTrue(market.funding_ms)
-            self.assertLess(max(market.funding_ms), TRAIN_DATA_UNTIL_MS + DAY)
+            self.assertLess(max(market.funding_ms), TRAIN_DATA_UNTIL_MS)
             self.assertEqual(list(market.funding_ms), sorted(market.funding_ms))
         self.assertEqual(tuple(self.dataset.markets), SYMBOLS)
 
@@ -237,6 +265,30 @@ class LoadDatasetTests(PipelineFixture):
         late.unlink()
         ds = load_dataset(copy, until_ms=TRAIN_DATA_UNTIL_MS, start_day=FIRST_DAY)
         self.assertEqual(ds.data_sha256, self.dataset.data_sha256)
+
+    def test_train_data_sha_covers_only_the_sliced_arrays(self):
+        self.assertRegex(self.dataset.train_data_sha256, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(self.dataset.train_data_sha256, self.dataset.data_sha256)
+        # A bar after the cut (2026-08-05 02:00 WIB) changes the file hash only.
+        copy = self.tmp / "data_after_cut"
+        shutil.copytree(self.data_dir, copy)
+        day = date(2026, 8, 5)
+        path = day_path(copy, "prod", "BTC-USDT", "1m", day)
+        rows = read_day(path)
+        k = 120
+        t, o, h, l, c, v = rows[k]
+        rows[k] = (t, o, h * 1.001, l, c, v)
+        write_day(path, rows)
+        after = load_dataset(copy, until_ms=TRAIN_DATA_UNTIL_MS, start_day=FIRST_DAY)
+        self.assertNotEqual(after.data_sha256, self.dataset.data_sha256)
+        self.assertEqual(after.train_data_sha256, self.dataset.train_data_sha256)
+        # A bar before the cut (00:30 WIB) changes both.
+        k = 30
+        t, o, h, l, c, v = rows[k]
+        rows[k] = (t, o, h * 1.001, l, c, v)
+        write_day(path, rows)
+        before = load_dataset(copy, until_ms=TRAIN_DATA_UNTIL_MS, start_day=FIRST_DAY)
+        self.assertNotEqual(before.train_data_sha256, self.dataset.train_data_sha256)
 
     def test_missing_funding_file_raises(self):
         root = self.tmp / "no_funding"
@@ -325,6 +377,8 @@ class TrainStageTests(PipelineFixture):
         sel = self.selection
         self.assertEqual(sel["spec_sha256"], self.sha)
         self.assertEqual(sel["data_sha256"], self.dataset.data_sha256)
+        self.assertEqual(sel["train_data_sha256"], self.dataset.train_data_sha256)
+        self.assertEqual(sel["meta_trainer"], "<injected>")
         self.assertIsNotNone(sel["contender1"])
         self.assertIn(sel["contender1"], sel["rules"])
         trend, entry = sel["contender1"].split("|")[:2]
@@ -397,6 +451,8 @@ class TrainStageTests(PipelineFixture):
     def test_supply_for_admits_only_candidates_at_or_above_threshold(self):
         self.assertGreater(self.trainer.supply["all"], 0.0)
         self.assertEqual(self.trainer.supply["none"], 0.0)
+        self.assertEqual(self.trainer.supply["at"], self.trainer.supply["all"])
+        self.assertEqual(self.trainer.supply["below"], 0.0)
 
     def test_regime_counts_cover_each_symbol_and_trend(self):
         regimes = self.selection["regime_counts"]
@@ -435,6 +491,69 @@ class TrainStageTests(PipelineFixture):
                         segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer())
         live_worst = replace(CALIB, latencies_ms=(64_000.0,))
         pipeline._check_purge_covers(live_worst, ExecConfig())  # live max: fits
+
+    def test_shared_fixture_file_is_refused_under_the_real_spec_sha(self):
+        real = spec_sha256()
+        with self.assertRaises(HoldoutLockError):
+            load_selection_checked(self.selection_path, real)
+        # Even relabelled with the real sha, its injected settings are refused.
+        doc = dict(self.selection, spec_sha256=real)
+        path = self.tmp / "relabelled.json"
+        path.write_text(json.dumps(doc))
+        with self.assertRaises(HoldoutLockError):
+            load_selection_checked(path, real)
+
+    def test_train_stage_refuses_the_real_sha_with_injected_settings(self):
+        real = spec_sha256()
+        cases = {
+            "segments": dict(segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer()),
+            "selection": dict(sel_cfg=LENIENT_SEL),
+            "exec": dict(exec_cfg=replace(ExecConfig(), fee_pct=0.05)),
+            "guard": dict(guard_cfg=NO_GUARDS),
+            "model": dict(model_cfg=replace(ModelConfig(), threshold_hi=0.8)),
+            "meta_trainer": dict(meta_trainer=FakeMetaTrainer()),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as ctx:
+                    train_stage(self.dataset, CALIB, self.tmp / f"real_{name}", real, **kwargs)
+                self.assertIn(name, str(ctx.exception))
+                self.assertFalse((self.tmp / f"real_{name}").exists())
+
+    def test_train_stage_refuses_to_overwrite_a_selection_file(self):
+        out = self.tmp / "existing"
+        out.mkdir()
+        stamp = datetime.now(WIB).strftime("%Y%m%d")
+        existing = out / f"pine_gate_selection_{stamp}.json"
+        existing.write_text("{}")
+        with self.assertRaises(FileExistsError) as ctx:
+            train_stage(self.dataset, CALIB, out, self.sha, segments=TEST_SEGMENTS,
+                        sel_cfg=LENIENT_SEL, meta_trainer=FakeMetaTrainer())
+        self.assertIn(str(existing), str(ctx.exception))
+        self.assertEqual(existing.read_text(), "{}")
+
+    def test_atomic_write_never_replaces_an_existing_file(self):
+        path = self.tmp / "atomic" / "sel.json"
+        pipeline._write_json_atomic(path, {"a": 1})
+        with self.assertRaises(FileExistsError) as ctx:
+            pipeline._write_json_atomic(path, {"a": 2})
+        self.assertIn(str(path), str(ctx.exception))
+        self.assertEqual(json.loads(path.read_text()), {"a": 1})
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["sel.json"])
+
+    def test_train_stage_refuses_a_frame_with_hourly_bars_past_the_boundary(self):
+        late = load_dataset(
+            self.data_dir, until_ms=TRAIN_DATA_UNTIL_MS + DAY, start_day=FIRST_DAY
+        )
+        frames = dict(self.dataset.frames)
+        good, bad = frames["ETH-USDT"], late.frames["ETH-USDT"]
+        # 1m bars end at the limit; only the derived 5m/1h/4h/3m series run past it.
+        frames["ETH-USDT"] = FeatureFrame("ETH-USDT", good.bars_1m, bad._bars_5m, bad._tables)
+        forged = replace(self.dataset, frames=frames)
+        with self.assertRaises(ValueError) as ctx:
+            train_stage(forged, CALIB, self.tmp / "forged_htf", self.sha,
+                        segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer())
+        self.assertIn("ETH-USDT", str(ctx.exception))
 
     def test_train_stage_rejects_a_malformed_spec_sha(self):
         with self.assertRaises(ValueError):
@@ -495,6 +614,14 @@ class PrimaryRuleTests(unittest.TestCase):
         primary = pipeline._primary_rule(_selection(None, results), cfg)
         self.assertEqual(primary, RuleSpec("E200", "P40", "OFF"))
 
+    def test_fallback_primary_forces_strength_off(self):
+        cfg = SelectionConfig()
+        results = _empty_results(cfg)
+        key = "H1|B12|ADX_DI|OFF|OFF"
+        results[key] = replace(results[key], block_wr=(60.0,) * 4, block_lb=(55.0,) * 4)
+        primary = pipeline._primary_rule(_selection(None, results), cfg)
+        self.assertEqual(primary, RuleSpec("H1", "B12", "OFF", "OFF", "OFF"))
+
     def test_no_ranked_rule_means_no_primary_and_no_contender3(self):
         cfg = SelectionConfig()
         self.assertIsNone(pipeline._primary_rule(_selection(None, _empty_results(cfg)), cfg))
@@ -525,42 +652,76 @@ class RegimeCountTests(PipelineFixture):
         self.assertEqual(months["2026-08"]["n"] + months["2026-08"]["unknown"], 12)
 
 
+def spec_doc(sha, **extra):
+    doc = {"spec_sha256": sha, "contender1": "H1|P35|OFF|OFF|OFF", **spec_run_record()}
+    doc.update(extra)
+    return doc
+
+
 class HoldoutLockTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="pine_lock_"))
+        self.path = self.tmp / "sel.json"
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, doc):
+        self.path.write_text(json.dumps(doc))
 
     def test_load_selection_refuses_missing_file(self):
         with self.assertRaises(HoldoutLockError):
             load_selection_checked(self.tmp / "none.json", "abc")
 
     def test_load_selection_refuses_sha_mismatch(self):
-        path = self.tmp / "sel.json"
-        path.write_text(json.dumps({"spec_sha256": "a" * 64}))
+        self.write(spec_doc("a" * 64))
         with self.assertRaises(HoldoutLockError) as ctx:
-            load_selection_checked(path, "b" * 64)
-        self.assertIn(str(path), str(ctx.exception))
+            load_selection_checked(self.path, "b" * 64)
+        self.assertIn(str(self.path), str(ctx.exception))
 
     def test_load_selection_refuses_invalid_json(self):
-        path = self.tmp / "sel.json"
-        path.write_text("{not json")
+        self.path.write_text("{not json")
         with self.assertRaises(HoldoutLockError):
-            load_selection_checked(path, "a" * 64)
+            load_selection_checked(self.path, "a" * 64)
 
     def test_load_selection_refuses_missing_or_non_string_sha(self):
-        path = self.tmp / "sel.json"
-        for doc in ({"contender1": None}, [1, 2], {"spec_sha256": None}):
-            path.write_text(json.dumps(doc))
+        for doc in ({"contender1": None}, [1, 2], spec_doc(None)):
+            self.write(doc)
             with self.assertRaises(HoldoutLockError):
-                load_selection_checked(path, "a" * 64)
+                load_selection_checked(self.path, "a" * 64)
 
-    def test_load_selection_returns_the_document_when_sha_matches(self):
-        path = self.tmp / "sel.json"
-        doc = {"spec_sha256": "c" * 64, "contender1": "H1|P35|OFF|OFF|OFF"}
-        path.write_text(json.dumps(doc))
-        self.assertEqual(load_selection_checked(path, "c" * 64), doc)
+    def test_load_selection_returns_the_document_when_everything_matches(self):
+        doc = spec_doc("c" * 64)
+        self.write(doc)
+        self.assertEqual(load_selection_checked(self.path, "c" * 64), doc)
+
+    def test_load_selection_refuses_one_changed_config_field(self):
+        for section, field, value in (("exec", "fee_pct", 0.05), ("guard", "max_entries", 35),
+                                      ("selection", "min_tp_sl", 1),
+                                      ("model", "threshold_hi", 0.8)):
+            doc = spec_doc("c" * 64)
+            doc["configs"][section][field] = value
+            self.write(doc)
+            with self.subTest(section):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    load_selection_checked(self.path, "c" * 64)
+                self.assertIn("configs", str(ctx.exception))
+
+    def test_load_selection_refuses_non_spec_segments_or_trainer(self):
+        segments = spec_run_record()["segments"]
+        segments["train_end_ms"] -= DAY
+        for field, value in (("segments", segments), ("meta_trainer", "<injected>"),
+                             ("configs", None)):
+            self.write(spec_doc("c" * 64, **{field: value}))
+            with self.subTest(field):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    load_selection_checked(self.path, "c" * 64)
+                self.assertIn(field, str(ctx.exception))
+        doc = spec_doc("c" * 64)
+        del doc["meta_trainer"]
+        self.write(doc)
+        with self.assertRaises(HoldoutLockError):
+            load_selection_checked(self.path, "c" * 64)
 
 
 if __name__ == "__main__":
