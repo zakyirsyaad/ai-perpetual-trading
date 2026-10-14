@@ -9,6 +9,7 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from research.pine_gate import lock, pipeline
 from research.pine_gate.bars import (
@@ -576,6 +577,22 @@ class IntegrityRecordTests(PipelineFixture):
     def test_selection_records_the_code_sha256(self):
         self.assertEqual(self.selection["code_sha256"], lock.code_sha256())
         self.assertRegex(self.selection["code_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_recorded_code_sha_is_the_one_taken_before_the_run(self):
+        first, later = "a" * 64, "b" * 64
+        current = [first]
+        real_context = pipeline._context
+
+        def run_then_change_the_code(*args, **kwargs):
+            current[0] = later  # the code changes once the long run has started
+            return real_context(*args, **kwargs)
+
+        with mock.patch.object(pipeline, "code_sha256", side_effect=lambda: current[0]), \
+                mock.patch.object(pipeline, "_context", run_then_change_the_code):
+            path = train_stage(self.dataset, CALIB, self.tmp / "fingerprint_once", self.sha,
+                               segments=TEST_SEGMENTS, sel_cfg=LENIENT_SEL, spa_n=200,
+                               meta_trainer=FakeMetaTrainer())
+        self.assertEqual(json.loads(path.read_text())["code_sha256"], first)
 
     def test_training_c0_is_recorded_per_symbol_and_side(self):
         c0 = self.selection["c0_training"]

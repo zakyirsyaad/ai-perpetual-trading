@@ -901,14 +901,14 @@ class ReportCommandTest(Dirs):
 
 
 class CodeHashTest(unittest.TestCase):
-    def test_code_hash_covers_the_research_package_and_pine_indicators(self):
+    def test_code_hash_covers_the_research_package_and_the_bot_modules_it_imports(self):
         files = cli_stages.code_files()
         names = [rel for rel, _ in files]
         self.assertIn("research/pine_gate/cli.py", names)
-        self.assertIn("bot/strategy/pine_indicators.py", names)
         self.assertEqual(names, sorted(names))
-        self.assertFalse(any(n.startswith("bot/") and n != "bot/strategy/pine_indicators.py"
-                             for n in names))
+        self.assertEqual([n for n in names if n.startswith("bot/")],
+                         ["bot/arena/setup_profile.py", "bot/strategy/indicators.py",
+                          "bot/strategy/pine_indicators.py"])
 
 
 class PublicHelperNamesTest(unittest.TestCase):

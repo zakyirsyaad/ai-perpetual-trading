@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from research.pine_gate import fileio
+from research.pine_gate import fileio, lock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 PACKAGE = SRC / "research" / "pine_gate"
@@ -31,6 +31,37 @@ class PrivateImportTests(unittest.TestCase):
                         if alias.name.startswith("_") and not alias.name.startswith("__"):
                             offenders.append(f"{path.name}: {node.module}.{alias.name}")
         self.assertEqual(offenders, [])
+
+
+# Imported lazily by the CLI for I/O only (reading the env, opening the Supabase
+# store); neither shapes a computed result, and both change often on main.
+_IO_ONLY_BOT_IMPORTS = frozenset({"bot/config.py", "bot/storage/supabase_trade_store.py"})
+
+
+def _bot_sources_imported_by_research():
+    """src-relative .py paths of every ``bot.*`` module any research module imports."""
+    found = set()
+    for path in sorted((SRC / "research").rglob("*.py")):
+        for node in ast.walk(_tree(path)):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module] + [f"{node.module}.{a.name}" for a in node.names]
+            else:
+                continue
+            for name in names:
+                rel = Path(*name.split(".")).with_suffix(".py")
+                if name.split(".")[0] == "bot" and (SRC / rel).is_file():
+                    found.add(rel.as_posix())
+    return found
+
+
+class CodeFingerprintCoverageTests(unittest.TestCase):
+    def test_fingerprint_covers_every_bot_module_the_research_imports(self):
+        imported = _bot_sources_imported_by_research() - _IO_ONLY_BOT_IMPORTS
+        self.assertIn("bot/strategy/indicators.py", imported)  # the walk finds something
+        covered = {rel for rel, _sha in lock.code_files()}
+        self.assertEqual(sorted(imported - covered), [])
 
 
 class ExclusiveWriterTests(unittest.TestCase):

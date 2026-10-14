@@ -693,6 +693,7 @@ def train_stage(
     check_spec_run(spec_sha, settings)
     _check_dataset(dataset, settings.segments)
     check_purge_covers(calib, settings.exec_cfg)
+    code_sha = code_sha256()  # the code that runs, taken before the long run
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{SELECTION_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
     if path.exists():  # fail before hours of work; the final write checks again
@@ -702,7 +703,7 @@ def train_stage(
     primary = _primary_rule(sel, ctx.sel_cfg)
     extra = {
         "spec_sha256": spec_sha, "created_at": created.isoformat(),
-        "code_sha256": code_sha256(), **_data_record(dataset), **c0_training(ctx),
+        "code_sha256": code_sha, **_data_record(dataset), **c0_training(ctx),
         "spa_p": _spa(ctx, sel.results, spa_n), "spa_n": spa_n,
         "regime_counts": regime_counts(ctx.frames, ctx.segments.train_start_ms,
                                        ctx.segments.train_end_ms),

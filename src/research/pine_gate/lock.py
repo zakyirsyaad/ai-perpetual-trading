@@ -44,7 +44,13 @@ TimeRange = Tuple[int, int]
 MetaTrainer = Callable[..., Tuple[Any, Dict[str, Any]]]
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]
-_CODE_EXTRA = ("bot/strategy/pine_indicators.py",)
+# Live-bot modules the research imports (features.py): a change on main to any of
+# them changes contender 2's gate, so it must change the fingerprint too.
+_CODE_EXTRA = (
+    "bot/arena/setup_profile.py",
+    "bot/strategy/indicators.py",
+    "bot/strategy/pine_indicators.py",
+)
 
 
 class HoldoutLockError(RuntimeError):
@@ -212,7 +218,7 @@ def latencies_sha256(latencies_ms: Sequence[float]) -> str:
 
 
 def code_files() -> List[Tuple[str, str]]:
-    """(path relative to ``src``, sha256) of every research .py plus pine_indicators.py."""
+    """(path relative to ``src``, sha256) of every research .py plus the bot modules it imports."""
     paths = sorted((_SRC_ROOT / "research").rglob("*.py"))
     paths += [_SRC_ROOT / rel for rel in _CODE_EXTRA]
     files = [(p.relative_to(_SRC_ROOT).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
