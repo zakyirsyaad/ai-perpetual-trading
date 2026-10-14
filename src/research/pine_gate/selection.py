@@ -4,8 +4,9 @@ Stage 1 evaluates the 36 base rules; the best five by block-consistent rank
 become the pool for Stage 2 (volatility x volume-profile variants). A rule is
 only ever chosen when it is eligible (enough bracket exits, enough supply),
 consistent across blocks, and sits in a stable area of the rule grid. PBO is
-computed over every evaluated rule so the report can show how much the search
-itself overfits. Research code; the bot never imports it. Standard library only.
+computed over every evaluated rule with enough bracket exits (``_sample_ok``) so
+the report can show how much the search itself overfits; thin rules would win
+in-sample halves by noise and inflate it. Research code; the bot never imports it. Standard library only.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ class RuleResult:
     rule: RuleSpec
     trades: Tuple[Trade, ...]
     block_counts: Counts  # (tp, sl) per block B1-B4
+    block_exit_days: Tuple[int, ...]  # WIB days with a TP or SL exit, per block B1-B4
     cscv_counts: Counts  # (tp, sl) per CSCV block
     n_tp_sl: int
     supply_per_day: float
@@ -56,7 +58,7 @@ class Selection:
     choice: Optional[RuleSpec]
     top: Tuple[RuleSpec, ...]
     stable: bool
-    pbo: float
+    pbo: Optional[float]  # None with fewer than two rules passing _sample_ok
     supply_limited: bool
     results: Mapping[str, RuleResult]
 
@@ -92,16 +94,19 @@ def summarize(
     all_trades = tuple(trades)
     block_wr = []
     block_lb = []
+    exit_days = []
     for (start, end), days in zip(block_bounds_ms, block_days):
         inside = [t for t in all_trades if start <= t.entry_ms < end]
         block_wr.append(win_rate(inside))
         block_lb.append(wr_lower_bound(day_aggregates(inside, days), z))
+        exit_days.append(len({t.wib_day for t in inside if t.kind in ("TP", "SL")}))
     block_counts = _counts_in(all_trades, block_bounds_ms)
     n_tp_sl = sum(1 for t in all_trades if t.kind in ("TP", "SL"))
     return RuleResult(
         rule=rule,
         trades=all_trades,
         block_counts=block_counts,
+        block_exit_days=tuple(exit_days),
         cscv_counts=_counts_in(all_trades, cscv_bounds_ms),
         n_tp_sl=n_tp_sl,
         supply_per_day=trades_per_trading_day(all_trades, trading_days),
@@ -121,15 +126,30 @@ def _sample_ok(r: RuleResult, cfg: SelectionConfig) -> bool:
     return r.n_tp_sl >= cfg.min_tp_sl
 
 
+def _thick_blocks(r: RuleResult, cfg: SelectionConfig) -> Tuple[bool, ...]:
+    """Per block: at least ``block_min_tp_sl`` TP+SL trades on at least
+    ``block_min_exit_days`` WIB days with a TP or SL exit."""
+    return tuple(tp + sl >= cfg.block_min_tp_sl and days >= cfg.block_min_exit_days
+                 for (tp, sl), days in zip(r.block_counts, r.block_exit_days))
+
+
+def block_median_lb(r: RuleResult, cfg: SelectionConfig) -> float:
+    """Median over B1-B4 of the block WR lower bound, without the WR vote; a thin
+    block or one without a lower bound counts as -inf."""
+    bounds = [lb if thick and lb is not None else -math.inf
+              for lb, thick in zip(r.block_lb, _thick_blocks(r, cfg))]
+    return statistics.median(bounds)
+
+
 def rank_value(r: RuleResult, cfg: SelectionConfig) -> float:
-    """Median over B1-B4 of the block WR lower bound; -inf unless at least
-    ``blocks_above_half`` blocks have WR above ``block_min_wr``. A block
-    without a WR or lower bound counts as failing."""
-    passing = sum(1 for wr in r.block_wr if wr is not None and wr > cfg.block_min_wr)
+    """``block_median_lb``; -inf unless at least ``blocks_above_half`` blocks have
+    WR above ``block_min_wr``. A thin block (``_thick_blocks``) or one without a WR
+    or lower bound counts as failing: no vote, lower bound -inf."""
+    passing = sum(1 for wr, thick in zip(r.block_wr, _thick_blocks(r, cfg))
+                  if thick and wr is not None and wr > cfg.block_min_wr)
     if passing < cfg.blocks_above_half:
         return -math.inf
-    bounds = [-math.inf if lb is None else lb for lb in r.block_lb]
-    return statistics.median(bounds)
+    return block_median_lb(r, cfg)
 
 
 def _stable(
@@ -205,7 +225,8 @@ def select(evaluate: Callable[[RuleSpec], RuleResult], cfg: SelectionConfig) -> 
             choice = rule
             break
 
-    pbo = pbo_cscv({k: r.cscv_counts for k, r in cache.items()})
+    sampled = {k: r.cscv_counts for k, r in cache.items() if _sample_ok(r, cfg)}
+    pbo = pbo_cscv(sampled) if len(sampled) >= 2 else None
     return Selection(
         choice=choice,
         top=top,

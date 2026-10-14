@@ -250,6 +250,14 @@ class RenderMarkdownTests(unittest.TestCase):
         tahap = section(render_markdown(results), "Tahap latih")
         self.assertIn("model fill tidak valid pada data latih", tahap)
 
+    def test_undefined_pbo_is_reported_as_a_criterion_9_failure(self, _):
+        results = make_results()
+        self.assertNotIn("tak terdefinisi", section(render_markdown(results), "Tahap latih"))
+        results["selection"].update(pbo=None, pbo_pass=False, pbo_reason="PBO undefined")
+        tahap = section(render_markdown(results), "Tahap latih")
+        self.assertIn("tak terdefinisi: kurang dari dua aturan dengan ≥ 1.000 TP+SL", tahap)
+        self.assertIn("kriteria 9 gagal untuk kontender 1 dan 3", tahap)
+
     def test_spa_is_described_as_direction_value_on_the_same_entries(self, _):
         tahap = section(render_markdown(make_results()), "Tahap latih")
         self.assertIn("nilai arah vs sisi acak pada entri yang sama", tahap)

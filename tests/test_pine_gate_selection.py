@@ -26,12 +26,14 @@ DEFAULT_WR = 55.0
 
 
 def result(rule, score=DEFAULT_SCORE, wr=DEFAULT_WR, n=2000, supply=12.0,
-           block_wr=None, block_lb=None):
+           block_wr=None, block_lb=None, block_counts=None, block_exit_days=None,
+           cscv_counts=None):
     return RuleResult(
         rule=rule,
         trades=(),
-        block_counts=((60, 40),) * 4,
-        cscv_counts=((60, 40),) * 8,
+        block_counts=block_counts if block_counts is not None else ((60, 40),) * 4,
+        block_exit_days=block_exit_days if block_exit_days is not None else (20,) * 4,
+        cscv_counts=cscv_counts if cscv_counts is not None else ((60, 40),) * 8,
         n_tp_sl=n,
         supply_per_day=supply,
         wr=wr,
@@ -75,6 +77,31 @@ class EligibilityAndRankTest(unittest.TestCase):
         self.assertEqual(rank_value(ok, CFG), 5.5)  # None lb -> -inf; median(-inf, 5, 6, 7)
         bad = result(r, block_wr=(60.0, 61.0, None, None), block_lb=(5.0, 6.0, None, None))
         self.assertEqual(rank_value(bad, CFG), -math.inf)
+
+    def test_a_thin_block_neither_votes_nor_bounds(self):
+        r = RULES[0]
+        wr, lb = (60.0, 61.0, 62.0, 63.0), (5.0, 6.0, 7.0, 8.0)
+        thick = result(r, block_wr=wr, block_lb=lb)
+        self.assertEqual(rank_value(thick, CFG), 6.5)
+        few_trades = result(r, block_wr=wr, block_lb=lb,
+                            block_counts=((60, 40),) * 3 + ((40, 19),))  # 59 TP+SL
+        self.assertEqual(rank_value(few_trades, CFG), 5.5)  # median(-inf, 5, 6, 7)
+        few_days = result(r, block_wr=wr, block_lb=lb, block_exit_days=(20, 20, 20, 9))
+        self.assertEqual(rank_value(few_days, CFG), 5.5)
+        two_thin = result(r, block_wr=wr, block_lb=lb, block_exit_days=(20, 20, 9, 9))
+        self.assertEqual(rank_value(two_thin, CFG), -math.inf)  # 2 votes < 3
+        at_floor = result(r, block_wr=wr, block_lb=lb, block_counts=((30, 30),) * 4,
+                          block_exit_days=(10,) * 4)  # 60 TP+SL on 10 days is enough
+        self.assertEqual(rank_value(at_floor, CFG), 6.5)
+
+    def test_two_thin_lucky_blocks_cannot_carry_a_rule(self):
+        """The reviewer's case: two all-TP or tidy thin blocks give near-zero SEs and,
+        before the floor, a median near 77 that passed the 3-of-4 vote."""
+        r = RULES[0]
+        lucky = result(r, block_wr=(53.0, 53.0, 100.0, 75.0), block_lb=(45.0, 46.0, 100.0, 75.0),
+                       block_counts=((530, 470), (530, 470), (2, 0), (9, 3)),
+                       block_exit_days=(60, 60, 2, 3))
+        self.assertEqual(rank_value(lucky, CFG), -math.inf)  # 2 voting blocks < 3
 
     def test_none_lower_bound_ranks_as_minus_infinity(self):
         r = RULES[0]
@@ -126,6 +153,28 @@ class SelectTest(unittest.TestCase):
         self.assertTrue(sel.stable)
         expected = pbo_cscv({k: r.cscv_counts for k, r in sel.results.items()})
         self.assertEqual(sel.pbo, expected)
+
+    def test_pbo_covers_only_rules_with_enough_tp_sl(self):
+        # thin rules that win every in-sample half by noise and lose out of sample
+        lucky = ((9, 0), (0, 9)) * 4
+        overrides = {RULES[i].key(): result(RULES[i], n=999, cscv_counts=lucky)
+                     for i in range(30, 36)}
+        overrides.update({RULES[i].key(): result(RULES[i], cscv_counts=((60 + i, 40),) * 8)
+                          for i in range(30)})
+        sel = select(Script(overrides), CFG)
+        sampled = {k: r.cscv_counts for k, r in sel.results.items() if r.n_tp_sl >= 1000}
+        self.assertEqual(len(sampled), len(sel.results) - 6)
+        self.assertEqual(sel.pbo, pbo_cscv(sampled))
+        self.assertNotEqual(sel.pbo, pbo_cscv({k: r.cscv_counts for k, r in sel.results.items()}))
+
+    def test_pbo_is_none_below_two_rules_with_enough_tp_sl(self):
+        overrides = {r.key(): result(r, n=999) for r in RULES}
+        # one rule with enough TP+SL; it ranks -inf, so no Stage-2 variant is evaluated
+        overrides[RULES[2].key()] = result(RULES[2], block_wr=(40.0,) * 4)
+        sel = select(Script(overrides), CFG)
+        self.assertEqual(len(sel.results), 36)
+        self.assertEqual(sum(1 for r in sel.results.values() if r.n_tp_sl >= 1000), 1)
+        self.assertIsNone(sel.pbo)
 
     def test_stable_area_moves_to_next_rule(self):
         first, second = RULES[0], RULES[20]
@@ -252,6 +301,7 @@ class SummarizeTest(unittest.TestCase):
         self.assertIsNotNone(res.block_lb[0])
         self.assertIsNone(res.block_lb[1])
         self.assertIsInstance(res.trades, tuple)
+        self.assertEqual(res.block_exit_days, (4, 0, 1, 1))  # WIB days with a TP or SL
         self.assertEqual(rank_value(res, CFG), -math.inf)  # only block 0 and 3 above 50
 
     def test_summarize_ignores_trades_outside_all_ranges_for_counts(self):

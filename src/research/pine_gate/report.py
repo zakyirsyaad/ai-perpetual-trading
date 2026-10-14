@@ -431,6 +431,10 @@ def _rule_row(key: str, metrics: Mapping[str, Any]) -> List[Any]:
             "ya" if metrics.get("eligible") is True else "tidak"]
 
 
+PBO_UNDEFINED = ("; tak terdefinisi: kurang dari dua aturan dengan ≥ 1.000 TP+SL, jadi kriteria 9 "
+                 "gagal untuk kontender 1 dan 3")
+
+
 def _training(selection: Any) -> Lines:
     sel = _mapping(selection)
     if not sel.get("rules") and not sel.get("top"):
@@ -442,7 +446,8 @@ def _training(selection: Any) -> Lines:
         f"`{sel.get('primary_rule') or NA}`.",
         f"- Aturan dinilai: {len(rules)}; stabil: {_yes_no(sel.get('stable'))}; pasokan "
         f"membatasi: {_yes_no(sel.get('supply_limited'))}.",
-        f"- PBO (CSCV): {fmt_dec(sel.get('pbo'), 2)} (lulus jika < 0.5: {_yes_no(sel.get('pbo_pass'))}).",
+        f"- PBO (CSCV, aturan dengan ≥ 1.000 TP+SL): {fmt_dec(sel.get('pbo'), 2)} (lulus jika "
+        f"< 0.5: {_yes_no(sel.get('pbo_pass'))}){PBO_UNDEFINED if sel.get('pbo_reason') else ''}.",
         f"- SPA p: {fmt_p(sel.get('spa_p'))} ({fmt_int(sel.get('spa_n'))} replikasi; nilai arah vs "
         "sisi acak pada entri yang sama).", ""]
     headers = ["Aturan", "n TP+SL", "WR", "batas bawah", "gross bps", "net/1M", "transaksi/hari",

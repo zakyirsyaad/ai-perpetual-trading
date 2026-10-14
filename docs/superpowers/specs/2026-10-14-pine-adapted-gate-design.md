@@ -206,13 +206,17 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
    of at least 10 trades per trading day. If no rule is eligible, selection continues without the
    supply condition and the result is reported as supply-limited.
 3. **Rank** by the median over B1–B4 of WR − 2 × SE (SE clustered by WIB day); a rule must also show
-   WR > 50% in at least 3 of the 4 blocks.
+   WR > 50% in at least 3 of the 4 blocks. A block with fewer than 60 take-profit + stop-loss
+   trades, or fewer than 10 WIB days with a take-profit or stop-loss exit, counts as failing: it
+   has no WR vote and its lower bound is −∞ (a thin block's day-clustered SE is near zero).
 4. Stage 1 → the 5 best base rules → Stage 2 variants → the best variant by the same ranking.
 5. **Stable area:** at least 4 of the 7 Stage-1 neighbours of the chosen base rule (one dimension
    changed) have a training WR no more than 3 points below the chosen base rule's; otherwise move
    to the next in rank.
-6. **Overfitting checks:** the probability of backtest overfitting over all evaluated rules,
-   computed by CSCV on the 8 training blocks, must be < 0.5; Hansen's SPA of each rule's
+6. **Overfitting checks:** the probability of backtest overfitting over the evaluated rules with
+   ≥ 1,000 take-profit + stop-loss trades, computed by CSCV on the 8 training blocks, must be
+   < 0.5 (with fewer than two such rules PBO is undefined, which fails criterion 9 for contenders
+   1 and 3); Hansen's SPA of each rule's
    direction value is reported: per training trading day, the mean over its trades of the rule
    side's gross minus a seeded random side's gross on the same entry bar and bracket (0 on a day
    without trades).

@@ -90,6 +90,8 @@ LENIENT_SEL = replace(
     min_tp_sl=1,
     min_supply_per_day=0.0,
     blocks_above_half=0,
+    block_min_tp_sl=0,
+    block_min_exit_days=0,
     neighbour_min=0,
 )
 # Daily guards off, so an always-long clock reaches the late-evening purge windows.
@@ -681,9 +683,27 @@ def _empty_results(sel_cfg):
     }
 
 
+# Blocks above SelectionConfig's thin-block floor (60 TP+SL on 10 exit days).
+THICK = dict(block_counts=((60, 40),) * 4, block_exit_days=(20,) * 4)
+
+
 def _selection(choice, results):
     return Selection(choice=choice, top=(), stable=choice is not None, pbo=0.0,
                      supply_limited=False, results=results)
+
+
+class PboRecordTests(unittest.TestCase):
+    def test_pbo_passes_below_the_maximum(self):
+        cfg = SelectionConfig()
+        self.assertEqual(pipeline.pbo_record(0.2, cfg),
+                         {"pbo": 0.2, "pbo_pass": True, "pbo_reason": None})
+        self.assertFalse(pipeline.pbo_record(0.5, cfg)["pbo_pass"])
+
+    def test_undefined_pbo_fails_with_its_reason(self):
+        record = pipeline.pbo_record(None, SelectionConfig())
+        self.assertIsNone(record["pbo"])
+        self.assertIs(record["pbo_pass"], False)
+        self.assertIn("fewer than two rules with at least 1000 TP+SL", record["pbo_reason"])
 
 
 class PrimaryRuleTests(unittest.TestCase):
@@ -695,7 +715,7 @@ class PrimaryRuleTests(unittest.TestCase):
     def test_fallback_is_the_best_ranked_stage1_rule_ties_to_the_simpler(self):
         cfg = SelectionConfig()
         results = _empty_results(cfg)
-        good = dict(block_wr=(60.0,) * 4, block_lb=(55.0,) * 4)
+        good = dict(block_wr=(60.0,) * 4, block_lb=(55.0,) * 4, **THICK)
         for key in ("H1|B12|ADX|OFF|OFF", "E200|P40|OFF|OFF|OFF"):
             results[key] = replace(results[key], **good)
         primary = pipeline._primary_rule(_selection(None, results), cfg)
@@ -705,7 +725,7 @@ class PrimaryRuleTests(unittest.TestCase):
         cfg = SelectionConfig()
         results = _empty_results(cfg)
         key = "H1|B12|ADX_DI|OFF|OFF"
-        results[key] = replace(results[key], block_wr=(60.0,) * 4, block_lb=(55.0,) * 4)
+        results[key] = replace(results[key], block_wr=(60.0,) * 4, block_lb=(55.0,) * 4, **THICK)
         primary = pipeline._primary_rule(_selection(None, results), cfg)
         self.assertEqual(primary, RuleSpec("H1", "B12", "OFF", "OFF", "OFF"))
 

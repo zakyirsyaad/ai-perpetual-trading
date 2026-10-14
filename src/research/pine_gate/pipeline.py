@@ -643,6 +643,16 @@ def _rule_metrics(r: RuleResult, cfg: SelectionConfig) -> Dict[str, Any]:
     }
 
 
+def pbo_record(pbo: Optional[float], cfg: SelectionConfig) -> Dict[str, Any]:
+    """PBO, its pass (< ``pbo_max``) and, when undefined, why: criterion 9 then fails
+    for contenders 1 and 3."""
+    if pbo is None:
+        return {"pbo": None, "pbo_pass": False,
+                "pbo_reason": f"PBO undefined: fewer than two rules with at least "
+                              f"{cfg.min_tp_sl} TP+SL trades"}
+    return {"pbo": pbo, "pbo_pass": pbo < cfg.pbo_max, "pbo_reason": None}
+
+
 def _selection_document(
     ctx: _Context, sel: Selection, primary: Optional[RuleSpec], extra: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -650,8 +660,7 @@ def _selection_document(
         "contender1": sel.choice.key() if sel.choice is not None else None,
         "top": [r.key() for r in sel.top],
         "stable": sel.stable,
-        "pbo": sel.pbo,
-        "pbo_pass": sel.pbo < ctx.sel_cfg.pbo_max,
+        **pbo_record(sel.pbo, ctx.sel_cfg),
         "supply_limited": sel.supply_limited,
         "primary_rule": primary.key() if primary is not None else None,
         "s_star_bps": ctx.calib.s_star_bps,

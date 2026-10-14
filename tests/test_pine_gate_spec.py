@@ -87,7 +87,8 @@ class ConfigTests(unittest.TestCase):
             max_entries=34, max_volume_usdt=1_000_000.0))
         self.assertEqual(dataclasses.asdict(SelectionConfig()), dict(
             min_tp_sl=1000, min_supply_per_day=10.0, z=2.0, blocks_above_half=3,
-            block_min_wr=50.0, top_n=5, neighbour_min=4, neighbour_tolerance_pts=3.0,
+            block_min_wr=50.0, block_min_tp_sl=60, block_min_exit_days=10, top_n=5,
+            neighbour_min=4, neighbour_tolerance_pts=3.0,
             pbo_max=0.5, vol_high_pct=67.0, vol_lookback_1h=720, vp_bin_bps=5.0,
             trend_band_atr=0.25))
         self.assertEqual(dataclasses.asdict(ModelConfig()), dict(

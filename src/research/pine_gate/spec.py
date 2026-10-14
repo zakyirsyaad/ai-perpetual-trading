@@ -102,6 +102,10 @@ class SelectionConfig:
     z: float = 2.0
     blocks_above_half: int = 3
     block_min_wr: float = 50.0
+    # A block thinner than this neither votes nor bounds (lower bound -inf): its
+    # day-clustered SE is unreliable with few exits.
+    block_min_tp_sl: int = 60
+    block_min_exit_days: int = 10
     top_n: int = 5
     neighbour_min: int = 4
     neighbour_tolerance_pts: float = 3.0
@@ -289,11 +293,16 @@ def _policies() -> Dict[str, Any]:
                        "combined supply of at least min_supply_per_day per trading day; "
                        "if no rule is eligible, drop the supply condition and report supply-limited",
         "selection_rank": "median over B1-B4 of WR - 2 * SE (SE clustered by WIB day); "
-                          "WR > 50 in at least 3 of 4 blocks",
+                          "WR > 50 in at least 3 of 4 blocks; a block with fewer than "
+                          "block_min_tp_sl TP+SL trades or fewer than block_min_exit_days WIB "
+                          "days with a TP or SL exit counts as failing (no WR vote, lower "
+                          "bound -inf)",
         "stage_flow": "stage 1 -> 5 best base rules -> stage 2 variants -> best variant by the same ranking",
         "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "
                        "base rule, else the next in rank",
-        "overfitting": "PBO by CSCV on 8 CSCV blocks over all evaluated rules must be < 0.5; "
+        "overfitting": "PBO by CSCV on 8 CSCV blocks over the evaluated rules with at least "
+                       "min_tp_sl TP+SL trades must be < 0.5; with fewer than two such rules "
+                       "PBO is undefined and criterion 9 fails for c1 and c3; "
                        "Hansen SPA of each evaluated rule's direction value is reported: per "
                        "training trading day the mean over its trades of gross bps (rule side) "
                        "minus gross bps (seeded random side, one draw per trade, same entry "
