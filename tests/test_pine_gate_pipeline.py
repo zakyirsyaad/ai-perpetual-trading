@@ -492,7 +492,7 @@ class TrainStageTests(PipelineFixture):
             train_stage(self.dataset, slow, self.tmp / "slow", self.sha,
                         segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer())
         live_worst = replace(CALIB, latencies_ms=(64_000.0,))
-        pipeline._check_purge_covers(live_worst, ExecConfig())  # live max: fits
+        pipeline.check_purge_covers(live_worst, ExecConfig())  # live max: fits
 
     def test_shared_fixture_file_is_refused_under_the_real_spec_sha(self):
         real = spec_sha256()
@@ -540,31 +540,6 @@ class TrainStageTests(PipelineFixture):
         self.assertEqual(self.selection["latencies_sha256"], expected)
         self.assertEqual(pipeline.latencies_sha256(CALIB.latencies_ms), expected)
         self.assertNotEqual(pipeline.latencies_sha256((1.0, 2.0, 3.0)), expected)
-
-    def test_atomic_write_race_names_the_file_kind(self):
-        path = self.tmp / "race" / "pine_gate_holdout_20261014.json"
-
-        def late_link(src, dst):
-            Path(dst).write_text("{}")  # another run wins between the check and the link
-            raise FileExistsError(dst)
-
-        with mock.patch.object(pipeline.os, "link", side_effect=late_link):
-            with self.assertRaises(FileExistsError) as ctx:
-                pipeline._write_json_atomic(path, {"a": 1}, label="holdout")
-        self.assertIn("holdout file already exists", str(ctx.exception))
-        self.assertEqual(path.read_text(), "{}")
-        with self.assertRaises(FileExistsError) as ctx:
-            pipeline._write_json_atomic(path, {"a": 1}, label="holdout")
-        self.assertIn("holdout file already exists", str(ctx.exception))
-
-    def test_atomic_write_never_replaces_an_existing_file(self):
-        path = self.tmp / "atomic" / "sel.json"
-        pipeline._write_json_atomic(path, {"a": 1})
-        with self.assertRaises(FileExistsError) as ctx:
-            pipeline._write_json_atomic(path, {"a": 2})
-        self.assertIn(str(path), str(ctx.exception))
-        self.assertEqual(json.loads(path.read_text()), {"a": 1})
-        self.assertEqual([p.name for p in path.parent.iterdir()], ["sel.json"])
 
     def test_train_stage_refuses_a_frame_with_hourly_bars_past_the_boundary(self):
         late = load_dataset(

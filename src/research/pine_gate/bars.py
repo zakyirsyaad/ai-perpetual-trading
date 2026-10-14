@@ -11,7 +11,9 @@ header-less rows ``open_ms,open,high,low,close,volume``.
 from __future__ import annotations
 
 import gzip
+import math
 import os
+import re
 import tempfile
 import zlib
 from array import array
@@ -19,8 +21,9 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
+from .fileio import write_exclusive
 from .spec import WIB, ms
 
 Row = Tuple[int, float, float, float, float, float]
@@ -30,6 +33,8 @@ _MS_PER_DAY = 24 * _MS_PER_HOUR
 _WIB_OFFSET_MS = 7 * _MS_PER_HOUR
 _ROW_FIELDS = 6
 _UNIX_EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
+# Venue-form USDT pairs only: the symbol becomes part of every data path.
+SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{2,20}-USDT")
 
 
 class BarGapError(ValueError):
@@ -77,8 +82,23 @@ def interval_to_ms(interval: str) -> int:
     return int(interval[:-1]) * _UNIT_MS[unit]
 
 
+def _check_bar(t: int, o: float, h: float, low: float, c: float, v: float) -> None:
+    """Finite values, positive prices, high/low bracketing open and close, volume >= 0."""
+    if not all(math.isfinite(x) for x in (o, h, low, c, v)):
+        raise ValueError(f"bar at {t} has a non-finite value")
+    if min(o, h, low, c) <= 0.0:
+        raise ValueError(f"bar at {t} has a non-positive price")
+    if h < max(o, c) or low > min(o, c):
+        raise ValueError(f"bar at {t}: high/low do not bracket open and close")
+    if v < 0.0:
+        raise ValueError(f"bar at {t} has a negative volume")
+
+
 def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
-    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``."""
+    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``.
+
+    Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
+    gap, duplicate or disorder raises ``BarGapError``."""
     out = _empty(interval_ms)
     previous = None
     for row in rows:
@@ -87,13 +107,15 @@ def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
             raise BarGapError(
                 f"bar at {t} does not follow {previous} by {interval_ms} ms"
             )
+        o, h, low, c, v = (float(x) for x in row[1:6])
+        _check_bar(t, o, h, low, c, v)
         previous = t
         out.open_ms.append(t)
-        out.open.append(float(row[1]))
-        out.high.append(float(row[2]))
-        out.low.append(float(row[3]))
-        out.close.append(float(row[4]))
-        out.volume.append(float(row[5]))
+        out.open.append(o)
+        out.high.append(h)
+        out.low.append(low)
+        out.close.append(c)
+        out.volume.append(v)
     return out
 
 
@@ -162,6 +184,23 @@ def last_closed_index(bars: Bars, t_ms: int) -> int:
     return bisect_right(bars.open_ms, t_ms - bars.interval_ms) - 1
 
 
+def entry_index_for(bars: Bars, order_ms: int) -> Optional[int]:
+    """Index of the bar containing ``order_ms`` (the bar an order fills on); ``None``
+    when no bar covers it."""
+    i = bisect_right(bars.open_ms, order_ms) - 1
+    if i < 0 or order_ms >= bars.open_ms[i] + bars.interval_ms:
+        return None
+    return i
+
+
+def index_closing_at(bars: Bars, close_ms: int) -> Optional[int]:
+    """Index of the bar closing exactly at ``close_ms`` (inverse of an entry fill time)."""
+    i = entry_index_for(bars, close_ms - bars.interval_ms)
+    if i is None or bars.open_ms[i] + bars.interval_ms != close_ms:
+        return None
+    return i
+
+
 def slice_until(bars: Bars, t_ms: int) -> Bars:
     """Bars already closed at ``t_ms`` (the still-forming bar is excluded)."""
     end = last_closed_index(bars, t_ms) + 1
@@ -191,18 +230,29 @@ def wib_day_start_ms(day: date) -> int:
     return ms(datetime(day.year, day.month, day.day, tzinfo=WIB))
 
 
+def check_symbol(symbol: str) -> str:
+    """Accept venue-form USDT pairs only (``BTC-USDT``); anything else is a ``ValueError``."""
+    if not isinstance(symbol, str) or SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise ValueError(f"not a BingX USDT symbol: {symbol!r}")
+    return symbol
+
+
 def day_path(data_dir: Path, source: str, symbol: str, interval: str, day: date) -> Path:
-    return Path(data_dir) / source / symbol / interval / f"{day.isoformat()}.csv.gz"
+    return Path(data_dir) / source / check_symbol(symbol) / interval / f"{day.isoformat()}.csv.gz"
 
 
 def warmup_path(data_dir: Path, symbol: str, interval: str) -> Path:
     """Warm-up bars (same row format as day files) of the production source."""
-    return Path(data_dir) / "prod" / symbol / interval / "warmup.csv.gz"
+    return Path(data_dir) / "prod" / check_symbol(symbol) / interval / "warmup.csv.gz"
 
 
 def funding_path(data_dir: Path, symbol: str) -> Path:
     """JSON list of funding times as UTC milliseconds."""
-    return Path(data_dir) / "prod" / symbol / "funding.json"
+    return Path(data_dir) / "prod" / check_symbol(symbol) / "funding.json"
+
+
+def _day_text(rows: Sequence[Row]) -> str:
+    return "".join(f"{int(t)},{o!r},{h!r},{l!r},{c!r},{v!r}\n" for t, o, h, l, c, v in rows)
 
 
 def write_day(path: Path, rows: Sequence[Row]) -> None:
@@ -213,8 +263,7 @@ def write_day(path: Path, rows: Sequence[Row]) -> None:
     try:
         with os.fdopen(fd, "wb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
-                for t, o, h, l, c, v in rows:
-                    gz.write(f"{int(t)},{o!r},{h!r},{l!r},{c!r},{v!r}\n".encode("utf-8"))
+                gz.write(_day_text(rows).encode("utf-8"))
         os.replace(tmp_name, path)
     except BaseException:
         try:
@@ -222,6 +271,17 @@ def write_day(path: Path, rows: Sequence[Row]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def write_day_exclusive(path: Path, rows: Sequence[Row]) -> bool:
+    """Write a day file only if none exists; ``False`` when one exists or appears
+    meanwhile (another writer won), ``True`` when this call wrote it."""
+    data = gzip.compress(_day_text(rows).encode("utf-8"), mtime=0)
+    try:
+        write_exclusive(path, data, "day")
+    except FileExistsError:
+        return False
+    return True
 
 
 def read_day(path: Path) -> List[Row]:

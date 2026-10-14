@@ -86,7 +86,7 @@ class BracketOutcomeTests(unittest.TestCase):
         self.assertAlmostEqual(o.raw_exit_price, gap_open, places=9)
 
     def test_time_stop_exits_at_bar_60_close(self):
-        rows = with_bar(flat(80), 60, c=100.05)
+        rows = with_bar(flat(80), 60, h=100.05, c=100.05)  # a valid bar: high >= close
         # a touch on bar 61 must not matter
         rows = with_bar(rows, 61, h=TP_LONG + 1.0)
         o = bracket_outcome(bars_of(rows), 0, 1, CFG)

@@ -25,14 +25,15 @@ import json
 import math
 import random
 import statistics
-from bisect import bisect_left
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .bars import index_closing_at
 from .calibrate import Calibration
+from .fileio import write_json_exclusive
 from .holdout_gate import GateVerdict, choose_contender, gate_symbol, traded_symbols
 from .holdout_replay import (
     FEE_SENSITIVITY_PCT,
@@ -48,17 +49,9 @@ from .holdout_replay import (
     symbol_metrics,
     trades_of,
 )
+from .lock import HoldoutLockError, check_spec_sha, latencies_sha256, load_selection_checked
 from .outcomes import OutcomeCache
-from .pipeline import (
-    SYMBOLS,
-    latencies_sha256,
-    Dataset,
-    HoldoutLockError,
-    _check_purge_covers,
-    _check_spec_sha,
-    _write_json_atomic,
-    load_selection_checked,
-)
+from .pipeline import SYMBOLS, Dataset, check_purge_covers
 from .rules import reference_signal
 from .simulate import Market, SignalFn, Trade
 from .spec import WIB, ExecConfig, GateConfig, GuardConfig, spec_sha256
@@ -235,15 +228,15 @@ def _pooled_lower_bound(
 
 
 def _entry_index(market: Market, trade: Trade) -> int:
-    open_ms = market.bars_1m.open_ms
-    i = bisect_left(open_ms, trade.entry_ms - _MS_PER_MIN)
-    if i >= len(open_ms) or open_ms[i] != trade.entry_ms - _MS_PER_MIN:
+    i = index_closing_at(market.bars_1m, trade.entry_ms)
+    if i is None:
         raise ValueError(f"{trade.symbol}: no 1m bar closes at {trade.entry_ms}")
     return i
 
 
 def _quantile(values: Sequence[float], q: float) -> Optional[float]:
-    """Linear interpolation between order statistics; ``None`` for no values."""
+    """Linear interpolation between order statistics of ``values``, which must be
+    sorted ascending; ``None`` for no values."""
     if not values:
         return None
     pos = q * (len(values) - 1)
@@ -553,14 +546,14 @@ def test_stage(
     """
     selection = load_selection_checked(selection_path, spec_sha)
     check_calibration(selection_path, selection, calib)
-    _check_spec_sha(spec_sha)
+    check_spec_sha(spec_sha)
     counts = {"offsets": offsets, "permutation_shifts": permutation_shifts,
               "c1_seeds": c1_seeds, "bootstrap_n": bootstrap_n}
     settings = _settings(period, exec_cfg, guard_cfg, gate_cfg, counts)
     _check_spec_run(spec_sha, settings, selection, seed)
     refuse_any_holdout(out_dir)
     _check_holdout_dataset(dataset, settings.period)
-    _check_purge_covers(calib, settings.exec_cfg)
+    check_purge_covers(calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{HOLDOUT_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
@@ -570,5 +563,5 @@ def test_stage(
     doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).name,
                 "selection_sha256": selection_sha, "created_at": created.isoformat()})
     refuse_any_holdout(out_dir)  # again after the work: a concurrent run may have written
-    _write_json_atomic(path, doc, label="holdout")
+    write_json_exclusive(path, doc, "holdout")
     return path

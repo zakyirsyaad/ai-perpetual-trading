@@ -22,12 +22,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import cli_common as common
-from .bars import Bars, interval_to_ms, load_days, wib_day
+from .bars import Bars, entry_index_for, interval_to_ms, load_days, wib_day
 from .calibrate import fetch_all
 from .checks import (
     DecisionRow,
     decision_buckets,
-    entry_index,
     load_edge_klines_vst,
     parse_decision,
     vst_agreement,
@@ -38,7 +37,7 @@ from .holdout import HOLDOUT_PREFIX
 from .holdout_replay import HoldoutPeriod, build_contenders, parse_rule
 from .metalabel import MetaModel, candidate_features
 from .outcomes import OutcomeCache, gross_bps
-from .pipeline import HoldoutLockError, load_selection_checked
+from .lock import HoldoutLockError, load_selection_checked
 from .rules import contender2_required_fields, contender2_signal, required_fields, rule_signal
 from .spec import TRAIN_START, VP_PARAMS, ExecConfig, FillConfig, RuleSpec, ms, spec_sha256
 
@@ -221,7 +220,7 @@ def cmd_vst_check(args: argparse.Namespace) -> int:
     times = [t for t in overlap_times(bars, vst)
              if snapshot_valid(chosen, prod, prod, t) and snapshot_valid(chosen, vst_frame, prod, t)]
     agreement = vst_agreement(prod, vst_frame, signal_for(chosen), times, ExecConfig())
-    common.write_json_exclusive(path, asdict(agreement))
+    common.write_json_exclusive(path, asdict(agreement), "vst-check")
     print(f"vst-check {args.symbol} contender {chosen.name}: n {agreement.n}, "
           f"side agree {agreement.side_agree}, outcome agree {agreement.outcome_agree}, "
           f"WR prod {agreement.wr_prod} vs VST {agreement.wr_vst}, passed {agreement.passed}")
@@ -331,7 +330,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     cache = OutcomeCache(bars, cfg)
 
     def outcome_for(symbol: str, t: int, side: int) -> Optional[Tuple[str, float]]:
-        i = entry_index(bars, placed.orders[(symbol, t)])
+        i = entry_index_for(bars, placed.orders[(symbol, t)])
         o = cache.get(i, side) if i is not None else None
         return None if o is None else (o.kind, gross_bps(o, side, overshoot, cfg))
 
@@ -352,7 +351,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         "data_until_ms": _last_close(bars),
         "buckets": buckets,
     }
-    common.write_json_exclusive(path, doc)
+    common.write_json_exclusive(path, doc, "decisions")
     print(f"decisions {DECISIONS_SYMBOL} contender {name}: {len(placed.rows)} rows "
           f"({placed.n_outside} outside the data, {placed.n_fallback} with the median latency)")
     print(path)

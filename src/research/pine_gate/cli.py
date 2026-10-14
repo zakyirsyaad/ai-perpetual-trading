@@ -17,14 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import cli_checks, cli_data, cli_stages
 from . import cli_common as common
 from .fetch import ExchangeError, IncompleteDayError
-from .pipeline import HoldoutLockError
+from .lock import HoldoutLockError
 from .spec import spec_document, spec_sha256
 
 DEFAULT_DATA_DIR = "~/replay/pine_gate/data"
@@ -34,8 +34,9 @@ _EXPECTED_ERRORS = (common.CliError, OSError, ValueError, NotImplementedError, E
 
 
 def _iso_date(text: str) -> date:
+    """``YYYY-MM-DD`` only, the same on Python 3.10 and 3.11."""
     try:
-        return date.fromisoformat(text)
+        return datetime.strptime(text, "%Y-%m-%d").date()
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a YYYY-MM-DD date: {text!r}") from None
 
@@ -54,7 +55,7 @@ def _symbols(text: str) -> List[str]:
 def cmd_spec(args: argparse.Namespace) -> int:
     """Write the pre-registered spec as canonical JSON; its file sha256 is the spec sha256."""
     text = json.dumps(spec_document(), sort_keys=True, separators=(",", ":"))
-    common.write_text_exclusive(Path(args.write).expanduser(), text)
+    common.write_exclusive(Path(args.write).expanduser(), text, "spec")
     print(spec_sha256())
     return 0
 

@@ -27,7 +27,7 @@ from bot.arena.setup_profile import build_setup_profile
 from bot.strategy import indicators as live
 from bot.strategy import pine_indicators as pine
 
-from .bars import Bars, aggregate, concat, last_closed_index
+from .bars import BarGapError, Bars, aggregate, concat, last_closed_index
 from .spec import (
     ENTRY_PARAMS,
     STRENGTH_PARAMS,
@@ -202,9 +202,10 @@ def htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
     """Native warm-up bars before the first aggregated bar, then the aggregated bars.
 
     ``aggregate`` drops a partial leading bucket (1m data starting mid-bucket), so
-    the native bar of that bucket is kept and fills the seam. With no aggregated
-    bar yet the whole warm-up is used; ``last_closed_index`` still hides any bar
-    not closed at the snapshot time.
+    the native bar of that bucket is kept and fills the seam. The last kept native
+    bar must open exactly one interval before the first aggregated bar, else
+    ``BarGapError``. With no aggregated bar yet the whole warm-up is used;
+    ``last_closed_index`` still hides any bar not closed at the snapshot time.
     """
     aggregated = aggregate(bars_1m, interval_ms)
     if warmup is None:
@@ -215,7 +216,13 @@ def htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
         )
     if not len(aggregated):
         return warmup
-    keep = bisect_left(warmup.open_ms, aggregated.open_ms[0])
+    first = aggregated.open_ms[0]
+    keep = bisect_left(warmup.open_ms, first)
+    if keep and warmup.open_ms[keep - 1] + interval_ms != first:
+        raise BarGapError(
+            f"warm-up ends at {warmup.open_ms[keep - 1]}, not one {interval_ms} ms bar before "
+            f"the first aggregated bar at {first}"
+        )
     return concat(_head(warmup, keep), aggregated)
 
 
@@ -282,6 +289,10 @@ class FeatureFrame:
     @property
     def bars_1m(self) -> Bars:
         return self._bars_1m
+
+    def series(self) -> Tuple[Bars, ...]:
+        """Every bar series the frame reads: 1m, then its 5m, 1h, 4h and 3m tables."""
+        return (self._bars_1m, *(table.bars for table in self._tables))
 
     def snapshot(self, t_ms: int) -> Snapshot:
         values: Dict[str, object] = {"t_ms": t_ms}

@@ -798,10 +798,10 @@ class CodeHashTest(unittest.TestCase):
 
 class PublicHelperNamesTest(unittest.TestCase):
     def test_helpers_shared_with_the_cli_are_public(self):
-        from research.pine_gate import calibrate, checks, features, holdout
+        from research.pine_gate import bars, calibrate, features, holdout
 
         for module, name in ((holdout, "check_calibration"), (holdout, "refuse_any_holdout"),
-                             (features, "htf_bars"), (checks, "entry_index"),
+                             (features, "htf_bars"), (bars, "entry_index_for"),
                              (calibrate, "fetch_all")):
             self.assertTrue(callable(getattr(module, name, None)), f"{module.__name__}.{name}")
 

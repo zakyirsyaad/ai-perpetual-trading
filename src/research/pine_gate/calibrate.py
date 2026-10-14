@@ -19,13 +19,13 @@ from __future__ import annotations
 import bisect
 import logging
 import math
-import re
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from .spec import FillConfig
+from .timeparse import parse_iso_datetime
 
 GetRows = Callable[[str, "list[tuple[str, str]]"], Awaitable["list[dict]"]]
 
@@ -45,8 +45,6 @@ def _day_start_iso(day: str) -> str:
 DEFAULT_LATENCY_SINCE = _day_start_iso(_FILL.latency_since)
 DEFAULT_OVERSHOOT_SINCE = _day_start_iso(_FILL.overshoot_since)
 
-_FRACTION = re.compile(r"\.(\d+)")
-
 
 @dataclass(frozen=True)
 class StopOvershootDetail:
@@ -59,23 +57,6 @@ class Calibration:
     s_star_bps: float
     n_stops: int
     latencies_ms: Tuple[float, ...]
-
-
-def _parse_ts(value: Any) -> Optional[datetime]:
-    """Parse a PostgREST timestamptz (``Z`` suffix, 1-6 fraction digits) on Python 3.10."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    text = _FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
 
 
 def _positive_finite(value: Any) -> Optional[float]:
@@ -175,7 +156,7 @@ class _DecisionIndex:
     def __init__(self, rows: Sequence[dict]) -> None:
         grouped: dict = {}
         for row in rows:
-            created = _parse_ts(row.get("created_at"))
+            created = parse_iso_datetime(row.get("created_at"))
             if created is None:
                 continue
             key = (row.get("symbol"), row.get("action"))
@@ -218,7 +199,7 @@ async def stop_overshoot_detail(
             ("opened_at", f"gte.{since_iso}"),
         ],
     )
-    since = _parse_ts(since_iso)
+    since = parse_iso_datetime(since_iso)
     lookback_iso = (since - _DECISION_LOOKBACK).isoformat() if since else since_iso
     decisions = await fetch_all(
         get_rows,
@@ -233,7 +214,7 @@ async def stop_overshoot_detail(
     samples: List[float] = []
     skipped = 0
     for trade in trades:
-        opened_at = _parse_ts(trade.get("opened_at"))
+        opened_at = parse_iso_datetime(trade.get("opened_at"))
         action = _ACTION_FOR_DIRECTION.get(trade.get("direction"))
         overshoot: Optional[float] = None
         if opened_at is not None and action is not None:

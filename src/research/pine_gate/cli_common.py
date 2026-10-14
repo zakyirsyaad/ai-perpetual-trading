@@ -17,18 +17,17 @@ import argparse
 import hashlib
 import json
 import math
-import os
-import re
-import tempfile
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from . import calibrate
+from .bars import SYMBOL_PATTERN, check_symbol
 from .calibrate import Calibration
-from .calibrate import make_get_rows as _store_get_rows
 from .fetch import httpx_get
-from .pipeline import latencies_sha256
+from .fileio import write_exclusive, write_json_exclusive
+from .lock import latencies_sha256
 from .spec import WIB
 
 http_get = httpx_get
@@ -45,9 +44,10 @@ def make_settings() -> Any:  # pragma: no cover - reads the live .env
     return Settings()
 
 
-make_get_rows: Callable[[Any], Any] = _store_get_rows
+make_get_rows: Callable[[Any], Any] = calibrate.make_get_rows
 
-SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}-USDT$")
+# SYMBOL_PATTERN and check_symbol (bars), write_exclusive and write_json_exclusive
+# (fileio) reach the CLI modules through this one.
 _MAX_MESSAGE_CHARS = 400
 
 
@@ -60,13 +60,6 @@ def one_line(message: Any) -> str:
     if len(text) > _MAX_MESSAGE_CHARS:
         text = text[: _MAX_MESSAGE_CHARS - 3] + "..."
     return text
-
-
-def check_symbol(symbol: str) -> str:
-    """Accept venue-form USDT pairs only; the symbol becomes part of data paths."""
-    if not SYMBOL_PATTERN.match(symbol):
-        raise ValueError(f"not a BingX USDT symbol: {symbol!r}")
-    return symbol
 
 
 def positive_int(text: str) -> int:
@@ -87,36 +80,6 @@ def wib_today() -> date:
 def stamped_path(out_dir: Path, prefix: str, suffix: str = ".json") -> Path:
     """``<out_dir>/<prefix><YYYYMMDD><suffix>`` dated by today's WIB day."""
     return Path(out_dir) / f"{prefix}{wib_today():%Y%m%d}{suffix}"
-
-
-def write_text_exclusive(path: Path, text: str) -> None:
-    """Write ``text`` atomically; refuse (``FileExistsError``) when ``path`` exists.
-
-    The file is written under a temp name and hard-linked into place, so an
-    existing file is never replaced, not even by a concurrent run."""
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"{path}: already exists; remove it deliberately to write again")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        try:
-            os.link(tmp, path)
-        except FileExistsError:
-            raise FileExistsError(
-                f"{path}: already exists; remove it deliberately to write again"
-            ) from None
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-
-
-def write_json_exclusive(path: Path, doc: Any) -> None:
-    write_text_exclusive(path, json.dumps(doc, sort_keys=True, indent=1, allow_nan=False) + "\n")
 
 
 def read_json(path: Path) -> Any:

@@ -8,13 +8,14 @@ from bot.arena.setup_profile import build_setup_profile
 from bot.strategy import indicators as live
 from bot.strategy import pine_indicators as pine
 from research.pine_gate.bars import (
+    BarGapError,
     Bars,
     aggregate,
     bars_from_rows,
     concat,
     slice_until,
 )
-from research.pine_gate.features import FeatureFrame, Snapshot, htf_agreement
+from research.pine_gate.features import FeatureFrame, Snapshot, htf_agreement, htf_bars
 from research.pine_gate.spec import ms
 
 MIN = 60_000
@@ -430,6 +431,26 @@ class HtfAgreementTest(unittest.TestCase):
             htf_agreement(head, tail)
         with self.assertRaises(ValueError):
             htf_agreement(self.native, aggregate(self.native, H4))
+
+
+class HtfSeamTest(unittest.TestCase):
+    """The native warm-up must end exactly where the aggregated bars begin (C7)."""
+
+    def test_a_hole_at_the_warmup_seam_raises(self):
+        bars, w1h, w4h = make_dataset(days=1)
+        self.assertEqual(len(htf_bars(bars, w1h, HOUR)), len(w1h) + 24)
+        self.assertGreater(len(htf_bars(bars, w4h, H4)), len(w4h))
+        early = slice_until(w1h, START_1M - 3 * HOUR)  # last warm-up bar opens 4 h early
+        with self.assertRaises(BarGapError) as ctx:
+            htf_bars(bars, early, HOUR)
+        self.assertIn(str(START_1M), str(ctx.exception))
+
+    def test_series_lists_every_bar_series_the_frame_reads(self):
+        bars, w1h, w4h = make_dataset(days=1)
+        frame = FeatureFrame.build("BTC-USDT", bars, w1h, w4h)
+        series = frame.series()
+        self.assertIs(series[0], bars)
+        self.assertEqual([s.interval_ms for s in series], [MIN, M5, HOUR, H4, M3])
 
 
 if __name__ == "__main__":

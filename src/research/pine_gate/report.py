@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .checks import OUTCOME_AGREE_MIN, SIDE_AGREE_MIN, WR_DIFF_MAX_PTS
+from .fileio import write_exclusive
 from .holdout_gate import C0_CENTRE_WR, C0_GROSS_TOLERANCE_BPS, C0_WR_TOLERANCE_PTS
 from .pipeline import REGIME_MIN_N, SYMBOLS
 from .spec import WIB, GateConfig
@@ -714,20 +713,6 @@ def render_markdown(results: Mapping[str, Any]) -> str:
     return _render(results, verdict_sentence(summarize_for_verdict(results)))
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Write under a temp name, then hard-link into place: an existing file is never replaced."""
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.link(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-
-
 def write_report(
     results: Mapping[str, Any], out_dir: Path, now: Optional[datetime] = None
 ) -> Tuple[Path, Path]:
@@ -748,9 +733,9 @@ def write_report(
         if path.exists():
             raise FileExistsError(f"{path}: report already exists; remove it deliberately")
     out.mkdir(parents=True, exist_ok=True)
-    _write_text_atomic(md_path, markdown)
+    write_exclusive(md_path, markdown, "report")
     try:
-        _write_text_atomic(json_path, text + "\n")
+        write_exclusive(json_path, text + "\n", "report")
     except BaseException:
         md_path.unlink()
         raise

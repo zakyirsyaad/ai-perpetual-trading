@@ -17,8 +17,8 @@ from .metalabel import MetaModel, candidate_features
 from .pipeline import (
     PURGE_TICK_MINUTES,
     Dataset,
-    _training_markets,
     contender2_fn,
+    fresh_markets,
     rule_signal_fn,
 )
 from .rules import contender2_signal, rule_signal, trend_label
@@ -119,7 +119,7 @@ def permutation_ks(seed: int, n: int, days: int) -> List[int]:
 
 def holdout_markets(dataset: Dataset, exec_cfg: ExecConfig) -> Tuple[Market, ...]:
     """Both markets in tick order with fresh outcome caches on ``exec_cfg``."""
-    return _training_markets(dataset, exec_cfg)
+    return fresh_markets(dataset, exec_cfg)
 
 
 def simulate_holdout(

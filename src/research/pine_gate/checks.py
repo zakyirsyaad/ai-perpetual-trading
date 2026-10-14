@@ -8,18 +8,16 @@ from __future__ import annotations
 
 import json
 import math
-import re
-from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .bars import Bars, bars_from_rows, wib_day
+from .bars import Bars, bars_from_rows, entry_index_for, wib_day
 from .features import FeatureFrame
 from .outcomes import OutcomeCache
 from .simulate import SignalFn
 from .spec import ExecConfig
+from .timeparse import parse_iso_ms
 
 _MS_1M = 60_000
 _MS_PER_SECOND = 1000
@@ -37,10 +35,6 @@ _EPS = 1e-9
 AI_MIN_CONFIDENCE = 0.75
 
 _SIDES = {"OPEN_LONG": 1, "OPEN_SHORT": -1, "HOLD": 0}
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_ISO = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}(?::?\d{2})?)?$"
-)
 
 OutcomeFor = Callable[[str, int, int], Optional[Tuple[str, float]]]
 
@@ -77,14 +71,6 @@ class Agreement:
     wr_prod: Optional[float]  # TP / (TP + SL) in percent
     wr_vst: Optional[float]
     passed: bool
-
-
-def entry_index(bars: Bars, order_ms: int) -> Optional[int]:
-    """Index of the 1m bar containing ``order_ms``; ``None`` when not covered."""
-    i = bisect_right(bars.open_ms, order_ms) - 1
-    if i < 0 or order_ms >= bars.open_ms[i] + bars.interval_ms:
-        return None
-    return i
 
 
 def _wr(kinds: Sequence[str]) -> Optional[float]:
@@ -127,8 +113,8 @@ def vst_agreement(
         if side_prod == 0:
             continue
         order_ms = t + cfg.order_delay_s * _MS_PER_SECOND
-        i_prod = entry_index(prod.bars_1m, order_ms)
-        i_vst = entry_index(vst.bars_1m, order_ms)
+        i_prod = entry_index_for(prod.bars_1m, order_ms)
+        i_vst = entry_index_for(vst.bars_1m, order_ms)
         if i_prod is None or i_vst is None:
             continue
         o_prod = prod_cache.get(i_prod, side_prod)
@@ -175,27 +161,6 @@ class DecisionRow:
     ai_call_id: Optional[str]
 
 
-def _parse_created_ms(text: Any) -> Optional[int]:
-    """ISO-8601 to UTC ms; accepts ``Z`` and 1-6+ fractional digits (Python 3.10)."""
-    if not isinstance(text, str):
-        return None
-    m = _ISO.match(text.strip())
-    if m is None:
-        return None
-    day, clock, frac, offset = m.groups()
-    if offset is None or offset == "Z":
-        offset = "+00:00"
-    elif ":" not in offset:
-        offset = offset[:3] + ":" + (offset[3:] or "00")
-    fraction = (frac or "0")[:6].ljust(6, "0")
-    try:
-        dt = datetime.fromisoformat(f"{day}T{clock}.{fraction}{offset}")
-    except ValueError:
-        return None
-    delta = dt - _EPOCH
-    return (delta.days * 86400 + delta.seconds) * 1000 + delta.microseconds // 1000
-
-
 def _payload(row: Dict[str, Any]) -> Dict[str, Any]:
     payload = row.get("payload_json")
     if isinstance(payload, str):
@@ -215,7 +180,7 @@ def parse_decision(row: Dict[str, Any]) -> Optional[DecisionRow]:
         return None
     symbol = row.get("symbol")
     side = _SIDES.get(row.get("action"))
-    created_ms = _parse_created_ms(row.get("created_at"))
+    created_ms = parse_iso_ms(row.get("created_at"))
     confidence = row.get("confidence")
     if not isinstance(symbol, str) or not symbol or side is None or created_ms is None:
         return None

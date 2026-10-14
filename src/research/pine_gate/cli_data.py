@@ -172,7 +172,7 @@ def cmd_funding(args: argparse.Namespace) -> int:
             failed_any = True
             print(f"{label}: failed: {common.one_line(exc)}")
             continue
-        common.write_text_exclusive(path, json.dumps(times) + "\n")
+        common.write_exclusive(path, json.dumps(times) + "\n", "funding")
         print(f"{label}: {len(times)} times")
     return 1 if failed_any else 0
 

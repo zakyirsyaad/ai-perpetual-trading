@@ -270,6 +270,22 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(len(trades), 3)
         self.assertTrue(all(t.kind == "TIME" and t.net_usdt < 0 for t in trades))
 
+    def test_loss_streak_resets_at_the_wib_day_roll(self):
+        start = wib(2026, 9, 15, 21, 0)
+        midnight = wib(2026, 9, 16, 0, 0)
+        btc = make_market(BTC, start - HOUR, midnight + 4 * HOUR, bar=flat_bar)
+        guards = GuardConfig(max_consecutive_losses=2)
+
+        trades = run(always({BTC: 1}), [btc], start, midnight + 3 * HOUR, guard_cfg=guards)
+
+        tuesday = [t for t in trades if t.wib_day == date(2026, 9, 15)]
+        wednesday = [t for t in trades if t.wib_day == date(2026, 9, 16)]
+        self.assertEqual(len(tuesday), 2)  # the streak of two blocks the rest of Tuesday
+        self.assertTrue(all(t.kind == "TIME" and t.net_usdt < 0 for t in trades))
+        self.assertEqual(len(wednesday), 2)  # a fresh streak after midnight
+        self.assertGreaterEqual(wednesday[0].signal_ms, midnight)
+        self.assertLess(wednesday[0].signal_ms, midnight + IDLE_STEP)
+
     def test_drawdown_guard_stops_the_day(self):
         start = TUE_0800
         btc = make_market(BTC, start - HOUR, start + 3 * HOUR)

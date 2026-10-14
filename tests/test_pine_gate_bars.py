@@ -12,6 +12,8 @@ from research.pine_gate.bars import (
     bars_from_rows,
     concat,
     day_path,
+    entry_index_for,
+    index_closing_at,
     interval_to_ms,
     funding_path,
     last_closed_index,
@@ -23,6 +25,7 @@ from research.pine_gate.bars import (
     wib_day_start_ms,
     wib_hour,
     write_day,
+    write_day_exclusive,
 )
 from research.pine_gate.spec import ms
 
@@ -310,6 +313,98 @@ class DayFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
                 load_days(Path(tmp), "prod", "BTC-USDT", "1h", date(2026, 1, 2), date(2026, 1, 1))
+
+
+class BarValidationTest(unittest.TestCase):
+    """bars_from_rows refuses values no real bar can carry (C6)."""
+
+    def test_rejects_non_finite_non_positive_and_broken_ohlc(self):
+        good = (T0, 100.0, 102.0, 99.0, 101.0, 5.0)
+        bad = {
+            "nan open": (T0, float("nan"), 102.0, 99.0, 101.0, 5.0),
+            "inf high": (T0, 100.0, float("inf"), 99.0, 101.0, 5.0),
+            "nan volume": (T0, 100.0, 102.0, 99.0, 101.0, float("nan")),
+            "zero low": (T0, 100.0, 102.0, 0.0, 101.0, 5.0),
+            "negative close": (T0, 100.0, 102.0, 99.0, -1.0, 5.0),
+            "high below close": (T0, 100.0, 100.5, 99.0, 101.0, 5.0),
+            "high below open": (T0, 103.0, 102.0, 99.0, 101.0, 5.0),
+            "low above open": (T0, 98.0, 102.0, 99.0, 101.0, 5.0),
+            "low above close": (T0, 100.0, 102.0, 99.0, 98.5, 5.0),
+            "negative volume": (T0, 100.0, 102.0, 99.0, 101.0, -0.1),
+        }
+        bars_from_rows([good], MIN)
+        for name, row in bad.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as ctx:
+                    bars_from_rows([(T0 - MIN,) + good[1:], row], MIN)
+                self.assertIn(str(T0), str(ctx.exception))
+                self.assertNotIsInstance(ctx.exception, BarGapError)
+
+    def test_zero_volume_and_flat_bars_are_valid(self):
+        bars = bars_from_rows([(T0, 1.0, 1.0, 1.0, 1.0, 0.0)], MIN)
+        self.assertEqual(len(bars), 1)
+
+
+class EntryIndexTest(unittest.TestCase):
+    """The one entry-index helper (C2) and its inverse."""
+
+    def setUp(self):
+        self.bars = bars_from_rows(make_rows(T0, MIN, 3), MIN)
+
+    def test_entry_index_is_the_bar_containing_the_order_time(self):
+        self.assertEqual(entry_index_for(self.bars, T0), 0)
+        self.assertEqual(entry_index_for(self.bars, T0 + MIN - 1), 0)
+        self.assertEqual(entry_index_for(self.bars, T0 + MIN), 1)
+        self.assertEqual(entry_index_for(self.bars, T0 + 3 * MIN - 1), 2)
+        self.assertIsNone(entry_index_for(self.bars, T0 - 1))
+        self.assertIsNone(entry_index_for(self.bars, T0 + 3 * MIN))
+        self.assertIsNone(entry_index_for(bars_from_rows([], MIN), T0))
+
+    def test_index_closing_at_inverts_the_entry_fill_time(self):
+        for i in range(3):
+            close = self.bars.open_ms[i] + MIN
+            self.assertEqual(index_closing_at(self.bars, close), i)
+        self.assertIsNone(index_closing_at(self.bars, T0))
+        self.assertIsNone(index_closing_at(self.bars, T0 + MIN + 1))
+        self.assertIsNone(index_closing_at(self.bars, T0 + 4 * MIN))
+
+
+class PathSymbolTest(unittest.TestCase):
+    def test_paths_refuse_symbols_that_are_not_usdt_pairs(self):
+        base = Path("/data")
+        for symbol in ("../etc", "BTC-USDT\n", "btc-usdt", "BTC/USDT", "BTC-USDT/../x"):
+            with self.subTest(symbol=symbol):
+                with self.assertRaises(ValueError):
+                    day_path(base, "prod", symbol, "1m", date(2026, 1, 2))
+                with self.assertRaises(ValueError):
+                    warmup_path(base, symbol, "1h")
+                with self.assertRaises(ValueError):
+                    funding_path(base, symbol)
+
+
+class ExclusiveDayWriteTest(unittest.TestCase):
+    def test_write_day_exclusive_never_replaces_and_reports_a_late_file(self):
+        from unittest import mock
+
+        from research.pine_gate import fileio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prod" / "2026-01-01.csv.gz"
+            self.assertTrue(write_day_exclusive(path, make_rows(T0, MIN, 3)))
+            self.assertEqual(len(read_day(path)), 3)
+            self.assertFalse(write_day_exclusive(path, make_rows(T0, MIN, 2)))
+            self.assertEqual(len(read_day(path)), 3)
+            late = Path(tmp) / "prod" / "2026-01-02.csv.gz"
+
+            def racing_link(src, dst):
+                Path(dst).write_bytes(b"other writer")
+                raise FileExistsError(dst)
+
+            with mock.patch.object(fileio.os, "link", side_effect=racing_link):
+                self.assertFalse(write_day_exclusive(late, make_rows(T0, MIN, 1)))
+            self.assertEqual(late.read_bytes(), b"other writer")
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()),
+                             ["2026-01-01.csv.gz", "2026-01-02.csv.gz"])
 
 
 if __name__ == "__main__":

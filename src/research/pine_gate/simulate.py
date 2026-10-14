@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
-from .bars import Bars, wib_day, wib_day_start_ms
+from .bars import Bars, entry_index_for, wib_day, wib_day_start_ms
 from .outcomes import OutcomeCache, gross_bps
 from .spec import ExecConfig, GuardConfig
 
@@ -98,6 +98,92 @@ def _merge_windows(windows: Iterable[Tuple[int, int]]) -> Tuple[List[int], List[
     return starts, ends
 
 
+class _DayGuards:
+    """The live bot's daily guards, keyed on the WIB calendar day of a time.
+
+    ``roll`` resets every counter when the day changes; ``allows`` says whether a
+    new entry may open; ``record`` books a filled trade on its entry's day."""
+
+    def __init__(self, cfg: GuardConfig, trade_volume: float) -> None:
+        self._cfg = cfg
+        self._trade_volume = trade_volume
+        self._day: Optional[int] = None
+        self._reset()
+
+    def _reset(self) -> None:
+        self.stops = self.losses = self.entries = 0
+        self.day_net = self.volume = 0.0
+
+    def roll(self, t_ms: int) -> None:
+        day = (t_ms + _WIB_OFFSET_MS) // _MS_PER_DAY
+        if day != self._day:
+            self._day = day
+            self._reset()
+
+    def allows(self) -> bool:
+        cfg = self._cfg
+        return (self.stops < cfg.max_stops
+                and self.losses < cfg.max_consecutive_losses
+                and self.day_net > -cfg.max_drawdown_usdt
+                and self.entries < cfg.max_entries
+                and self.volume + self._trade_volume <= cfg.max_volume_usdt)
+
+    def record(self, trade: "Trade") -> None:
+        self.roll(trade.entry_ms)
+        self.entries += 1
+        self.volume += self._trade_volume
+        self.day_net += trade.net_usdt
+        if trade.kind == "SL":
+            self.stops += 1
+        self.losses = self.losses + 1 if trade.net_usdt < 0 else 0
+
+
+@dataclass(frozen=True)
+class _Fill:
+    """What an entry needs besides the signal: costs, latency sample and slippage."""
+
+    exec_cfg: ExecConfig
+    latencies: Tuple[int, ...]
+    overshoot_bps: float
+    round_trip_fee_bps: float
+
+
+def _choose(signal: SignalFn, markets: Sequence[Market], t: int,
+            blackout_s: int) -> Optional[Tuple[Market, int]]:
+    """The first market (in tick order) outside a funding blackout that signals at ``t``."""
+    for market in markets:
+        if in_funding_blackout(t, market.funding_ms, blackout_s):
+            continue
+        side = signal(market.symbol, t)
+        if side == 0:
+            continue
+        if side not in (1, -1):
+            raise ValueError(f"signal for {market.symbol} returned {side!r}")
+        return market, side
+    return None
+
+
+def _try_entry(market: Market, side: int, t: int, rng: random.Random,
+               fill: _Fill) -> Optional[Trade]:
+    """The trade a tick at ``t`` opens; ``None`` when the order bar is missing or the
+    data ends before the bracket resolves (the run stops there)."""
+    latency = rng.choice(fill.latencies) if fill.latencies else 0
+    order_ms = t + latency + fill.exec_cfg.order_delay_s * 1000
+    entry_idx = entry_index_for(market.bars_1m, order_ms)
+    if entry_idx is None:
+        return None
+    outcome = market.outcomes.get(entry_idx, side)
+    if outcome is None:
+        return None
+    open_ms = market.bars_1m.open_ms
+    entry_ms = open_ms[entry_idx] + _MS_PER_MIN
+    exit_ms = open_ms[outcome.exit_idx] + (0 if outcome.gapped else _MS_PER_MIN)
+    gross = gross_bps(outcome, side, fill.overshoot_bps, fill.exec_cfg)
+    net = fill.exec_cfg.notional_usdt * (gross - fill.round_trip_fee_bps) / _BPS
+    return Trade(market.symbol, side, t, entry_ms, exit_ms, outcome.kind, gross, net,
+                 wib_day(entry_ms), outcome.both_touched)
+
+
 def simulate(
     signal: SignalFn,
     markets: Sequence[Market],
@@ -119,101 +205,32 @@ def simulate(
     not exist or the data ends before the bracket resolves.
     """
     rng = random.Random(seed)
-    latencies = tuple(int(x) for x in latencies_ms)
     blocked_starts, blocked_ends = _merge_windows(blocked_entry_windows)
-
     fee = exec_cfg.fee_pct if fee_pct is None else fee_pct
-    round_trip_fee_bps = 2 * fee * 100.0
-    notional = exec_cfg.notional_usdt
-    trade_volume = 2 * notional
+    fill = _Fill(exec_cfg, tuple(int(x) for x in latencies_ms), overshoot_bps, 2 * fee * 100.0)
+    guards = _DayGuards(guard_cfg, 2 * exec_cfg.notional_usdt)
     idle_step = (exec_cfg.idle_tick_s + exec_cfg.tick_s) * 1000
-    after_exit = exec_cfg.tick_s * 1000
-    order_delay = exec_cfg.order_delay_s * 1000
     cooldown = exec_cfg.cooldown_min * _MS_PER_MIN
-    blackout_s = exec_cfg.funding_blackout_s
-
-    max_stops = guard_cfg.max_stops
-    max_losses = guard_cfg.max_consecutive_losses
-    min_net = -guard_cfg.max_drawdown_usdt
-    max_entries = guard_cfg.max_entries
-    max_volume = guard_cfg.max_volume_usdt
 
     trades: List[Trade] = []
     next_entry_ms = None  # cooldown end
-    day = None  # WIB day index of the guard counters
-    stops = losses = entries = 0
-    day_net = volume = 0.0
-
     t = start_ms + offset_s * 1000
     while t < end_ms:
-        tick_day = (t + _WIB_OFFSET_MS) // _MS_PER_DAY
-        if tick_day != day:
-            day = tick_day
-            stops = losses = entries = 0
-            day_net = volume = 0.0
-
+        guards.roll(t)
         chosen = None
-        if (
-            in_entry_window(t)
-            and not _in_windows(t, blocked_starts, blocked_ends)
-            and (next_entry_ms is None or t >= next_entry_ms)
-            and stops < max_stops
-            and losses < max_losses
-            and day_net > min_net
-            and entries < max_entries
-            and volume + trade_volume <= max_volume
-        ):
-            for market in markets:
-                if in_funding_blackout(t, market.funding_ms, blackout_s):
-                    continue
-                side = signal(market.symbol, t)
-                if side == 0:
-                    continue
-                if side not in (1, -1):
-                    raise ValueError(f"signal for {market.symbol} returned {side!r}")
-                chosen = (market, side)
-                break
-
+        if (in_entry_window(t) and not _in_windows(t, blocked_starts, blocked_ends)
+                and (next_entry_ms is None or t >= next_entry_ms) and guards.allows()):
+            chosen = _choose(signal, markets, t, exec_cfg.funding_blackout_s)
         if chosen is None:
             t += idle_step
             continue
-
-        market, side = chosen
-        latency = rng.choice(latencies) if latencies else 0
-        order_ms = t + latency + order_delay
-        open_ms = market.bars_1m.open_ms
-        entry_idx = bisect_right(open_ms, order_ms) - 1
-        if entry_idx < 0 or order_ms >= open_ms[entry_idx] + _MS_PER_MIN:
+        trade = _try_entry(chosen[0], chosen[1], t, rng, fill)
+        if trade is None:
             break
-        outcome = market.outcomes.get(entry_idx, side)
-        if outcome is None:
-            break
-
-        entry_ms = open_ms[entry_idx] + _MS_PER_MIN
-        exit_ms = open_ms[outcome.exit_idx] + (0 if outcome.gapped else _MS_PER_MIN)
-        gross = gross_bps(outcome, side, overshoot_bps, exec_cfg)
-        net = notional * (gross - round_trip_fee_bps) / _BPS
-        trades.append(
-            Trade(
-                market.symbol, side, t, entry_ms, exit_ms, outcome.kind, gross, net,
-                wib_day(entry_ms), outcome.both_touched,
-            )
-        )
-
-        entry_day = (entry_ms + _WIB_OFFSET_MS) // _MS_PER_DAY
-        if entry_day != day:
-            day = entry_day
-            stops = losses = entries = 0
-            day_net = volume = 0.0
-        entries += 1
-        volume += trade_volume
-        day_net += net
-        if outcome.kind == "SL":
-            stops += 1
-        losses = losses + 1 if net < 0 else 0
-
-        next_entry_ms = entry_ms + cooldown
-        t = exit_ms + after_exit
+        trades.append(trade)
+        guards.record(trade)
+        next_entry_ms = trade.entry_ms + cooldown
+        t = trade.exit_ms + exec_cfg.tick_s * 1000
     return trades
 
 

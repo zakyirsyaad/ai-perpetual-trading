@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,19 +18,14 @@ from . import cli_common as common
 from .cli_checks import DECISIONS_PREFIX, VST_PREFIX
 from .calibrate import load_entry_latencies_ms, s_star, stop_overshoot_detail
 from .holdout import HOLDOUT_PREFIX, check_calibration, refuse_any_holdout, test_stage
-from .pipeline import (
-    TRAIN_DATA_UNTIL_MS,
-    latencies_sha256,
-    load_dataset,
-    load_selection_checked,
-    train_stage,
-)
+from .lock import code_files, code_sha256, latencies_sha256, load_selection_checked
+from .pipeline import TRAIN_DATA_UNTIL_MS, load_dataset, train_stage
 from .report import write_report
 from .spec import spec_sha256
 
 CALIBRATION_PREFIX = "pine_gate_calibration_"
-_SRC_ROOT = Path(__file__).resolve().parents[2]
-_CODE_EXTRA = ("bot/strategy/pine_indicators.py",)
+# code_files / code_sha256 live in ``lock`` (the selection and holdout files record
+# the code sha256) and stay importable from here.
 
 
 # --------------------------------------------------------------------------- calibrate
@@ -63,7 +57,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         "latencies_sha256": latencies_sha256(latencies),
         "created_at": common.now().isoformat(),
     }
-    common.write_json_exclusive(path, doc)
+    common.write_json_exclusive(path, doc, "calibration")
     print(f"s* {doc['s_star_bps']} bps, n_stops {doc['n_stops']}, "
           f"n_skipped {doc['n_skipped']}, n_latencies {len(latencies)}")
     print(path)
@@ -94,19 +88,6 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- report
-
-
-def code_files() -> List[Tuple[str, str]]:
-    """(path relative to ``src``, sha256) of every research .py plus pine_indicators.py."""
-    paths = sorted((_SRC_ROOT / "research").rglob("*.py"))
-    paths += [_SRC_ROOT / rel for rel in _CODE_EXTRA]
-    files = [(p.relative_to(_SRC_ROOT).as_posix(), common.file_sha256(p)) for p in paths]
-    return sorted(files)
-
-
-def code_sha256() -> str:
-    text = "\n".join(f"{rel}:{sha}" for rel, sha in code_files())
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _vst_symbol(path: Path) -> str:
