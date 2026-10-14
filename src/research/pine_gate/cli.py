@@ -54,7 +54,10 @@ def _symbol(text: str) -> str:
 
 
 def _symbols(text: str) -> List[str]:
-    return [_symbol(part.strip()) for part in text.split(",") if part.strip()]
+    symbols = [_symbol(part.strip()) for part in text.split(",") if part.strip()]
+    if not symbols:  # "," would otherwise fetch nothing and exit 0
+        raise argparse.ArgumentTypeError(f"no symbol in {text!r}")
+    return symbols
 
 
 def cmd_spec(args: argparse.Namespace) -> int:

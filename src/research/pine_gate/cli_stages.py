@@ -112,12 +112,22 @@ def _vst_symbol(path: Path) -> str:
     return stem.rsplit("_", 1)[0]
 
 
-def _vst_paths(out_dir: Path, explicit: Optional[List[str]]) -> Dict[str, Path]:
-    if explicit:
-        paths = [Path(p).expanduser() for p in explicit]
-    else:
+def _vst_docs(out_dir: Path, explicit: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
+    """``{symbol: vst-check output}``: the newest file per symbol in ``out_dir``, or the
+    ``--vst`` files keyed by the symbol each records (one file per symbol)."""
+    if not explicit:
         paths = sorted(Path(out_dir).glob(f"{VST_PREFIX}*_*.json"))  # newest last per symbol
-    return {_vst_symbol(p): p for p in paths}
+        return {_vst_symbol(p): common.json_doc(p) for p in paths}
+    docs: Dict[str, Dict[str, Any]] = {}
+    for path in (Path(p).expanduser() for p in explicit):
+        doc = common.json_doc(path)
+        symbol = doc.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            raise common.CliError(f"{path}: records no symbol; pass vst-check outputs only")
+        if symbol in docs:
+            raise common.CliError(f"{path}: a second --vst file for {symbol}")
+        docs[symbol] = doc
+    return docs
 
 
 def _pick(explicit: Optional[str], out_dir: Path, prefix: str) -> Optional[Path]:
@@ -147,7 +157,7 @@ def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
     hold_path, holdout, sel_path = _report_inputs(args)
     selection = common.json_doc(sel_path)
     decisions = common.json_doc(_pick(args.decisions, args.out_dir, DECISIONS_PREFIX))
-    vst = {symbol: common.json_doc(p) for symbol, p in _vst_paths(args.out_dir, args.vst).items()}
+    vst = _vst_docs(args.out_dir, args.vst)
     return {
         "selection": selection,
         "holdout": holdout,
@@ -192,5 +202,7 @@ def add_parsers(sub: Any) -> None:
     p.add_argument("--selection", help="default: the selection file the holdout was made from")
     p.add_argument("--holdout", help="default: the newest holdout file in --out-dir")
     p.add_argument("--decisions")
-    p.add_argument("--vst", action="append", help="repeatable; default: newest per symbol")
+    p.add_argument("--vst", action="append",
+                   help="repeatable, one per symbol (keyed by the symbol each file records); "
+                        "default: newest per symbol")
     p.set_defaults(handler=cmd_report)

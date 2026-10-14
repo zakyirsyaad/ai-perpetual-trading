@@ -14,11 +14,13 @@ resolved), of any date, refuses the run, and so does an existing run marker
 ``<data_dir>/holdout_runs/<spec_sha256>.json`` (mandatory under the current spec
 sha256). Every data check that can refuse comes before the marker is written (the
 files checked without computing anything, the training part hashed from a
-training-only load), and the full holdout load after it. A run under the current spec sha256 must also use the seed recorded in
-the selection file (the spec seed), run on the code and the Python version that
-trained (``code_sha256``, ``python_version``), follow a
-training C0 that passed, write next to its selection file and read holdout data
-whose training part is the data the selection was trained on.
+training-only load), and the full holdout load after it. A run under the current
+spec sha256 must also use the seed recorded in the selection file (the spec seed),
+run on the code and the Python version that trained (``code_sha256``,
+``python_version``), follow a training C0 that passed, write next to its selection
+file and read holdout data whose training part is the data the selection was
+trained on. Criterion 2 is also reported under a 5-day block bootstrap
+(``sensitivities.c0_block``, report only).
 
 Every per-symbol number comes from that symbol's trades inside the joint
 one-position run over BTC and ETH (BTC first), except the C0 controls, which
@@ -74,7 +76,15 @@ from .pipeline import SYMBOLS, Dataset, check_purge_covers
 from .rules import reference_signal
 from .simulate import Market, SignalFn, Trade
 from .spec import HOLDOUT_END, WIB, ExecConfig, GateConfig, GuardConfig, ms, spec_sha256
-from .stats import bootstrap_paired_p, day_aggregates, holm, permutation_p, win_rate, wr_lower_bound
+from .stats import (
+    bootstrap_paired_block_p,
+    bootstrap_paired_p,
+    day_aggregates,
+    holm,
+    permutation_p,
+    win_rate,
+    wr_lower_bound,
+)
 
 HOLDOUT_PREFIX = "pine_gate_holdout_"
 HOLDOUT_RUNS_DIR = "holdout_runs"  # one run marker per spec sha256, under the data folder
@@ -187,6 +197,20 @@ def _p_c0(h: Holdout, runs: Mapping[str, _Runs], c0) -> Dict[str, Dict[str, floa
             out[name][s] = bootstrap_paired_p(day_aggregates(trades_of(r.main, s), h.days), base,
                                               n=h.gate_cfg.bootstrap_n, seed=h.seed)
     return out
+
+
+def _p_c0_block(h: Holdout, runs: Mapping[str, _Runs], c0) -> Dict[str, Any]:
+    """Criterion 2 again under a circular block bootstrap of ``c0_block_days`` days,
+    raw and Holm-adjusted (report only: trend regimes last weeks)."""
+    days = h.gate_cfg.c0_block_days
+    raw: Dict[str, Dict[str, float]] = {name: {} for name in runs}
+    for s in SYMBOLS:
+        base = day_aggregates(c0[s]["long"] + c0[s]["short"], h.days)
+        for name, r in runs.items():
+            raw[name][s] = bootstrap_paired_block_p(
+                day_aggregates(trades_of(r.main, s), h.days), base,
+                n=h.gate_cfg.bootstrap_n, seed=h.seed, block_days=days)
+    return {"block_days": days, "p": raw, "p_holm": _holm_by_symbol(raw, h.gate_cfg.holm_family)}
 
 
 def _holm_by_symbol(
@@ -419,7 +443,7 @@ def _evaluate(h: Holdout, selection: Mapping[str, Any]) -> Dict[str, Any]:
         "contenders": docs, "skipped": skipped,
         "controls": {"c0": c0_doc,
                      "c1": {c.name: _c1_control(h, runs[c.name].main) for c in contenders}},
-        "sensitivities": _sensitivities(h, contenders),
+        "sensitivities": {**_sensitivities(h, contenders), "c0_block": _p_c0_block(h, runs, c0)},
         "chosen": chosen, "symbols_to_trade": list(traded_symbols(all_verdicts, chosen)),
     }
 

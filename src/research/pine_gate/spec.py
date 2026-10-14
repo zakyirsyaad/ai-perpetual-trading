@@ -146,6 +146,8 @@ class GateConfig:
     permutation_shifts: int = 1000
     c1_seeds: int = 200
     holm_family: int = 3
+    # report only: criterion 2 again under a circular block bootstrap of 5 days (L14)
+    c0_block_days: int = 5
 
 
 @dataclass(frozen=True)

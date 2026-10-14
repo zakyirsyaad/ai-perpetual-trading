@@ -183,6 +183,45 @@ def bootstrap_paired_p(
     return (1 + hits) / (1 + n)
 
 
+def bootstrap_paired_block_p(
+    a_aggs: Sequence[DayAgg], b_aggs: Sequence[DayAgg], n: int, seed: int, block_days: int
+) -> float:
+    """``bootstrap_paired_p`` with circular blocks of ``block_days`` consecutive days.
+
+    Both sides are aligned on every listed day in calendar order (days without a
+    bracket exit stay, so a block spans real consecutive days); each resample joins
+    blocks starting at uniformly drawn days, wrapping at the end, cut to the series
+    length. Trend regimes last weeks, so this is the sensitivity of a day bootstrap
+    that treats days as independent (report only). Same p and conventions."""
+    if type(block_days) is not int or block_days < 1:
+        raise ValueError(f"block_days must be a positive integer, got {block_days!r}")
+    by_day: Dict[date, List[int]] = {}
+    for col, aggs in ((0, a_aggs), (2, b_aggs)):
+        for x in aggs:
+            row = by_day.setdefault(x.day, [0, 0, 0, 0])
+            row[col] += x.tp
+            row[col + 1] += x.tp + x.sl
+    rows = [tuple(r) for _, r in sorted(by_day.items())]
+    if not any(r[1] + r[3] for r in rows):
+        return 1.0
+    rng = random.Random(seed)
+    k = len(rows)
+    starts_per_sample = -(-k // block_days)
+    hits = 0
+    for _ in range(n):
+        tp_a = m_a = tp_b = m_b = 0
+        taken = 0
+        for _ in range(starts_per_sample):
+            start = rng.randrange(k)
+            for j in range(min(block_days, k - taken)):
+                r = rows[(start + j) % k]
+                tp_a, m_a, tp_b, m_b = tp_a + r[0], m_a + r[1], tp_b + r[2], m_b + r[3]
+            taken += block_days
+        if m_a == 0 or m_b == 0 or tp_a / m_a - tp_b / m_b <= 0:
+            hits += 1
+    return (1 + hits) / (1 + n)
+
+
 def holm(p: Mapping[str, float]) -> Dict[str, float]:
     """Holm step-down adjusted p-values (monotone, capped at 1), same keys."""
     for key, value in p.items():

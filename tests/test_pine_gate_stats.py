@@ -7,6 +7,7 @@ from research.pine_gate.simulate import Trade
 from research.pine_gate.stats import (
     DayAgg,
     bootstrap_p_above,
+    bootstrap_paired_block_p,
     bootstrap_paired_p,
     day_aggregates,
     holm,
@@ -181,6 +182,40 @@ class BootstrapTests(unittest.TestCase):
         b = [agg(0, 0, 1)]
         p = bootstrap_paired_p(a, b, n=1000, seed=0)
         self.assertTrue(0.31 < p < 0.41, p)
+
+
+class BlockBootstrapTests(unittest.TestCase):
+    def test_a_block_as_long_as_the_series_only_rotates_it(self):
+        # every resample is the whole series rotated, so its sums are the observed ones
+        a = [agg(d, 11 if d % 7 else 3, 9) for d in range(30)]
+        b = [agg(d, 10, 10) for d in range(30)]
+        self.assertAlmostEqual(bootstrap_paired_block_p(a, b, n=200, seed=0, block_days=30),
+                               1 / 201)
+        self.assertEqual(bootstrap_paired_block_p(b, a, n=200, seed=0, block_days=30), 1.0)
+
+    def test_blocks_keep_a_streak_together(self):
+        # a beats b only on one 10-day streak (equal elsewhere): a resample with no
+        # streak day counts against a. Day by day that almost never happens; with
+        # 10-day blocks the streak is often missed whole (about (41/60)^6 = 10%).
+        a = [agg(d, 15 if 10 <= d < 20 else 10, 5 if 10 <= d < 20 else 10) for d in range(60)]
+        b = [agg(d, 10, 10) for d in range(60)]
+        iid = bootstrap_paired_block_p(a, b, n=2000, seed=4, block_days=1)
+        block = bootstrap_paired_block_p(a, b, n=2000, seed=4, block_days=10)
+        self.assertLess(iid, 0.01)
+        self.assertTrue(0.05 < block < 0.2, block)
+
+    def test_block_bootstrap_is_seeded_and_checks_its_inputs(self):
+        a = [agg(d, 6 + d % 3, 5) for d in range(30)]
+        b = [agg(d, 6, 5) for d in range(30)]
+        first = bootstrap_paired_block_p(a, b, n=300, seed=1, block_days=5)
+        self.assertEqual(first, bootstrap_paired_block_p(a, b, n=300, seed=1, block_days=5))
+        self.assertTrue(0.0 < first < 1.0)
+        self.assertEqual(bootstrap_paired_block_p([agg(0, 0, 0, n=1)], [], n=50, seed=0,
+                                                  block_days=5), 1.0)
+        for bad in (0, -1, 2.5):
+            with self.subTest(block_days=bad):
+                with self.assertRaises(ValueError):
+                    bootstrap_paired_block_p(a, b, n=10, seed=0, block_days=bad)
 
 
 class HolmAndPermutationTests(unittest.TestCase):

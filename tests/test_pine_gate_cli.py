@@ -552,6 +552,16 @@ class CollectCommandTest(Dirs):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     cli._symbol(text)
 
+    def test_an_empty_symbol_list_is_a_usage_error(self):
+        for text in (",", " , ", ""):
+            with self.subTest(text=text):
+                code, out, err = run_cli(self.base_args() + [
+                    "fetch", "--source", "prod", "--symbols", text,
+                    "--start", "2026-07-01", "--end", "2026-07-02"])
+                self.assertEqual(code, 2, err)
+                self.assertIn("no symbol", err)
+                self.assertEqual(out, "")
+
 
 class CheckDataCommandTest(Dirs):
     def test_check_data_reports_a_missing_day(self):
@@ -873,7 +883,8 @@ class VstCheckCommandTest(Dirs):
         doc = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(set(doc), {"n", "n_either", "n_both", "n_prod", "n_vst", "side_agree",
                                     "outcome_agree", "wr_prod", "wr_vst", "passed",
-                                    "contender", "selection_sha256"})
+                                    "contender", "selection_sha256", "symbol"})
+        self.assertEqual(doc["symbol"], "BTC-USDT")
         self.assertEqual(doc["contender"], "c1")
         self.assertEqual(doc["selection_sha256"],
                          hashlib.sha256((self.out / "s.json").read_bytes()).hexdigest())
@@ -1021,6 +1032,50 @@ class ReportCommandTest(Dirs):
         self.assertEqual(len(sha["code"]), 64)
         self.assertEqual(out.strip().splitlines(), [str(self.out / "r.md"),
                                                     str(self.out / "r.json")])
+
+
+    def write_report_inputs(self):
+        selection = self.out / "pine_gate_selection_20261014.json"
+        selection.write_text(json.dumps({"data_sha256": "abc"}), encoding="utf-8")
+        (self.out / "pine_gate_holdout_20261014.json").write_text(
+            json.dumps({"chosen": "c2", "selection_file": selection.name}), encoding="utf-8")
+
+    def gather(self, *vst_paths):
+        captured = {}
+
+        def fake_write(results, out_dir):
+            captured["results"] = results
+            return Path(out_dir) / "r.md", Path(out_dir) / "r.json"
+
+        argv = self.base_args() + ["report"]
+        for path in vst_paths:
+            argv += ["--vst", str(path)]
+        with mock.patch.object(cli_stages, "write_report", fake_write):
+            code, _, err = run_cli(argv)
+        return code, err, captured.get("results")
+
+    def test_explicit_vst_files_are_keyed_by_their_recorded_symbol(self):
+        self.write_report_inputs()
+        btc, eth = self.root / "check one.json", self.root / "check-two.json"
+        btc.write_text(json.dumps({"symbol": "BTC-USDT", "n": 1}), encoding="utf-8")
+        eth.write_text(json.dumps({"symbol": "ETH-USDT", "n": 2}), encoding="utf-8")
+        code, err, results = self.gather(btc, eth)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(results["vst"], {"BTC-USDT": {"symbol": "BTC-USDT", "n": 1},
+                                          "ETH-USDT": {"symbol": "ETH-USDT", "n": 2}})
+
+    def test_explicit_vst_files_for_one_symbol_or_without_one_are_refused(self):
+        self.write_report_inputs()
+        first, second = self.root / "a.json", self.root / "b.json"
+        first.write_text(json.dumps({"symbol": "BTC-USDT"}), encoding="utf-8")
+        second.write_text(json.dumps({"symbol": "BTC-USDT"}), encoding="utf-8")
+        code, err, _ = self.gather(first, second)
+        self.assertEqual(code, 1, err)
+        self.assertIn("BTC-USDT", err)
+        second.write_text(json.dumps({"n": 3}), encoding="utf-8")
+        code, err, _ = self.gather(first, second)
+        self.assertEqual(code, 1, err)
+        self.assertIn("symbol", err)
 
 
 class CodeHashTest(unittest.TestCase):

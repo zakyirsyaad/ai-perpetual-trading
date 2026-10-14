@@ -90,6 +90,9 @@ def make_holdout(passed=True, c0_ok=True, tp=120, sl=80):
                                "combined_supply": 11.0} for n in names},
             "reference": {s: symbol_block("ref", s, False) for s in (BTC, ETH)},
             "fee_pct": 0.05,
+            "c0_block": {"block_days": 5,
+                         "p": {n: {s: 0.0123 for s in (BTC, ETH)} for n in names},
+                         "p_holm": {n: {s: 0.0369 for s in (BTC, ETH)} for n in names}},
             "overshoot": {n: {b: {s: dict(brief, wr=wr) for s in (BTC, ETH)}
                               for b, wr in (("0.0", 53.5), ("1.0", 52.7))} for n in names},
         },
@@ -138,9 +141,10 @@ def make_selection():
 
 
 def agreement(passed=True, contender="c2"):
-    return {"n": 5000, "side_agree": 0.982, "outcome_agree": 0.961, "wr_prod": 54.0,
+    return {"n": 5000, "n_either": 410, "n_both": 377, "n_prod": 395, "n_vst": 388,
+            "side_agree": 0.982, "outcome_agree": 0.961, "wr_prod": 54.0,
             "wr_vst": 53.0, "passed": passed, "contender": contender,
-            "selection_sha256": SHA["selection"]}
+            "selection_sha256": SHA["selection"], "symbol": BTC}
 
 
 def buckets():
@@ -249,7 +253,7 @@ class RenderMarkdownTests(unittest.TestCase):
         results = make_results()
         tahap = section(render_markdown(results), "Tahap latih")
         self.assertIn("C0 pada data latih", tahap)
-        self.assertIn("50.4%", tahap)
+        self.assertIn("50.40%", tahap)
         self.assertIn("-0.90", tahap)
         self.assertNotIn("model fill tidak valid", tahap)
         results["selection"]["c0_training_pass"] = False
@@ -289,8 +293,8 @@ class RenderMarkdownTests(unittest.TestCase):
     def test_overshoot_sensitivity_is_reported(self, _):
         text = section(render_markdown(make_results()), "Biaya kadens dan guard")
         self.assertIn("overshoot stop", text)
-        self.assertIn("53.5%", text)
-        self.assertIn("52.7%", text)
+        self.assertIn("53.50%", text)
+        self.assertIn("52.70%", text)
 
     def test_fill_caveat_names_the_bar_containing_the_order(self, _):
         text = section(render_markdown(make_results()), "Periode uji")
@@ -366,8 +370,41 @@ class RenderMarkdownTests(unittest.TestCase):
         vst = section(render_markdown(make_results()), "VST vs produksi")
 
         self.assertIn("98.2%", vst)
-        self.assertIn("96.1%", vst)
+        self.assertIn("96.10%", vst)  # within a point of 97%: two decimals
         self.assertIn("97%", vst)
+
+    def test_vst_table_shows_the_counts_behind_each_share(self, _):
+        vst = section(render_markdown(make_results()), "VST vs produksi")
+        header = next(line for line in vst.splitlines() if line.startswith("| Kontender"))
+        for label in ("tick salah satu sinyal", "tick sinyal searah", "sinyal produksi",
+                      "sinyal VST"):
+            self.assertIn(label, header)
+        self.assertNotIn("| tick |", header)
+        self.assertIn("| 410 | 377 | 395 | 388 |", vst)
+
+    def test_gate_reports_criterion_2_under_a_five_day_block_bootstrap(self, _):
+        gerbang = section(render_markdown(make_results()), "Gerbang")
+        self.assertIn("p Holm (blok 5 hari)", gerbang)
+        self.assertIn("0.037", gerbang)
+        self.assertIn("sensitivitas", gerbang)
+
+    def test_spec_or_code_mismatch_starts_ringkasan_with_a_warning(self, _):
+        cases = {"spec": ("selection", "spec_sha256"), "kode": ("holdout", "code_sha256")}
+        for word, (part, key) in cases.items():
+            with self.subTest(word):
+                results = make_results()
+                results[part][key] = "f" * 64
+                body = section(render_markdown(results), "Ringkasan").split("\n", 1)[1].strip()
+                self.assertTrue(body.startswith("**PERINGATAN: sha256 tidak cocok**"), body[:80])
+                self.assertIn(word, body.split("\n", 1)[0])
+        results = make_results()
+        results["sha256"]["code"] = "f" * 64  # the code changed after the holdout ran
+        self.assertIn("sha256 tidak cocok", render_markdown(results))
+
+    def test_kesimpulan_lists_the_simulation_caveats(self, _):
+        kesimpulan = section(render_markdown(make_results()), "Kesimpulan")
+        for needle in ("CSCV", "closed_at", "setelah panggilan AI", "bucket B, E dan F"):
+            self.assertIn(needle, kesimpulan)
 
     def test_vst_and_decision_tables_show_the_contender(self, _):
         text = render_markdown(make_results())
@@ -430,7 +467,7 @@ class RenderMarkdownTests(unittest.TestCase):
 
         self.assertIn("C0", kontrol)
         self.assertIn("C1", kontrol)
-        self.assertIn("50.4%", kontrol)  # mean shifted WR
+        self.assertIn("50.40%", kontrol)  # mean shifted WR
         self.assertIn("0.030", kontrol)  # paired p of contender 3
 
     def test_cadence_section_compares_with_the_main_run(self, _):
@@ -528,7 +565,7 @@ class RenderMarkdownTests(unittest.TestCase):
 
 class FormatTests(unittest.TestCase):
     def test_number_formats(self):
-        self.assertEqual(report.fmt_wr(55.55), "55.5%")
+        self.assertEqual(report.fmt_wr(62.34), "62.3%")
         self.assertEqual(report.fmt_wr(None), "–")
         self.assertEqual(report.fmt_bps(2.345), "2.35")
         self.assertEqual(report.fmt_bps(None), "–")
@@ -536,6 +573,19 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(report.fmt_money(None), "–")
         self.assertEqual(report.fmt_share(0.982), "98.2%")
         self.assertEqual(report.fmt_bps(float("inf")), "–")
+
+    def test_values_within_one_point_of_a_gate_threshold_get_two_decimals(self):
+        self.assertEqual(report.fmt_wr(56.96), "56.96%")  # would round to 57.0
+        self.assertEqual(report.fmt_wr(55.55), "55.55%")  # criterion 6
+        self.assertEqual(report.fmt_wr(58.0), "58.00%")
+        self.assertEqual(report.fmt_wr(58.01), "58.0%")
+        self.assertEqual(report.fmt_wr(49.5), "49.50%")  # criterion 5
+        self.assertEqual(report.fmt_wr(47.2), "47.20%")  # C0 50 - 3
+        self.assertEqual(report.fmt_share(0.9696), "96.96%")  # VST 97% would show 97.0%
+        self.assertEqual(report.fmt_share(0.9455), "94.55%")
+        self.assertEqual(report.fmt_share(0.5), "50.0%")
+        self.assertEqual(report.fmt_points(1.96, near=(2.0,)), "1.96")
+        self.assertEqual(report.fmt_points(0.5, near=(2.0,)), "0.5")
 
 
 class SummarizeForVerdictTests(unittest.TestCase):
@@ -663,7 +713,19 @@ class WriteReportTests(unittest.TestCase):
         self.assertEqual(sorted(p.suffix for p in self.out.iterdir()), [".json", ".md"])
 
 
-@unittest.skip("TODO(user): verdict_sentence is the user's contribution")
+def _verdict_sentence_is_written():
+    """False while ``verdict_sentence`` is still the TODO(user) stub."""
+    try:
+        verdict_sentence({"outcome": "insufficient", "contender": None, "symbols": [],
+                          "failed_symbols": [], "wr": {}, "lower_bound": {}, "n_tp_sl": {},
+                          "c0_valid": None, "per_contender": {}})
+    except NotImplementedError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_verdict_sentence_is_written(),
+                     "TODO(user): verdict_sentence is the user's contribution")
 class VerdictSentenceTests(unittest.TestCase):
     def summary(self, outcome, **extra):
         base = {"outcome": outcome, "contender": None, "symbols": [], "failed_symbols": [],

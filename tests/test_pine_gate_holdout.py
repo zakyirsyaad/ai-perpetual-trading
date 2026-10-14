@@ -948,8 +948,16 @@ class TestStageTests(StageFixture):
 
     def test_sensitivities_are_reported(self):
         sens = self.doc["sensitivities"]
-        for key in ("eth_first", "cadence", "guards_off", "reference"):
+        for key in ("eth_first", "cadence", "guards_off", "reference", "c0_block"):
             self.assertIn(key, sens)
+        block = sens["c0_block"]  # criterion 2 under a 5-day block bootstrap, report only
+        self.assertEqual(block["block_days"], 5)
+        for name in ("c1", "c2", "c3"):
+            for key in ("p", "p_holm"):
+                self.assertEqual(sorted(block[key][name]), sorted(SYMBOLS))
+                self.assertTrue(all(0.0 < v <= 1.0 for v in block[key][name].values()))
+            for s in SYMBOLS:
+                self.assertGreaterEqual(block["p_holm"][name][s], block["p"][name][s])
         for name in ("c1", "c2", "c3"):
             co = sens["eth_first"][name]["co_signal"]
             self.assertGreater(co["evaluated_ticks"], 0)

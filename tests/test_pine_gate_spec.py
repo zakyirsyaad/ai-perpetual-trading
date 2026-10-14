@@ -100,7 +100,7 @@ class ConfigTests(unittest.TestCase):
             min_tp_sl=60, alpha=0.05, min_wr=57.0, half_min_wr=50.0,
             robust_overshoot_bps=2.0, robust_min_wr=55.0, offsets=20, offsets_min_pass=15,
             min_supply_per_day=10.0, bootstrap_n=10_000, permutation_shifts=1000,
-            c1_seeds=200, holm_family=3))
+            c1_seeds=200, holm_family=3, c0_block_days=5))
         fill = FillConfig()
         self.assertEqual(
             (fill.overshoot_since, fill.min_samples, fill.fallback_bps, fill.round_up_bps),

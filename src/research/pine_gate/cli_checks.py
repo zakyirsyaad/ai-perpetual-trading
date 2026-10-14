@@ -237,7 +237,7 @@ def cmd_vst_check(args: argparse.Namespace) -> int:
     times = [t for t in overlap_times(bars, vst)
              if snapshot_valid(chosen, prod, prod, t) and snapshot_valid(chosen, vst_frame, prod, t)]
     agreement = vst_agreement(prod, vst_frame, signal_for(chosen), times, ExecConfig())
-    doc = {**asdict(agreement), "contender": chosen.name,
+    doc = {**asdict(agreement), "symbol": args.symbol, "contender": chosen.name,
            "selection_sha256": locked.selection_sha256}
     common.write_json_exclusive(path, doc, "vst-check")
     print(f"vst-check {args.symbol} contender {chosen.name}: n {agreement.n}, either "
