@@ -14,7 +14,8 @@ The Pine script contributes a **structure**, not numbers:
 
 - a trend direction filter (the script used close vs EMA(125) on 5m);
 - entry on a pullback against that direction (the script used RSI(5) < 40 long / > 55 short);
-- a trend-strength filter (the script used ADX(11) > 20; DI+/DI− were computed but unused).
+- a trend-strength filter (the script used ADX(11) > 20; DI+/DI− were computed but unused — this
+  design adds DI agreement with the trade direction as an option).
 
 The user considers the script's numbers inaccurate, so the parameters are searched on training data
 and verified once on a locked holdout. The script's trailing stop (0.08% trigger, 0.01% offset),
@@ -143,13 +144,13 @@ Features may look back across a boundary; outcomes may not. A training trade mus
 
 ### 5.5 Contender 1 — Pine structure, parameters from data
 
-One parameter set for BTC and ETH. 48 combinations:
+One parameter set for BTC and ETH. 72 combinations (3 × 4 × 3 × 2):
 
 | Dimension | Values |
 |---|---|
 | Trend source | E200: 5m close vs EMA(200), no band · H1: 1h EMA(20) − EMA(50) beyond ±0.25 × ATR14(1h) · H4: the same on 4h. Inside the band = neutral = no entry |
 | Pullback timing | Wilder RSI on 5m, length {5, 14} × symmetric thresholds {35/65, 40/60}: long when RSI < lower in an uptrend, short when RSI > upper in a downtrend |
-| Trend strength | ADX(14) on 5m: {off, > 20} |
+| Trend strength | DMI(14, 14) on 5m (Pine `ta.dmi(14, 14)`): {off, ADX > 20, ADX > 20 with DI agreeing — DI+ > DI− for a long, DI− > DI+ for a short} |
 | Volume profile | {off, on}: rolling 24-hour profile from production 1m volume, 5 bps bins, each bar's volume spread evenly over the bins its high–low range covers; POC = busiest bin (ties → nearest to price). Price = the last closed 5m close at the tick. Long only if price ≤ POC, short only if price ≥ POC |
 
 Signals are read at each simulated bot tick from the last closed 5m bar (and the last closed 1h/4h
@@ -162,8 +163,9 @@ bar for H1/H4).
 2. Keep combinations whose combined supply is ≥ 10 trades per trading day. If none qualifies,
    continue without this condition and report the result as supply-limited.
 3. Rank by the lower bound WR − 2 × SE, with SE clustered by WIB day.
-4. **Stable area:** the chosen combination needs at least 3 of its 6 neighbours (one dimension
-   changed) at WR ≥ 57% on training data; otherwise take the next in rank.
+4. **Stable area:** the chosen combination needs at least 4 of its 7 neighbours (one dimension
+   changed; trend source and trend strength each have two alternatives) at WR ≥ 57% on training
+   data; otherwise take the next in rank.
 5. Freeze the choice in the selection file (5.1).
 
 ### 5.7 Contender 2 — the bot's own logic, fixed
@@ -267,6 +269,22 @@ was open).
 - Contents: training grid, holdout results per contender and symbol, controls, permutation, cadence
   cost, guard/supply grid, VST divergence, fill calibration, decision-level buckets.
 - Results recorded in project memory.
+
+### 5.14 TradingView visual aid
+
+`docs/tradingview/pine_adapted_gate_v1.pine` (Pine v5) draws the same structure on a TradingView
+chart so the manager can see where signals appear. Every grid dimension is an input. It is **not
+evidence**:
+
+- Its Strategy Tester fills orders at TradingView bar prices; it does not model the bot's tick
+  clock, AI latency, 5-second polling overshoot, daily guards or funding blackouts.
+- Its volume profile is built from the chart's own bars, not from 1m production bars.
+- Its default inputs are placeholders. After Phase 1 freezes the selection, the defaults are
+  updated to the frozen parameters.
+- Parameters must not be chosen from its Strategy Tester: the chart contains the locked holdout
+  (2026-08-05 → 2026-10-14), so choosing from it would leak the holdout into the selection.
+- The original script's BingX signal-bot alert codes are deliberately left out, because those
+  codes can trigger orders on their owner's signal bot.
 
 ## 6. Integration design, chosen with Phase 1 data
 
