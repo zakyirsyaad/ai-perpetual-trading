@@ -729,7 +729,26 @@ class PrimaryRuleTests(unittest.TestCase):
         primary = pipeline._primary_rule(_selection(None, results), cfg)
         self.assertEqual(primary, RuleSpec("H1", "B12", "OFF", "OFF", "OFF"))
 
-    def test_no_ranked_rule_means_no_primary_and_no_contender3(self):
+    def test_without_a_ranked_rule_the_best_median_block_bound_is_primary(self):
+        cfg = SelectionConfig()
+        results = _empty_results(cfg)
+        no_vote = dict(block_wr=(45.0,) * 4, **THICK)  # every rule ranks -inf
+        for key, lb, wr in (("H1|B12|ADX|OFF|OFF", 40.0, 45.0), ("H4|P35|OFF|OFF|OFF", 42.0, 44.0),
+                            ("E200|B24|OFF|OFF|OFF", None, 60.0)):
+            results[key] = replace(results[key], block_lb=(lb,) * 4, wr=wr, **no_vote)
+        primary = pipeline._primary_rule(_selection(None, results), cfg)
+        self.assertEqual(primary, RuleSpec("H4", "P35", "OFF"))
+
+    def test_without_any_block_bound_pooled_wr_then_the_simpler_rule_decides(self):
+        cfg = SelectionConfig()
+        results = _empty_results(cfg)
+        for key, wr in (("H4|B24|ADX|OFF|OFF", 48.0), ("H1|P40|OFF|OFF|OFF", 49.0),
+                        ("E200|B12|ADX_DI|OFF|OFF", 49.0)):
+            results[key] = replace(results[key], wr=wr)
+        primary = pipeline._primary_rule(_selection(None, results), cfg)
+        self.assertEqual(primary, RuleSpec("E200", "B12", "OFF"))  # tie -> Stage-1 order
+
+    def test_no_rule_with_any_tp_sl_means_no_primary_and_no_contender3(self):
         cfg = SelectionConfig()
         self.assertIsNone(pipeline._primary_rule(_selection(None, _empty_results(cfg)), cfg))
         out = pipeline._contender3(None, None, FakeMetaTrainer())

@@ -321,6 +321,9 @@ def _policies() -> Dict[str, Any]:
                         "(train_data_sha256) the selection was made with; an exclusive run "
                         "marker <data_dir>/holdout_runs/<spec_sha256>.json is written before "
                         "any holdout data is read and refuses every later run",
+        "contender3_primary_fallback": "every Stage-1 rule ranking -inf: median block lower "
+                                       "bound without the vote (none last) -> pooled WR -> "
+                                       "Stage-1 order",
         "eth_first_sensitivity": True,
     }
 
@@ -361,7 +364,11 @@ def _contenders_and_controls() -> Dict[str, Any]:
         },
         "contender3": {
             "primary_rule": "chosen trend + entry of contender 1, strength OFF, no filters",
-            "fallback_primary": "best-ranked Stage-1 base rule",
+            "fallback_primary": "best-ranked Stage-1 base rule; when every Stage-1 rule "
+                                "ranks -inf: the highest median block lower bound without the "
+                                "vote (none last), then the higher pooled WR, then the simpler "
+                                "rule (Stage-1 order); no primary only when no Stage-1 rule has "
+                                "any TP+SL",
             "features": list(CONTENDER3_FEATURES),
             "label": "bracket trade gross return > 0",
             "model": "L2 logistic regression",

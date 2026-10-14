@@ -63,7 +63,15 @@ from .lock import (
 from .metalabel import Candidate, candidate_features, train_meta
 from .outcomes import OutcomeCache, gross_bps
 from .rules import contender2_signal, rule_signal, trend_label
-from .selection import RuleResult, Selection, eligible, rank_value, select, summarize
+from .selection import (
+    RuleResult,
+    Selection,
+    block_median_lb,
+    eligible,
+    rank_value,
+    select,
+    summarize,
+)
 from .simulate import Market, SignalFn, Trade, in_entry_window, simulate, trading_days
 from .spec import (
     HOLDOUT_END,
@@ -514,9 +522,22 @@ def c0_training(ctx: _Context) -> Dict[str, Any]:
     return {"c0_training": cells, "c0_training_pass": passed}
 
 
+def _fallback_order(index: int, r: RuleResult, cfg: SelectionConfig) -> Optional[Tuple]:
+    """Sort key of a Stage-1 rule when no rule ranks: the median block lower bound
+    without the vote (none last), then pooled WR, then Stage-1 order; ``None`` for a
+    rule without any TP+SL."""
+    median = block_median_lb(r, cfg)
+    has_median = math.isfinite(median)
+    if not has_median and r.wr is None:
+        return None
+    return (not has_median, -median if has_median else 0.0, r.wr is None, -(r.wr or 0.0), index)
+
+
 def _primary_rule(sel: Selection, cfg: SelectionConfig) -> Optional[RuleSpec]:
-    """Trend and entry of contender 1, else of the best-ranked Stage-1 rule, with
-    strength off and no filters (ruling: the fallback is a primary rule too)."""
+    """Trend and entry of contender 1, else of the best-ranked Stage-1 rule, else (every
+    Stage-1 rule ranks -inf) of the first rule in ``_fallback_order``, with strength off
+    and no filters (ruling: the fallback is a primary rule too). ``None`` only when no
+    Stage-1 rule has any TP+SL."""
     if sel.choice is not None:
         return RuleSpec(sel.choice.trend, sel.choice.entry, "OFF")
     best: Optional[RuleSpec] = None
@@ -525,6 +546,11 @@ def _primary_rule(sel: Selection, cfg: SelectionConfig) -> Optional[RuleSpec]:
         value = rank_value(sel.results[rule.key()], cfg)
         if value > best_value:
             best, best_value = rule, value
+    if best is None:
+        keyed = [(_fallback_order(i, sel.results[rule.key()], cfg), rule)
+                 for i, rule in enumerate(stage1_rules())]
+        keyed = [(key, rule) for key, rule in keyed if key is not None]
+        best = min(keyed, key=lambda kr: kr[0])[1] if keyed else None
     return None if best is None else RuleSpec(best.trend, best.entry, "OFF")
 
 

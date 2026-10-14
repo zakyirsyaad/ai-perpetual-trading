@@ -233,7 +233,10 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
 
 - **Primary rule:** the trend source and entry of contender 1's frozen rule, with strength off and
   no Stage-2 filters, so the model sees as many candidates as possible. If contender 1 has no
-  eligible rule, the best-ranked Stage-1 base rule is used.
+  eligible rule, the best-ranked Stage-1 base rule is used. If every Stage-1 rule ranks −∞ (no
+  rule passes the 3-of-4 vote), the order is: the higher median block lower bound without the
+  vote (a rule without one last), then the higher pooled WR, then the simpler rule (Stage-1
+  order). Contender 3 is absent only when no Stage-1 rule has any take-profit or stop-loss trade.
 - **Label:** 1 if the candidate's bracket trade ends with a positive gross return (take-profit, or a
   time stop above zero), else 0.
 - **Features (8), computed at the tick from closed bars and signed by the trade side:** trend
