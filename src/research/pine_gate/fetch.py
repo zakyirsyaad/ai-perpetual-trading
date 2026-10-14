@@ -7,21 +7,27 @@ keys, no signing, no orders. Every network and clock dependency is injected
 Rules enforced here:
 
 * fixed ``startTime`` + ``endTime`` windows, never pagination on ``startTime``
-  alone;
+  alone, at most ``MAX_SPAN_DAYS`` per call and ``MAX_FUNDING_REQUESTS`` per
+  funding fetch;
 * at least ``MIN_REQUEST_GAP_SECONDS`` between two requests of one job;
 * every parsed row is validated and a violation raises ``ExchangeError``;
-* a day is stored only when it holds exactly 1,440 consecutive 1m bars.
+* only transport errors, short windows and HTTP 5xx are retried; HTTP
+  403/418/429 raise ``RateLimitedError``, which is never retried and stops the
+  job; a range stops after ``MAX_CONSECUTIVE_FAILED_DAYS`` failed days in a row;
+* a day is stored only when it holds exactly 1,440 consecutive 1m bars, and a
+  day file is never replaced (another writer's file wins).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Tuple
 
 import httpx
 
@@ -31,8 +37,9 @@ from .bars import (
     day_path,
     interval_to_ms,
     wib_day_start_ms,
-    write_day,
+    write_day_exclusive,
 )
+from .fileio import exists_message
 
 PROD_HOST = "https://open-api.bingx.com"
 VST_HOST = "https://open-api-vst.bingx.com"
@@ -46,8 +53,14 @@ MAX_FUNDING_PER_REQUEST = 1000
 BARS_PER_DAY = 1440
 DEFAULT_RETRIES = 3
 REQUEST_TIMEOUT_SECONDS = 20
+MAX_BODY_BYTES = 4 * 1024 * 1024  # a full kline or funding window is far below 1 MB
+RATE_LIMIT_STATUSES = frozenset({403, 418, 429})
 _MS_PER_DAY = 86_400_000
-_ALLOWED_HOSTS = frozenset({PROD_HOST, VST_HOST})
+SOURCE_HOSTS = {"prod": PROD_HOST, "vst": VST_HOST}
+_ALLOWED_HOSTS = frozenset(SOURCE_HOSTS.values())
+MAX_SPAN_DAYS = 900  # training + holdout is about 440 days
+MAX_CONSECUTIVE_FAILED_DAYS = 3
+COLLECT_BACKFILL_DAYS = 7
 _MAX_REASON_CHARS = 200
 
 HttpGet = Callable[[str, Mapping[str, str], Mapping[str, str]], Any]
@@ -64,27 +77,84 @@ class IncompleteDayError(RuntimeError):
     """A window returned fewer bars than the window holds."""
 
 
-_TRANSIENT_ERRORS = (IncompleteDayError, ExchangeError, httpx.TransportError)
+class HttpStatusError(ExchangeError):
+    """A non-2xx answer; only 5xx is worth retrying."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return 500 <= self.status < 600
 
 
-def httpx_get(
-    url: str, params: Mapping[str, str], headers: Mapping[str, str]
-) -> Any:  # pragma: no cover
-    """Real transport: GET without redirects; non-2xx and 3xx raise ``ExchangeError``."""
-    response = httpx.get(
+class RateLimitedError(RuntimeError):
+    """HTTP 403/418/429: the venue asks the client to stop. Never retried; it stops the
+    whole job or command (its message reports any Retry-After)."""
+
+
+MAX_FUNDING_REQUESTS = 500
+# A failed day is recorded and the range goes on; a rate limit stops it.
+_DAY_ERRORS = (ExchangeError, IncompleteDayError, httpx.HTTPError)
+# The collector also survives local and argument errors of one job.
+_JOB_ERRORS = _DAY_ERRORS + (OSError, ValueError)
+
+
+def check_status(status: int, headers: Mapping[str, str], host: str) -> None:
+    """Raise for a non-2xx status: ``RateLimitedError`` for 403/418/429, else
+    ``HttpStatusError`` (3xx included: redirects are never followed)."""
+    if 200 <= status < 300:
+        return
+    if status in RATE_LIMIT_STATUSES:
+        retry = headers.get("Retry-After")
+        hint = f"; Retry-After {' '.join(str(retry).split())[:32]!r}" if retry else ""
+        raise RateLimitedError(f"HTTP {status} from {host}{hint}")
+    raise HttpStatusError(status, f"HTTP {status} from {host}")
+
+
+def read_capped(chunks: Iterable[bytes], content_length: Optional[str]) -> bytes:
+    """The body, refused (``ExchangeError``) when it is larger than ``MAX_BODY_BYTES``,
+    by its Content-Length before reading or by its size while reading."""
+    if content_length is not None and content_length.strip().isdigit():
+        if int(content_length) > MAX_BODY_BYTES:
+            raise ExchangeError(f"response body of {int(content_length)} bytes exceeds the cap")
+    body = bytearray()
+    for chunk in chunks:
+        body.extend(chunk)
+        if len(body) > MAX_BODY_BYTES:
+            raise ExchangeError(f"response body exceeds {MAX_BODY_BYTES} bytes")
+    return bytes(body)
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON number {name}")
+
+
+def parse_json_body(body: bytes) -> Any:
+    """Strict JSON (NaN and Infinity refused); anything else is an ``ExchangeError``."""
+    try:
+        return json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
+    except ValueError as exc:  # includes UnicodeDecodeError and JSONDecodeError
+        raise ExchangeError("response body is not JSON") from exc
+
+
+def httpx_get(url: str, params: Mapping[str, str], headers: Mapping[str, str]) -> Any:
+    """Real transport: one streamed GET, no redirects, no proxy or other environment
+    settings (``trust_env=False``); the status is checked before the body is read and
+    the body is capped at ``MAX_BODY_BYTES``."""
+    with httpx.stream(
+        "GET",
         url,
         params=dict(params),
         headers=dict(headers),
         timeout=REQUEST_TIMEOUT_SECONDS,
         follow_redirects=False,
-    )
-    status = response.status_code
-    if not 200 <= status < 300:
-        raise ExchangeError(f"HTTP {status} from {httpx.URL(url).host}")
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise ExchangeError("response body is not JSON") from exc
+        trust_env=False,
+    ) as response:
+        check_status(response.status_code, response.headers, httpx.URL(url).host)
+        body = read_capped(response.iter_bytes(), response.headers.get("Content-Length"))
+    return parse_json_body(body)
 
 
 class _Throttled:
@@ -114,6 +184,17 @@ def _throttled(http_get: HttpGet, sleep: Sleep) -> HttpGet:
 def _check_host(host: str) -> None:
     if host not in _ALLOWED_HOSTS:
         raise ValueError(f"host {host!r} is not a known BingX public host")
+
+
+def _check_source(source: str, host: str) -> None:
+    """Day files of ``source`` come from its own host only (prod <-> PROD_HOST, vst <-> VST_HOST)."""
+    if SOURCE_HOSTS.get(source) != host:
+        raise ValueError(f"source {source!r} does not match host {host!r}")
+
+
+def _check_span_ms(start_ms: int, end_ms: int) -> None:
+    if end_ms - start_ms > MAX_SPAN_DAYS * _MS_PER_DAY:
+        raise ValueError(f"range {start_ms}..{end_ms} spans more than {MAX_SPAN_DAYS} days")
 
 
 def _get_data_list(http_get: HttpGet, url: str, params: Mapping[str, str]) -> list:
@@ -208,17 +289,23 @@ def fetch_window(
     return rows
 
 
+def _retryable(exc: BaseException) -> bool:
+    if isinstance(exc, HttpStatusError):
+        return exc.retryable
+    return isinstance(exc, (httpx.TransportError, IncompleteDayError))
+
+
 def _call_with_retries(attempt: Callable[[], Any], retries: int) -> Any:
+    """Up to ``retries`` attempts; only ``_retryable`` errors try again."""
     if retries < 1:
         raise ValueError("retries must be at least 1")
-    last: Optional[BaseException] = None
-    for _ in range(retries):
+    for k in range(retries):
         try:
             return attempt()
-        except _TRANSIENT_ERRORS as exc:
-            last = exc
-    assert last is not None
-    raise last
+        except (httpx.TransportError, IncompleteDayError, HttpStatusError) as exc:
+            if not _retryable(exc) or k == retries - 1:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _fetch_complete_window(
@@ -273,6 +360,7 @@ class SyncResult:
     fetched: int
     skipped: int
     failed: Tuple[date, ...]
+    not_attempted: Tuple[date, ...] = ()  # after MAX_CONSECUTIVE_FAILED_DAYS failures
 
 
 def _sync_one_day(
@@ -284,14 +372,14 @@ def _sync_one_day(
     data_dir: Path,
     sleep: Sleep,
 ) -> str:
-    """Store one day unless its file exists; returns ``"fetched"`` or ``"skipped"``."""
+    """Store one day unless its file exists; returns ``"fetched"`` or ``"skipped"``
+    (also when another writer stored the day while it was being fetched)."""
     path = day_path(data_dir, source, symbol, "1m", day)
     if path.exists():
         return "skipped"
     rows = fetch_day(http_get, host, symbol, day, sleep=sleep)
     bars_from_rows(rows, interval_to_ms("1m"))  # contiguity check before storing
-    write_day(path, rows)
-    return "fetched"
+    return "fetched" if write_day_exclusive(path, rows) else "skipped"
 
 
 def sync_days(
@@ -307,28 +395,35 @@ def sync_days(
     """Fetch every missing WIB day of ``[start_day, end_day]`` into day files.
 
     Existing files are skipped. A day that cannot be fetched completely is
-    recorded in ``failed`` and nothing is written for it.
+    recorded in ``failed`` and nothing is written for it; after
+    ``MAX_CONSECUTIVE_FAILED_DAYS`` failed days in a row the remaining days are
+    ``not_attempted``. ``RateLimitedError`` propagates and stops the range.
     """
     if end_day < start_day:
         raise ValueError(f"end_day {end_day} is before start_day {start_day}")
+    days = [start_day + timedelta(days=k) for k in range((end_day - start_day).days + 1)]
+    if len(days) > MAX_SPAN_DAYS:
+        raise ValueError(f"{start_day}..{end_day} spans more than {MAX_SPAN_DAYS} days")
+    _check_source(source, host)
     paced = _throttled(http_get, sleep)
-    fetched = skipped = 0
+    counts = {"fetched": 0, "skipped": 0}
     failed: List[date] = []
-    day = start_day
-    while day <= end_day:
+    streak = 0
+    for i, day in enumerate(days):
         try:
             outcome = _sync_one_day(paced, host, source, symbol, day, data_dir, sleep)
-        except _TRANSIENT_ERRORS as exc:
+        except _DAY_ERRORS as exc:
             failed.append(day)
+            streak += 1
             _log.warning("%s/%s/1m %s: failed: %s", source, symbol, day, _reason(exc))
-        else:
-            if outcome == "fetched":
-                fetched += 1
-            else:
-                skipped += 1
-            _log.info("%s/%s/1m %s: %s", source, symbol, day, outcome)
-        day += timedelta(days=1)
-    return SyncResult(fetched, skipped, tuple(failed))
+            if streak >= MAX_CONSECUTIVE_FAILED_DAYS:
+                return SyncResult(counts["fetched"], counts["skipped"], tuple(failed),
+                                  tuple(days[i + 1:]))
+            continue
+        streak = 0
+        counts[outcome] += 1
+        _log.info("%s/%s/1m %s: %s", source, symbol, day, outcome)
+    return SyncResult(counts["fetched"], counts["skipped"], tuple(failed))
 
 
 def sync_warmup(
@@ -351,6 +446,7 @@ def sync_warmup(
         raise ValueError(
             f"range {start_ms}..{end_ms} is not a non-empty whole number of {interval} bars"
         )
+    _check_span_ms(start_ms, end_ms)
     paced = _throttled(http_get, sleep)
     window_ms = MAX_KLINES_PER_REQUEST * interval_ms
     rows: List[Row] = []
@@ -364,13 +460,29 @@ def sync_warmup(
         )
         cursor = window_end
     bars_from_rows(rows, interval_ms)  # contiguity check before storing
-    write_day(path, rows)
+    if not write_day_exclusive(path, rows):
+        raise FileExistsError(exists_message(path, "warm-up"))
     _log.info("prod/%s/%s warmup: %d bars", symbol, interval, len(rows))
 
 
+class _RequestBudget:
+    """At most ``limit`` requests; one more raises ``ExchangeError``."""
+
+    def __init__(self, limit: int) -> None:
+        self._left = limit
+        self._limit = limit
+
+    def take(self) -> None:
+        if self._left <= 0:
+            raise ExchangeError(f"funding fetch needs more than {self._limit} requests")
+        self._left -= 1
+
+
 def _funding_window(
-    http_get: HttpGet, host: str, symbol: str, start_ms: int, end_ms: int
+    http_get: HttpGet, host: str, symbol: str, start_ms: int, end_ms: int,
+    budget: _RequestBudget,
 ) -> List[int]:
+    budget.take()
     params = {
         "symbol": symbol,
         "startTime": str(start_ms),
@@ -394,9 +506,8 @@ def _funding_window(
         # The answer may have been cut at the limit: split the window by time
         # and fetch both halves with fixed bounds.
         middle = (start_ms + end_ms) // 2
-        return _funding_window(http_get, host, symbol, start_ms, middle) + _funding_window(
-            http_get, host, symbol, middle + 1, end_ms
-        )
+        return (_funding_window(http_get, host, symbol, start_ms, middle, budget)
+                + _funding_window(http_get, host, symbol, middle + 1, end_ms, budget))
     return times
 
 
@@ -411,17 +522,39 @@ def fetch_funding_times(
     """Funding times (UTC ms) inside ``[start_ms, end_ms]``, sorted, no duplicates.
 
     Each request carries both bounds and asks for at most 1,000 rows; a window
-    that fills the limit is split in two rather than paginated.
+    that fills the limit is split in two rather than paginated, with at most
+    ``MAX_FUNDING_REQUESTS`` requests in all.
     """
     _check_host(host)
     if end_ms < start_ms:
         raise ValueError(f"end_ms {end_ms} is before start_ms {start_ms}")
-    return _funding_window(_throttled(http_get, sleep), host, symbol, start_ms, end_ms)
+    _check_span_ms(start_ms, end_ms)
+    return _funding_window(_throttled(http_get, sleep), host, symbol, start_ms, end_ms,
+                           _RequestBudget(MAX_FUNDING_REQUESTS))
 
 
 def _reason(exc: BaseException) -> str:
     text = " ".join(f"{type(exc).__name__}: {exc}".split())
     return text[:_MAX_REASON_CHARS]
+
+
+def sync_line(label: str, result: SyncResult) -> str:
+    """``<label>: fetched N, skipped M, failed K`` plus the failed and not-attempted days.
+
+    A line with any failure contains ``failed:``; a clean line never does."""
+    line = f"{label}: fetched {result.fetched}, skipped {result.skipped}, failed {len(result.failed)}"
+    if result.failed:
+        line += "; failed: " + ", ".join(d.isoformat() for d in result.failed)
+    if result.not_attempted:
+        line += "; not attempted: " + ", ".join(d.isoformat() for d in result.not_attempted)
+    return line
+
+
+COLLECT_JOBS = (
+    ("vst", VST_HOST, "ETH-USDT"),
+    ("prod", PROD_HOST, "BTC-USDT"),
+    ("prod", PROD_HOST, "ETH-USDT"),
+)
 
 
 def collect(
@@ -430,25 +563,29 @@ def collect(
     today: date,
     sleep: Sleep = time.sleep,
 ) -> List[str]:
-    """Fetch yesterday's (WIB) 1m bars for the three collector jobs.
+    """Sync the last ``COLLECT_BACKFILL_DAYS`` WIB days (to yesterday) for each job.
 
-    Returns one log line per job. A failing job never stops the others.
+    Existing days are skipped, so a day missed earlier is fetched on a later run.
+    Returns one line per job (``sync_line``, or ``<label>: failed: <reason>``); a
+    failing job never stops the others, except a rate limit, after which the
+    remaining jobs are not attempted.
     """
-    day = today - timedelta(days=1)
-    jobs = (
-        ("vst", VST_HOST, "ETH-USDT"),
-        ("prod", PROD_HOST, "BTC-USDT"),
-        ("prod", PROD_HOST, "ETH-USDT"),
-    )
+    start, end = today - timedelta(days=COLLECT_BACKFILL_DAYS), today - timedelta(days=1)
     paced = _throttled(http_get, sleep)
     lines: List[str] = []
-    for source, host, symbol in jobs:
-        label = f"{source}/{symbol}/1m {day.isoformat()}"
-        try:
-            outcome = _sync_one_day(paced, host, source, symbol, day, Path(data_dir), sleep)
-        except _TRANSIENT_ERRORS as exc:
-            outcome = f"failed: {_reason(exc)}"
-        line = f"{label}: {outcome}"
+    limited = False
+    for source, host, symbol in COLLECT_JOBS:
+        label = f"{source}/{symbol}/1m {start.isoformat()}..{end.isoformat()}"
+        if limited:
+            line = f"{label}: failed: not attempted (rate limited)"
+        else:
+            try:
+                line = sync_line(label, sync_days(paced, host, source, symbol, start, end,
+                                                  Path(data_dir), sleep=sleep))
+            except RateLimitedError as exc:
+                limited, line = True, f"{label}: failed: {_reason(exc)}"
+            except _JOB_ERRORS as exc:
+                line = f"{label}: failed: {_reason(exc)}"
         _log.info("%s", line)
         lines.append(line)
     return lines

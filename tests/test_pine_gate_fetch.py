@@ -1,10 +1,14 @@
+import contextlib
 import logging
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 import httpx
+
+from research.pine_gate import fetch
 
 from research.pine_gate.bars import (
     day_path,
@@ -17,13 +21,20 @@ from research.pine_gate.fetch import (
     KLINES_PATH,
     PROD_HOST,
     VST_HOST,
+    MAX_BODY_BYTES,
+    MAX_FUNDING_REQUESTS,
     ExchangeError,
+    HttpStatusError,
     IncompleteDayError,
+    RateLimitedError,
     SyncResult,
+    check_status,
     collect,
     fetch_day,
     fetch_funding_times,
     fetch_window,
+    parse_json_body,
+    read_capped,
     sync_days,
     sync_warmup,
 )
@@ -224,12 +235,12 @@ class FetchDayTest(unittest.TestCase):
         self.assertEqual(len(rows), 1440)
         self.assertEqual(len(fake.calls), 2)
 
-    def test_transport_error_and_exchange_error_are_retried(self):
+    def test_transport_error_and_http_5xx_are_retried(self):
         def respond(params, index):
             if index == 0:
                 raise httpx.ConnectError("boom")
             if index == 1:
-                return {"code": 100500, "msg": "busy"}
+                raise HttpStatusError(503, "HTTP 503 from open-api.bingx.com")
             return ok(klines_for(params))
 
         fake = FakeHttp(respond)
@@ -239,11 +250,27 @@ class FetchDayTest(unittest.TestCase):
         self.assertEqual(len(fake.calls), 3)
         self.assertEqual(len(sleeps.calls), 2)
 
-    def test_persistent_exchange_error_is_raised(self):
-        fake = FakeHttp(lambda p, i: {"code": 1, "msg": "no"})
-        with self.assertRaises(ExchangeError):
+    def test_exchange_and_validation_errors_are_not_retried(self):
+        for name, respond in (
+            ("exchange code", lambda p, i: {"code": 1, "msg": "no"}),
+            ("bad row", lambda p, i: ok([kline(0, high="1")])),
+            ("http 400", lambda p, i: (_ for _ in ()).throw(HttpStatusError(400, "HTTP 400"))),
+            ("decoding", lambda p, i: (_ for _ in ()).throw(httpx.DecodingError("bad gzip"))),
+        ):
+            with self.subTest(name):
+                fake = FakeHttp(respond)
+                with self.assertRaises((ExchangeError, httpx.HTTPError)):
+                    fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=noop)
+                self.assertEqual(len(fake.calls), 1)
+
+    def test_rate_limit_is_never_retried(self):
+        def respond(params, index):
+            raise RateLimitedError("HTTP 429 from open-api.bingx.com; Retry-After '30'")
+
+        fake = FakeHttp(respond)
+        with self.assertRaises(RateLimitedError):
             fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=noop)
-        self.assertEqual(len(fake.calls), 3)
+        self.assertEqual(len(fake.calls), 1)
 
     def test_programming_errors_propagate(self):
         def respond(params, index):
@@ -251,6 +278,95 @@ class FetchDayTest(unittest.TestCase):
 
         with self.assertRaises(KeyError):
             fetch_day(FakeHttp(respond), PROD_HOST, "BTC-USDT", DAY1, sleep=noop)
+
+
+def no_network():
+    """Every other httpx entry point fails the test instead of reaching the network."""
+    stack = contextlib.ExitStack()
+    for name in ("get", "request", "Client", "AsyncClient"):
+        stack.enter_context(mock.patch.object(
+            fetch.httpx, name, side_effect=AssertionError(f"network via httpx.{name}")))
+    return stack
+
+
+class HttpPolicyTest(unittest.TestCase):
+    """Status, size and body rules of the real transport (B2)."""
+
+    def test_status_classification(self):
+        check_status(200, {}, "open-api.bingx.com")
+        for status in (403, 418, 429):
+            with self.subTest(status=status):
+                with self.assertRaises(RateLimitedError) as ctx:
+                    check_status(status, {"Retry-After": "30"}, "open-api.bingx.com")
+                self.assertIn(f"HTTP {status}", str(ctx.exception))
+                self.assertIn("Retry-After '30'", str(ctx.exception))
+        with self.assertRaises(RateLimitedError) as ctx:
+            check_status(429, {"Retry-After": "x" * 500 + "\nboom"}, "h")
+        self.assertLess(len(str(ctx.exception)), 120)
+        self.assertNotIn("\n", str(ctx.exception))
+        for status, retryable in ((500, True), (503, True), (404, False), (302, False)):
+            with self.subTest(status=status):
+                with self.assertRaises(HttpStatusError) as ctx:
+                    check_status(status, {}, "h")
+                self.assertEqual(ctx.exception.status, status)
+                self.assertEqual(ctx.exception.retryable, retryable)
+                self.assertIsInstance(ctx.exception, ExchangeError)
+
+    def test_bodies_over_the_cap_are_refused(self):
+        self.assertEqual(read_capped([b"ab", b"c"], "3"), b"abc")
+        self.assertEqual(read_capped([b"{}"], None), b"{}")
+        with self.assertRaises(ExchangeError):
+            read_capped([b"x"], str(MAX_BODY_BYTES + 1))
+        chunk = b"x" * (1024 * 1024)
+        with self.assertRaises(ExchangeError):
+            read_capped([chunk] * 5, None)  # no Content-Length: counted while reading
+
+    def test_json_body(self):
+        self.assertEqual(parse_json_body(b'{"code": 0}'), {"code": 0})
+        for body in (b"not json", b'{"x": NaN}', b"\xff\xfe"):
+            with self.subTest(body=body):
+                with self.assertRaises(ExchangeError):
+                    parse_json_body(body)
+
+    def test_httpx_get_streams_without_proxies_env_or_redirects(self):
+        seen = {}
+
+        class Response:
+            status_code = 200
+            headers = {"Content-Length": "12"}
+
+            def iter_bytes(self):
+                yield b'{"code": 0}\n'
+
+        @contextlib.contextmanager
+        def stream(method, url, **kwargs):
+            seen.update(kwargs, method=method, url=url)
+            yield Response()
+
+        with mock.patch.object(fetch.httpx, "stream", stream), no_network():
+            got = fetch.httpx_get(PROD_HOST + KLINES_PATH, {"symbol": "BTC-USDT"}, HEADERS)
+        self.assertEqual(got, {"code": 0})
+        self.assertEqual(seen["method"], "GET")
+        self.assertIs(seen["trust_env"], False)
+        self.assertIs(seen["follow_redirects"], False)
+        self.assertEqual(seen["headers"], HEADERS)
+        self.assertEqual(seen["params"], {"symbol": "BTC-USDT"})
+
+    def test_httpx_get_raises_on_status_before_reading(self):
+        class Response:
+            status_code = 429
+            headers = {"Retry-After": "5"}
+
+            def iter_bytes(self):
+                raise AssertionError("body read")
+
+        @contextlib.contextmanager
+        def stream(method, url, **kwargs):
+            yield Response()
+
+        with mock.patch.object(fetch.httpx, "stream", stream), no_network():
+            with self.assertRaises(RateLimitedError):
+                fetch.httpx_get(PROD_HOST + KLINES_PATH, {}, HEADERS)
 
 
 class SyncDaysTest(unittest.TestCase):
@@ -318,6 +434,72 @@ class SyncDaysTest(unittest.TestCase):
         self.assertEqual(result.failed, (DAY1,))
         self.assertEqual(result.fetched, 1)
 
+    def test_three_consecutive_failed_days_abort_the_rest(self):
+        days = [DAY1 + timedelta(days=k) for k in range(6)]
+        failing = {wib_day_start_ms(d) for d in days[:3]}
+
+        def respond(params, index):
+            return ok(klines_for(params, drop=1 if int(params["startTime"]) in failing else 0))
+
+        fake = FakeHttp(respond)
+        result = sync_days(fake, PROD_HOST, "prod", "BTC-USDT", days[0], days[-1],
+                           self.data_dir, sleep=noop)
+        self.assertEqual(result.failed, tuple(days[:3]))
+        self.assertEqual(result.not_attempted, tuple(days[3:]))
+        self.assertEqual(result.fetched, 0)
+        self.assertEqual({int(c[1]["startTime"]) for c in fake.calls}, failing)
+
+    def test_a_success_resets_the_failure_streak(self):
+        days = [DAY1 + timedelta(days=k) for k in range(5)]
+        failing = {wib_day_start_ms(days[k]) for k in (0, 2, 3)}
+
+        def respond(params, index):
+            return ok(klines_for(params, drop=1 if int(params["startTime"]) in failing else 0))
+
+        result = sync_days(FakeHttp(respond), PROD_HOST, "prod", "BTC-USDT", days[0], days[-1],
+                           self.data_dir, sleep=noop)
+        self.assertEqual(result.failed, (days[0], days[2], days[3]))
+        self.assertEqual(result.not_attempted, ())
+        self.assertEqual(result.fetched, 2)
+
+    def test_rate_limit_stops_the_whole_range(self):
+        def respond(params, index):
+            if index == 1:
+                raise RateLimitedError("HTTP 429 from open-api.bingx.com")
+            return ok(klines_for(params))
+
+        fake = FakeHttp(respond)
+        with self.assertRaises(RateLimitedError):
+            sync_days(fake, PROD_HOST, "prod", "BTC-USDT", DAY1, DAY1 + timedelta(days=4),
+                      self.data_dir, sleep=noop)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_a_day_file_written_meanwhile_is_kept_and_counted_as_skipped(self):
+        target = day_path(self.data_dir, "prod", "BTC-USDT", "1m", DAY1)
+
+        def respond(params, index):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"other writer")  # e.g. the cron collector won the race
+            return ok(klines_for(params))
+
+        result = sync_days(FakeHttp(respond), PROD_HOST, "prod", "BTC-USDT", DAY1, DAY1,
+                           self.data_dir, sleep=noop)
+        self.assertEqual((result.fetched, result.skipped, result.failed), (0, 1, ()))
+        self.assertEqual(target.read_bytes(), b"other writer")
+        self.assertEqual([p.name for p in target.parent.iterdir()], [target.name])
+
+    def test_spans_over_900_days_and_mismatched_hosts_are_refused(self):
+        fake = FakeHttp(full_klines)
+        with self.assertRaises(ValueError):
+            sync_days(fake, PROD_HOST, "prod", "BTC-USDT", DAY1, DAY1 + timedelta(days=900),
+                      self.data_dir, sleep=noop)
+        for source, host in (("prod", VST_HOST), ("vst", PROD_HOST), ("other", PROD_HOST)):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    sync_days(fake, host, source, "BTC-USDT", DAY1, DAY1, self.data_dir,
+                              sleep=noop)
+        self.assertEqual(fake.calls, [])
+
     def test_end_before_start_raises(self):
         with self.assertRaises(ValueError):
             sync_days(FakeHttp(full_klines), PROD_HOST, "prod", "BTC-USDT", date(2026, 7, 2), DAY1, self.data_dir, sleep=noop)
@@ -363,6 +545,12 @@ class SyncWarmupTest(unittest.TestCase):
             sync_warmup(fake, PROD_HOST, "BTC-USDT", "1h", 0, 10 * HOUR, self.path, sleep=noop)
         self.assertFalse(self.path.exists())
         self.assertEqual(list(self.path.parent.iterdir()), [])
+
+    def test_more_than_900_days_is_refused(self):
+        fake = FakeHttp(full_klines)
+        with self.assertRaises(ValueError):
+            sync_warmup(fake, PROD_HOST, "BTC-USDT", "1h", 0, 901 * DAY, self.path, sleep=noop)
+        self.assertEqual(fake.calls, [])
 
     def test_misaligned_range_raises(self):
         for start, end in ((1, 10 * HOUR), (0, 10 * HOUR + 1), (HOUR, HOUR), (2 * HOUR, HOUR)):
@@ -438,6 +626,22 @@ class FundingTest(unittest.TestCase):
                 with self.assertRaises(ExchangeError):
                     fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 10 * HOUR, sleep=noop)
 
+    def test_more_than_900_days_is_refused(self):
+        fake = FakeHttp(lambda p, i: ok([]))
+        with self.assertRaises(ValueError):
+            fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 901 * DAY, sleep=noop)
+        self.assertEqual(fake.calls, [])
+
+    def test_the_number_of_split_requests_is_capped(self):
+        def dense(params, index):  # a funding time every millisecond: every window is full
+            start, end, limit = (int(params[k]) for k in ("startTime", "endTime", "limit"))
+            return ok([funding_row(t) for t in range(start, min(end, start + limit - 1) + 1)])
+
+        fake = FakeHttp(dense)
+        with self.assertRaisesRegex(ExchangeError, str(MAX_FUNDING_REQUESTS)):
+            fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 2_000_000, sleep=noop)
+        self.assertEqual(len(fake.calls), MAX_FUNDING_REQUESTS)
+
     def test_bad_arguments_raise(self):
         fake = FakeHttp(lambda p, i: ok([]))
         with self.assertRaises(ValueError):
@@ -448,42 +652,37 @@ class FundingTest(unittest.TestCase):
 
 
 class CollectTest(unittest.TestCase):
+    """The daily collector backfills the last seven WIB days per job (B1)."""
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.data_dir = Path(self._tmp.name)
         self.today = date(2026, 10, 14)
-        self.yesterday = date(2026, 10, 13)
+        self.days = [date(2026, 10, 7) + timedelta(days=k) for k in range(7)]
 
-    def test_fetches_yesterday_for_each_job(self):
+    def test_backfills_the_last_seven_days_for_each_job(self):
         fake = FakeHttp(full_klines)
         sleeps = Sleeps()
         lines = collect(fake, self.data_dir, self.today, sleep=sleeps)
-        self.assertEqual(
-            lines,
-            [
-                "vst/ETH-USDT/1m 2026-10-13: fetched",
-                "prod/BTC-USDT/1m 2026-10-13: fetched",
-                "prod/ETH-USDT/1m 2026-10-13: fetched",
-            ],
-        )
-        self.assertEqual(
-            [(c[0], c[1]["symbol"]) for c in fake.calls],
-            [
-                (VST_HOST + KLINES_PATH, "ETH-USDT"),
-                (PROD_HOST + KLINES_PATH, "BTC-USDT"),
-                (PROD_HOST + KLINES_PATH, "ETH-USDT"),
-            ],
-        )
-        start = wib_day_start_ms(self.yesterday)
+        self.assertEqual(lines, [
+            "vst/ETH-USDT/1m 2026-10-07..2026-10-13: fetched 7, skipped 0, failed 0",
+            "prod/BTC-USDT/1m 2026-10-07..2026-10-13: fetched 7, skipped 0, failed 0",
+            "prod/ETH-USDT/1m 2026-10-07..2026-10-13: fetched 7, skipped 0, failed 0",
+        ])
+        hosts = [(c[0], c[1]["symbol"]) for c in fake.calls]
+        self.assertEqual(hosts, [(VST_HOST + KLINES_PATH, "ETH-USDT")] * 7
+                         + [(PROD_HOST + KLINES_PATH, "BTC-USDT")] * 7
+                         + [(PROD_HOST + KLINES_PATH, "ETH-USDT")] * 7)
+        starts = [int(c[1]["startTime"]) for c in fake.calls[:7]]
+        self.assertEqual(starts, [wib_day_start_ms(d) for d in self.days])
         for _, params, headers in fake.calls:
-            self.assertEqual(params["startTime"], str(start))
-            self.assertEqual(params["endTime"], str(start + DAY - 1))
             self.assertEqual(headers, HEADERS)
         for source, symbol in (("vst", "ETH-USDT"), ("prod", "BTC-USDT"), ("prod", "ETH-USDT")):
-            path = day_path(self.data_dir, source, symbol, "1m", self.yesterday)
-            self.assertEqual(len(read_day(path)), 1440)
-        self.assertEqual(len(sleeps.calls), 2)
+            for d in self.days:
+                self.assertEqual(len(read_day(day_path(self.data_dir, source, symbol, "1m", d))),
+                                 1440)
+        self.assertEqual(len(sleeps.calls), len(fake.calls) - 1)
         self.assertTrue(all(s >= 1.0 for s in sleeps.calls))
 
     def test_second_run_skips_without_requests(self):
@@ -491,7 +690,20 @@ class CollectTest(unittest.TestCase):
         fake = FakeHttp(full_klines)
         lines = collect(fake, self.data_dir, self.today, sleep=noop)
         self.assertEqual(fake.calls, [])
-        self.assertTrue(all(line.endswith(": skipped") for line in lines))
+        self.assertTrue(all(line.endswith(": fetched 0, skipped 7, failed 0") for line in lines))
+
+    def test_a_missed_day_is_backfilled_on_the_next_run(self):
+        def respond(params, index):
+            day_start = wib_day_start_ms(self.days[3])
+            drop = 1 if int(params["startTime"]) == day_start else 0
+            return ok(klines_for(params, drop=drop))
+
+        lines = collect(FakeHttp(respond), self.data_dir, self.today, sleep=noop)
+        self.assertTrue(all("failed: 2026-10-10" in line for line in lines), lines)
+        fake = FakeHttp(full_klines)
+        lines = collect(fake, self.data_dir, self.today, sleep=noop)
+        self.assertTrue(all(line.endswith(": fetched 1, skipped 6, failed 0") for line in lines))
+        self.assertEqual(len(fake.calls), 3)
 
     def test_one_failing_job_does_not_stop_the_others(self):
         def respond(params, index):
@@ -500,10 +712,36 @@ class CollectTest(unittest.TestCase):
             return ok(klines_for(params))
 
         lines = collect(FakeHttp(respond), self.data_dir, self.today, sleep=noop)
-        self.assertTrue(lines[0].endswith(": fetched"))
-        self.assertTrue(lines[1].startswith("prod/BTC-USDT/1m 2026-10-13: failed: IncompleteDayError"))
-        self.assertTrue(lines[2].endswith(": fetched"))
-        self.assertFalse(day_path(self.data_dir, "prod", "BTC-USDT", "1m", self.yesterday).exists())
+        self.assertTrue(lines[0].endswith(": fetched 7, skipped 0, failed 0"))
+        self.assertIn("prod/BTC-USDT/1m 2026-10-07..2026-10-13: fetched 0, skipped 0, failed 3; "
+                      "failed: 2026-10-07, 2026-10-08, 2026-10-09; not attempted: 2026-10-10",
+                      lines[1])
+        self.assertTrue(lines[2].endswith(": fetched 7, skipped 0, failed 0"))
+
+    def test_job_errors_become_one_failed_line_each(self):
+        errors = {"vst": httpx.DecodingError("bad gzip"), "BTC-USDT": OSError("disk full")}
+
+        def respond(params, index):
+            raise httpx.DecodingError("bad gzip")
+
+        with mock.patch.object(fetch, "sync_days", side_effect=[
+                errors["vst"], errors["BTC-USDT"], ValueError("odd")]):
+            lines = collect(FakeHttp(respond), self.data_dir, self.today, sleep=noop)
+        self.assertEqual(len(lines), 3)
+        self.assertIn(": failed: DecodingError: bad gzip", lines[0])
+        self.assertIn(": failed: OSError: disk full", lines[1])
+        self.assertIn(": failed: ValueError: odd", lines[2])
+
+    def test_a_rate_limit_stops_the_remaining_jobs(self):
+        def respond(params, index):
+            raise RateLimitedError("HTTP 429 from open-api-vst.bingx.com")
+
+        fake = FakeHttp(respond)
+        lines = collect(fake, self.data_dir, self.today, sleep=noop)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn(": failed: RateLimitedError: HTTP 429", lines[0])
+        self.assertTrue(lines[1].endswith(": failed: not attempted (rate limited)"))
+        self.assertTrue(lines[2].endswith(": failed: not attempted (rate limited)"))
 
     def test_failure_reason_is_a_single_bounded_line(self):
         def respond(params, index):
@@ -511,7 +749,7 @@ class CollectTest(unittest.TestCase):
 
         lines = collect(FakeHttp(respond), self.data_dir, self.today, sleep=noop)
         for line in lines:
-            self.assertIn(": failed: ConnectError", line)
+            self.assertIn("failed: 2026-10-07, 2026-10-08, 2026-10-09", line)
             self.assertNotIn("\n", line)
             self.assertLess(len(line), 300)
 

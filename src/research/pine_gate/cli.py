@@ -21,16 +21,18 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+import httpx
+
 from . import cli_checks, cli_data, cli_stages
 from . import cli_common as common
-from .fetch import ExchangeError, IncompleteDayError
+from .fetch import ExchangeError, IncompleteDayError, RateLimitedError
 from .lock import HoldoutLockError
 from .spec import spec_document, spec_sha256
 
 DEFAULT_DATA_DIR = "~/replay/pine_gate/data"
 DEFAULT_OUT_DIR = "~/replay/out"
 _EXPECTED_ERRORS = (common.CliError, OSError, ValueError, NotImplementedError, ExchangeError,
-                    IncompleteDayError)
+                    IncompleteDayError, RateLimitedError, httpx.HTTPError)
 
 
 def _iso_date(text: str) -> date:

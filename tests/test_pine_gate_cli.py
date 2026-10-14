@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import contextlib
 import gzip
@@ -333,8 +334,8 @@ class FetchCommandTest(Dirs):
                 "fetch", "--source", "vst", "--symbols", "ETH-USDT",
                 "--start", "2026-07-01", "--end", "2026-07-01"])
         self.assertEqual(code, 1)
-        self.assertIn("vst/ETH-USDT/1m 2026-07-01..2026-07-01: fetched 0, skipped 0, failed 1", out)
-        self.assertIn("failed days: 2026-07-01", out)
+        self.assertIn("vst/ETH-USDT/1m 2026-07-01..2026-07-01: fetched 0, skipped 0, failed 1; "
+                      "failed: 2026-07-01", out)
 
     def test_fetch_rejects_a_symbol_that_is_not_a_usdt_pair(self):
         code, _, err = run_cli(self.base_args() + [
@@ -427,7 +428,7 @@ class FundingCommandTest(Dirs):
 
 
 class CollectCommandTest(Dirs):
-    def test_collect_fetches_yesterday_and_exits_1_when_a_job_fails(self):
+    def test_collect_backfills_the_last_week_and_exits_1_when_a_job_fails(self):
         http = FakeHttp(fail_symbols={"ETH-USDT"})
         with mock.patch.object(cli_common, "http_get", http), \
                 mock.patch.object(cli_common, "sleep", Sleeps()):
@@ -435,9 +436,39 @@ class CollectCommandTest(Dirs):
         self.assertEqual(code, 1)
         lines = out.strip().splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertTrue(lines[1].startswith("prod/BTC-USDT/1m 2026-10-13: fetched"))
-        self.assertIn("failed", lines[0])
-        self.assertTrue(day_path(self.data, "prod", "BTC-USDT", "1m", date(2026, 10, 13)).exists())
+        self.assertEqual(lines[1], "prod/BTC-USDT/1m 2026-10-07..2026-10-13: fetched 7, "
+                                   "skipped 0, failed 0")
+        self.assertIn("failed: 2026-10-07", lines[0])
+        for k in range(7):
+            day = date(2026, 10, 7) + timedelta(days=k)
+            self.assertTrue(day_path(self.data, "prod", "BTC-USDT", "1m", day).exists())
+        with mock.patch.object(cli_common, "http_get", FakeHttp()), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, _ = run_cli(self.base_args() + ["collect"])
+        self.assertEqual(code, 0, out)
+
+    def test_a_rate_limit_stops_fetch_with_one_error_line(self):
+        from research.pine_gate.fetch import RateLimitedError
+
+        def limited(url, params, headers):
+            raise RateLimitedError("HTTP 429 from open-api.bingx.com; Retry-After '30'")
+
+        with mock.patch.object(cli_common, "http_get", limited), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, err = run_cli(self.base_args() + [
+                "fetch", "--source", "prod", "--symbols", "BTC-USDT,ETH-USDT",
+                "--start", "2026-07-01", "--end", "2026-07-03"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("HTTP 429", err)
+        self.assertIn("Retry-After", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_symbols_must_match_the_whole_pattern(self):
+        for text in ("BTC-USDT\n", "BTC-USDT ", "xBTC-USDT"):
+            with self.subTest(text=text):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    cli._symbol(text)
 
 
 class CheckDataCommandTest(Dirs):

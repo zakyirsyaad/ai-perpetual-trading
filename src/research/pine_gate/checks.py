@@ -42,21 +42,34 @@ OutcomeFor = Callable[[str, int, int], Optional[Tuple[str, float]]]
 # --- VST klines ------------------------------------------------------------
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON number {name}")
+
+
+def _edge_row(path: Path, key: Any, value: Any) -> Tuple[int, float, float, float, float, float]:
+    """One ``"<open_ms>": [o, h, l, c]`` entry as a row; ``ValueError`` when malformed."""
+    if not isinstance(key, str) or not key.isdigit():
+        raise ValueError(f"{path}: k1 key {key!r} is not a non-negative integer of ms")
+    if (not isinstance(value, list) or len(value) != 4
+            or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in value)):
+        raise ValueError(f"{path}: k1[{key}] is not a list of four numbers")
+    o, h, low, c = (float(x) for x in value)
+    return (int(key), o, h, low, c, 0.0)
+
+
 def load_edge_klines_vst(path: Path) -> Bars:
     """Load 1m VST bars from ``{"k1": {"<open_ms>": [o, h, l, c], ...}, ...}``.
 
-    Other keys are ignored and volume is 0.0. Bars must be contiguous; a gap
-    raises ``BarGapError``.
+    Other keys are ignored and volume is 0.0. NaN/Infinity, a malformed entry and
+    any value ``bars_from_rows`` refuses (non-positive price, broken OHLC) raise
+    ``ValueError``; a gap raises ``BarGapError``.
     """
     with open(path, "r", encoding="utf-8") as fh:
-        payload = json.load(fh)
+        payload = json.load(fh, parse_constant=_reject_constant)
     k1 = payload.get("k1") if isinstance(payload, dict) else None
     if not isinstance(k1, dict):
         raise ValueError(f"{path}: expected a JSON object with a 'k1' mapping")
-    rows = []
-    for key in sorted(k1, key=int):
-        o, h, l, c = k1[key]
-        rows.append((int(key), float(o), float(h), float(l), float(c), 0.0))
+    rows = sorted(_edge_row(path, key, value) for key, value in k1.items())
     return bars_from_rows(rows, _MS_1M)
 
 

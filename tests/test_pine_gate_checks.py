@@ -170,10 +170,13 @@ class VstAgreementTests(unittest.TestCase):
 
 class LoadVstKlinesTests(unittest.TestCase):
     def write(self, payload):
+        return self.write_text(json.dumps(payload))
+
+    def write_text(self, text):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / "edge.json"
-        path.write_text(json.dumps(payload))
+        path.write_text(text, encoding="utf-8")
         return path
 
     def test_loads_sorted_with_zero_volume_and_ignores_other_keys(self):
@@ -190,6 +193,34 @@ class LoadVstKlinesTests(unittest.TestCase):
         self.assertEqual(list(bars.close), [1.5, 2.5, 3.5])
         self.assertEqual(list(bars.high), [2.0, 3.0, 4.0])
         self.assertEqual(list(bars.volume), [0.0, 0.0, 0.0])
+
+    def test_bad_values_and_malformed_rows_raise_value_error(self):
+        raw_cases = {
+            "nan": '{"k1": {"0": [1, NaN, 1, 1]}}',
+            "infinity": '{"k1": {"0": [1, Infinity, 1, 1]}}',
+            "minus infinity": '{"k1": {"0": [1, 1, -Infinity, 1]}}',
+        }
+        for name, text in raw_cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    load_edge_klines_vst(self.write_text(text))
+        cases = {
+            "zero price": {"0": [0, 1, 0, 1]},
+            "negative price": {"0": [-1, 1, -2, 1]},
+            "high below close": {"0": [1, 1.5, 1, 2]},
+            "low above open": {"0": [1, 2, 1.5, 1.8]},
+            "three values": {"0": [1, 1, 1]},
+            "not a list": {"0": "1,1,1,1"},
+            "string price": {"0": ["a", 1, 1, 1]},
+            "bool price": {"0": [True, 1, 1, 1]},
+            "non-integer key": {"x": [1, 1, 1, 1]},
+            "negative key": {"-60000": [1, 1, 1, 1]},
+        }
+        for name, k1 in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as ctx:
+                    load_edge_klines_vst(self.write({"k1": k1}))
+                self.assertNotIsInstance(ctx.exception, (TypeError, KeyError))
 
     def test_gap_raises_and_missing_k1_raises(self):
         with self.assertRaises(BarGapError):

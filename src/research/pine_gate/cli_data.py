@@ -9,6 +9,7 @@ of one call, and the CLI sleeps one second between two library calls so the
 gap also holds across symbols and jobs. Existing files are never overwritten:
 day files and warm-up, native-check or funding files that exist are skipped,
 and a skipped file's covered range is printed so the operator can confirm it.
+A rate limit (``RateLimitedError``) stops the whole command.
 """
 
 from __future__ import annotations
@@ -42,23 +43,25 @@ from .features import FeatureFrame, htf_agreement
 from .fetch import (
     MIN_REQUEST_GAP_SECONDS,
     PROD_HOST,
-    VST_HOST,
+    SOURCE_HOSTS,
     ExchangeError,
     IncompleteDayError,
     collect,
     fetch_funding_times,
     sync_days,
+    sync_line,
     sync_warmup,
 )
 from .pipeline import SYMBOLS, TRAIN_DATA_UNTIL_MS
 from .spec import HOLDOUT_END, TRAIN_END, TRAIN_START, WIB, ms
 
-HOSTS = {"prod": PROD_HOST, "vst": VST_HOST}
+HOSTS = SOURCE_HOSTS
 WARMUP_INTERVALS = ("1h", "4h")
 NATIVE_CHECK_FILE = "native_check.csv.gz"
 NATIVE_CHECK_DEFAULT = (date(2025, 8, 1), date(2025, 9, 1))  # inside training
 NATIVE_AGREEMENT_MIN = 0.999
-_NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.TransportError)
+# Per symbol: recorded and the next symbol goes on. RateLimitedError is not here.
+_NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.HTTPError)
 _MS_1M = 60_000
 _LISTED_DAYS = 10
 
@@ -90,11 +93,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         pace()
         result = sync_days(common.http_get, HOSTS[args.source], args.source, symbol,
                            args.start, args.end, args.data_dir, sleep=common.sleep)
-        print(f"{args.source}/{symbol}/1m {args.start}..{args.end}: fetched {result.fetched}, "
-              f"skipped {result.skipped}, failed {len(result.failed)}")
-        if result.failed:
-            failed_any = True
-            print("  failed days: " + ", ".join(d.isoformat() for d in result.failed))
+        print(sync_line(f"{args.source}/{symbol}/1m {args.start}..{args.end}", result))
+        failed_any = failed_any or bool(result.failed or result.not_attempted)
     return 1 if failed_any else 0
 
 
@@ -181,7 +181,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
     lines = collect(common.http_get, args.data_dir, common.wib_today(), sleep=common.sleep)
     for line in lines:
         print(line)
-    return 1 if any(": failed" in line for line in lines) else 0
+    return 1 if any("failed:" in line for line in lines) else 0
 
 
 # --------------------------------------------------------------------------- check-data
@@ -337,7 +337,7 @@ def add_parsers(sub: Any, date_type: Callable[[str], date],
     p.add_argument("--end", type=date_type, required=True, help="exclusive (WIB midnight)")
     p.set_defaults(handler=cmd_funding)
 
-    p = sub.add_parser("collect", help="daily collector: yesterday's WIB day")
+    p = sub.add_parser("collect", help="daily collector: the last 7 WIB days, missing ones only")
     p.set_defaults(handler=cmd_collect)
 
     p = sub.add_parser("check-data", help="complete days, native agreement, truncation test")
