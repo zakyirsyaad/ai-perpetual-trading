@@ -316,9 +316,16 @@ with about 250–500 holdout trades per symbol, a true 60% has a 95% interval of
 
 Execution happens on VST, so the production backtest must be a valid stand-in:
 
-- signal side from VST vs production 5m agrees on ≥ 97% of ticks;
-- bracket outcome on VST vs production 1m agrees on ≥ 95% of entries;
-- WR differs by ≤ 2 points.
+- signal side from VST vs production 5m agrees on ≥ 97% of the ticks where either side signals
+  (same side ÷ ticks with a non-zero side on VST or production; ticks where both are flat are
+  left out);
+- bracket outcome on VST vs production 1m agrees on ≥ 95% of the ticks where both signal the same
+  side;
+- WR differs by ≤ 2 points, each WR taken at that side's own signal ticks with its own side and
+  bars (VST's signals on VST bars, production's on production bars);
+- the counts behind each share are reported (ticks where either signals, where both signal the
+  same side, production and VST signal ticks with a resolved outcome); without a tick where
+  either side signals the check fails.
 
 BTC is checked on the VST cache since 2026-09-09. ETH is checked once the collector has two weeks
 of VST ETH data; until then ETH cannot move to enforce. If the check fails, the forward read on VST

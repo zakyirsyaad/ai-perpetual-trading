@@ -23,9 +23,10 @@ from .timeparse import parse_iso_ms
 _MS_1M = 60_000
 _MS_PER_SECOND = 1000
 
-# Spec 5.12: VST must be a valid stand-in for production. The signal side agrees
-# on at least 97% of ticks, the bracket outcome kind on at least 95% of entries,
-# and the win rate differs by at most 2 percentage points.
+# Spec 5.12: VST must be a valid stand-in for production. Over the ticks where either
+# side signals, the side agrees on at least 97%; over the ticks where both signal the
+# same side, the bracket outcome kind agrees on at least 95%; each side's win rate is
+# taken at its own signal ticks with its own side, and the two differ by at most 2 points.
 SIDE_AGREE_MIN = 0.97
 OUTCOME_AGREE_MIN = 0.95
 WR_DIFF_MAX_PTS = 2.0
@@ -80,10 +81,14 @@ def load_edge_klines_vst(path: Path) -> Bars:
 @dataclass(frozen=True)
 class Agreement:
     n: int  # ticks compared
-    side_agree: Optional[float]  # share of ticks with equal side (0..1)
-    outcome_agree: Optional[float]  # share of compared entries with equal kind (0..1)
-    wr_prod: Optional[float]  # TP / (TP + SL) in percent
-    wr_vst: Optional[float]
+    n_either: int  # ticks where production or VST signals
+    n_both: int  # ticks where both signal the same side and both outcomes resolve
+    n_prod: int  # production signal ticks with a resolved production outcome
+    n_vst: int  # VST signal ticks with a resolved VST outcome
+    side_agree: Optional[float]  # same side / n_either (0..1)
+    outcome_agree: Optional[float]  # same kind / n_both (0..1)
+    wr_prod: Optional[float]  # TP / (TP + SL) in percent, production at its own ticks
+    wr_vst: Optional[float]  # the same for VST at its own ticks and side
     passed: bool
 
 
@@ -93,22 +98,26 @@ def _wr(kinds: Sequence[str]) -> Optional[float]:
     return 100.0 * tp / (tp + sl) if tp + sl else None
 
 
-def _outcome_kinds(
-    prod: FeatureFrame, vst: FeatureFrame, prod_side: int, t: int, cfg: ExecConfig,
-    caches: Tuple[OutcomeCache, OutcomeCache],
-) -> Optional[Tuple[str, str]]:
-    """Bracket outcome kinds on production and VST for an order at ``t`` + order delay
-    (no latency) on the production side; ``None`` when either is unresolved."""
-    order_ms = t + cfg.order_delay_s * _MS_PER_SECOND
-    i_prod = entry_index_for(prod.bars_1m, order_ms)
-    i_vst = entry_index_for(vst.bars_1m, order_ms)
-    if i_prod is None or i_vst is None:
+def _outcome_kind(frame: FeatureFrame, side: int, t: int, cfg: ExecConfig,
+                  cache: OutcomeCache) -> Optional[str]:
+    """Bracket outcome kind on ``frame``'s own 1m bars for an order at ``t`` + order
+    delay (no latency) on ``side``; ``None`` when flat or unresolved."""
+    if side == 0:
         return None
-    o_prod = caches[0].get(i_prod, prod_side)
-    o_vst = caches[1].get(i_vst, prod_side)
-    if o_prod is None or o_vst is None:
-        return None
-    return o_prod.kind, o_vst.kind
+    i = entry_index_for(frame.bars_1m, t + cfg.order_delay_s * _MS_PER_SECOND)
+    o = cache.get(i, side) if i is not None else None
+    return None if o is None else o.kind
+
+
+def _passed(n_either: int, same_side: int, pairs: Sequence[Tuple[str, str]],
+            wr_prod: Optional[float], wr_vst: Optional[float]) -> bool:
+    same_kind = sum(1 for a, b in pairs if a == b)
+    return (
+        n_either > 0 and len(pairs) > 0 and wr_prod is not None and wr_vst is not None
+        and same_side * 100 >= SIDE_AGREE_MIN * 100 * n_either - _EPS
+        and same_kind * 100 >= OUTCOME_AGREE_MIN * 100 * len(pairs) - _EPS
+        and abs(wr_prod - wr_vst) <= WR_DIFF_MAX_PTS + _EPS
+    )
 
 
 def vst_agreement(
@@ -122,31 +131,35 @@ def vst_agreement(
 
     ``signal_for(features, poc_frame, t)`` is called as ``(prod, prod, t)`` and
     ``(vst, prod, t)`` so volume-profile rules read the production POC on both
-    sides. Outcomes are compared where the production side is not 0
-    (``_outcome_kinds``); the win rates use the same compared entries. Outcome
-    kinds do not depend on the stop overshoot.
+    sides. Ticks where neither side signals are left out. Each side's outcomes and
+    WR come from its own signal ticks, side and bars; outcome kinds are compared
+    where both signal the same side. Outcome kinds do not depend on the stop
+    overshoot. Without a tick where either side signals the check never passes.
     """
     caches = (OutcomeCache(prod.bars_1m, cfg), OutcomeCache(vst.bars_1m, cfg))
-    same_side = 0
-    kinds: List[Tuple[str, str]] = []
+    n_either = same_side = 0
+    prod_kinds: List[str] = []
+    vst_kinds: List[str] = []
+    pairs: List[Tuple[str, str]] = []
     for t in times:
-        side_prod = signal_for(prod, prod, t)
-        same_side += side_prod == signal_for(vst, prod, t)
-        pair = _outcome_kinds(prod, vst, side_prod, t, cfg, caches) if side_prod else None
-        if pair is not None:
-            kinds.append(pair)
-    n, compared = len(times), len(kinds)
-    same_kind = sum(1 for a, b in kinds if a == b)
-    wr_prod, wr_vst = _wr([a for a, _ in kinds]), _wr([b for _, b in kinds])
-    passed = (
-        n > 0 and compared > 0 and wr_prod is not None and wr_vst is not None
-        and same_side * 100 >= SIDE_AGREE_MIN * 100 * n - _EPS
-        and same_kind * 100 >= OUTCOME_AGREE_MIN * 100 * compared - _EPS
-        and abs(wr_prod - wr_vst) <= WR_DIFF_MAX_PTS + _EPS
-    )
-    return Agreement(n=n, side_agree=same_side / n if n else None,
-                     outcome_agree=same_kind / compared if compared else None,
-                     wr_prod=wr_prod, wr_vst=wr_vst, passed=passed)
+        side_prod, side_vst = signal_for(prod, prod, t), signal_for(vst, prod, t)
+        if side_prod == 0 and side_vst == 0:
+            continue
+        n_either += 1
+        same_side += side_prod == side_vst
+        kind_prod = _outcome_kind(prod, side_prod, t, cfg, caches[0])
+        kind_vst = _outcome_kind(vst, side_vst, t, cfg, caches[1])
+        prod_kinds += [kind_prod] if kind_prod is not None else []
+        vst_kinds += [kind_vst] if kind_vst is not None else []
+        if side_prod == side_vst and kind_prod is not None and kind_vst is not None:
+            pairs.append((kind_prod, kind_vst))
+    wr_prod, wr_vst = _wr(prod_kinds), _wr(vst_kinds)
+    same_kind = sum(1 for a, b in pairs if a == b)
+    return Agreement(n=len(times), n_either=n_either, n_both=len(pairs), n_prod=len(prod_kinds),
+                     n_vst=len(vst_kinds), side_agree=same_side / n_either if n_either else None,
+                     outcome_agree=same_kind / len(pairs) if pairs else None,
+                     wr_prod=wr_prod, wr_vst=wr_vst,
+                     passed=_passed(n_either, same_side, pairs, wr_prod, wr_vst))
 
 
 # --- AI decisions ----------------------------------------------------------

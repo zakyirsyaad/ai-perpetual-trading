@@ -221,8 +221,9 @@ def cmd_vst_check(args: argparse.Namespace) -> int:
              if snapshot_valid(chosen, prod, prod, t) and snapshot_valid(chosen, vst_frame, prod, t)]
     agreement = vst_agreement(prod, vst_frame, signal_for(chosen), times, ExecConfig())
     common.write_json_exclusive(path, asdict(agreement), "vst-check")
-    print(f"vst-check {args.symbol} contender {chosen.name}: n {agreement.n}, "
-          f"side agree {agreement.side_agree}, outcome agree {agreement.outcome_agree}, "
+    print(f"vst-check {args.symbol} contender {chosen.name}: n {agreement.n}, either "
+          f"{agreement.n_either}, both {agreement.n_both}, side agree {agreement.side_agree}, "
+          f"outcome agree {agreement.outcome_agree}, "
           f"WR prod {agreement.wr_prod} vs VST {agreement.wr_vst}, passed {agreement.passed}")
     print(path)
     return 0

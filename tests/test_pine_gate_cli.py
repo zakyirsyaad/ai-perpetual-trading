@@ -756,8 +756,8 @@ class VstCheckCommandTest(Dirs):
         self.assertEqual(code, 0, err)
         path = self.out / "pine_gate_vst_BTC-USDT_20261014.json"
         doc = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(set(doc), {"n", "side_agree", "outcome_agree", "wr_prod", "wr_vst",
-                                    "passed"})
+        self.assertEqual(set(doc), {"n", "n_either", "n_both", "n_prod", "n_vst", "side_agree",
+                                    "outcome_agree", "wr_prod", "wr_vst", "passed"})
         self.assertGreater(doc["n"], 100)
         self.assertEqual(doc["side_agree"], 1.0)  # identical prices on both sides
         self.assertIn("contender c1", out)

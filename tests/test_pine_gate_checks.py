@@ -98,6 +98,10 @@ class VstAgreementTests(unittest.TestCase):
         with self.subTest("side 97% passes"):
             r = self.check(base, base, long_signal(ts[:3]), ts)
             self.assertEqual(r.side_agree, 0.97)
+            self.assertEqual((r.n_either, r.n_both, r.n_prod, r.n_vst), (100, 97, 100, 100))
+            # VST's WR is taken at its own ticks with its own side: the three shorts turn
+            # TP, SL, TP spikes into SL, TP, SL
+            self.assertEqual((r.wr_prod, r.wr_vst), (50.0, 49.0))
             self.assertTrue(r.passed)
         with self.subTest("side 96% fails"):
             r = self.check(base, base, long_signal(ts[:4]), ts)
@@ -144,9 +148,10 @@ class VstAgreementTests(unittest.TestCase):
             self.assertEqual(r.n, 0)
             self.assertIsNone(r.side_agree)
             self.assertFalse(r.passed)
-        with self.subTest("production never signals"):
+        with self.subTest("neither side ever signals"):
             r = self.check([TP, SL], [TP, SL], signal_for=lambda f, p, t: 0)
-            self.assertEqual(r.side_agree, 1.0)
+            self.assertEqual((r.n, r.n_either), (2, 0))
+            self.assertIsNone(r.side_agree)
             self.assertIsNone(r.outcome_agree)
             self.assertFalse(r.passed)
         with self.subTest("no TP or SL, only time stops"):
@@ -154,6 +159,36 @@ class VstAgreementTests(unittest.TestCase):
             self.assertEqual(r.outcome_agree, 1.0)
             self.assertIsNone(r.wr_prod)
             self.assertFalse(r.passed)
+
+    def test_signals_that_never_overlap_fail(self):
+        """Production signals at tick 10 only, VST at tick 50 only: the flat ticks on
+        both sides must not carry the side agreement (the reviewer's counterexample)."""
+        kinds = [TP, SL] * 50
+        ts = entry_times(100)
+
+        def signal_for(frame, poc, t):
+            own = ts[50] if frame.bars_1m is not poc.bars_1m else ts[10]
+            return 1 if t == own else 0
+
+        r = self.check(kinds, kinds, signal_for, ts)
+        self.assertEqual(r.n, 100)
+        self.assertEqual((r.n_either, r.n_both, r.n_prod, r.n_vst), (2, 0, 1, 1))
+        self.assertEqual(r.side_agree, 0.0)
+        self.assertIsNone(r.outcome_agree)
+        self.assertEqual((r.wr_prod, r.wr_vst), (100.0, 100.0))
+        self.assertFalse(r.passed)
+
+    def test_vst_only_signals_count_against_the_side_agreement(self):
+        kinds = [TP, SL] * 50
+        ts = entry_times(100)
+
+        def signal_for(frame, poc, t):  # production silent on the first 4 ticks VST trades
+            return 0 if t in ts[:4] and frame.bars_1m is poc.bars_1m else 1
+
+        r = self.check(kinds, kinds, signal_for, ts)
+        self.assertEqual((r.n_either, r.n_both, r.n_prod, r.n_vst), (100, 96, 96, 100))
+        self.assertEqual(r.side_agree, 0.96)
+        self.assertFalse(r.passed)
 
     def test_unresolved_outcomes_are_skipped(self):
         kinds = [TP, SL]
@@ -163,6 +198,7 @@ class VstAgreementTests(unittest.TestCase):
         times = entry_times(2) + [last_bar]  # last bar: bracket runs off the data
         r = vst_agreement(prod, vst, long_signal(), times, CFG)
         self.assertEqual(r.n, 3)
+        self.assertEqual((r.n_either, r.n_both, r.n_prod, r.n_vst), (3, 2, 2, 2))
         self.assertEqual(r.side_agree, 1.0)
         self.assertEqual(r.outcome_agree, 1.0)
         self.assertEqual(r.wr_prod, 50.0)
