@@ -244,6 +244,10 @@ class ChoiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             choose_contender([verdict("c9", BTC, True)], {})
 
+    def test_verdict_counts_are_required(self):
+        with self.assertRaises(TypeError):
+            GateVerdict("c2", BTC, True, (), 70.0, None, 1.0, 0.01)
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -304,6 +308,7 @@ class SupplyCriterionTests(unittest.TestCase):
         full, verdicts = holdout._gate_contender(evidence, metrics, GateConfig())
         self.assertTrue(verdicts[BTC].passed and verdicts[ETH].passed)
         self.assertEqual((full[BTC]["supply_holdout"], full[BTC]["supply_last20"]), (11.0, 10.0))
+        self.assertEqual(full[BTC]["supply_set"], [BTC, ETH])
         # ETH fails criterion 3: BTC alone no longer supplies 10 a day
         evidence[ETH] = self.evidence(ETH, tp=50, sl=50)
         full, verdicts = holdout._gate_contender(evidence, metrics, GateConfig())
@@ -311,6 +316,7 @@ class SupplyCriterionTests(unittest.TestCase):
         self.assertEqual(verdicts[ETH].failed_criteria, (3,))
         self.assertEqual(full[ETH]["supply_holdout"], 11.0)  # the passing set plus itself
         self.assertEqual(full[BTC]["supply_holdout"], 6.0)
+        self.assertEqual((full[BTC]["supply_set"], full[ETH]["supply_set"]), ([BTC], [BTC, ETH]))
 
     def test_pooled_lower_bound_uses_passing_symbols_only(self):
         from types import SimpleNamespace
@@ -418,10 +424,17 @@ def meta_model_dict():
                      stds=(1.0,) * len(FEATURES), threshold=0.5, C=0.1).to_dict()
 
 
+def latencies_sha256(latencies):
+    """The selection file's binding of the latency sample (explicit formula)."""
+    payload = json.dumps([float(x) for x in latencies], allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def write_selection(path, sha, **override):
     doc = {"spec_sha256": sha, **spec_run_record(), "contender1": RULE, "primary_rule": RULE,
            "pbo": 0.2, "pbo_pass": True, "s_star_bps": 1.0, "n_stops": 20, "n_latencies": 3,
-           "meta_model": meta_model_dict()}
+           "meta_model": meta_model_dict(), "seed": 0,
+           "latencies_sha256": latencies_sha256(CALIB.latencies_ms)}
     doc.update(override)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc))
@@ -500,6 +513,43 @@ class LockTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     self.run_stage(path, sha=sha, **kwargs)
                 self.assertIn("spec run", str(ctx.exception))
+
+    def test_any_existing_holdout_file_refuses_the_run(self):
+        path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
+        old = self.tmp / "out" / "pine_gate_holdout_20260101.json"
+        old.parent.mkdir(parents=True)
+        old.write_text("{}")
+        with self.assertRaises(FileExistsError) as ctx:
+            self.run_stage(path)
+        self.assertIn(old.name, str(ctx.exception))
+        self.assertEqual(old.read_text(), "{}")
+
+    def test_real_spec_sha_requires_the_selection_seed(self):
+        sha = spec_sha256()
+        for recorded, seed in ((0, 1), (3, 0), (None, 0)):
+            path = write_selection(self.tmp / f"sel_{recorded}_{seed}.json", sha, seed=recorded)
+            with self.subTest(recorded=recorded, seed=seed):
+                with self.assertRaises(ValueError) as ctx:
+                    self.run_stage(path, sha=sha, seed=seed)
+                self.assertIn("seed", str(ctx.exception))
+        # the recorded seed passes this check and goes on to read the dataset
+        path = write_selection(self.tmp / "sel_ok.json", sha, seed=3)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path, sha=sha, seed=3)
+        # a dummy sha may pick any seed
+        path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, seed=3)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path, seed=7)
+
+    def test_latency_sample_must_be_the_selection_one(self):
+        path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
+        same_size = replace(CALIB, latencies_ms=(21_000.0, 30_000.0, 40_000.0))
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(path, calib=same_size)
+        self.assertIn("latenc", str(ctx.exception))
+        path = write_selection(self.tmp / "sel_old.json", DUMMY_SHA, latencies_sha256=None)
+        with self.assertRaises(HoldoutLockError):
+            self.run_stage(path)
 
     def test_counts_must_be_positive_integers(self):
         path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
@@ -616,9 +666,10 @@ class TestStageTests(StageFixture):
         row = c1["c2"][BTC]
         self.assertEqual(row["n_seeds"], 5)
         self.assertEqual(row["n_entries"], self.doc["contenders"]["c2"]["symbols"][BTC]["n"])
-        if row["mean"] is not None:
-            self.assertLessEqual(row["p5"], row["mean"])
-            self.assertLessEqual(row["mean"], row["p95"])
+        self.assertGreater(row["n_entries"], 0)
+        self.assertIsNotNone(row["mean"])
+        self.assertLessEqual(row["p5"], row["mean"])
+        self.assertLessEqual(row["mean"], row["p95"])
 
     def test_source_of_the_edge(self):
         for name in ("c1", "c2"):
@@ -668,6 +719,47 @@ class TestStageTests(StageFixture):
         self.assertIn("both_touch_share", row)
         self.assertAlmostEqual(row["net_per_1m_fee_sensitivity"] - row["net_per_1m"],
                                -50 * 2 * 100 * (0.05 - 0.035))
+
+
+# Every criterion threshold relaxed so a synthetic contender passes. The C0
+# tolerances stay the spec's: the synthetic always-long/short WRs are 47.8-50.9
+# and gross -1.5..-0.3 bps, inside 50 +- 3 and +-2 bps.
+RELAXED_GATE = replace(GateConfig(), min_tp_sl=1, alpha=1.01, min_wr=0.0, half_min_wr=-1.0,
+                       robust_min_wr=0.0, offsets_min_pass=0, min_supply_per_day=0.0)
+
+
+class RelaxedGateStageTests(unittest.TestCase):
+    def test_a_passing_contender_is_chosen_with_its_passing_symbols(self):
+        _build_shared()
+        out = Path(tempfile.mkdtemp(prefix="pine_holdout_relaxed_"))
+        try:
+            sel = write_selection(out / "sel.json", DUMMY_SHA)
+            path = run_test_stage(_Shared.dataset, sel, CALIB, out / "o", DUMMY_SHA, seed=2,
+                                  period=TEST_PERIOD, guard_cfg=NO_GUARDS,
+                                  gate_cfg=RELAXED_GATE, **SMALL)
+            doc = json.loads(path.read_text())
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+        chosen = doc["chosen"]
+        self.assertIsNotNone(chosen)
+        block = doc["contenders"][chosen]
+        self.assertTrue(block["symbols_passed"])
+        self.assertEqual(doc["symbols_to_trade"], block["symbols_passed"])
+        self.assertIsNotNone(block["pooled_lower_bound"])
+        verdicts = []
+        for name, b in doc["contenders"].items():
+            passed = [s for s in SYMBOLS if b["symbols"][s]["verdict"]["passed"]]
+            self.assertEqual(passed, b["symbols_passed"])
+            for s in SYMBOLS:
+                row = b["symbols"][s]
+                expected = passed if row["verdict"]["passed"] else [
+                    x for x in SYMBOLS if x in set(passed) | {s}]
+                self.assertEqual(row["evidence"]["supply_set"], expected)
+                self.assertAlmostEqual(row["evidence"]["supply_holdout"],
+                                       sum(b["symbols"][x]["supply"] for x in expected))
+                verdicts.append(gate_symbol(row["evidence"], RELAXED_GATE))
+        lbs = {n: b["pooled_lower_bound"] for n, b in doc["contenders"].items()}
+        self.assertEqual(choose_contender(verdicts, lbs), chosen)
 
 
 class StageSkipTests(unittest.TestCase):

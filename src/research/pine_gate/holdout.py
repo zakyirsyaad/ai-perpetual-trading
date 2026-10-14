@@ -8,7 +8,9 @@ that the calibration is the one the selection was made with; only then does it
 read the holdout. It replays the holdout [2026-08-05, 2026-10-14) WIB with entry
 ticks blocked in the final 65 minutes, runs contenders 1-3 and the controls,
 applies the nine gate criteria per symbol, chooses what moves on and writes
-``pine_gate_holdout_<YYYYMMDD>.json``, never overwriting an existing file.
+``pine_gate_holdout_<YYYYMMDD>.json``. The holdout runs once: any existing
+holdout file in ``out_dir``, of any date, refuses the run, and a run under the
+current spec sha256 must use the seed recorded in the selection file.
 
 Every per-symbol number comes from that symbol's trades inside the joint
 one-position run over BTC and ETH (BTC first), except the C0 controls, which
@@ -49,6 +51,7 @@ from .holdout_replay import (
 from .outcomes import OutcomeCache
 from .pipeline import (
     SYMBOLS,
+    latencies_sha256,
     Dataset,
     HoldoutLockError,
     _check_purge_covers,
@@ -212,7 +215,8 @@ def _gate_contender(
         members = passing | {s}
         full[s] = {**ev,
                    "supply_holdout": sum(metrics[x]["supply"] for x in members),
-                   "supply_last20": sum(metrics[x]["supply_last20"] for x in members)}
+                   "supply_last20": sum(metrics[x]["supply_last20"] for x in members),
+                   "supply_set": [x for x in SYMBOLS if x in members]}
         verdicts[s] = gate_symbol(full[s], cfg)
     return full, verdicts
 
@@ -433,13 +437,20 @@ def _settings(period, exec_cfg, guard_cfg, gate_cfg, counts: Mapping[str, Option
                           guard_cfg if guard_cfg is not None else spec.guard_cfg, gate)
 
 
-def _check_spec_run(spec_sha: str, settings: _StageSettings) -> None:
+def _check_spec_run(
+    spec_sha: str, settings: _StageSettings, selection: Mapping[str, Any], seed: int
+) -> None:
+    """Under the current spec sha256: spec settings only, and the selection's seed, so
+    the one holdout run cannot be repeated with other seeds."""
     if spec_sha != spec_sha256():
         return
     fields = settings.non_spec_fields()
     if fields:
         raise ValueError("the current spec sha256 may only label a spec run; non-spec "
                          "settings: " + ", ".join(fields))
+    recorded = selection.get("seed")
+    if type(recorded) is not int or seed != recorded:
+        raise ValueError(f"a spec run must use the selection's seed {recorded!r}, got {seed!r}")
 
 
 def _check_calibration(path: Path, selection: Mapping[str, Any], calib: Calibration) -> None:
@@ -451,6 +462,8 @@ def _check_calibration(path: Path, selection: Mapping[str, Any], calib: Calibrat
             f"vs {calib.s_star_bps}, latencies {selection.get('n_latencies')} vs "
             f"{len(calib.latencies_ms)})"
         )
+    if selection.get("latencies_sha256") != latencies_sha256(calib.latencies_ms):
+        raise HoldoutLockError(f"{path}: the latency sample differs from the selection's")
 
 
 def _selection_sha256(path: Path, selection: Mapping[str, Any]) -> str:
@@ -476,9 +489,15 @@ def _check_holdout_dataset(dataset: Dataset, period: HoldoutPeriod) -> None:
             raise ValueError(f"dataset lacks {symbol}")
 
 
-def _refuse_existing_holdout(path: Path) -> None:
-    if path.exists():
-        raise FileExistsError(f"{path}: holdout file already exists; the holdout runs once")
+def _refuse_any_holdout(out_dir: Path) -> None:
+    """The holdout runs once: any earlier holdout file, of any date, refuses the run."""
+    existing = sorted(Path(out_dir).glob(f"{HOLDOUT_PREFIX}*.json"))
+    if existing:
+        names = ", ".join(str(p) for p in existing)
+        raise FileExistsError(
+            f"holdout file already exists: {names}; the holdout runs once, so re-running "
+            "means removing it deliberately"
+        )
 
 
 def _context(dataset: Dataset, settings: _StageSettings, calib: Calibration, seed: int) -> Holdout:
@@ -527,8 +546,10 @@ def test_stage(
     """Run the holdout once and write its file; returns the path.
 
     The lock comes first: nothing of the holdout is read unless the selection file
-    passes ``load_selection_checked`` and matches ``calib``. Injected settings and
-    counts are for tests and are refused under the current spec sha256.
+    passes ``load_selection_checked`` and matches ``calib`` (s*, latency sample).
+    Injected settings and counts are for tests and are refused under the current
+    spec sha256, as is a seed other than the selection's. Any existing
+    ``pine_gate_holdout_*.json`` in ``out_dir`` refuses the run.
     """
     selection = load_selection_checked(selection_path, spec_sha)
     _check_calibration(selection_path, selection, calib)
@@ -536,17 +557,18 @@ def test_stage(
     counts = {"offsets": offsets, "permutation_shifts": permutation_shifts,
               "c1_seeds": c1_seeds, "bootstrap_n": bootstrap_n}
     settings = _settings(period, exec_cfg, guard_cfg, gate_cfg, counts)
-    _check_spec_run(spec_sha, settings)
+    _check_spec_run(spec_sha, settings, selection, seed)
+    _refuse_any_holdout(out_dir)
     _check_holdout_dataset(dataset, settings.period)
     _check_purge_covers(calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{HOLDOUT_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
-    _refuse_existing_holdout(path)
     selection_sha = _selection_sha256(selection_path, selection)
     doc = _evaluate(_context(dataset, settings, calib, seed), selection)
     doc.update(_provenance(dataset, calib, settings, seed))
     doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).name,
                 "selection_sha256": selection_sha, "created_at": created.isoformat()})
-    _write_json_atomic(path, doc)
+    _refuse_any_holdout(out_dir)  # again after the work: a concurrent run may have written
+    _write_json_atomic(path, doc, label="holdout")
     return path

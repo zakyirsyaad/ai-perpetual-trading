@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 from dataclasses import asdict
@@ -5,6 +6,7 @@ import random
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -531,6 +533,29 @@ class TrainStageTests(PipelineFixture):
                         sel_cfg=LENIENT_SEL, meta_trainer=FakeMetaTrainer())
         self.assertIn(str(existing), str(ctx.exception))
         self.assertEqual(existing.read_text(), "{}")
+
+    def test_selection_records_the_latency_sample_hash(self):
+        payload = json.dumps([float(x) for x in CALIB.latencies_ms], allow_nan=False)
+        expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        self.assertEqual(self.selection["latencies_sha256"], expected)
+        self.assertEqual(pipeline.latencies_sha256(CALIB.latencies_ms), expected)
+        self.assertNotEqual(pipeline.latencies_sha256((1.0, 2.0, 3.0)), expected)
+
+    def test_atomic_write_race_names_the_file_kind(self):
+        path = self.tmp / "race" / "pine_gate_holdout_20261014.json"
+
+        def late_link(src, dst):
+            Path(dst).write_text("{}")  # another run wins between the check and the link
+            raise FileExistsError(dst)
+
+        with mock.patch.object(pipeline.os, "link", side_effect=late_link):
+            with self.assertRaises(FileExistsError) as ctx:
+                pipeline._write_json_atomic(path, {"a": 1}, label="holdout")
+        self.assertIn("holdout file already exists", str(ctx.exception))
+        self.assertEqual(path.read_text(), "{}")
+        with self.assertRaises(FileExistsError) as ctx:
+            pipeline._write_json_atomic(path, {"a": 1}, label="holdout")
+        self.assertIn("holdout file already exists", str(ctx.exception))
 
     def test_atomic_write_never_replaces_an_existing_file(self):
         path = self.tmp / "atomic" / "sel.json"

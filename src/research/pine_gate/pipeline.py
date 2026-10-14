@@ -654,6 +654,12 @@ def _rule_metrics(r: RuleResult, cfg: SelectionConfig) -> Dict[str, Any]:
     }
 
 
+def latencies_sha256(latencies_ms: Sequence[float]) -> str:
+    """sha256 of the latency sample as a JSON list of floats; binds it to the selection."""
+    payload = json.dumps([float(x) for x in latencies_ms], allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _selection_document(
     ctx: _Context, sel: Selection, primary: Optional[RuleSpec], extra: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -668,6 +674,7 @@ def _selection_document(
         "s_star_bps": ctx.calib.s_star_bps,
         "n_stops": ctx.calib.n_stops,
         "n_latencies": len(ctx.calib.latencies_ms),
+        "latencies_sha256": latencies_sha256(ctx.calib.latencies_ms),
         "seed": ctx.seed,
         "rules": {k: _rule_metrics(r, ctx.sel_cfg) for k, r in sorted(sel.results.items())},
     }
@@ -675,22 +682,22 @@ def _selection_document(
     return doc
 
 
-def _refuse_existing(path: Path) -> None:
+def _refuse_existing(path: Path, label: str = "selection") -> None:
     if path.exists():
         raise FileExistsError(
-            f"{path}: selection file already exists; remove it deliberately to train again"
+            f"{path}: {label} file already exists; remove it deliberately to run again"
         )
 
 
-def _write_json_atomic(path: Path, doc: Mapping[str, Any]) -> None:
+def _write_json_atomic(path: Path, doc: Mapping[str, Any], label: str = "selection") -> None:
     """Write the complete file under a temp name, then hard-link it into place.
 
     ``os.link`` fails when ``path`` exists, so an existing file is never replaced,
-    not even by a concurrent run."""
+    not even by a concurrent run. ``label`` names the file kind in the refusal."""
     text = json.dumps(doc, sort_keys=True, indent=1, allow_nan=False)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _refuse_existing(path)
+    _refuse_existing(path, label)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -698,7 +705,7 @@ def _write_json_atomic(path: Path, doc: Mapping[str, Any]) -> None:
         try:
             os.link(tmp, path)
         except FileExistsError:
-            _refuse_existing(path)
+            _refuse_existing(path, label)
             raise
     finally:
         try:

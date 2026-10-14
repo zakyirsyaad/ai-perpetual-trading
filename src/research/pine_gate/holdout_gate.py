@@ -45,8 +45,8 @@ class GateVerdict:
     lower_bound: Optional[float]
     gross_bps: Optional[float]
     p_holm: float
-    tp: int = 0
-    sl: int = 0
+    tp: int
+    sl: int
 
 
 def _wr(tp: int, sl: int) -> Optional[float]:
@@ -67,7 +67,11 @@ def _within(value: Optional[float], centre: float, tolerance: float) -> bool:
 
 def _robust(ev: Mapping[str, Any], cfg: GateConfig) -> bool:
     """WR >= 55 with 2 bps overshoot and WR > 50 in >= 15 of the 20 offset runs;
-    a missing offset run or one without TP+SL counts as failing."""
+    a missing offset run or one without TP+SL counts as failing.
+
+    Spec 5.11 uses the same 50 % floor in item 5 ("WR > 50% in each half") and in
+    item 6 ("WR > 50% in at least 15 of 20 tick offsets"), so both read
+    ``cfg.half_min_wr``; GateConfig has no separate offset floor."""
     passing = sum(1 for wr in ev["wr_offsets"] if _above(wr, cfg.half_min_wr))
     return _at_least(ev["wr_overshoot"], cfg.robust_min_wr) and passing >= cfg.offsets_min_pass
 
