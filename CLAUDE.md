@@ -43,6 +43,13 @@ PYTHONPATH=src python src/report_arena.py attribution --diagnose
 PYTHONPATH=src python src/report_ai_usage.py --days 1                      # AI token spend by purpose
 PYTHONPATH=src python src/replay_ai_decisions.py --limit 500               # deduplicated decision replay
 PYTHONPATH=src python src/realtime_backtest.py --source auto --no-trades   # dry-run, places no orders
+
+# entry-block latch watchdog (cron on the VPS; --dry-run decides but never restarts)
+PYTHONPATH=src python src/supervisor.py --dry-run
+
+# offline Pine-gate research (see "Offline research"); `--help` lists every stage
+PYTHONPATH=src python -m research.pine_gate.cli --help
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_pine_*.py'   # its tests only
 ```
 
 **CI is the merge gate.** `.github/workflows/tests.yml` runs `compileall` → `coverage run` → `coverage report` on every push to `main` and every pull request. `fail_under = 80` in `pyproject.toml` makes the report step fail the build below 80% line coverage, so run those three locally before proposing a merge.
@@ -167,6 +174,20 @@ Supabase is **required** — `main.py` refuses to start without `SUPABASE_URL` +
 **A position is never left unmonitored.** A failed price read inside `_monitor_position` costs one iteration (WARNING, ERROR from the third consecutive failure) and monitoring continues; any other exception from the monitor is caught in `_manage_open_position` and monitoring resumes with a capped backoff. Failures that still escape happened in the close phase, where an exit order may already exist and a retry could duplicate it, so `_manage_open_position_guarded` asks the venue: flat keeps trading (the trade record may be missing), open or unreadable sets `_entries_blocked_reason`. Both `_execute_single_trade` and `_resume_persisted_positions` use it. Before this, one SSL `ConnectError` on `quote/price` (2026-09-12 15:03 UTC) reached the `run_forever` catch-all and left a LONG unwatched for hours. The supervisor treats this latch as `hold`, never `restart`.
 
 A missing/invalid persisted envelope is unknown exposure. A mismatch, an unreadable position, or exposure with no persisted record is **never auto-flattened** — it sets `_entries_blocked_reason`, which blocks every subsequent tick at gate 1 and alerts the operator until a human resolves it.
+
+### Entry-block supervisor
+
+`src/supervisor.py` is a cron-run watchdog for the `_entries_blocked_reason` latch, which is otherwise silent (it once idled the bot for 1h21m unnoticed). It tails the pm2 error log since the last `trade engine started` line and does the reconciliation a human would: it reads the venue position size and looks the order up by `clientOrderId`. It restarts the pm2 app only when both say nothing happened, and at most once per order id (a repeat means the latch is not the real problem). Every other case, including all unmatched exposure, is `hold` for a person. It never places, cancels or closes an order. State is kept in `logs/supervisor_state.json`.
+
+### Offline research (`src/research/`)
+
+`research.pine_gate` is the Phase-1 evaluation of a Pine-adapted entry gate (spec `docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md`, plan `docs/superpowers/plans/2026-10-14-pine-gate-phase1.md`; the plan's "Global Constraints" are binding). **`bot` never imports `research`**, and `src/bot/strategy/pine_indicators.py` (Pine-compatible RMA/EMA/RSI/ATR/DMI, causal, `None` until warmed up) is deliberately unwired from the live bot. It still counts toward the global 80% coverage gate.
+
+- **Data path:** `fetch`/`warmup`/`funding`/`collect` pull *production* public klines and funding (`open-api.bingx.com`, public endpoints only, ≥1 s between requests, fixed `startTime`+`endTime` windows) into 1m WIB day files. Production is used because VST volume is not real (VST prices match production, volume does not). An incomplete or disordered day (<1,440 bars, gaps, duplicates) is refetched or rejected, never stored.
+- **Stages:** `spec` → `calibrate` (live latency and stop overshoot from Supabase, read-only) → `train` (writes the selection file) → `test` (the one-shot holdout) → `report` (in Indonesian; code and repo docs stay English). `vst-check` and `decisions` are side analyses.
+- **The holdout lock is the core invariant.** `spec.py` holds every pre-registered number, and its `spec_sha256()` is bound into the selection file along with configs, segments, the latency calibration and a `code_sha256` over the research package plus `pine_indicators.py`. `test` refuses (exit 2) on any mismatch, and refuses entirely if any earlier holdout file exists in `out_dir`. Changing a spec constant, or any bound module, invalidates prior selections by design. `train` must never read bars past the holdout boundary + 60 min.
+- **Output files are never overwritten** (`fileio.write_exclusive`). CLI exit codes: 0 ok, 1 expected failure (one `error:` line), 2 usage error or lock refusal. Set `PINE_GATE_DEBUG=1` for tracebacks.
+- On the VPS it runs under `nice -n 19` with CWD `~/ai-perpetual-trading` (for `.env`) but `PYTHONPATH=$HOME/replay/pine_gate_repo/src`, with data in `~/replay/pine_gate/data/` and outputs in `~/replay/out/`. It must never restart pm2, edit `.env`, or touch `~/replay/kline_keeper.py` or its cron line.
 
 ### Live dashboard feed (optional, off by default)
 
