@@ -251,6 +251,7 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertIn("p = 1", policies["holm"])
         self.assertIn("c0_training", policies)
         self.assertIn("code_sha256", policies["holdout_lock"])
+        self.assertIn("sum(w * logloss) / sum(w)", policies["meta_model_objective"])
 
     def test_each_call_returns_a_fresh_document(self):
         first = spec_document()

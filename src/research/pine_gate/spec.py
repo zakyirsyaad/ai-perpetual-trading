@@ -309,6 +309,11 @@ def _policies() -> Dict[str, Any]:
                        "bar and bracket), 0 on a day without trades",
         "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
                            "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
+        "meta_model_objective": "L2 logistic minimising sum(w * logloss) / sum(w) + "
+                                "|beta|^2 / (2C), intercept unpenalised, w = uniqueness "
+                                "weights, so C means the same at every sample size; the "
+                                "selection records the B2-B4 supply at p* for the out-of-fold "
+                                "and the final model's training probabilities",
         "contender_choice_order": ["most symbols passed", "higher pooled WR lower bound",
                                    "simpler (c2, c1, c3)"],
         "c1_c3_must_beat_c2_holdout_wr": True,
