@@ -1,7 +1,7 @@
 //@version=5
 // =============================================================================
-// Pine-adapted gate v1 — alat bantu VISUAL (2026-10-14)
-// Spek: docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md (bagian 5.14)
+// Pine-adapted gate v2 — alat bantu VISUAL (2026-10-14)
+// Spek: docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md (bagian 5.15)
 //
 // PENTING
 // - Ini alat bantu visual untuk melihat di mana sinyal muncul, BUKAN bukti.
@@ -9,25 +9,31 @@
 //   3 menit + jeda AI, harga dicek tiap 5 detik (stop meleset), guard harian,
 //   dan jeda funding. Keputusan diambil dari uji offline yang dikunci.
 // - Angka default hanyalah titik awal. Angka final dipilih uji offline dari
-//   data latih (sebelum 5 Agu 2026), lalu diuji sekali di 5 Agu - 14 Okt 2026.
-//   JANGAN memilih angka dari Strategy Tester: chart memuat periode uji itu,
-//   jadi memilih dari sini sama dengan mengintip jawaban.
+//   data latih (1 Agu 2025 - 5 Agu 2026), lalu diuji sekali di 5 Agu - 14 Okt
+//   2026. JANGAN memilih angka dari Strategy Tester: chart memuat periode uji
+//   itu, jadi memilih dari sini sama dengan mengintip jawaban.
+// - Model meta-labeling (kontender 3) tidak ada di sini: koefisiennya baru ada
+//   setelah uji offline.
 // - Kode sinyal bot BingX dari script asli sengaja tidak dibawa: kode itu bisa
 //   memicu order di bot sinyal milik pemiliknya.
 // - Pakai chart 5 menit pada perpetual BingX produksi (BINGX:BTCUSDT.P atau
 //   BINGX:ETHUSDT.P) supaya volume untuk volume profile adalah volume riil.
 //
-// Perubahan dari script asli:
+// Isi (sesuai grid spek):
 // - Arah: close vs EMA200 (5m), atau EMA20 vs EMA50 di candle 1 jam / 4 jam
 //   yang sudah tutup, dengan zona netral +-0,25 x ATR14.
-// - Pullback: RSI Wilder dengan ambang simetris (35/65 atau 40/60).
+// - Entry: Pullback (RSI14 Wilder, ambang 35/65 atau 40/60) atau Breakout
+//   (close menembus high/low 12 atau 24 candle 5m sebelumnya, searah tren).
 // - Kekuatan: DMI(14, 14) — mati, ADX > 20, atau ADX > 20 dengan DI searah.
-// - Lokasi: opsi filter POC volume profile 24 jam (bin 5 bps).
-// - Bracket TP = SL = 0,2% dari harga fill, time stop 60 menit, fee 0,035%.
-// - Tanpa trailing, tanpa reversal, satu posisi, jendela entry Sen 07:00 -
+// - Volatilitas: persentil ATR14(1h)/close dalam 720 candle 1 jam (30 hari);
+//   "tinggi" = persentil >= 67.
+// - Lokasi: POC volume profile 24 jam (bin 5 bps). Pullback: long di/bawah
+//   POC, short di/atas POC. Breakout: long di/atas POC, short di/bawah POC.
+// - Bracket TP = SL = 0,2% dari harga fill, time stop 60 menit, fee 0,035%,
+//   tanpa trailing, tanpa reversal, satu posisi, jendela entry Sen 07:00 -
 //   Sab 00:00 WIB.
 // =============================================================================
-strategy("Pine-adapted gate v1 (alat bantu visual)", shorttitle="PAG v1",
+strategy("Pine-adapted gate v2 (alat bantu visual)", shorttitle="PAG v2",
      overlay=true,
      initial_capital=100000,
      currency=currency.USDT,
@@ -48,18 +54,22 @@ trendSrc = input.string("H1", "Sumber tren", options=["E200", "H1", "H4"], group
      tooltip="E200 = close vs EMA200 di chart 5m. H1/H4 = EMA20 vs EMA50 di candle 1 jam / 4 jam yang sudah tutup.")
 bandAtr = input.float(0.25, "Zona netral H1/H4 (x ATR14)", step=0.05, group=grpT)
 
-grpP = "Timing pullback"
-rsiLen = input.int(14, "Panjang RSI", options=[5, 14], group=grpP)
-rsiBand = input.string("35/65", "Ambang RSI", options=["35/65", "40/60"], group=grpP,
-     tooltip="Long saat RSI di bawah ambang bawah dalam tren naik; short saat RSI di atas ambang atas dalam tren turun.")
+grpE = "Entry"
+entryType = input.string("Pullback", "Jenis entry", options=["Pullback", "Breakout"], group=grpE,
+     tooltip="Pullback: masuk saat koreksi melawan tren (RSI14). Breakout: masuk saat close menembus high/low N candle sebelumnya, searah tren.")
+rsiBand = input.string("35/65", "Ambang RSI14 (pullback)", options=["35/65", "40/60"], group=grpE)
+brkLen = input.int(12, "Panjang breakout (candle 5m)", options=[12, 24], group=grpE,
+     tooltip="12 = high/low 1 jam terakhir, 24 = 2 jam terakhir.")
 
 grpS = "Kekuatan tren"
 strength = input.string("ADX>20+DI", "Filter kekuatan", options=["Mati", "ADX>20", "ADX>20+DI"], group=grpS,
      tooltip="ADX>20+DI: ADX(14) > 20 dan DI searah trade (DI+ > DI- untuk long, DI- > DI+ untuk short).")
 
-grpV = "Volume profile"
-useVp = input.bool(false, "Filter lokasi POC 24 jam", group=grpV,
-     tooltip="Long hanya jika close <= POC, short hanya jika close >= POC. POC dari candle chart 24 jam terakhir, bin 5 bps.")
+grpF = "Filter tahap 2"
+volState = input.string("Mati", "Kondisi volatilitas", options=["Mati", "Tinggi", "Bukan tinggi"], group=grpF,
+     tooltip="Persentil ATR14(1h)/close dalam 720 candle 1 jam. Tinggi = persentil >= 67.")
+useVp = input.bool(false, "Filter lokasi POC 24 jam", group=grpF,
+     tooltip="Pullback: long jika close <= POC, short jika close >= POC. Breakout: long jika close >= POC, short jika close <= POC.")
 
 grpR = "Eksekusi"
 tpPct = input.float(0.20, "Take profit (%)", step=0.01, group=grpR)
@@ -67,8 +77,9 @@ slPct = input.float(0.20, "Stop loss (%)", step=0.01, group=grpR)
 timeStopMin = input.int(60, "Time stop (menit)", minval=5, group=grpR)
 useWindow = input.bool(true, "Jendela entry Sen 07:00 - Sab 00:00 WIB", group=grpR)
 
-FEE_RT_BPS = 7.0    // 0,035% per sisi x 2 sisi
-VP_BIN_PCT = 0.05   // lebar bin volume profile: 5 bps dari harga
+FEE_RT_BPS = 7.0      // 0,035% per sisi x 2 sisi
+VP_BIN_PCT = 0.05     // lebar bin volume profile: 5 bps dari harga
+VOL_HIGH_PCT = 67.0   // batas "volatilitas tinggi" (persentil)
 VP_BARS = math.max(1, math.min(480, math.round(86400.0 / timeframe.in_seconds())))
 
 // ------------------------------------------------------------ arah tren
@@ -86,15 +97,26 @@ else if not na(hE20) and not na(hE50) and not na(hAtr)
     float diff = hE20 - hE50
     trend := diff > bandAtr * hAtr ? 1 : diff < -bandAtr * hAtr ? -1 : 0
 
-// ----------------------------------------------- timing dan kekuatan tren
-r = ta.rsi(close, rsiLen)
+// --------------------------------------------------------------- entry
+r = ta.rsi(close, 14)
 lowerBand = rsiBand == "35/65" ? 35.0 : 40.0
 upperBand = 100.0 - lowerBand
+hiN = ta.highest(high, brkLen)[1]
+loN = ta.lowest(low, brkLen)[1]
+isPull = entryType == "Pullback"
+longEntry = isPull ? r < lowerBand : close > hiN
+shortEntry = isPull ? r > upperBand : close < loN
 
+// ----------------------------------------------------- kekuatan tren
 [diPlus, diMinus, adx] = ta.dmi(14, 14)
 adxOk = adx > 20
 longStrong = strength == "Mati" ? true : strength == "ADX>20" ? adxOk : (adxOk and diPlus > diMinus)
 shortStrong = strength == "Mati" ? true : strength == "ADX>20" ? adxOk : (adxOk and diMinus > diPlus)
+
+// -------------------------------------------------- kondisi volatilitas
+volPct = request.security(syminfo.tickerid, "60", ta.percentrank(ta.atr(14) / close, 720)[1],
+     lookahead=barmerge.lookahead_on)
+volOk = volState == "Mati" ? true : na(volPct) ? false : volState == "Tinggi" ? volPct >= VOL_HIGH_PCT : volPct < VOL_HIGH_PCT
 
 // ------------------------------------------------------- jendela entry
 dow = dayofweek(time_close, "Asia/Jakarta")
@@ -102,8 +124,8 @@ hr = hour(time_close, "Asia/Jakarta")
 inWindow = not useWindow or (dow >= dayofweek.monday and dow <= dayofweek.friday and (dow != dayofweek.monday or hr >= 7))
 
 flat = strategy.position_size == 0
-longRaw = trend == 1 and r < lowerBand and longStrong
-shortRaw = trend == -1 and r > upperBand and shortStrong
+longRaw = trend == 1 and longEntry and longStrong and volOk
+shortRaw = trend == -1 and shortEntry and shortStrong and volOk
 
 // ------------------------------------------------------ volume profile
 hh = ta.highest(high, VP_BARS)
@@ -138,8 +160,8 @@ vpWanted = useVp and flat and inWindow and (longRaw or shortRaw)
 if vpWanted and not na(hh) and not na(ll)
     poc := f_poc(hh, ll, VP_BARS, close, VP_BIN_PCT)
 
-longOk = longRaw and (not useVp or (not na(poc) and close <= poc))
-shortOk = shortRaw and (not useVp or (not na(poc) and close >= poc))
+longOk = longRaw and (not useVp or (not na(poc) and (isPull ? close <= poc : close >= poc)))
+shortOk = shortRaw and (not useVp or (not na(poc) and (isPull ? close >= poc : close <= poc)))
 
 var int vpBlocked = 0
 if vpWanted and not (longOk or shortOk)
@@ -167,6 +189,8 @@ if strategy.position_size != 0 and strategy.opentrades > 0
 plot(trendSrc == "E200" ? e200 : na, "EMA200 5m", color=color.orange, linewidth=2)
 plot(trendSrc != "E200" ? hE20 : na, "EMA20 HTF", color=color.aqua, linewidth=2)
 plot(trendSrc != "E200" ? hE50 : na, "EMA50 HTF", color=color.fuchsia, linewidth=2)
+plot(not isPull ? hiN : na, "High N (breakout)", color=color.new(color.lime, 40), style=plot.style_stepline)
+plot(not isPull ? loN : na, "Low N (breakout)", color=color.new(color.red, 40), style=plot.style_stepline)
 plot(poc, "POC 24 jam", color=color.yellow, style=plot.style_circles, linewidth=3)
 bgcolor(trend == 1 ? color.new(color.green, 92) : trend == -1 ? color.new(color.red, 92) : na, title="Arah tren")
 plotshape(flat and inWindow and longOk, "Sinyal long", shape.triangleup, location.belowbar, color.lime, size=size.tiny)
@@ -176,7 +200,7 @@ plotshape(vpWanted and not (longOk or shortOk), "Ditolak VP", shape.xcross, loca
 // ------------------------------------------------------------ ringkasan
 // WR = TP / (TP + SL); time stop dihitung terpisah. Gross dari harga saja
 // (sebelum fee); net per 1 juta volume = 50 x (gross bps - 7).
-var table dash = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 25), border_width=1)
+var table dash = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 25), border_width=1)
 if barstate.islast
     int n = strategy.closedtrades
     int nTp = 0
@@ -202,9 +226,10 @@ if barstate.islast
     float wr = nTp + nSl > 0 ? 100.0 * nTp / (nTp + nSl) : na
     float grossBps = n > 0 ? sumBps / n : na
     float net1m = na(grossBps) ? na : 50.0 * (grossBps - FEE_RT_BPS)
+    string setup = trendSrc + " | " + (isPull ? "Pullback RSI14 " + rsiBand : "Breakout " + str.tostring(brkLen)) + " | " + strength + (volState != "Mati" ? " | Vol " + volState : "") + (useVp ? " | VP" : "")
 
-    table.cell(dash, 0, 0, "PAG v1 (visual, bukan bukti)", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 0, trendSrc + " | RSI" + str.tostring(rsiLen) + " " + rsiBand + " | " + strength + (useVp ? " | VP" : ""), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 0, "PAG v2 (visual, bukan bukti)", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, setup, text_color=color.white, text_size=size.small)
     table.cell(dash, 0, 1, "Trade (TP / SL / time)", text_color=color.gray, text_size=size.small)
     table.cell(dash, 1, 1, str.tostring(n) + " (" + str.tostring(nTp) + " / " + str.tostring(nSl) + " / " + str.tostring(nTs) + ")", text_color=color.white, text_size=size.small)
     table.cell(dash, 0, 2, "WR = TP/(TP+SL)", text_color=color.gray, text_size=size.small)
@@ -219,5 +244,7 @@ if barstate.islast
     table.cell(dash, 1, 6, str.tostring(vpBlocked), text_color=color.white, text_size=size.small)
     table.cell(dash, 0, 7, "Arah saat ini", text_color=color.gray, text_size=size.small)
     table.cell(dash, 1, 7, trend == 1 ? "naik (long saja)" : trend == -1 ? "turun (short saja)" : "netral (tidak entry)", text_color=color.white, text_size=size.small)
-    table.cell(dash, 0, 8, "Timeframe chart", text_color=color.gray, text_size=size.small)
-    table.cell(dash, 1, 8, timeframe.period == "5" ? "5m (sesuai spek)" : "BUKAN 5m - ganti ke 5m", text_color=timeframe.period == "5" ? color.white : color.red, text_size=size.small)
+    table.cell(dash, 0, 8, "Volatilitas 1h (persentil)", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 8, na(volPct) ? "-" : str.tostring(volPct, "#") + (volPct >= VOL_HIGH_PCT ? " (tinggi)" : ""), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 9, "Timeframe chart", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 9, timeframe.period == "5" ? "5m (sesuai spek)" : "BUKAN 5m - ganti ke 5m", text_color=timeframe.period == "5" ? color.white : color.red, text_size=size.small)
