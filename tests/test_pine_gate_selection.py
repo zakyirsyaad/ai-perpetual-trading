@@ -109,6 +109,11 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(len(set(script.calls)), len(script.calls))  # evaluated once each
         self.assertEqual(len(sel.results), 61)
 
+    def test_evaluate_returning_another_rule_is_rejected(self):
+        wrong = lambda rule: result(RULES[0])
+        with self.assertRaises(ValueError):
+            select(wrong, CFG)
+
     def test_stage2_variant_can_win_and_pbo_covers_every_result(self):
         base = RULES[0]
         variant = RuleSpec(base.trend, base.entry, base.strength, "HIGH", "OFF")
@@ -177,9 +182,21 @@ class SelectTest(unittest.TestCase):
         overrides[RULES[2].key()] = result(RULES[2], score=3.0, supply=4.0)
         sel = select(Script(overrides), CFG)
         self.assertTrue(sel.supply_limited)
-        self.assertIn(thin, sel.top)  # ranked in the pool of all 36
-        self.assertEqual(sel.choice, RULES[2])  # but min_tp_sl still binds the winner
+        self.assertNotIn(thin, sel.top)  # supply is dropped, the sample floor is not
+        self.assertEqual(len(sel.top), 5)  # 35 valid rules fill the top 5
+        self.assertEqual(sel.top[0], RULES[2])
+        self.assertEqual(sel.choice, RULES[2])
         self.assertTrue(sel.stable)
+
+    def test_supply_limited_with_every_rule_thin_selects_nothing(self):
+        overrides = {r.key(): result(r, supply=4.0, n=900) for r in RULES}
+        script = Script(overrides)
+        sel = select(script, CFG)
+        self.assertTrue(sel.supply_limited)
+        self.assertEqual(sel.top, ())
+        self.assertIsNone(sel.choice)
+        self.assertFalse(sel.stable)
+        self.assertEqual(len(script.calls), 36)  # no Stage 2 without a top
 
     def test_supply_limited_not_flagged_when_some_rule_is_eligible(self):
         overrides = {r.key(): result(r, supply=4.0) for r in RULES}
@@ -190,11 +207,9 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(sel.choice, RULES[5])
 
     def test_ties_break_by_rule_order(self):
-        ordered = sorted(RULES)
         sel = select(Script(), CFG)
-        self.assertEqual(sel.top, tuple(ordered[:5]))
-        base = RuleSpec(sel.choice.trend, sel.choice.entry, sel.choice.strength)
-        self.assertEqual(base, ordered[0])
+        self.assertEqual(sel.top, tuple(RULES[:5]))  # Stage-1 order, not alphabetical
+        self.assertEqual(sel.choice, RULES[0])  # the base beats its filtered variants
 
 
 def trade(entry_ms, kind, day, gross=0.0):
@@ -219,7 +234,7 @@ class SummarizeTest(unittest.TestCase):
         trades.append(trade(2100, "SL", block_days[2][0]))
         trades.append(trade(3600, "TP", block_days[3][0]))
         rule = RULES[0]
-        res = summarize(rule, trades, block_bounds, cscv_bounds, block_days, all_days)
+        res = summarize(rule, trades, block_bounds, cscv_bounds, block_days, all_days, z=CFG.z)
         self.assertEqual(res.rule, rule)
         self.assertEqual(res.block_counts, ((3, 1), (0, 0), (0, 1), (1, 0)))
         self.assertEqual(sum(tp + sl for tp, sl in res.cscv_counts), 6)
@@ -243,7 +258,7 @@ class SummarizeTest(unittest.TestCase):
         d = date(2026, 1, 5)
         res = summarize(
             RULES[0], [trade(9999, "TP", d)], ((0, 1000),) * 4, ((0, 500),) * 8,
-            ((d,),) * 4, (d,),
+            ((d,),) * 4, (d,), z=CFG.z,
         )
         self.assertEqual(res.block_counts, ((0, 0),) * 4)
         self.assertEqual(res.n_tp_sl, 1)  # the pooled total still counts every trade

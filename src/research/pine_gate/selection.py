@@ -83,7 +83,8 @@ def summarize(
     cscv_bounds_ms: Sequence[TimeRange],
     block_days: Sequence[Sequence[date]],
     trading_days: Sequence[date],
-    z: float = SelectionConfig.z,
+    *,
+    z: float,
 ) -> RuleResult:
     """Reduce one rule's training trades to the numbers selection needs."""
     if len(block_bounds_ms) != len(block_days):
@@ -157,23 +158,34 @@ def select(evaluate: Callable[[RuleSpec], RuleResult], cfg: SelectionConfig) -> 
     def run(rule: RuleSpec) -> RuleResult:
         key = rule.key()
         if key not in cache:
-            cache[key] = evaluate(rule)
+            res = evaluate(rule)
+            if res.rule != rule:
+                raise ValueError(f"evaluate({key}) returned a result for {res.rule.key()}")
+            cache[key] = res
         return cache[key]
 
+    stage1 = stage1_rules()
+    order = {r.key(): i for i, r in enumerate(stage1)}
+
     def ranked(rules: Sequence[RuleSpec]) -> list:
+        """Best first; exact ties prefer the simpler rule (no filters, then
+        Stage-1 order of the base, then RuleSpec order)."""
         scored = [(rank_value(cache[r.key()], cfg), r) for r in rules]
         scored = [(v, r) for v, r in scored if v != -math.inf]
-        scored.sort(key=lambda vr: (-vr[0], vr[1]))
+        scored.sort(key=lambda vr: (
+            -vr[0], vr[1].vol != "OFF", vr[1].vp != "OFF",
+            order[_base_of(vr[1]).key()], vr[1],
+        ))
         return scored
 
-    stage1 = stage1_rules()
     for rule in stage1:
         run(rule)
 
     pool = [r for r in stage1 if eligible(cache[r.key()], cfg)]
     supply_limited = not pool
     if supply_limited:
-        pool = list(stage1)
+        # Only the supply condition is dropped; the bracket-exit floor stays.
+        pool = [r for r in stage1 if _sample_ok(cache[r.key()], cfg)]
         passes = _sample_ok
     else:
         passes = eligible
