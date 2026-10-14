@@ -2,7 +2,9 @@
 
 Research code; the bot never imports it. It reads the live bot's Supabase
 records READ-ONLY through an injected ``get_rows`` coroutine (one PostgREST
-page per call) and pages every query itself. The two outputs calibrate the
+page per call) and pages every query itself, at most ``MAX_PAGES`` pages.
+``make_get_rows`` yields a reader that only GETs the three tables in
+``READ_TABLES`` and closes the store's HTTP client afterwards. The two outputs calibrate the
 simulator: the entry-call latency distribution and ``s*``, how far past the
 stop level live stop-loss exits actually filled (the bot polls every 5 s and
 closes with a market order).
@@ -12,17 +14,22 @@ and ``CompactDecisionContextBuilder.build_entry_payload``)::
 
     payload_json.decision.stop_loss_pct
     payload_json.request.market_context.technicals  # [{symbol, last_price, atr_14, ...}]
+
+Only those paths are selected (``json_select``; PostgREST ``alias:column->key``,
+null when a path is absent) and ``payload_from_row`` rebuilds the payload.
 """
 
 from __future__ import annotations
 
 import bisect
+import json
 import logging
 import math
 import statistics
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .spec import FillConfig
 from .timeparse import parse_iso_datetime
@@ -30,6 +37,15 @@ from .timeparse import parse_iso_datetime
 GetRows = Callable[[str, "list[tuple[str, str]]"], Awaitable["list[dict]"]]
 
 PAGE_SIZE = 1000  # PostgREST server cap per request
+DECISION_PAGE_SIZE = 500  # decision rows carry JSON; smaller pages
+MAX_PAGES = 200  # a server that keeps answering full pages is refused, not followed
+READ_TABLES = frozenset({"trades", "ai_decisions", "ai_call_metrics"})
+# PostgREST JSON paths of ai_decisions.payload_json, selected under these aliases.
+JSON_PATHS = {
+    "pj_decision": "payload_json->decision",
+    "pj_technicals": "payload_json->request->market_context->technicals",
+    "pj_ai_call_id": "payload_json->ai_call_id",
+}
 _ORDER = "created_at.asc,id.asc"
 DECISION_WINDOW_SECONDS = 180
 _DECISION_LOOKBACK = timedelta(days=1)
@@ -44,6 +60,10 @@ def _day_start_iso(day: str) -> str:
 
 DEFAULT_LATENCY_SINCE = _day_start_iso(_FILL.latency_since)
 DEFAULT_OVERSHOOT_SINCE = _day_start_iso(_FILL.overshoot_since)
+
+
+class TooManyPagesError(RuntimeError):
+    """A query returned full pages ``MAX_PAGES`` times in a row."""
 
 
 @dataclass(frozen=True)
@@ -67,20 +87,52 @@ def _positive_finite(value: Any) -> Optional[float]:
 
 
 async def fetch_all(
-    get_rows: GetRows, table: str, params: Sequence[Tuple[str, str]]
+    get_rows: GetRows,
+    table: str,
+    params: Sequence[Tuple[str, str]],
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
 ) -> List[dict]:
-    """Page with limit/offset until a page returns fewer than ``PAGE_SIZE`` rows."""
+    """Page with limit/offset until a page returns fewer than ``page_size`` rows;
+    ``TooManyPagesError`` after ``max_pages`` full pages."""
     rows: List[dict] = []
-    offset = 0
-    while True:
+    for page_no in range(max_pages):
+        offset = page_no * page_size
         page = await get_rows(
             table,
-            [*params, ("order", _ORDER), ("limit", str(PAGE_SIZE)), ("offset", str(offset))],
+            [*params, ("order", _ORDER), ("limit", str(page_size)), ("offset", str(offset))],
         )
         rows.extend(page)
-        if len(page) < PAGE_SIZE:
+        if len(page) < page_size:
             return rows
-        offset += PAGE_SIZE
+    raise TooManyPagesError(f"{table}: more than {max_pages} pages of {page_size} rows")
+
+
+def json_select(*aliases: str) -> str:
+    """``alias:payload_json->path`` select items for the given ``JSON_PATHS`` aliases."""
+    return ",".join(f"{alias}:{JSON_PATHS[alias]}" for alias in aliases)
+
+
+def payload_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The decision payload of a row: its full ``payload_json`` (dict or JSON text) when
+    present, else the parts rebuilt from the ``JSON_PATHS`` columns it carries."""
+    raw = row.get("payload_json")
+    if raw is not None:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return {}
+        return raw if isinstance(raw, dict) else {}
+    payload: Dict[str, Any] = {}
+    if "pj_decision" in row:
+        payload["decision"] = row["pj_decision"]
+    if "pj_technicals" in row:
+        payload["request"] = {"market_context": {"technicals": row["pj_technicals"]}}
+    if "pj_ai_call_id" in row:
+        payload["ai_call_id"] = row["pj_ai_call_id"]
+    return payload
 
 
 async def load_entry_latencies_ms(
@@ -205,10 +257,11 @@ async def stop_overshoot_detail(
         get_rows,
         decisions_table,
         [
-            ("select", "id,created_at,symbol,action,payload_json"),
+            ("select", "id,created_at,symbol,action," + json_select("pj_decision", "pj_technicals")),
             ("action", "in.(OPEN_LONG,OPEN_SHORT)"),
             ("created_at", f"gte.{lookback_iso}"),
         ],
+        page_size=DECISION_PAGE_SIZE,
     )
     index = _DecisionIndex(decisions)
     samples: List[float] = []
@@ -220,7 +273,7 @@ async def stop_overshoot_detail(
         if opened_at is not None and action is not None:
             symbol = trade.get("symbol")
             match = index.latest_before(symbol, action, opened_at)
-            context = _entry_context(match.get("payload_json"), symbol) if match else None
+            context = _entry_context(payload_from_row(match), symbol) if match else None
             if context is not None:
                 overshoot = _overshoot_bps(trade, _stop_pct(*context))
         if overshoot is None:
@@ -265,9 +318,32 @@ async def load_calibration(
     )
 
 
-def make_get_rows(settings: Any) -> GetRows:  # pragma: no cover
-    """Wrap the bot's ``SupabaseTradeStore._get_rows`` (read-only; no URLs or keys are logged)."""
+def read_only(get_rows: GetRows) -> GetRows:
+    """A reader of ``READ_TABLES`` only; any other table is a ``ValueError``."""
+
+    async def read(table: str, params: "list[tuple[str, str]]") -> "list[dict]":
+        if table not in READ_TABLES:
+            raise ValueError(f"table {table!r} is not readable here")
+        return await get_rows(table, list(params))
+
+    return read
+
+
+@asynccontextmanager
+async def make_get_rows(
+    settings: Any, store_factory: Optional[Callable[[Any], Any]] = None
+) -> AsyncIterator[GetRows]:
+    """``async with make_get_rows(settings) as get_rows``: a ``read_only`` reader over the
+    bot's Supabase store (GET only; the store itself is never handed out), whose HTTP
+    client is closed on exit. ``store_factory`` is for tests."""
+    store = (store_factory or _bot_store)(settings)
+    try:
+        yield read_only(store._get_rows)
+    finally:
+        await store.close()
+
+
+def _bot_store(settings: Any) -> Any:  # pragma: no cover - builds the live store
     from bot.storage.supabase_trade_store import SupabaseTradeStore
 
-    store = SupabaseTradeStore(settings, logging.getLogger("research.pine_gate.calibrate"))
-    return store._get_rows
+    return SupabaseTradeStore(settings, logging.getLogger("research.pine_gate.calibrate"))

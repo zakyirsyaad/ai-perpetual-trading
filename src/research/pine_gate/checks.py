@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .bars import Bars, bars_from_rows, entry_index_for, wib_day
+from .calibrate import payload_from_row
 from .features import FeatureFrame
 from .outcomes import OutcomeCache
 from .simulate import SignalFn
@@ -174,16 +175,6 @@ class DecisionRow:
     ai_call_id: Optional[str]
 
 
-def _payload(row: Dict[str, Any]) -> Dict[str, Any]:
-    payload = row.get("payload_json")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            return {}
-    return payload if isinstance(payload, dict) else {}
-
-
 def parse_decision(row: Dict[str, Any]) -> Optional[DecisionRow]:
     """Turn an ``ai_decisions`` row into a ``DecisionRow``; ``None`` if unusable.
 
@@ -205,7 +196,7 @@ def parse_decision(row: Dict[str, Any]) -> Optional[DecisionRow]:
         return None
     if not math.isfinite(confidence):
         return None
-    payload = _payload(row)
+    payload = payload_from_row(row)
     decision = payload.get("decision")
     review = decision.get("risk_review") if isinstance(decision, dict) else None
     approved = isinstance(review, dict) and review.get("approved") is True

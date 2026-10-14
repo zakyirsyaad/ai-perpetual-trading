@@ -32,11 +32,15 @@ CALIBRATION_PREFIX = "pine_gate_calibration_"
 # --------------------------------------------------------------------------- calibrate
 
 
-async def _read_calibration(get_rows: Any, settings: Any) -> Tuple[Any, List[float]]:
-    detail = await stop_overshoot_detail(
-        get_rows, settings.supabase_trades_table, settings.supabase_ai_decisions_table
-    )
-    latencies = await load_entry_latencies_ms(get_rows, settings.supabase_ai_call_metrics_table)
+async def _read_calibration(settings: Any) -> Tuple[Any, List[float]]:
+    """Stop overshoots and entry latencies through the read-only Supabase reader."""
+    async with common.make_get_rows(settings) as get_rows:
+        detail = await stop_overshoot_detail(
+            get_rows, settings.supabase_trades_table, settings.supabase_ai_decisions_table
+        )
+        latencies = await load_entry_latencies_ms(
+            get_rows, settings.supabase_ai_call_metrics_table
+        )
     return detail, latencies
 
 
@@ -45,10 +49,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     if path.exists():
         raise FileExistsError(f"{path}: already exists; remove it deliberately to write again")
     settings = common.call_live("loading the bot settings", common.make_settings)
-    get_rows = common.call_live("opening the Supabase reader",
-                                lambda: common.make_get_rows(settings))
     detail, latencies = common.call_live(
-        "reading Supabase", lambda: asyncio.run(_read_calibration(get_rows, settings))
+        "reading Supabase", lambda: asyncio.run(_read_calibration(settings))
     )
     doc = {
         "s_star_bps": s_star(detail.samples),

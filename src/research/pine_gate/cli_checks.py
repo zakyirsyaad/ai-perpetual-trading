@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import cli_common as common
 from .bars import Bars, entry_index_for, interval_to_ms, load_days, wib_day
-from .calibrate import fetch_all
+from .calibrate import DECISION_PAGE_SIZE, fetch_all, json_select
 from .checks import (
     DecisionRow,
     decision_buckets,
@@ -231,18 +231,22 @@ def cmd_vst_check(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- decisions
 
 
-async def _read_decisions(get_rows: Any, settings: Any) -> Tuple[List[dict], List[dict]]:
-    decisions = await fetch_all(get_rows, settings.supabase_ai_decisions_table, [
-        ("select", "id,created_at,symbol,action,confidence,payload_json"),
-        ("symbol", DECISIONS_STORED_SYMBOLS),
-        ("exchange", "eq.bingx"),
-        ("created_at", f"gte.{DECISIONS_SINCE}"),
-    ])
-    metrics = await fetch_all(get_rows, settings.supabase_ai_call_metrics_table, [
-        ("select", "id,created_at,call_id,latency_ms,purpose,success"),
-        ("purpose", f"eq.{_FILL.latency_purpose}"),
-        ("created_at", f"gte.{METRICS_SINCE}"),
-    ])
+async def _read_decisions(settings: Any) -> Tuple[List[dict], List[dict]]:
+    """Stored BTC decisions (only the JSON paths parse_decision reads) and entry-call
+    metrics, through the read-only Supabase reader."""
+    async with common.make_get_rows(settings) as get_rows:
+        decisions = await fetch_all(get_rows, settings.supabase_ai_decisions_table, [
+            ("select", "id,created_at,symbol,action,confidence,"
+                       + json_select("pj_decision", "pj_ai_call_id")),
+            ("symbol", DECISIONS_STORED_SYMBOLS),
+            ("exchange", "eq.bingx"),
+            ("created_at", f"gte.{DECISIONS_SINCE}"),
+        ], page_size=DECISION_PAGE_SIZE)
+        metrics = await fetch_all(get_rows, settings.supabase_ai_call_metrics_table, [
+            ("select", "id,created_at,call_id,latency_ms,purpose,success"),
+            ("purpose", f"eq.{_FILL.latency_purpose}"),
+            ("created_at", f"gte.{METRICS_SINCE}"),
+        ])
     return decisions, metrics
 
 
@@ -302,10 +306,8 @@ def place_rows(rows: Sequence[DecisionRow], latency: Mapping[str, float], median
 def _live_decisions() -> Tuple[List[dict], Dict[str, float]]:
     """Stored decisions and the entry-call latencies, read-only from Supabase."""
     settings = common.call_live("loading the bot settings", common.make_settings)
-    get_rows = common.call_live("opening the Supabase reader",
-                                lambda: common.make_get_rows(settings))
     raw, metrics = common.call_live("reading Supabase",
-                                    lambda: asyncio.run(_read_decisions(get_rows, settings)))
+                                    lambda: asyncio.run(_read_decisions(settings)))
     latency = entry_latencies(metrics)
     if not latency:
         raise common.CliError("no successful entry-call latency in ai_call_metrics")

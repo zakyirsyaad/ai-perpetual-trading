@@ -557,6 +557,16 @@ class FakeSettings:
     supabase_ai_call_metrics_table = "ai_call_metrics"
 
 
+def reader(rows):
+    """A stand-in for ``cli_common.make_get_rows``: an async context manager yielding ``rows``."""
+
+    @contextlib.asynccontextmanager
+    async def make(settings):
+        yield rows
+
+    return make
+
+
 class FakeRows:
     """Async get_rows: one page per table, then empty pages; records the params."""
 
@@ -577,7 +587,7 @@ class CalibrateCommandTest(Dirs):
                                              {"created_at": "2026-09-27T00:00:00Z",
                                               "latency_ms": 2500}]})
         with mock.patch.object(cli_common, "make_settings", FakeSettings), \
-                mock.patch.object(cli_common, "make_get_rows", lambda s: rows):
+                mock.patch.object(cli_common, "make_get_rows", reader(rows)):
             code, out, err = run_cli(self.base_args() + ["calibrate"])
             self.assertEqual(code, 0, err)
             path = self.out / "pine_gate_calibration_20261014.json"
@@ -725,8 +735,7 @@ class DecisionsCommandTest(Dirs):
         decisions = [
             {"id": 1, "created_at": iso(base + 3 * HOUR), "symbol": "BTC/USDT",
              "action": "OPEN_LONG", "confidence": 0.8,
-             "payload_json": {"decision": {"risk_review": {"approved": True}},
-                              "ai_call_id": "call-1"}},
+             "pj_decision": {"risk_review": {"approved": True}}, "pj_ai_call_id": "call-1"},
             {"id": 2, "created_at": iso(base + 5 * HOUR), "symbol": "BTC/USDT",
              "action": "HOLD", "confidence": 0.5, "payload_json": {"ai_call_id": None}},
             {"id": 3, "created_at": iso(base + 30 * DAY), "symbol": "BTC/USDT",
@@ -742,7 +751,7 @@ class DecisionsCommandTest(Dirs):
 
         with mock.patch.object(cli_checks, "load_selection_checked", lambda p, s: SELECTION), \
                 mock.patch.object(cli_common, "make_settings", FakeSettings), \
-                mock.patch.object(cli_common, "make_get_rows", lambda s: fake):
+                mock.patch.object(cli_common, "make_get_rows", reader(fake)):
             code, out, err = run_cli(self.base_args() + [
                 "decisions", "--selection", str(self.out / "s.json")])
         self.assertEqual(code, 0, err)
@@ -754,6 +763,9 @@ class DecisionsCommandTest(Dirs):
         self.assertEqual(doc["buckets"]["A"]["n"], 1)
         decision_params = dict(next(p for t, p in fake.calls if t == "ai_decisions"))
         self.assertEqual(decision_params["exchange"], "eq.bingx")
+        self.assertIn("pj_decision:payload_json->decision", decision_params["select"])
+        self.assertIn("pj_ai_call_id:payload_json->ai_call_id", decision_params["select"])
+        self.assertNotIn(",payload_json,", decision_params["select"] + ",")
         self.assertTrue(decision_params["created_at"].startswith("gte.2026-08-31"))
         self.assertIn("decisions", out)
 

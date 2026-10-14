@@ -2,11 +2,18 @@ import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from research.pine_gate import calibrate
 from research.pine_gate.calibrate import (
+    MAX_PAGES,
     PAGE_SIZE,
+    READ_TABLES,
     Calibration,
+    TooManyPagesError,
+    fetch_all,
     load_calibration,
     load_entry_latencies_ms,
+    make_get_rows,
+    payload_from_row,
     s_star,
     stop_overshoot_detail,
     stop_overshoot_samples,
@@ -227,6 +234,134 @@ class StopReconstructionTests(unittest.TestCase):
         self.assertEqual(detail.skipped, PAGE_SIZE + 3)
         trade_calls = [c for c in fake.calls if c[0] == "trades"]
         self.assertEqual(len(trade_calls), 2)
+
+
+class JsonPathSelectTests(unittest.TestCase):
+    """Decisions are read as three JSON paths, not the whole payload_json (D2)."""
+
+    def test_decision_query_selects_only_the_needed_paths(self):
+        fake = FakeRows({"trades": [], "ai_decisions": []})
+        asyncio.run(stop_overshoot_detail(fake, "trades", "ai_decisions"))
+        params = dict(fake.calls[1][1])
+        self.assertEqual(params["select"], "id,created_at,symbol,action,"
+                         "pj_decision:payload_json->decision,"
+                         "pj_technicals:payload_json->request->market_context->technicals")
+        self.assertNotIn("payload_json,", params["select"] + ",")
+        self.assertEqual(params["limit"], str(calibrate.DECISION_PAGE_SIZE))
+
+    def test_rows_with_path_columns_reconstruct_the_stop(self):
+        trades = [stop_trade(1, "LONG", 100.0, 99.5, T0)]
+        full = decision(10, T0 - timedelta(seconds=30), "BTC/USDT", "OPEN_LONG", 0.30, 0.1, 100.0)
+        payload = full.pop("payload_json")
+        selected = dict(full, pj_decision=payload["decision"],
+                        pj_technicals=payload["request"]["market_context"]["technicals"])
+        fake = FakeRows({"trades": trades, "ai_decisions": [selected]})
+        detail = asyncio.run(stop_overshoot_detail(fake, "trades", "ai_decisions"))
+        self.assertEqual(len(detail.samples), 1)
+        self.assertAlmostEqual(detail.samples[0], 20.0, places=6)
+        absent = dict(full, pj_decision=None, pj_technicals=None)  # a path the row lacks
+        fake = FakeRows({"trades": trades, "ai_decisions": [absent]})
+        detail = asyncio.run(stop_overshoot_detail(fake, "trades", "ai_decisions"))
+        self.assertEqual((detail.samples, detail.skipped), ((), 1))
+
+    def test_payload_from_row_prefers_a_full_payload_and_parses_text(self):
+        self.assertEqual(payload_from_row({"payload_json": {"a": 1}, "pj_decision": {"b": 2}}),
+                         {"a": 1})
+        self.assertEqual(payload_from_row({"payload_json": '{"a": 1}'}), {"a": 1})
+        self.assertEqual(payload_from_row({"payload_json": "not json"}), {})
+        self.assertEqual(payload_from_row({"pj_decision": {"x": 1}, "pj_ai_call_id": "c"}),
+                         {"decision": {"x": 1}, "ai_call_id": "c"})
+        self.assertEqual(payload_from_row({"pj_technicals": [1]}),
+                         {"request": {"market_context": {"technicals": [1]}}})
+        self.assertEqual(payload_from_row({}), {})
+
+
+class PagingCapTests(unittest.TestCase):
+    def test_a_server_that_keeps_returning_full_pages_is_refused(self):
+        calls = []
+
+        async def endless(table, params):
+            calls.append(dict(params))
+            return [{"id": len(calls)}] * 2
+
+        with self.assertRaises(TooManyPagesError):
+            asyncio.run(fetch_all(endless, "trades", [], page_size=2, max_pages=3))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c["offset"] for c in calls], ["0", "2", "4"])
+        self.assertGreaterEqual(MAX_PAGES, 100)
+
+
+class FakeStore:
+    """Stands in for SupabaseTradeStore: records reads, fails on any write."""
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.reads = []
+        self.closed = False
+
+    async def _get_rows(self, table, params):
+        self.reads.append((table, list(params)))
+        offset = int(dict(params).get("offset", "0"))
+        return list(self.rows) if offset == 0 else []
+
+    async def _insert(self, *a, **k):
+        raise AssertionError("write")
+
+    async def _upsert(self, *a, **k):
+        raise AssertionError("write")
+
+    async def _delete(self, *a, **k):
+        raise AssertionError("write")
+
+    async def close(self):
+        self.closed = True
+
+
+class ReadOnlyReaderTests(unittest.TestCase):
+    """make_get_rows yields only a GET closure over three tables and closes the store (D1)."""
+
+    def read(self, store, body):
+        async def run():
+            async with make_get_rows(object(), store_factory=lambda settings: store) as get_rows:
+                return await body(get_rows)
+
+        return asyncio.run(run())
+
+    def test_only_reads_of_the_three_tables_reach_the_store(self):
+        self.assertEqual(READ_TABLES, frozenset({"trades", "ai_decisions", "ai_call_metrics"}))
+        store = FakeStore([metric("2026-09-26T00:00:00+00:00", 1200.0, idx=1)])
+
+        async def body(get_rows):
+            latencies = await load_entry_latencies_ms(get_rows, "ai_call_metrics")
+            for table in ("open_position_state", "ai_exit_verdicts", "trades; drop"):
+                with self.assertRaises(ValueError):
+                    await get_rows(table, [("select", "id")])
+            return latencies
+
+        self.assertEqual(self.read(store, body), [1200.0])
+        self.assertEqual([t for t, _ in store.reads], ["ai_call_metrics"])
+        self.assertTrue(store.closed)
+
+    def test_the_yielded_reader_exposes_no_store_or_write_method(self):
+        store = FakeStore()
+
+        async def body(get_rows):
+            return get_rows
+
+        get_rows = self.read(store, body)
+        self.assertFalse(hasattr(get_rows, "__self__"))
+        for name in ("_insert", "_upsert", "_delete", "_client", "_get_rows", "close", "store"):
+            self.assertFalse(hasattr(get_rows, name), name)
+
+    def test_the_store_is_closed_when_the_read_fails(self):
+        store = FakeStore()
+
+        async def body(get_rows):
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            self.read(store, body)
+        self.assertTrue(store.closed)
 
 
 class SStarTests(unittest.TestCase):
