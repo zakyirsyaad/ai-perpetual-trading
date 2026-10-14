@@ -320,6 +320,34 @@ class LoadDatasetTests(PipelineFixture):
         self.assertEqual(len(ds.missing_warmups), 4)
         self.assertEqual(self.dataset.missing_warmups, ())
 
+    def test_a_funding_file_with_a_gap_is_refused(self):
+        root = self.tmp / "funding_gap"
+        write_data_dir(root, last_day=date(2026, 7, 22))
+        for symbol, cut in (("BTC-USDT", "hole"), ("ETH-USDT", "short")):
+            path = funding_path(root, symbol)
+            times = json.loads(path.read_text())
+            if cut == "hole":
+                del times[3]
+            else:
+                times = [t for t in times if t < wib(2026, 7, 20)]
+            path.write_text(json.dumps(times))
+            with self.subTest(cut):
+                with self.assertRaises(ValueError) as ctx:
+                    load_dataset(root, until_ms=wib(2026, 7, 22, 12), start_day=FIRST_DAY)
+                self.assertIn("funding", str(ctx.exception))
+                self.assertIn(symbol, str(ctx.exception))
+            write_data_dir(root, last_day=date(2026, 7, 22))  # restore before the next case
+
+    def test_an_unused_warmup_is_recorded_as_missing(self):
+        root = self.tmp / "late_warmup"
+        write_data_dir(root, last_day=date(2026, 7, 22))
+        path = warmup_path(root, "ETH-USDT", "4h")
+        first = wib_day_start_ms(FIRST_DAY) // H4 * H4 + H4  # the first whole 4h bucket
+        write_day(path, [(first + k * H4, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(3)])
+        ds = load_dataset(root, until_ms=wib(2026, 7, 22, 12), start_day=FIRST_DAY)
+        self.assertEqual(len(ds.missing_warmups), 1)
+        self.assertIn("ETH-USDT/4h/warmup.csv.gz", ds.missing_warmups[0])
+
     def test_markets_use_the_given_exec_config(self):
         cfg = replace(ExecConfig(), bracket_pct=0.30)
         ds = load_dataset(
@@ -544,6 +572,13 @@ class TrainStageTests(PipelineFixture):
             train_stage(self.dataset, CALIB, self.tmp / "real_seed", spec_sha256(), seed=1)
         self.assertIn("seed", str(ctx.exception))
         self.assertFalse((self.tmp / "real_seed").exists())
+
+    def test_train_stage_refuses_the_real_sha_without_every_warmup(self):
+        gappy = replace(self.dataset, missing_warmups=("prod/ETH-USDT/4h/warmup.csv.gz",))
+        with self.assertRaises(ValueError) as ctx:
+            train_stage(gappy, CALIB, self.tmp / "real_warmup", spec_sha256())
+        self.assertIn("warm-up", str(ctx.exception))
+        self.assertFalse((self.tmp / "real_warmup").exists())
 
     def test_train_stage_refuses_to_overwrite_a_selection_file(self):
         out = self.tmp / "existing"

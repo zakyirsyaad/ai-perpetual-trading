@@ -2,8 +2,8 @@
 
 Research code; the bot never imports it. Standard library only.
 
-``load_dataset`` reads production 1m day files, the native 1h/4h warm-up and
-the funding times, and cuts every bar series at ``until_ms``. ``train_stage``
+``load_dataset`` (in ``dataset``, importable from here) reads the stored data and
+cuts every bar series at ``until_ms``. ``train_stage``
 refuses a dataset loaded past the training end + 60 minutes, so no holdout bar
 can reach a feature, a trade or the model. It simulates every rule with entry
 ticks blocked in the 65 minutes before each block end (purge), runs the
@@ -14,35 +14,17 @@ that records the spec sha256. The lock the test stage must pass
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import random
 import statistics
-import sys
-from array import array
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .bars import (
-    Bars,
-    bars_from_rows,
-    day_path,
-    entry_index_for,
-    index_closing_at,
-    funding_path,
-    interval_to_ms,
-    load_days,
-    read_day,
-    slice_until,
-    warmup_path,
-    wib_day,
-    wib_day_start_ms,
-)
+from .bars import entry_index_for, index_closing_at, wib_day
 from .calibrate import Calibration
+from .dataset import SYMBOLS, TRAIN_DATA_UNTIL_MS, Dataset, load_dataset
 from .features import FeatureFrame, Snapshot
 from .fileio import exists_message, write_json_exclusive
 from .holdout_gate import c0_side_ok
@@ -56,6 +38,7 @@ from .lock import (
     check_spec_sha,
     code_sha256,
     equal_ranges,
+    is_spec_sha,
     latencies_sha256,
     load_selection_checked,
     python_version,
@@ -75,10 +58,7 @@ from .selection import (
 )
 from .simulate import Market, SignalFn, Trade, in_entry_window, simulate, trading_days
 from .spec import (
-    HOLDOUT_END,
     PURGE_MINUTES,
-    TRAIN_END,
-    TRAIN_START,
     TRENDS,
     WIB,
     ExecConfig,
@@ -86,29 +66,24 @@ from .spec import (
     ModelConfig,
     RuleSpec,
     SelectionConfig,
-    ms,
     stage1_rules,
 )
 from .stats import mean_gross_bps, spa_pvalue, trades_per_trading_day, win_rate
-
-SYMBOLS: Tuple[str, ...] = ("BTC-USDT", "ETH-USDT")  # tick order: BTC first
 
 _MS_PER_MIN = 60_000
 _MS_PER_HOUR = 60 * _MS_PER_MIN
 _MS_PER_DAY = 24 * _MS_PER_HOUR
 _BAR_5M_MS = 5 * _MS_PER_MIN
 
-# Outcomes may resolve up to 60 minutes after the training end; nothing later is loaded.
-TRAIN_DATA_UNTIL_MS = ms(TRAIN_END) + _MS_PER_HOUR
 # Task 8 ruling: the purge gates the TICK time, so it is 5 minutes longer than
 # PURGE_MINUTES; a tick at B - 65 min fills by about B - 63 min and its 60-minute
 # time stop exits before B.
 PURGE_TICK_MINUTES = PURGE_MINUTES + 5
 REGIME_MIN_N = 60
 SELECTION_PREFIX = "pine_gate_selection_"
-_WARMUP_INTERVALS = ("1h", "4h")
 # HoldoutLockError, Segments, equal_ranges, latencies_sha256 and load_selection_checked
-# live in ``lock`` and stay importable from here.
+# live in ``lock``, SYMBOLS, TRAIN_DATA_UNTIL_MS, Dataset and load_dataset in
+# ``dataset``; all stay importable from here.
 
 # --------------------------------------------------------------------------- segments
 
@@ -121,168 +96,6 @@ def purge_windows(segments: Segments) -> Tuple[TimeRange, ...]:
 
 def _in_any(t_ms: int, windows: Sequence[TimeRange]) -> bool:
     return any(a <= t_ms < b for a, b in windows)
-
-
-# --------------------------------------------------------------------------- loading
-
-
-@dataclass(frozen=True)
-class Dataset:
-    frames: Mapping[str, FeatureFrame]
-    markets: Mapping[str, Market]
-    data_sha256: str  # sha256 over the sorted "relative_path:sha256" of every file read
-    loaded_until_ms: int  # nothing at or after this time was kept
-    missing_warmups: Tuple[str, ...] = ()
-    # sha256 over the arrays actually kept after the cut: 1m bars, warm-ups, funding times
-    train_data_sha256: str = ""
-    # the same hash over those arrays cut at TRAIN_DATA_UNTIL_MS: for a training load it
-    # equals train_data_sha256; the holdout compares it with the selection's (spec 5.1)
-    train_part_sha256: str = ""
-
-
-def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def _file_line(data_dir: Path, path: Path) -> str:
-    return f"{Path(path).relative_to(data_dir).as_posix()}:{_file_sha256(path)}"
-
-
-_BAR_FIELDS = ("open_ms", "open", "high", "low", "close", "volume")
-
-
-def _array_bytes(values: array) -> bytes:
-    """Little-endian bytes of an array, whatever the platform."""
-    if sys.byteorder == "little":
-        return values.tobytes()
-    swapped = array(values.typecode, values)
-    swapped.byteswap()
-    return swapped.tobytes()
-
-
-def _content_sha256(
-    bars: Bars, warmups: Mapping[str, Optional[Bars]], funding: Sequence[int]
-) -> str:
-    """sha256 over one symbol's kept arrays, each section labelled with its length."""
-    h = hashlib.sha256()
-    sections = [("1m", bars)] + [(k, warmups[k]) for k in _WARMUP_INTERVALS]
-    for label, part in sections:
-        if part is None:
-            h.update(f"{label}:absent\n".encode("ascii"))
-            continue
-        for field in _BAR_FIELDS:
-            values = getattr(part, field)
-            h.update(f"{label}/{field}:{len(values)}\n".encode("ascii"))
-            h.update(_array_bytes(values))
-    h.update(f"funding:{len(funding)}\n".encode("ascii"))
-    h.update(_array_bytes(array("q", funding)))
-    return h.hexdigest()
-
-
-def _read_warmup(path: Path, interval: str, until_ms: Optional[int]) -> Bars:
-    bars = bars_from_rows(read_day(path), interval_to_ms(interval))
-    return bars if until_ms is None else slice_until(bars, until_ms)
-
-
-def _read_funding(path: Path, until_ms: Optional[int]) -> Tuple[int, ...]:
-    """Funding times from JSON (required); kept below ``until_ms``.
-
-    A tick never runs at or after ``until_ms``, so a later funding time can never
-    start a blackout."""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, list) or any(type(t) is not int for t in raw):
-        raise ValueError(f"{path}: expected a JSON list of integer milliseconds")
-    return tuple(sorted(t for t in raw if until_ms is None or t < until_ms))
-
-
-def _training_part_sha256(
-    bars: Bars, warmups: Mapping[str, Optional[Bars]], funding: Sequence[int]
-) -> str:
-    """``_content_sha256`` of the arrays cut as a training load cuts them."""
-    cut = TRAIN_DATA_UNTIL_MS
-    part = {k: None if w is None else slice_until(w, cut) for k, w in warmups.items()}
-    return _content_sha256(slice_until(bars, cut), part, [t for t in funding if t < cut])
-
-
-@dataclass(frozen=True)
-class _Loaded:
-    frame: FeatureFrame
-    market: Market
-    lines: List[str]  # "relative_path:sha256" of every file read
-    missing: List[str]  # warm-up files not found
-    content: str  # sha256 of the arrays kept after the cut
-    train_part: str  # the same over the training part
-
-
-def _load_symbol(
-    data_dir: Path,
-    symbol: str,
-    days: Tuple[date, date],
-    until_ms: Optional[int],
-    exec_cfg: ExecConfig,
-) -> _Loaded:
-    """One symbol's frame and market with the hashes of what was read and kept."""
-    start_day, end_day = days
-    bars = load_days(data_dir, "prod", symbol, "1m", start_day, end_day)
-    if until_ms is not None:
-        bars = slice_until(bars, until_ms)
-    lines = [
-        _file_line(data_dir, day_path(data_dir, "prod", symbol, "1m", start_day + timedelta(k)))
-        for k in range((end_day - start_day).days + 1)
-    ]
-    warmups: Dict[str, Optional[Bars]] = {}
-    missing: List[str] = []
-    for interval in _WARMUP_INTERVALS:
-        path = warmup_path(data_dir, symbol, interval)
-        if path.exists():
-            lines.append(_file_line(data_dir, path))
-            warmups[interval] = _read_warmup(path, interval, until_ms)
-        else:
-            missing.append(path.relative_to(data_dir).as_posix())
-            warmups[interval] = None
-    fpath = funding_path(data_dir, symbol)
-    funding = _read_funding(fpath, until_ms)
-    lines.append(_file_line(data_dir, fpath))
-    frame = FeatureFrame.build(symbol, bars, warmups["1h"], warmups["4h"])
-    market = Market(symbol, bars, OutcomeCache(bars, exec_cfg), funding)
-    return _Loaded(frame, market, lines, missing, _content_sha256(bars, warmups, funding),
-                   _training_part_sha256(bars, warmups, funding))
-
-
-def load_dataset(
-    data_dir: Path,
-    until_ms: Optional[int],
-    *,
-    start_day: Optional[date] = None,
-    exec_cfg: Optional[ExecConfig] = None,
-) -> Dataset:
-    """Load both symbols from ``start_day`` (default: the training start's WIB day).
-
-    With ``until_ms`` the day files run to ``wib_day(until_ms - 1)`` and every bar
-    series is cut to bars closed by ``until_ms``; without it they run to the last
-    holdout day. Missing day or funding files raise; a missing warm-up is recorded.
-    """
-    data_dir = Path(data_dir)
-    first = start_day if start_day is not None else wib_day(ms(TRAIN_START))
-    end_ms = until_ms if until_ms is not None else ms(HOLDOUT_END)
-    last = wib_day(end_ms - 1)
-    cfg = exec_cfg if exec_cfg is not None else ExecConfig()
-    loaded = {s: _load_symbol(data_dir, s, (first, last), until_ms, cfg) for s in SYMBOLS}
-    lines = sorted(line for x in loaded.values() for line in x.lines)
-    loaded_until = until_ms if until_ms is not None else wib_day_start_ms(last + timedelta(1))
-    return Dataset(
-        frames=MappingProxyType({s: x.frame for s, x in loaded.items()}),
-        markets=MappingProxyType({s: x.market for s, x in loaded.items()}),
-        data_sha256=_text_sha256(lines),
-        loaded_until_ms=loaded_until,
-        missing_warmups=tuple(m for x in loaded.values() for m in x.missing),
-        train_data_sha256=_text_sha256([f"{s}:{x.content}" for s, x in loaded.items()]),
-        train_part_sha256=_text_sha256([f"{s}:{x.train_part}" for s, x in loaded.items()]),
-    )
-
-
-def _text_sha256(lines: Sequence[str]) -> str:
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- signals
@@ -425,6 +238,14 @@ def _check_dataset(dataset: Dataset, segments: Segments) -> None:
                     f"{symbol} holds a {bars.interval_ms // _MS_PER_MIN}-minute bar closing "
                     f"after the training limit {limit}"
                 )
+
+
+def _check_warmups(spec_sha: str, dataset: Dataset) -> None:
+    """A spec run needs every 1h/4h warm-up: without one, the H4 EMA50 stays ``None``
+    for weeks of training (spec 5.2)."""
+    if is_spec_sha(spec_sha) and dataset.missing_warmups:
+        raise ValueError("a spec run needs every 1h/4h warm-up; missing or unused: "
+                         + ", ".join(dataset.missing_warmups))
 
 
 def check_purge_covers(calib: Calibration, exec_cfg: ExecConfig) -> None:
@@ -732,6 +553,7 @@ def train_stage(
     check_spec_sha(spec_sha)
     settings = run_settings(segments, exec_cfg, guard_cfg, sel_cfg, model_cfg, meta_trainer)
     check_spec_run(spec_sha, settings, seed)
+    _check_warmups(spec_sha, dataset)
     _check_dataset(dataset, settings.segments)
     check_purge_covers(calib, settings.exec_cfg)
     code_sha = code_sha256()  # the code that runs, taken before the long run

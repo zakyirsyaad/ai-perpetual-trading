@@ -226,6 +226,17 @@ def htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
     return concat(_head(warmup, keep), aggregated)
 
 
+def warmup_unused(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> bool:
+    """Whether a present warm-up adds nothing to ``htf_bars``: it is empty or starts at
+    or after the first aggregated bar (so long EMAs stay ``None`` for weeks)."""
+    if warmup is None:
+        return False
+    aggregated = aggregate(bars_1m, interval_ms)
+    if not len(aggregated):
+        return not len(warmup)
+    return bisect_left(warmup.open_ms, aggregated.open_ms[0]) == 0
+
+
 def _poc(
     lows: Sequence[float], highs: Sequence[float], volumes: Sequence[float], price: float
 ) -> Optional[float]:

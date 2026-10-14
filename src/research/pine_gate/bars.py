@@ -45,6 +45,10 @@ class MissingDayError(FileNotFoundError):
     """One or more day files of a requested range do not exist."""
 
 
+class DayShapeError(ValueError):
+    """A day file does not hold exactly its own WIB day of bars."""
+
+
 @dataclass(frozen=True)
 class Bars:
     interval_ms: int
@@ -328,7 +332,8 @@ def load_days(
     """Load the inclusive WIB day range into one ``Bars``.
 
     Raises ``MissingDayError`` listing every missing day before reading any file,
-    and ``BarGapError`` when the days do not join without a gap.
+    ``DayShapeError`` when a file does not hold exactly its own WIB day of bars
+    (spec 5.2: 1,440 1m bars) and ``BarGapError`` when the bars do not join.
     """
     if end_day < start_day:
         raise ValueError(f"end_day {end_day} is before start_day {start_day}")
@@ -341,7 +346,42 @@ def load_days(
         raise MissingDayError(
             f"missing {source}/{symbol}/{interval} day files: {', '.join(missing)}"
         )
+    interval_ms = interval_to_ms(interval)
     rows: List[Row] = []
-    for path in paths:
-        rows.extend(read_day(path))
-    return bars_from_rows(rows, interval_to_ms(interval))
+    for day, path in zip(days, paths):
+        day_rows = read_day(path)
+        problem = day_shape_problem(day_rows, day, interval_ms)
+        if problem is not None:
+            raise DayShapeError(f"{path} ({day.isoformat()}): {problem}")
+        rows.extend(day_rows)
+    return bars_from_rows(rows, interval_ms)
+
+
+def day_shape_problem(rows: Sequence[Row], day: date, interval_ms: int) -> Optional[str]:
+    """Why ``rows`` are not exactly the bars of WIB ``day`` (count, first and last open
+    time), else ``None``; contiguity is ``bars_from_rows``'s check."""
+    expected = _MS_PER_DAY // interval_ms
+    start = wib_day_start_ms(day)
+    last = start + _MS_PER_DAY - interval_ms
+    if len(rows) != expected:
+        return f"holds {len(rows)} bars, not {expected}"
+    if int(rows[0][0]) != start or int(rows[-1][0]) != last:
+        return (f"bars run {int(rows[0][0])}..{int(rows[-1][0])}, not the day's "
+                f"{start}..{last}")
+    return None
+
+
+def funding_gap_problem(times: Sequence[int], start_ms: int, end_ms: int,
+                        max_gap_ms: int) -> Optional[str]:
+    """Why ``times`` do not cover [start_ms, end_ms) at the funding cadence, else ``None``.
+
+    The range's start, the funding times inside it and its end must follow each other
+    by at most ``max_gap_ms``, so a hole, a late first time, an early last time or a
+    list cut at a row limit all fail; times outside the range are ignored."""
+    points = [start_ms] + sorted(t for t in times if start_ms <= t < end_ms) + [end_ms]
+    widest = max(zip(points, points[1:]), key=lambda ab: ab[1] - ab[0])
+    if widest[1] - widest[0] > max_gap_ms:
+        return (f"funding gap of {(widest[1] - widest[0]) / _MS_PER_HOUR:.1f} h from "
+                f"{widest[0]} to {widest[1]} (at most {max_gap_ms / _MS_PER_HOUR:.2f} h "
+                f"over {start_ms}..{end_ms})")
+    return None

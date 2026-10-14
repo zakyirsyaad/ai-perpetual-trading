@@ -6,6 +6,7 @@ from pathlib import Path
 
 from research.pine_gate.bars import (
     BarGapError,
+    DayShapeError,
     MissingDayError,
     aggregate,
     bars_from_rows,
@@ -14,6 +15,7 @@ from research.pine_gate.bars import (
     entry_index_for,
     index_closing_at,
     interval_to_ms,
+    funding_gap_problem,
     funding_path,
     last_closed_index,
     load_days,
@@ -262,18 +264,35 @@ class DayFilesTest(unittest.TestCase):
             self.assertNotIn("2026-01-01", message)
             self.assertEqual(d3.isoformat(), "2026-01-03")
 
-    def test_load_days_raises_gap_error_between_days(self):
+    def test_load_days_refuses_a_day_file_that_is_not_its_whole_wib_day(self):
+        day_ms = 86_400_000
+        d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+        start = wib_day_start_ms(d1)
+        cases = {
+            "late start": make_rows(start + day_ms + HOUR, HOUR, 23),
+            "short": make_rows(start + day_ms, HOUR, 23),
+            "shifted": make_rows(start + day_ms + HOUR, HOUR, 24),
+            "another day": make_rows(start + 2 * day_ms, HOUR, 24),
+        }
+        for name, rows in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                write_day(day_path(base, "prod", "BTC-USDT", "1h", d1), make_rows(start, HOUR, 24))
+                write_day(day_path(base, "prod", "BTC-USDT", "1h", d2), rows)
+                with self.assertRaises(DayShapeError) as ctx:
+                    load_days(base, "prod", "BTC-USDT", "1h", d1, d2)
+                self.assertIn("2026-01-02", str(ctx.exception))
+                self.assertIsInstance(ctx.exception, ValueError)
+
+    def test_a_duplicate_inside_a_whole_day_is_still_a_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
-            start = wib_day_start_ms(d1)
-            write_day(day_path(base, "prod", "BTC-USDT", "1h", d1), make_rows(start, HOUR, 24))
-            write_day(
-                day_path(base, "prod", "BTC-USDT", "1h", d2),
-                make_rows(start + 86_400_000 + HOUR, HOUR, 23),
-            )
+            d1 = date(2026, 1, 1)
+            rows = make_rows(wib_day_start_ms(d1), HOUR, 24)
+            rows[5] = rows[4]  # 24 rows on the day's bounds, one hole and one duplicate
+            write_day(day_path(base, "prod", "BTC-USDT", "1h", d1), rows)
             with self.assertRaises(BarGapError):
-                load_days(base, "prod", "BTC-USDT", "1h", d1, d2)
+                load_days(base, "prod", "BTC-USDT", "1h", d1, d1)
 
     def test_write_day_creates_parents_and_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,6 +331,41 @@ class DayFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
                 load_days(Path(tmp), "prod", "BTC-USDT", "1h", date(2026, 1, 2), date(2026, 1, 1))
+
+
+class FundingGapTest(unittest.TestCase):
+    EIGHT_H = 8 * HOUR
+    MAX_GAP = 8 * HOUR + 10 * MIN
+
+    def times(self, start, n):
+        return [start + k * self.EIGHT_H for k in range(n)]
+
+    def test_a_complete_cadence_passes(self):
+        start = T0
+        end = start + 10 * self.EIGHT_H
+        self.assertIsNone(funding_gap_problem(self.times(start, 10), start, end, self.MAX_GAP))
+        late = [t + 5 * MIN for t in self.times(start, 10)]  # within the slack
+        self.assertIsNone(funding_gap_problem(late, start, end, self.MAX_GAP))
+        # times outside the range are ignored, not counted against it
+        more = self.times(start - 3 * self.EIGHT_H, 16)
+        self.assertIsNone(funding_gap_problem(more, start, end, self.MAX_GAP))
+
+    def test_a_hole_or_missing_coverage_is_a_problem(self):
+        start = T0
+        end = start + 10 * self.EIGHT_H
+        full = self.times(start, 10)
+        cases = {
+            "hole": full[:4] + full[5:],
+            "late first": full[2:],
+            "early last": full[:7],
+            "empty": [],
+            "capped": full[:1],
+        }
+        for name, times in cases.items():
+            with self.subTest(name):
+                problem = funding_gap_problem(times, start, end, self.MAX_GAP)
+                self.assertIsNotNone(problem)
+                self.assertIn("gap", problem)
 
 
 class BarValidationTest(unittest.TestCase):

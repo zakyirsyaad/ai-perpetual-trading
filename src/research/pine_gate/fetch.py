@@ -202,6 +202,9 @@ def _get_data_list(http_get: HttpGet, url: str, params: Mapping[str, str]) -> li
     if not isinstance(payload, Mapping):
         raise ExchangeError("response is not a JSON object")
     code = payload.get("code")
+    # TODO(verify): an in-body rate-limit code (the review suggests 100410) should raise
+    # RateLimitedError and stop the job. No BingX error-code reference in this repo
+    # confirms 100410 or any other in-body rate-limit code, so nothing is mapped yet.
     if code != 0:
         raise ExchangeError(f"exchange code {code!r}: {str(payload.get('msg'))[:100]}")
     data = payload.get("data")

@@ -24,6 +24,7 @@ from research.pine_gate.spec import (
     VP_PARAMS,
     VPS,
     WIB,
+    DataConfig,
     ExecConfig,
     FillConfig,
     GateConfig,
@@ -253,6 +254,12 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertIn("c0_training", policies)
         self.assertIn("code_sha256", policies["holdout_lock"])
         self.assertIn("sum(w * logloss) / sum(w)", policies["meta_model_objective"])
+
+    def test_document_pre_registers_the_stored_data_checks(self):
+        self.assertEqual(spec_document()["data"], {
+            "funding_interval_s": 28_800, "funding_gap_tolerance_s": 600})
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            DataConfig().funding_interval_s = 1
 
     def test_document_pre_registers_the_seed(self):
         self.assertEqual(SEED, 0)

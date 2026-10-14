@@ -329,6 +329,19 @@ class FetchCommandTest(Dirs):
         # one second before every request after the first, across symbols too
         self.assertEqual(sleeps.calls, [1.0] * (len(http.calls) - 1))
 
+    def test_fetch_refuses_an_end_day_that_is_not_over(self):
+        http = FakeHttp()
+        for end in ("2026-10-14", "2026-10-20"):  # NOW is 2026-10-14 10:00 WIB
+            with self.subTest(end=end), mock.patch.object(cli_common, "http_get", http), \
+                    mock.patch.object(cli_common, "sleep", Sleeps()):
+                code, out, err = run_cli(self.base_args() + [
+                    "fetch", "--source", "prod", "--symbols", "BTC-USDT",
+                    "--start", "2026-10-13", "--end", end])
+                self.assertEqual(code, 1, err)
+                self.assertIn("forming", err)
+                self.assertEqual(out, "")
+        self.assertEqual(http.calls, [])
+
     def test_fetch_reports_failed_days_and_exits_1(self):
         with mock.patch.object(cli_common, "http_get", FakeHttp(fail_symbols={"ETH-USDT"})), \
                 mock.patch.object(cli_common, "sleep", Sleeps()):
@@ -424,9 +437,29 @@ class FundingCommandTest(Dirs):
                 mock.patch.object(cli_common, "sleep", Sleeps()):
             code, out, _ = run_cli(self.base_args() + [
                 "funding", "--start", "2026-07-01", "--end", "2026-07-03"])
+        self.assertEqual(code, 1)  # the stored file does not cover the longer range
+        self.assertIn("prod/BTC-USDT funding: failed: stored file (covers "
+                      "2026-07-01T00:00:00+07:00 .. 2026-07-01T16:00:00+07:00, 3 times)", out)
+        self.assertIn("gap", out)
+        with mock.patch.object(cli_common, "http_get", FakeHttp(funding=times)), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, _ = run_cli(self.base_args() + [
+                "funding", "--start", "2026-07-01", "--end", "2026-07-02"])
         self.assertEqual(code, 0)
         self.assertIn("prod/BTC-USDT funding: skipped, file exists (covers "
                       "2026-07-01T00:00:00+07:00 .. 2026-07-01T16:00:00+07:00, 3 times)", out)
+
+    def test_a_fetched_funding_list_with_a_gap_is_not_stored(self):
+        start = wib_day_start_ms(date(2026, 7, 1))
+        times = [start, start + 16 * HOUR]  # 08:00 is missing (a capped or partial answer)
+        with mock.patch.object(cli_common, "http_get", FakeHttp(funding=times)), \
+                mock.patch.object(cli_common, "sleep", Sleeps()):
+            code, out, err = run_cli(self.base_args() + [
+                "funding", "--start", "2026-07-01", "--end", "2026-07-02"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("prod/BTC-USDT funding: failed:", out)
+        self.assertIn("gap", out)
+        self.assertFalse(funding_path(self.data, "BTC-USDT").exists())
 
 
 class CoveredTest(unittest.TestCase):
@@ -529,6 +562,39 @@ class CheckDataCommandTest(Dirs):
         self.assertIn("FAIL complete days", out)
         self.assertIn("prod/BTC-USDT/1m missing 439 days", out)
         self.assertIn("2025-08-01", out)
+
+    def test_days_check_lists_a_day_file_that_is_not_a_whole_wib_day(self):
+        from research.pine_gate import cli_data
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 1439))
+        lines, ok = cli_data.days_check(self.data)
+        self.assertFalse(ok)
+        self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: 2025-08-01",
+                      lines)
+
+    def test_funding_check_needs_the_cadence_over_training_and_holdout(self):
+        from research.pine_gate import cli_data
+        from research.pine_gate.spec import HOLDOUT_END, TRAIN_START, ms
+
+        line, ok = cli_data.funding_check(self.data, "BTC-USDT")
+        self.assertFalse(ok)
+        self.assertTrue(line.startswith("FAIL"), line)
+        path = funding_path(self.data, "BTC-USDT")
+        path.parent.mkdir(parents=True)
+        full = list(range(ms(TRAIN_START) // (8 * HOUR) * (8 * HOUR), ms(HOLDOUT_END) + DAY,
+                          8 * HOUR))
+        path.write_text(json.dumps(full), encoding="utf-8")
+        line, ok = cli_data.funding_check(self.data, "BTC-USDT")
+        self.assertTrue(ok, line)
+        self.assertTrue(line.startswith("PASS"), line)
+        path.write_text(json.dumps(full[:100]), encoding="utf-8")  # a 100-row cap
+        line, ok = cli_data.funding_check(self.data, "BTC-USDT")
+        self.assertFalse(ok)
+        self.assertIn("gap", line)
+        code, out, _ = run_cli(self.base_args() + ["check-data", "--truncation-times", "2"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL funding cadence prod/ETH-USDT", out)
 
     def test_native_check_fails_without_the_native_check_file(self):
         write_prod_days(self.data, "BTC-USDT",

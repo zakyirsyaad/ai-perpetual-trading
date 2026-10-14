@@ -28,6 +28,7 @@ from .bars import (
     Bars,
     MissingDayError,
     aggregate,
+    day_shape_problem,
     bars_from_rows,
     day_path,
     funding_path,
@@ -52,7 +53,7 @@ from .fetch import (
     sync_line,
     sync_warmup,
 )
-from .pipeline import SYMBOLS, TRAIN_DATA_UNTIL_MS
+from .dataset import SYMBOLS, TRAIN_DATA_UNTIL_MS, funding_problem, read_funding_times
 from .spec import HOLDOUT_END, TRAIN_END, TRAIN_START, WIB, ms
 
 HOSTS = SOURCE_HOSTS
@@ -88,6 +89,10 @@ def _ceil_to(t_ms: int, step_ms: int) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
+    today = common.wib_today()
+    if args.end >= today:
+        raise ValueError(f"--end {args.end} is not over yet (today is {today} WIB); its last "
+                         "bars are still forming, so the last day to fetch is yesterday")
     pace, failed_any = _Pacer(), False
     for symbol in args.symbols:
         pace()
@@ -154,7 +159,8 @@ def cmd_native_check_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_funding(args: argparse.Namespace) -> int:
-    """Funding times in [WIB midnight of --start, of --end) per symbol."""
+    """Funding times in [WIB midnight of --start, of --end) per symbol; a list (fetched or
+    stored) with a gap wider than the funding cadence over that range fails."""
     start_ms = wib_day_start_ms(args.start)
     end_ms = wib_day_start_ms(args.end) - 1
     if end_ms < start_ms:
@@ -169,6 +175,12 @@ def cmd_funding(args: argparse.Namespace) -> int:
                 coverage = covered(saved, "times")
             except ValueError as exc:
                 raise ValueError(f"{path}: {exc}") from None
+            problem = funding_problem(saved, start_ms, end_ms + 1)
+            if problem is not None:  # never replaced: removing it is the operator's call
+                failed_any = True
+                print(f"{label}: failed: stored file ({coverage}) {problem}; remove it "
+                      "deliberately to fetch again")
+                continue
             print(f"{label}: skipped, file exists ({coverage})")
             continue
         pace()
@@ -178,6 +190,11 @@ def cmd_funding(args: argparse.Namespace) -> int:
         except _NETWORK_ERRORS as exc:
             failed_any = True
             print(f"{label}: failed: {common.one_line(exc)}")
+            continue
+        problem = funding_problem(times, start_ms, end_ms + 1)
+        if problem is not None:  # a short or capped answer is never stored
+            failed_any = True
+            print(f"{label}: failed: fetched {len(times)} times, {problem}; nothing stored")
             continue
         common.write_exclusive(path, json.dumps(times) + "\n", "funding")
         print(f"{label}: {len(times)} times")
@@ -198,20 +215,49 @@ def _days(first: date, last: date) -> List[date]:
     return [first + timedelta(days=k) for k in range((last - first).days + 1)]
 
 
+def _listed(days: Sequence[date]) -> str:
+    shown = ", ".join(d.isoformat() for d in days[:_LISTED_DAYS])
+    return shown + (", ..." if len(days) > _LISTED_DAYS else "")
+
+
+def _not_whole_day(path: Path, day: date) -> bool:
+    try:
+        return day_shape_problem(read_day(path), day, _MS_1M) is not None
+    except ValueError:  # a corrupt file is not a whole day either
+        return True
+
+
 def days_check(data_dir: Path) -> Tuple[List[str], bool]:
-    """Every WIB day of the training start .. the last holdout day, prod BTC/ETH 1m."""
+    """Every WIB day of the training start .. the last holdout day, prod BTC/ETH 1m: each
+    day file exists and holds exactly its own day's 1,440 bars."""
     first, last = wib_day(ms(TRAIN_START)), wib_day(ms(HOLDOUT_END) - 1)
     lines: List[str] = []
     for symbol in SYMBOLS:
-        missing = [d for d in _days(first, last)
-                   if not day_path(data_dir, "prod", symbol, "1m", d).exists()]
+        paths = {d: day_path(data_dir, "prod", symbol, "1m", d) for d in _days(first, last)}
+        missing = [d for d, p in paths.items() if not p.exists()]
+        broken = [d for d, p in paths.items() if p.exists() and _not_whole_day(p, d)]
         if missing:
-            shown = ", ".join(d.isoformat() for d in missing[:_LISTED_DAYS])
-            more = ", ..." if len(missing) > _LISTED_DAYS else ""
-            lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {shown}{more}")
+            lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {_listed(missing)}")
+        if broken:
+            lines.append(f"  prod/{symbol}/1m not a whole WIB day (1440 bars) on "
+                         f"{len(broken)} days: {_listed(broken)}")
     verdict = "FAIL" if lines else "PASS"
     head = f"{verdict} complete days: prod BTC/ETH 1m {first}..{last}"
     return [head] + lines, not lines
+
+
+def funding_check(data_dir: Path, symbol: str) -> Tuple[str, bool]:
+    """The stored funding times cover training start .. holdout end at the cadence."""
+    label = f"funding cadence prod/{symbol}"
+    path = funding_path(data_dir, symbol)
+    try:
+        times = read_funding_times(path)
+    except (OSError, ValueError) as exc:
+        return f"FAIL {label}: {common.one_line(exc)}", False
+    problem = funding_problem(times, ms(TRAIN_START), ms(HOLDOUT_END))
+    if problem is not None:
+        return f"FAIL {label}: {problem}", False
+    return f"PASS {label}: {covered(times, 'times')}", True
 
 
 def read_warmups(data_dir: Path, symbol: str) -> Tuple[Optional[Bars], Optional[Bars]]:
@@ -299,6 +345,9 @@ def truncation_check(series: Mapping[str, Series], times: int, seed: int) -> Tup
 def cmd_check_data(args: argparse.Namespace) -> int:
     lines, all_ok = days_check(args.data_dir)
     for symbol in SYMBOLS:
+        line, ok = funding_check(args.data_dir, symbol)
+        lines.append(line)
+        all_ok = all_ok and ok
         for interval in WARMUP_INTERVALS:
             line, ok = native_check(args.data_dir, symbol, interval)
             lines.append(line)
@@ -320,7 +369,7 @@ def cmd_check_data(args: argparse.Namespace) -> int:
 
 def add_parsers(sub: Any, date_type: Callable[[str], date],
                 symbols_type: Callable[[str], List[str]]) -> None:
-    p = sub.add_parser("fetch", help="fetch missing 1m WIB day files")
+    p = sub.add_parser("fetch", help="fetch missing 1m WIB day files (days before today WIB)")
     p.add_argument("--source", choices=sorted(HOSTS), required=True)
     p.add_argument("--symbols", type=symbols_type, required=True, help="e.g. BTC-USDT,ETH-USDT")
     p.add_argument("--start", type=date_type, required=True)
@@ -347,7 +396,8 @@ def add_parsers(sub: Any, date_type: Callable[[str], date],
     p = sub.add_parser("collect", help="daily collector: the last 7 WIB days, missing ones only")
     p.set_defaults(handler=cmd_collect)
 
-    p = sub.add_parser("check-data", help="complete days, native agreement, truncation test")
+    p = sub.add_parser("check-data", help="complete days, funding cadence, native agreement, "
+                                          "truncation test")
     p.add_argument("--truncation-times", type=common.positive_int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(handler=cmd_check_data)

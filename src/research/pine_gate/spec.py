@@ -178,6 +178,16 @@ class FillConfig:
     since_utc_offset: str = "+07:00"
 
 
+@dataclass(frozen=True)
+class DataConfig:
+    """Stored-data checks (spec 5.2): funding times must come every
+    ``funding_interval_s`` (BingX BTC/ETH: 8 h), with at most this much slack, over the
+    whole loaded range (a day file holds exactly its own WIB day: ``bars.load_days``)."""
+
+    funding_interval_s: int = 8 * 3600
+    funding_gap_tolerance_s: int = 600
+
+
 TRENDS = ("E200", "H1", "H4")
 ENTRIES = ("P35", "P40", "B12", "B24")
 STRENGTHS = ("OFF", "ADX", "ADX_DI")
@@ -414,6 +424,7 @@ def spec_document() -> Dict[str, Any]:
         "model": asdict(ModelConfig()),
         "gate": asdict(GateConfig()),
         "fill": asdict(FillConfig()),
+        "data": asdict(DataConfig()),
         "rules": {
             "signal_timeframe": SIGNAL_TIMEFRAME,
             "entry": ENTRY_PARAMS,

@@ -15,7 +15,13 @@ from research.pine_gate.bars import (
     concat,
     slice_until,
 )
-from research.pine_gate.features import FeatureFrame, Snapshot, htf_agreement, htf_bars
+from research.pine_gate.features import (
+    FeatureFrame,
+    Snapshot,
+    htf_agreement,
+    htf_bars,
+    warmup_unused,
+)
 from research.pine_gate.spec import ms
 
 MIN = 60_000
@@ -444,6 +450,20 @@ class HtfSeamTest(unittest.TestCase):
         with self.assertRaises(BarGapError) as ctx:
             htf_bars(bars, early, HOUR)
         self.assertIn(str(START_1M), str(ctx.exception))
+
+    def test_a_warmup_that_starts_at_or_after_the_first_aggregated_bar_is_unused(self):
+        bars, w1h, w4h = make_dataset(days=2)
+        self.assertFalse(warmup_unused(bars, w1h, HOUR))
+        self.assertFalse(warmup_unused(bars, w4h, H4))
+        self.assertFalse(warmup_unused(bars, None, HOUR))  # missing is recorded elsewhere
+        first_4h = aggregate(bars, H4).open_ms[0]
+        late = bars_from_rows([(first_4h + k * H4, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(3)],
+                              H4)
+        self.assertTrue(warmup_unused(bars, late, H4))
+        self.assertTrue(warmup_unused(bars, bars_from_rows([], H4), H4))
+        # htf_bars itself still ignores such a warm-up silently
+        self.assertEqual(list(htf_bars(bars, late, H4).open_ms),
+                         list(aggregate(bars, H4).open_ms))
 
     def test_series_lists_every_bar_series_the_frame_reads(self):
         bars, w1h, w4h = make_dataset(days=1)
