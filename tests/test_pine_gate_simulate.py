@@ -65,6 +65,19 @@ def run(signal, markets, start, end, **kw):
     return simulate(signal, markets, start, end, **params)
 
 
+class EntryBarTests(unittest.TestCase):
+    def test_the_entry_bars_own_range_does_not_close_the_trade(self):
+        start = TUE_0800
+        order_bar = start + CFG.order_delay_s * 1000 // MIN * MIN  # latency 0: bar of t + 5 s
+        wild = (order_bar, 100.0, 101.0, 99.0, 100.0, 1.0)  # crosses both levels
+        btc = make_market(BTC, start - HOUR, start + 3 * HOUR, bar=flat_bar,
+                          overrides={order_bar: wild})
+        trades = run(always({BTC: 1}), [btc], start, start + 1)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].entry_ms, order_bar + MIN)
+        self.assertEqual(trades[0].kind, "TIME")
+
+
 class LatencySampleTests(unittest.TestCase):
     def test_an_empty_latency_sample_is_refused_unless_zero_latency_is_explicit(self):
         start = TUE_0800

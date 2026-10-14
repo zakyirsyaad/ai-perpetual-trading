@@ -48,6 +48,20 @@ class BracketOutcomeTests(unittest.TestCase):
         self.assertFalse(o.gapped)
         self.assertFalse(o.both_touched)
 
+    def test_the_entry_bars_own_high_and_low_never_trigger_the_bracket(self):
+        # the fill is that bar's close, so its range happened before the position existed
+        wide = with_bar(flat(80), 0, h=BASE * 1.01, l=BASE * 0.99)
+        for side in (1, -1):
+            with self.subTest(side=side):
+                o = bracket_outcome(bars_of(wide), 0, side, CFG)
+                self.assertEqual((o.kind, o.exit_idx), ("TIME", CFG.time_stop_min))
+        later = with_bar(wide, 5, h=TP_LONG + 0.01)  # the walk starts on the next bar
+        o = bracket_outcome(bars_of(later), 0, 1, CFG)
+        self.assertEqual((o.kind, o.exit_idx), ("TP", 5))
+        cache = OutcomeCache(bars_of(wide), CFG)
+        self.assertEqual(cache.get(0, 1).kind, "TIME")
+        self.assertEqual(cache.get(0, -1).kind, "TIME")
+
     def test_long_sl_first_is_clean_stop(self):
         rows = with_bar(flat(80), 3, l=SL_LONG - 0.01)
         o = bracket_outcome(bars_of(rows), 0, 1, CFG)

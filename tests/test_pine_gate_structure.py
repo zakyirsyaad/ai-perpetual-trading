@@ -117,22 +117,67 @@ FORBIDDEN_IN_RESEARCH = ("bingx_client", "_signed_request", "X-BX-APIKEY", "list
 
 
 def _imports(tree):
+    """Every module a source names in an import statement or a dynamic import call
+    (``importlib.import_module("x")``, ``import_module("x")``, ``__import__("x")``)."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             yield from (alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             yield node.module
+            yield from (f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Call) and _is_dynamic_import(node.func) and node.args:
+            first = node.args[0]
+            yield first.value if isinstance(first, ast.Constant) else "<dynamic>"
+
+
+def _is_dynamic_import(func):
+    if isinstance(func, ast.Name):
+        return func.id in ("__import__", "import_module")
+    return isinstance(func, ast.Attribute) and func.attr == "import_module"
+
+
+def _live_sources():
+    """Every source outside the research package: the bot, main.py and the scripts."""
+    return [p for p in sorted(SRC.rglob("*.py")) if "research" not in p.relative_to(SRC).parts]
 
 
 class IsolationTests(unittest.TestCase):
     """The bot never imports research; research never touches private venue code (E8)."""
 
     def test_no_bot_module_or_main_imports_research(self):
-        paths = sorted(BOT.rglob("*.py")) + [SRC / "main.py"]
-        self.assertGreater(len(paths), 20)
+        paths = _live_sources()
+        self.assertIn(SRC / "main.py", paths)
+        self.assertGreater(len([p for p in paths if BOT in p.parents]), 20)
         offenders = [f"{p.relative_to(SRC)}: {name}" for p in paths
                      for name in _imports(_tree(p))
-                     if name == "research" or name.startswith("research.")]
+                     if name in ("research", "<dynamic>") or name.startswith("research.")]
+        self.assertEqual(offenders, [])
+
+    def test_the_guard_sees_dynamic_imports(self):
+        source = ("import importlib\n"
+                  "importlib.import_module('research.pine_gate')\n"
+                  "__import__('research')\n"
+                  "from importlib import import_module\n"
+                  "import_module(name)\n"
+                  "from bot.strategy import pine_indicators\n")
+        names = list(_imports(ast.parse(source)))
+        for name in ("research.pine_gate", "research", "<dynamic>",
+                     "bot.strategy.pine_indicators"):
+            self.assertIn(name, names)
+
+    def test_no_live_module_imports_pine_indicators(self):
+        target = "bot.strategy.pine_indicators"
+        offenders = []
+        for p in _live_sources():
+            if p == BOT / "strategy" / "pine_indicators.py":
+                continue
+            tree = _tree(p)
+            names = list(_imports(tree))
+            relative = [f"{node.module or ''}.{alias.name}" for node in ast.walk(tree)
+                        if isinstance(node, ast.ImportFrom) and node.level >= 1
+                        for alias in node.names]
+            if target in names or any("pine_indicators" in name for name in relative):
+                offenders.append(str(p.relative_to(SRC)))
         self.assertEqual(offenders, [])
 
     def test_research_never_references_private_venue_code(self):
