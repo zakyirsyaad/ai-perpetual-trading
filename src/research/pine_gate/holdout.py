@@ -11,8 +11,10 @@ applies the nine gate criteria per symbol, chooses what moves on and writes
 ``pine_gate_holdout_<YYYYMMDD>.json``. The holdout runs once: any existing
 holdout file in ``out_dir`` or next to the selection file (its real folder, links
 resolved), of any date, refuses the run, and so does an existing run marker
-``<data_dir>/holdout_runs/<spec_sha256>.json``, written before any holdout data is
-read (mandatory under the current spec sha256). A run under the current spec sha256 must also use the seed recorded in
+``<data_dir>/holdout_runs/<spec_sha256>.json`` (mandatory under the current spec
+sha256). Every data check that can refuse comes before the marker is written (the
+files checked without computing anything, the training part hashed from a
+training-only load), and the full holdout load after it. A run under the current spec sha256 must also use the seed recorded in
 the selection file (the spec seed), run on the code and the Python version that
 trained (``code_sha256``, ``python_version``), follow a
 training C0 that passed, write next to its selection file and read holdout data
@@ -35,7 +37,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .bars import index_closing_at
 from .calibrate import Calibration
@@ -67,10 +69,11 @@ from .lock import (
     python_version,
 )
 from .outcomes import OutcomeCache
+from .dataset import TRAIN_DATA_UNTIL_MS, DataSource
 from .pipeline import SYMBOLS, Dataset, check_purge_covers
 from .rules import reference_signal
 from .simulate import Market, SignalFn, Trade
-from .spec import WIB, ExecConfig, GateConfig, GuardConfig, spec_sha256
+from .spec import HOLDOUT_END, WIB, ExecConfig, GateConfig, GuardConfig, ms, spec_sha256
 from .stats import bootstrap_paired_p, day_aggregates, holm, permutation_p, win_rate, wr_lower_bound
 
 HOLDOUT_PREFIX = "pine_gate_holdout_"
@@ -591,16 +594,24 @@ def claim_holdout_run(data_dir: Path, selection_path: Path, selection_sha: str,
     return path
 
 
-def _claim(data_dir: Optional[Path], selection_path: Path, selection_sha: str,
-           spec_sha: str, out_dir: Path) -> None:
-    """The run marker; mandatory under the current spec sha256, skipped for a test sha
-    without ``data_dir``."""
+def _check_marker_free(data_dir: Optional[Path], spec_sha: str) -> None:
+    """Before any data is read: a spec run needs ``data_dir`` for its marker, and an
+    existing marker refuses the run (``claim_holdout_run`` checks again on writing)."""
     if data_dir is None:
         if is_spec_sha(spec_sha):
             raise HoldoutLockError("a spec holdout run needs data_dir for its run marker "
                                    f"({HOLDOUT_RUNS_DIR}/<spec_sha256>.json)")
         return
-    claim_holdout_run(data_dir, selection_path, selection_sha, spec_sha, out_dir)
+    path = run_marker_path(data_dir, spec_sha)
+    if path.exists():
+        raise _marker_refusal(path)
+
+
+def _claim(data_dir: Optional[Path], selection_path: Path, selection_sha: str,
+           spec_sha: str, out_dir: Path) -> None:
+    """The run marker; skipped for a test sha without ``data_dir``."""
+    if data_dir is not None:
+        claim_holdout_run(data_dir, selection_path, selection_sha, spec_sha, out_dir)
 
 
 def _check_training_part(path: Path, selection: Mapping[str, Any], dataset: Dataset,
@@ -610,6 +621,32 @@ def _check_training_part(path: Path, selection: Mapping[str, Any], dataset: Data
     if is_spec_sha(spec_sha) and dataset.train_part_sha256 != selection.get("train_data_sha256"):
         raise HoldoutLockError(f"{path}: the training part of the holdout data differs from "
                                "the data the selection was trained on")
+
+
+def _check_period_stored(period: HoldoutPeriod) -> None:
+    """A data source loads to the holdout end; a period past it cannot be replayed."""
+    if period.end_ms > ms(HOLDOUT_END):
+        raise ValueError(f"period ends at {period.end_ms}, after the holdout end "
+                         f"{ms(HOLDOUT_END)} the stored data reach")
+
+
+HoldoutData = Union[Dataset, DataSource]
+
+
+def _check_data(data: HoldoutData, path: Path, selection: Mapping[str, Any],
+                settings: "_StageSettings", spec_sha: str) -> None:
+    """Every data-dependent refusal that can come before the run marker: a loaded
+    dataset is checked whole; a source has its files checked (nothing computed) and,
+    under the current spec sha256, its training-only load hashed against the
+    selection's ``train_data_sha256``."""
+    if isinstance(data, Dataset):
+        _check_holdout_dataset(data, settings.period)
+        _check_training_part(path, selection, data, spec_sha)
+        return
+    _check_period_stored(settings.period)
+    data.check_files(None)
+    if is_spec_sha(spec_sha):
+        _check_training_part(path, selection, data.load(TRAIN_DATA_UNTIL_MS), spec_sha)
 
 
 def _context(dataset: Dataset, settings: _StageSettings, calib: Calibration, seed: int) -> Holdout:
@@ -641,11 +678,12 @@ def _provenance(
     }
 
 
-def _start(selection_path: Path, calib: Calibration, out_dir: Path, spec_sha: str, seed: int,
-           settings_args: Tuple[Any, ...], data_dir: Optional[Path]
+def _start(data: HoldoutData, selection_path: Path, calib: Calibration, out_dir: Path,
+           spec_sha: str, seed: int, settings_args: Tuple[Any, ...], data_dir: Optional[Path]
            ) -> Tuple[Dict[str, Any], _StageSettings, str]:
-    """Every check that needs no holdout data, then the run marker; returns the selection,
-    the settings and the selection file's sha256."""
+    """Every check that needs no holdout data, the data checks that can refuse before
+    evaluation (``_check_data``), then the run marker; returns the selection, the
+    settings and the selection file's sha256."""
     selection = load_selection_checked(selection_path, spec_sha)
     check_spec_sha(spec_sha)
     settings = _settings(*settings_args)
@@ -654,12 +692,14 @@ def _start(selection_path: Path, calib: Calibration, out_dir: Path, spec_sha: st
     check_purge_covers(calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
     selection_sha = _selection_sha256(selection_path, selection)
+    _check_marker_free(data_dir, spec_sha)
+    _check_data(data, selection_path, selection, settings, spec_sha)
     _claim(data_dir, selection_path, selection_sha, spec_sha, out_dir)
     return selection, settings, selection_sha
 
 
 def test_stage(
-    dataset: Union[Dataset, Callable[[], Dataset]],
+    dataset: HoldoutData,
     selection_path: Path,
     calib: Calibration,
     out_dir: Path,
@@ -678,24 +718,27 @@ def test_stage(
 ) -> Path:
     """Run the holdout once and write its file; returns the path.
 
-    The lock comes first: nothing of the holdout is read unless the selection file
-    passes ``load_selection_checked`` and ``check_ready``, and the run marker
-    ``<data_dir>/holdout_runs/<spec_sha256>.json`` is written (mandatory under the
-    current spec sha256; an existing marker refuses the run). ``dataset`` may be a
-    loader, called only after the marker. Injected settings and counts are for tests
-    and are refused under the current spec sha256, as is a seed other than the
-    selection's. Any existing ``pine_gate_holdout_*.json`` in ``out_dir`` or next to
-    the selection file refuses the run.
+    The lock comes first: nothing is read unless the selection file passes
+    ``load_selection_checked`` and ``check_ready``. Then every data check that can
+    refuse comes before the run marker ``<data_dir>/holdout_runs/<spec_sha256>.json``
+    (mandatory under the current spec sha256; an existing marker refuses the run), so
+    a refusal leaves no marker: for a ``DataSource`` the files are checked without
+    computing anything and, under the current spec sha256, a training-only load must
+    hash to the selection's ``train_data_sha256``; the full load comes after the
+    marker. Injected settings and counts are for tests and are refused under the
+    current spec sha256, as is a seed other than the selection's and the spec's. Any
+    existing ``pine_gate_holdout_*.json`` in ``out_dir`` or next to the selection
+    file refuses the run.
     """
     counts = {"offsets": offsets, "permutation_shifts": permutation_shifts,
               "c1_seeds": c1_seeds, "bootstrap_n": bootstrap_n}
     selection, settings, selection_sha = _start(
-        selection_path, calib, out_dir, spec_sha, seed,
+        dataset, selection_path, calib, out_dir, spec_sha, seed,
         (period, exec_cfg, guard_cfg, gate_cfg, counts), data_dir)
-    if callable(dataset):
-        dataset = dataset()
-    _check_holdout_dataset(dataset, settings.period)
-    _check_training_part(selection_path, selection, dataset, spec_sha)
+    if not isinstance(dataset, Dataset):
+        dataset = dataset.load(None)
+        _check_holdout_dataset(dataset, settings.period)
+        _check_training_part(selection_path, selection, dataset, spec_sha)
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{HOLDOUT_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
     doc = _evaluate(_context(dataset, settings, calib, seed), selection)

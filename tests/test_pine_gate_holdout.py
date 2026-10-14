@@ -13,6 +13,7 @@ from pathlib import Path
 from research.pine_gate.bars import (
     day_path,
     funding_path,
+    read_day,
     wib_day_start_ms,
     warmup_path,
     write_day,
@@ -39,6 +40,8 @@ from research.pine_gate.holdout_gate import (
 from research.pine_gate.metalabel import FEATURES, MetaModel
 from research.pine_gate.pipeline import (
     SYMBOLS,
+    TRAIN_DATA_UNTIL_MS,
+    Dataset,
     HoldoutLockError,
     Segments,
     contender2_fn,
@@ -494,11 +497,33 @@ def tearDownModule():
         shutil.rmtree(_Shared.tmp, ignore_errors=True)
 
 
+# What a training-only load returns, reduced to the hash the holdout compares.
+_TRAIN_STANDIN = Dataset(frames={}, markets={}, data_sha256="", loaded_until_ms=0)
+
+
 class _Untouchable:
     """A dataset stand-in that fails the test if anything reads it."""
 
     def __getattr__(self, name):
         raise AssertionError(f"dataset.{name} read before the lock refused")
+
+
+class _FakeSource:
+    """A data source whose file check and training load pass (the training part hashes
+    to ``train_sha``); the full load stops the run. Records each call and whether the
+    run marker existed at that moment."""
+
+    def __init__(self, marker, train_sha="e" * 64):
+        self.marker, self.train_sha, self.calls = marker, train_sha, []
+
+    def check_files(self, until_ms):
+        self.calls.append(("check", until_ms, self.marker.exists()))
+
+    def load(self, until_ms):
+        self.calls.append(("load", until_ms, self.marker.exists()))
+        if until_ms == TRAIN_DATA_UNTIL_MS:
+            return replace(_TRAIN_STANDIN, train_part_sha256=self.train_sha)
+        raise RuntimeError("stop after loading")
 
 
 class LockTests(unittest.TestCase):
@@ -525,11 +550,15 @@ class LockTests(unittest.TestCase):
             self.run_stage(path, sha=sha, out_dir=self.tmp, data_dir=None)
         self.assertIn("data_dir", str(ctx.exception))
 
-    def test_run_marker_is_written_before_any_holdout_data_is_read(self):
+    def test_run_marker_is_written_after_the_data_checks_and_before_the_holdout_load(self):
         sha = spec_sha256()
         path = write_selection(self.tmp / "sel" / "selection.json", sha)
-        with self.assertRaises(AssertionError):  # the marker is written, then the data read
-            self.run_stage(path, sha=sha, out_dir=self.tmp / "sel")
+        source = _FakeSource(self.marker(sha))
+        with self.assertRaises(RuntimeError):  # the marker is written, then the data read
+            self.run_stage(path, sha=sha, out_dir=self.tmp / "sel", dataset=source)
+        self.assertEqual(source.calls, [("check", None, False),
+                                        ("load", TRAIN_DATA_UNTIL_MS, False),
+                                        ("load", None, True)])
         doc = json.loads(self.marker(sha).read_text())
         self.assertEqual(doc["spec_sha256"], sha)
         self.assertEqual(doc["selection_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
@@ -537,29 +566,69 @@ class LockTests(unittest.TestCase):
         self.assertEqual(doc["out_dir"], str((self.tmp / "sel").resolve()))
         self.assertTrue(doc["created_at"].endswith("+00:00"))
 
-    def test_a_loader_runs_only_after_the_marker_is_written(self):
+    def test_a_test_sha_checks_the_files_but_skips_the_training_load(self):
         path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
-        seen = []
-
-        def loader():
-            seen.append(self.marker(DUMMY_SHA).exists())
-            raise RuntimeError("stop after loading")
-
+        source = _FakeSource(self.marker(DUMMY_SHA))
         with self.assertRaises(RuntimeError):
-            self.run_stage(path, dataset=loader)
-        self.assertEqual(seen, [True])
+            self.run_stage(path, dataset=source)
+        self.assertEqual(source.calls, [("check", None, False), ("load", None, True)])
+
+    def test_training_data_that_differs_refuses_without_a_marker(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel.json", sha)  # train_data_sha256 "eee..."
+        source = _FakeSource(self.marker(sha), train_sha="d" * 64)
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp, dataset=source)
+        self.assertIn("training part", str(ctx.exception))
+        self.assertFalse(self.marker(sha).exists())
+        self.assertEqual([c[0] for c in source.calls], ["check", "load"])
+
+    def test_a_missing_or_broken_holdout_day_file_refuses_without_a_marker(self):
+        _build_shared()
+        sha = spec_sha256()
+        data = self.tmp / "data"
+        shutil.copytree(_Shared.tmp / "data", data)
+        path = write_selection(self.tmp / "sel.json", sha)
+        day = date(2026, 10, 2)
+        day_file = day_path(data, "prod", ETH, "1m", day)
+        source = holdout.DataSource(data, start_day=FIRST_DAY)
+        rows = read_day(day_file)
+        day_file.unlink()
+        with self.assertRaises(FileNotFoundError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp, dataset=source)
+        self.assertIn("2026-10-02", str(ctx.exception))
+        self.assertFalse(self.marker(sha).exists())
+        write_day(day_file, rows[:-1])  # the day's last bar is missing
+        with self.assertRaises(ValueError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp, dataset=source)
+        self.assertIn("2026-10-02", str(ctx.exception))
+        self.assertFalse(self.marker(sha).exists())
+
+    def test_a_period_past_the_stored_data_refuses_without_a_marker(self):
+        path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
+        late = HoldoutPeriod(wib(2026, 9, 28), ms(HOLDOUT_END) + DAY, wib(2026, 10, 6),
+                             ms(HOLDOUT_END) + DAY)
+        source = _FakeSource(self.marker(DUMMY_SHA))
+        with self.assertRaises(ValueError) as ctx:
+            self.run_stage(path, dataset=source, period=late, **SMALL)
+        self.assertIn("holdout end", str(ctx.exception))
+        self.assertFalse(self.marker(DUMMY_SHA).exists())
+        self.assertEqual(source.calls, [])
 
     def test_an_existing_run_marker_refuses_a_rerun_in_a_fresh_folder(self):
         sha = spec_sha256()
         first = write_selection(self.tmp / "a" / "selection.json", sha)
-        with self.assertRaises(AssertionError):
-            self.run_stage(first, sha=sha, out_dir=self.tmp / "a")
+        with self.assertRaises(RuntimeError):
+            self.run_stage(first, sha=sha, out_dir=self.tmp / "a",
+                           dataset=_FakeSource(self.marker(sha)))
         copy = self.tmp / "b" / "selection.json"
         copy.parent.mkdir()
         shutil.copyfile(first, copy)  # same spec, fresh folder, no holdout file anywhere
+        again = _FakeSource(self.marker(sha))
         with self.assertRaises(HoldoutLockError) as ctx:
-            self.run_stage(copy, sha=sha, out_dir=self.tmp / "b")
+            self.run_stage(copy, sha=sha, out_dir=self.tmp / "b", dataset=again)
         self.assertIn(str(self.marker(sha)), str(ctx.exception))
+        self.assertEqual(again.calls, [])  # refused before any data is read
         self.assertEqual(list((self.tmp / "b").glob("pine_gate_holdout_*.json")), [])
 
     def test_a_refused_lock_check_writes_no_marker(self):
@@ -969,7 +1038,8 @@ class StageSkipTests(unittest.TestCase):
             short = replace(_Shared.dataset, loaded_until_ms=ms(HOLDOUT_END) - DAY)
             with self.assertRaises(ValueError):
                 run_test_stage(short, sel, CALIB, out / "o", DUMMY_SHA, period=TEST_PERIOD,
-                               **SMALL)
+                               data_dir=out / "data", **SMALL)
+            self.assertFalse((out / "data" / "holdout_runs").exists())  # refused first
         finally:
             shutil.rmtree(out, ignore_errors=True)
 

@@ -337,9 +337,12 @@ def _policies() -> Dict[str, Any]:
         "holdout_lock": "under the spec sha256 the test runs once, next to its selection file "
                         "(links resolved), on the code (code_sha256) and the training data "
                         "(train_data_sha256) and the Python major.minor (python_version) the "
-                        "selection was made with, with the spec seed; an exclusive run "
-                        "marker <data_dir>/holdout_runs/<spec_sha256>.json is written before "
-                        "any holdout data is read and refuses every later run",
+                        "selection was made with, with the spec seed; every data check "
+                        "that can refuse (the files checked without computing anything, the "
+                        "training part hashed from a training-only load) comes before the "
+                        "exclusive run marker <data_dir>/holdout_runs/<spec_sha256>.json, "
+                        "which is written before the holdout is loaded and refuses every "
+                        "later run",
         "contender3_primary_fallback": "every Stage-1 rule ranking -inf: median block lower "
                                        "bound without the vote (none last) -> pooled WR -> "
                                        "Stage-1 order",

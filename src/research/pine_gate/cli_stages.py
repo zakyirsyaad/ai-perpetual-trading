@@ -4,9 +4,10 @@ Research code; the bot never imports it. Standard library only. ``test``
 enforces the holdout lock before any holdout data is read: the selection file
 must pass ``load_selection_checked`` under the current spec sha256 and
 ``check_ready`` (no holdout file yet, the selection's calibration, its code
-sha256 and a passing training C0, the output next to the selection file), and
-``test_stage`` writes the run marker ``<data-dir>/holdout_runs/<spec_sha256>.json``.
-Only then is the full dataset loaded.
+sha256 and a passing training C0, the output next to the selection file).
+``test_stage`` then checks the data files and the training part, writes the run
+marker ``<data-dir>/holdout_runs/<spec_sha256>.json`` and only then loads the full
+dataset.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from .cli_checks import DECISIONS_PREFIX, VST_PREFIX
 from .calibrate import load_entry_latencies_ms, s_star, stop_overshoot_detail
 from .holdout import HOLDOUT_PREFIX, check_ready, test_stage
 from .lock import code_files, code_sha256, latencies_sha256, load_selection_checked
+from .dataset import DataSource
 from .pipeline import TRAIN_DATA_UNTIL_MS, load_dataset, train_stage
 from .report import write_report
 from .spec import spec_sha256
@@ -84,10 +86,10 @@ def cmd_test(args: argparse.Namespace) -> int:
     selection = load_selection_checked(selection_path, spec_sha)  # the lock comes first
     calib = common.load_calibration_file(Path(args.calibration).expanduser())
     check_ready(selection_path, selection, calib, spec_sha, args.out_dir)
-    # test_stage writes the run marker under --data-dir, then calls the loader
-    print(test_stage(lambda: load_dataset(args.data_dir, None), selection_path, calib,
-                     args.out_dir, spec_sha, seed=selection.get("seed", 0),
-                     data_dir=args.data_dir))
+    # test_stage checks the files and the training part, writes the run marker under
+    # --data-dir, then loads the holdout
+    print(test_stage(DataSource(args.data_dir), selection_path, calib, args.out_dir,
+                     spec_sha, seed=selection.get("seed", 0), data_dir=args.data_dir))
     return 0
 
 

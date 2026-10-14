@@ -155,6 +155,57 @@ class _Loaded:
     train_part: str  # the same over the training part
 
 
+@dataclass(frozen=True)
+class _Read:
+    """One symbol's stored files as read and checked, before any feature is built."""
+
+    bars: Bars
+    warmups: Mapping[str, Optional[Bars]]
+    funding: Tuple[int, ...]
+    missing: List[str]  # warm-up files not found or unused
+
+
+def _read_symbol(data_dir: Path, symbol: str, days: Tuple[date, date],
+                 until_ms: Optional[int]) -> _Read:
+    """Read and check every file of one symbol: whole day files, warm-ups, funding at
+    the cadence over the loaded range. Nothing is computed from the bars."""
+    start_day, end_day = days
+    bars = load_days(data_dir, "prod", symbol, "1m", start_day, end_day)
+    if until_ms is not None:
+        bars = slice_until(bars, until_ms)
+    warmups: Dict[str, Optional[Bars]] = {}
+    missing: List[str] = []
+    for interval in _WARMUP_INTERVALS:
+        path = warmup_path(data_dir, symbol, interval)
+        rel = path.relative_to(data_dir).as_posix()
+        if path.exists():
+            warmups[interval] = _read_warmup(path, interval, until_ms)
+            if warmup_unused(bars, warmups[interval], interval_to_ms(interval)):
+                missing.append(f"{rel} (unused: starts at or after the first aggregated bar)")
+        else:
+            missing.append(rel)
+            warmups[interval] = None
+    span = (wib_day_start_ms(start_day), wib_day_start_ms(end_day + timedelta(days=1)))
+    if until_ms is not None:
+        span = (span[0], min(span[1], until_ms))
+    try:
+        funding = _read_funding(funding_path(data_dir, symbol), span, until_ms)
+    except ValueError as exc:
+        raise ValueError(f"{symbol} funding: {exc}") from None
+    return _Read(bars, warmups, funding, missing)
+
+
+def _file_lines(data_dir: Path, symbol: str, days: Tuple[date, date]) -> List[str]:
+    """"relative_path:sha256" of every file a load of ``symbol`` reads."""
+    start_day, end_day = days
+    paths = [day_path(data_dir, "prod", symbol, "1m", start_day + timedelta(k))
+             for k in range((end_day - start_day).days + 1)]
+    paths += [p for p in (warmup_path(data_dir, symbol, i) for i in _WARMUP_INTERVALS)
+              if p.exists()]
+    paths.append(funding_path(data_dir, symbol))
+    return [_file_line(data_dir, p) for p in paths]
+
+
 def _load_symbol(
     data_dir: Path,
     symbol: str,
@@ -163,40 +214,29 @@ def _load_symbol(
     exec_cfg: ExecConfig,
 ) -> _Loaded:
     """One symbol's frame and market with the hashes of what was read and kept."""
-    start_day, end_day = days
-    bars = load_days(data_dir, "prod", symbol, "1m", start_day, end_day)
-    if until_ms is not None:
-        bars = slice_until(bars, until_ms)
-    lines = [
-        _file_line(data_dir, day_path(data_dir, "prod", symbol, "1m", start_day + timedelta(k)))
-        for k in range((end_day - start_day).days + 1)
-    ]
-    warmups: Dict[str, Optional[Bars]] = {}
-    missing: List[str] = []
-    for interval in _WARMUP_INTERVALS:
-        path = warmup_path(data_dir, symbol, interval)
-        rel = path.relative_to(data_dir).as_posix()
-        if path.exists():
-            lines.append(_file_line(data_dir, path))
-            warmups[interval] = _read_warmup(path, interval, until_ms)
-            if warmup_unused(bars, warmups[interval], interval_to_ms(interval)):
-                missing.append(f"{rel} (unused: starts at or after the first aggregated bar)")
-        else:
-            missing.append(rel)
-            warmups[interval] = None
-    fpath = funding_path(data_dir, symbol)
-    span = (wib_day_start_ms(start_day), wib_day_start_ms(end_day + timedelta(days=1)))
-    if until_ms is not None:
-        span = (span[0], min(span[1], until_ms))
-    try:
-        funding = _read_funding(fpath, span, until_ms)
-    except ValueError as exc:
-        raise ValueError(f"{symbol} funding: {exc}") from None
-    lines.append(_file_line(data_dir, fpath))
-    frame = FeatureFrame.build(symbol, bars, warmups["1h"], warmups["4h"])
-    market = Market(symbol, bars, OutcomeCache(bars, exec_cfg), funding)
-    return _Loaded(frame, market, lines, missing, _content_sha256(bars, warmups, funding),
-                   _training_part_sha256(bars, warmups, funding))
+    r = _read_symbol(data_dir, symbol, days, until_ms)
+    frame = FeatureFrame.build(symbol, r.bars, r.warmups["1h"], r.warmups["4h"])
+    market = Market(symbol, r.bars, OutcomeCache(r.bars, exec_cfg), r.funding)
+    return _Loaded(frame, market, _file_lines(data_dir, symbol, days), r.missing,
+                   _content_sha256(r.bars, r.warmups, r.funding),
+                   _training_part_sha256(r.bars, r.warmups, r.funding))
+
+
+def _day_range(until_ms: Optional[int], start_day: Optional[date]) -> Tuple[date, date]:
+    """First and last WIB day file a load reads."""
+    first = start_day if start_day is not None else wib_day(ms(TRAIN_START))
+    end_ms = until_ms if until_ms is not None else ms(HOLDOUT_END)
+    return first, wib_day(end_ms - 1)
+
+
+def check_data_files(data_dir: Path, until_ms: Optional[int], *,
+                     start_day: Optional[date] = None) -> None:
+    """Every check ``load_dataset`` makes on the files (presence, whole WIB days,
+    contiguity, warm-ups readable, funding cadence) without building features or
+    outcomes; raises what the load would raise."""
+    days = _day_range(until_ms, start_day)
+    for symbol in SYMBOLS:
+        _read_symbol(Path(data_dir), symbol, days, until_ms)
 
 
 def load_dataset(
@@ -213,9 +253,7 @@ def load_dataset(
     holdout day. Missing day or funding files raise; a missing warm-up is recorded.
     """
     data_dir = Path(data_dir)
-    first = start_day if start_day is not None else wib_day(ms(TRAIN_START))
-    end_ms = until_ms if until_ms is not None else ms(HOLDOUT_END)
-    last = wib_day(end_ms - 1)
+    first, last = _day_range(until_ms, start_day)
     cfg = exec_cfg if exec_cfg is not None else ExecConfig()
     loaded = {s: _load_symbol(data_dir, s, (first, last), until_ms, cfg) for s in SYMBOLS}
     lines = sorted(line for x in loaded.values() for line in x.lines)
@@ -229,6 +267,21 @@ def load_dataset(
         train_data_sha256=_text_sha256([f"{s}:{x.content}" for s, x in loaded.items()]),
         train_part_sha256=_text_sha256([f"{s}:{x.train_part}" for s, x in loaded.items()]),
     )
+
+
+@dataclass(frozen=True)
+class DataSource:
+    """The stored data under ``data_dir``, read only when asked: ``check_files`` checks
+    what a load would read without computing anything from it, ``load`` loads it."""
+
+    data_dir: Path
+    start_day: Optional[date] = None
+
+    def check_files(self, until_ms: Optional[int]) -> None:
+        check_data_files(self.data_dir, until_ms, start_day=self.start_day)
+
+    def load(self, until_ms: Optional[int]) -> Dataset:
+        return load_dataset(self.data_dir, until_ms, start_day=self.start_day)
 
 
 def _text_sha256(lines: Sequence[str]) -> str:

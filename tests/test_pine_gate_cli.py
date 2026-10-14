@@ -21,6 +21,7 @@ from research.pine_gate.bars import (
     wib_day_start_ms,
     write_day,
 )
+from research.pine_gate.dataset import DataSource
 from research.pine_gate.pipeline import TRAIN_DATA_UNTIL_MS, latencies_sha256
 from research.pine_gate.spec import spec_document, spec_sha256
 
@@ -205,27 +206,24 @@ class TestCommandTest(Dirs):
             order.append(("lock", Path(path), sha))
             return selection
 
-        def load(data_dir, until_ms):
-            order.append(("load", until_ms))
-            return "dataset"
-
-        def stage(loader, path, calib_obj, out_dir, sha, seed, data_dir):
-            order.append(("stage", data_dir, seed, calib_obj.latencies_ms))
-            self.assertEqual(loader(), "dataset")  # loaded only once test_stage asks
+        def stage(source, path, calib_obj, out_dir, sha, seed, data_dir):
+            order.append(("stage", data_dir, seed, calib_obj.latencies_ms, source))
             return Path(out_dir) / "pine_gate_holdout_20261014.json"
 
         with mock.patch.object(cli_stages, "load_selection_checked", lock), \
-                mock.patch.object(cli_stages, "load_dataset", load), \
+                mock.patch.object(cli_stages, "load_dataset",
+                                  side_effect=AssertionError("loaded outside test_stage")), \
                 mock.patch.object(cli_stages, "test_stage", stage):
             code, out, err = run_cli(self.base_args() + [
                 "test", "--selection", str(selection_path), "--calibration", str(calib)])
         self.assertEqual(code, 0, err)
-        self.assertEqual([step[0] for step in order], ["lock", "stage", "load"])
+        self.assertEqual([step[0] for step in order], ["lock", "stage"])
         self.assertEqual(order[0][2], spec_sha256())
         self.assertEqual(order[1][1], self.data)  # the run marker goes under --data-dir
         self.assertEqual(order[1][2], 0)
         self.assertEqual(order[1][3], (1000.0, 2000.0))
-        self.assertIsNone(order[2][1])
+        # test_stage gets the stored data unread, to check before the marker and load after
+        self.assertEqual(order[1][4], DataSource(self.data))
         self.assertIn("pine_gate_holdout_20261014.json", out)
 
     def test_test_command_refuses_when_a_holdout_file_exists_before_loading(self):
