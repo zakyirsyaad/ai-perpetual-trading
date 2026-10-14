@@ -58,6 +58,7 @@ from .lock import (
     equal_ranges,
     latencies_sha256,
     load_selection_checked,
+    python_version,
     run_settings,
 )
 from .metalabel import Candidate, candidate_features, train_meta
@@ -730,7 +731,7 @@ def train_stage(
     """
     check_spec_sha(spec_sha)
     settings = run_settings(segments, exec_cfg, guard_cfg, sel_cfg, model_cfg, meta_trainer)
-    check_spec_run(spec_sha, settings)
+    check_spec_run(spec_sha, settings, seed)
     _check_dataset(dataset, settings.segments)
     check_purge_covers(calib, settings.exec_cfg)
     code_sha = code_sha256()  # the code that runs, taken before the long run
@@ -743,7 +744,8 @@ def train_stage(
     primary = _primary_rule(sel, ctx.sel_cfg)
     extra = {
         "spec_sha256": spec_sha, "created_at": created.isoformat(),
-        "code_sha256": code_sha, **_data_record(dataset), **c0_training(ctx),
+        "code_sha256": code_sha, "python_version": python_version(),
+        **_data_record(dataset), **c0_training(ctx),
         "spa_p": _spa(ctx, sel.results, spa_n), "spa_n": spa_n,
         "regime_counts": regime_counts(ctx.frames, ctx.segments.train_start_ms,
                                        ctx.segments.train_end_ms),

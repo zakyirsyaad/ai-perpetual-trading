@@ -13,7 +13,8 @@ holdout file in ``out_dir`` or next to the selection file (its real folder, link
 resolved), of any date, refuses the run, and so does an existing run marker
 ``<data_dir>/holdout_runs/<spec_sha256>.json``, written before any holdout data is
 read (mandatory under the current spec sha256). A run under the current spec sha256 must also use the seed recorded in
-the selection file, run on the code that trained (``code_sha256``), follow a
+the selection file (the spec seed), run on the code and the Python version that
+trained (``code_sha256``, ``python_version``), follow a
 training C0 that passed, write next to its selection file and read holdout data
 whose training part is the data the selection was trained on.
 
@@ -57,11 +58,13 @@ from .holdout_replay import (
 )
 from .lock import (
     HoldoutLockError,
+    check_spec_seed,
     check_spec_sha,
     code_sha256,
     is_spec_sha,
     latencies_sha256,
     load_selection_checked,
+    python_version,
 )
 from .outcomes import OutcomeCache
 from .pipeline import SYMBOLS, Dataset, check_purge_covers
@@ -473,6 +476,7 @@ def _check_spec_run(
     recorded = selection.get("seed")
     if type(recorded) is not int or seed != recorded:
         raise ValueError(f"a spec run must use the selection's seed {recorded!r}, got {seed!r}")
+    check_spec_seed(seed)
 
 
 def check_calibration(path: Path, selection: Mapping[str, Any], calib: Calibration) -> None:
@@ -530,12 +534,17 @@ def refuse_any_holdout(out_dir: Path, *more_dirs: Path) -> None:
 
 
 def _check_locked_run(path: Path, selection: Mapping[str, Any], out_dir: Path) -> None:
-    """Under the current spec sha256: the code that trained, a passing training C0 and
-    the holdout file next to its selection file."""
+    """Under the current spec sha256: the code and Python that trained, a passing
+    training C0 and the holdout file next to its selection file."""
     recorded, current = selection.get("code_sha256"), code_sha256()
     if recorded != current:
         raise HoldoutLockError(f"{path}: code sha256 {recorded!r} differs from the current "
                                f"code {current}; the holdout runs on the code that trained")
+    trained_on, running = selection.get("python_version"), python_version()
+    if trained_on != running:
+        raise HoldoutLockError(f"{path}: Python {trained_on!r} trained, this is Python "
+                               f"{running}; the holdout runs on the Python version that "
+                               "trained (float sums can differ)")
     if selection.get("c0_training_pass") is not True:
         raise HoldoutLockError(f"{path}: fill model invalid on training C0; fix before test")
     if Path(out_dir).resolve() != selection_folder(path):
@@ -622,6 +631,7 @@ def _provenance(
         "data_content_sha256": dataset.train_data_sha256,
         "train_part_sha256": dataset.train_part_sha256,
         "code_sha256": code_sha256(),
+        "python_version": python_version(),
         "data_loaded_until_ms": dataset.loaded_until_ms,
         "missing_warmups": list(dataset.missing_warmups),
         "seed": seed,
@@ -690,7 +700,7 @@ def test_stage(
     path = Path(out_dir) / f"{HOLDOUT_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
     doc = _evaluate(_context(dataset, settings, calib, seed), selection)
     doc.update(_provenance(dataset, calib, settings, seed))
-    doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).name,
+    doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).resolve().name,
                 "selection_sha256": selection_sha, "created_at": created.isoformat()})
     # a concurrent run may have written in the meantime
     refuse_any_holdout(out_dir, selection_folder(selection_path))

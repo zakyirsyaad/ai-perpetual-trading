@@ -3,8 +3,8 @@
 Research code; the bot never imports it. Standard library only. Both score
 bracket outcomes inside the holdout period, so both run only after the one-shot
 holdout test: the selection file must pass the holdout lock, and a holdout file
-in ``--out-dir`` must exist that was made from that selection file under the
-current spec (``require_holdout_run``). Both checks come before any data is
+next to it must exist that was made from that selection file under the current
+spec and code (``require_holdout_run``). Both checks come before any data is
 loaded or Supabase is called. The contender is the one the holdout chose
 unless ``--contender`` names another. Both outputs record that ``contender`` and
 the selection file's ``selection_sha256``, so the report can refuse an output that
@@ -39,7 +39,7 @@ from .holdout import HOLDOUT_PREFIX
 from .holdout_replay import HoldoutPeriod, build_contenders, parse_rule
 from .metalabel import MetaModel, candidate_features
 from .outcomes import OutcomeCache, gross_bps
-from .lock import HoldoutLockError, load_selection_checked
+from .lock import HoldoutLockError, code_sha256, load_selection_checked
 from .rules import contender2_required_fields, contender2_signal, required_fields, rule_signal
 from .spec import TRAIN_START, VP_PARAMS, ExecConfig, FillConfig, RuleSpec, ms, spec_sha256
 
@@ -71,14 +71,17 @@ class Chosen:
     model: Optional[MetaModel] = None
 
 
-def require_holdout_run(out_dir: Path, selection_path: Path) -> Dict[str, Any]:
+def require_holdout_run(selection_path: Path) -> Dict[str, Any]:
     """The holdout file the one-shot test wrote from ``selection_path``; refuses otherwise.
 
-    The newest ``pine_gate_holdout_*.json`` in ``out_dir`` must record the current
-    spec sha256, the selection file's name and, when recorded, its sha256."""
-    path = common.newest(out_dir, f"{HOLDOUT_PREFIX}*.json")
+    The newest ``pine_gate_holdout_*.json`` next to the selection file (its real folder,
+    links resolved) must record the current spec sha256, the selection file's real name,
+    its sha256 and the current code sha256."""
+    real = Path(selection_path).resolve()
+    path = common.newest(real.parent, f"{HOLDOUT_PREFIX}*.json")
     if path is None:
-        raise HoldoutLockError(f"no holdout file in {out_dir}; run the test stage first")
+        raise HoldoutLockError(f"no holdout file next to the selection file in {real.parent}; "
+                               "run the test stage first")
     try:
         doc = common.json_doc(path)
     except ValueError as exc:
@@ -86,12 +89,15 @@ def require_holdout_run(out_dir: Path, selection_path: Path) -> Dict[str, Any]:
     if doc.get("spec_sha256") != spec_sha256():
         raise HoldoutLockError(f"{path}: spec_sha256 {doc.get('spec_sha256')!r} does not match "
                                f"the current spec {spec_sha256()}")
-    if doc.get("selection_file") != selection_path.name:
+    if doc.get("selection_file") != real.name:
         raise HoldoutLockError(f"{path}: selection_file {doc.get('selection_file')!r} is not "
-                               f"{selection_path.name!r}")
-    recorded = doc.get("selection_sha256")
-    if recorded is not None and recorded != common.file_sha256(selection_path):
-        raise HoldoutLockError(f"{path}: selection_sha256 differs from {selection_path}")
+                               f"{real.name!r}")
+    if doc.get("selection_sha256") != common.file_sha256(real):
+        raise HoldoutLockError(f"{path}: selection_sha256 missing or differs from {real}")
+    if doc.get("code_sha256") != code_sha256():
+        raise HoldoutLockError(f"{path}: code_sha256 {doc.get('code_sha256')!r} differs from the "
+                               f"current code {code_sha256()}; the checks run on the code "
+                               "that ran the holdout")
     return doc
 
 
@@ -108,7 +114,7 @@ def locked_selection(args: argparse.Namespace) -> Locked:
     """The checked selection and the contender name, before any data is touched."""
     selection_path = Path(args.selection).expanduser()
     selection = load_selection_checked(selection_path, spec_sha256())
-    holdout = require_holdout_run(args.out_dir, selection_path)
+    holdout = require_holdout_run(selection_path)
     name = args.contender or holdout.get("chosen")
     if name not in CONTENDERS:
         raise common.CliError("the holdout chose no contender; pass --contender c1|c2|c3")

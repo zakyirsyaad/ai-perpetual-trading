@@ -69,6 +69,9 @@ LAST20_START = _wib(2026, 9, 16)
 LAST20_END = HOLDOUT_END
 PURGE_MINUTES = 60
 EMBARGO_MINUTES = 60
+# The one seed of every random draw (latency samples, controls, bootstraps) in a spec
+# run; train and test refuse any other seed under the spec sha256.
+SEED = 0
 
 
 @dataclass(frozen=True)
@@ -323,7 +326,8 @@ def _policies() -> Dict[str, Any]:
                        "offset 0); outside c0 tolerances the test stage refuses to run",
         "holdout_lock": "under the spec sha256 the test runs once, next to its selection file "
                         "(links resolved), on the code (code_sha256) and the training data "
-                        "(train_data_sha256) the selection was made with; an exclusive run "
+                        "(train_data_sha256) and the Python major.minor (python_version) the "
+                        "selection was made with, with the spec seed; an exclusive run "
                         "marker <data_dir>/holdout_runs/<spec_sha256>.json is written before "
                         "any holdout data is read and refuses every later run",
         "contender3_primary_fallback": "every Stage-1 rule ranking -inf: median block lower "
@@ -403,6 +407,7 @@ def spec_document() -> Dict[str, Any]:
     """Every pre-registered constant as plain JSON data; a fresh dict per call."""
     doc = {
         "version": SPEC_VERSION,
+        "seed": SEED,
         "exec": asdict(ExecConfig()),
         "guards": asdict(GuardConfig()),
         "selection": asdict(SelectionConfig()),

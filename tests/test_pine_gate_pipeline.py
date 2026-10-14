@@ -4,6 +4,7 @@ import math
 from dataclasses import asdict
 import random
 import shutil
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -538,6 +539,12 @@ class TrainStageTests(PipelineFixture):
                 self.assertIn(name, str(ctx.exception))
                 self.assertFalse((self.tmp / f"real_{name}").exists())
 
+    def test_train_stage_refuses_the_real_sha_with_another_seed(self):
+        with self.assertRaises(ValueError) as ctx:
+            train_stage(self.dataset, CALIB, self.tmp / "real_seed", spec_sha256(), seed=1)
+        self.assertIn("seed", str(ctx.exception))
+        self.assertFalse((self.tmp / "real_seed").exists())
+
     def test_train_stage_refuses_to_overwrite_a_selection_file(self):
         out = self.tmp / "existing"
         out.mkdir()
@@ -583,6 +590,9 @@ class IntegrityRecordTests(PipelineFixture):
     def test_selection_records_the_code_sha256(self):
         self.assertEqual(self.selection["code_sha256"], lock.code_sha256())
         self.assertRegex(self.selection["code_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_selection_records_the_python_version(self):
+        self.assertEqual(self.selection["python_version"], list(sys.version_info[:2]))
 
     def test_recorded_code_sha_is_the_one_taken_before_the_run(self):
         first, later = "a" * 64, "b" * 64

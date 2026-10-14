@@ -29,6 +29,7 @@ from research.pine_gate.spec import (
     GateConfig,
     GuardConfig,
     ModelConfig,
+    SEED,
     RuleSpec,
     SelectionConfig,
     ms,
@@ -252,6 +253,11 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertIn("c0_training", policies)
         self.assertIn("code_sha256", policies["holdout_lock"])
         self.assertIn("sum(w * logloss) / sum(w)", policies["meta_model_objective"])
+
+    def test_document_pre_registers_the_seed(self):
+        self.assertEqual(SEED, 0)
+        self.assertEqual(spec_document()["seed"], SEED)
+        self.assertIn("python_version", spec_document()["policies"]["holdout_lock"])
 
     def test_each_call_returns_a_fresh_document(self):
         first = spec_document()

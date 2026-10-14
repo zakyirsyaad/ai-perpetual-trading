@@ -195,9 +195,10 @@ class TestCommandTest(Dirs):
         selection_path = self.out / "pine_gate_selection_20260101.json"
         calib = self.write_calibration()
         cal = calibration_doc()
-        selection = {"seed": 3, "s_star_bps": cal["s_star_bps"], "n_latencies": 2,
+        selection = {"seed": 0, "s_star_bps": cal["s_star_bps"], "n_latencies": 2,
                      "latencies_sha256": cal["latencies_sha256"],
-                     "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True}
+                     "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True,
+                     "python_version": pine_lock.python_version()}
         order = []
 
         def lock(path, sha):
@@ -222,7 +223,7 @@ class TestCommandTest(Dirs):
         self.assertEqual([step[0] for step in order], ["lock", "stage", "load"])
         self.assertEqual(order[0][2], spec_sha256())
         self.assertEqual(order[1][1], self.data)  # the run marker goes under --data-dir
-        self.assertEqual(order[1][2], 3)
+        self.assertEqual(order[1][2], 0)
         self.assertEqual(order[1][3], (1000.0, 2000.0))
         self.assertIsNone(order[2][1])
         self.assertIn("pine_gate_holdout_20261014.json", out)
@@ -247,7 +248,8 @@ class TestCommandTest(Dirs):
         cal = calibration_doc()
         base = {"seed": 0, "s_star_bps": cal["s_star_bps"], "n_latencies": 2,
                 "latencies_sha256": cal["latencies_sha256"],
-                "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True}
+                "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True,
+                "python_version": pine_lock.python_version()}
         cases = ((dict(base, code_sha256="f" * 64), "code sha256"),
                  (dict(base, c0_training_pass=False), "fill model invalid on training C0"))
         for selection, text in cases:
@@ -682,7 +684,8 @@ def write_lock_files(test, chosen="c1", **overrides):
     selection = test.out / "s.json"
     selection.write_text(json.dumps(SELECTION), encoding="utf-8")
     holdout = {"chosen": chosen, "spec_sha256": spec_sha256(), "selection_file": "s.json",
-               "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest()}
+               "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest(),
+               "code_sha256": pine_lock.code_sha256()}
     holdout.update(overrides)
     (test.out / "pine_gate_holdout_20261014.json").write_text(json.dumps(holdout),
                                                                encoding="utf-8")
@@ -741,6 +744,38 @@ class CheckLockTest(Dirs):
     def test_holdout_of_a_changed_selection_file_is_refused(self):
         write_lock_files(self, selection_sha256="f" * 64)
         self.assert_refused(self.run_both(), "selection_sha256")
+
+    def test_holdout_without_a_selection_sha_is_refused(self):
+        write_lock_files(self, selection_sha256=None)
+        self.assert_refused(self.run_both(), "selection_sha256")
+
+    def test_holdout_of_other_code_is_refused(self):
+        for code in ("f" * 64, None):
+            with self.subTest(code=code):
+                write_lock_files(self, code_sha256=code)
+                self.assert_refused(self.run_both(), "code_sha256")
+
+    def test_a_holdout_file_away_from_the_selection_file_is_refused(self):
+        write_lock_files(self)
+        moved = self.root / "elsewhere" / "s.json"
+        moved.parent.mkdir()
+        moved.write_bytes((self.out / "s.json").read_bytes())
+        (self.out / "s.json").unlink()
+        results = []
+        with self.patches():
+            for argv in (["vst-check", "--symbol", "BTC-USDT", "--selection", str(moved)],
+                         ["decisions", "--selection", str(moved)]):
+                results.append(run_cli(self.base_args() + argv))
+        self.assert_refused(results, "no holdout file")
+
+    def test_a_linked_selection_is_matched_by_its_real_name(self):
+        from research.pine_gate import cli_checks
+
+        write_lock_files(self)
+        link = self.root / "link.json"
+        link.symlink_to(self.out / "s.json")
+        doc = cli_checks.require_holdout_run(link)
+        self.assertEqual(doc["selection_file"], "s.json")
 
 
 class VstCheckCommandTest(Dirs):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -22,6 +23,7 @@ from .metalabel import train_meta
 from .spec import (
     BLOCKS,
     CSCV_BLOCKS,
+    SEED,
     TRAIN_END,
     TRAIN_START,
     ExecConfig,
@@ -34,8 +36,9 @@ from .spec import (
 
 __all__ = [
     "HoldoutLockError", "MetaTrainer", "RunSettings", "Segments", "TimeRange",
-    "check_spec_run", "check_spec_sha", "code_files", "code_sha256", "equal_ranges",
-    "is_spec_sha", "latencies_sha256", "load_selection_checked", "run_settings",
+    "check_spec_run", "check_spec_seed", "check_spec_sha", "code_files", "code_sha256", "equal_ranges",
+    "is_spec_sha", "latencies_sha256", "load_selection_checked", "python_version",
+    "run_settings",
     "write_exclusive", "write_json_exclusive",
 ]
 
@@ -196,8 +199,9 @@ def is_spec_sha(spec_sha: str) -> bool:
     return spec_sha == spec_sha256()
 
 
-def check_spec_run(spec_sha: str, settings: RunSettings) -> None:
-    """The real spec sha256 may only label a run with every spec default."""
+def check_spec_run(spec_sha: str, settings: RunSettings, seed: int) -> None:
+    """The real spec sha256 may only label a run with every spec default and the
+    pre-registered seed."""
     if not is_spec_sha(spec_sha):
         return
     fields = settings.non_spec_fields()
@@ -206,6 +210,18 @@ def check_spec_run(spec_sha: str, settings: RunSettings) -> None:
             "the current spec sha256 may only label a spec run; non-spec settings: "
             + ", ".join(fields)
         )
+    check_spec_seed(seed)
+
+
+def check_spec_seed(seed: Any) -> None:
+    """A spec run uses the pre-registered seed (``spec.SEED``) and no other."""
+    if type(seed) is not int or seed != SEED:
+        raise ValueError(f"a spec run uses the pre-registered seed {SEED}, got {seed!r}")
+
+
+def python_version() -> List[int]:
+    """[major, minor] of the running Python: float sums can differ across versions."""
+    return [sys.version_info[0], sys.version_info[1]]
 
 
 def latencies_sha256(latencies_ms: Sequence[float]) -> str:

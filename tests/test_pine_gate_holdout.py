@@ -3,6 +3,7 @@ import json
 import math
 import random
 import shutil
+import sys
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -453,7 +454,7 @@ def write_selection(path, sha, **override):
            "meta_model": meta_model_dict(), "seed": 0,
            "latencies_sha256": latencies_sha256(CALIB.latencies_ms),
            "code_sha256": lock.code_sha256(), "c0_training_pass": True,
-           "train_data_sha256": "e" * 64}
+           "train_data_sha256": "e" * 64, "python_version": list(sys.version_info[:2])}
     doc.update(override)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc))
@@ -629,16 +630,17 @@ class LockTests(unittest.TestCase):
 
     def test_real_spec_sha_requires_the_selection_seed(self):
         sha = spec_sha256()
-        for recorded, seed in ((0, 1), (3, 0), (None, 0)):
+        # the selection's seed and the pre-registered spec seed (0) must both hold
+        for recorded, seed in ((0, 1), (3, 0), (None, 0), (3, 3)):
             path = write_selection(self.tmp / f"sel_{recorded}_{seed}.json", sha, seed=recorded)
             with self.subTest(recorded=recorded, seed=seed):
                 with self.assertRaises(ValueError) as ctx:
                     self.run_stage(path, sha=sha, seed=seed)
                 self.assertIn("seed", str(ctx.exception))
-        # the recorded seed passes this check and goes on to read the dataset
-        path = write_selection(self.tmp / "sel_ok.json", sha, seed=3)
+        # the recorded spec seed passes this check and goes on to read the dataset
+        path = write_selection(self.tmp / "sel_ok.json", sha, seed=0)
         with self.assertRaises(AssertionError):
-            self.run_stage(path, sha=sha, seed=3, out_dir=self.tmp)
+            self.run_stage(path, sha=sha, seed=0, out_dir=self.tmp)
         # a dummy sha may pick any seed
         path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, seed=3)
         with self.assertRaises(AssertionError):
@@ -664,6 +666,20 @@ class LockTests(unittest.TestCase):
                 self.assertIn("code sha256", str(ctx.exception))
         # a dummy sha is a test run: the code hash is recorded, not enforced
         path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, code_sha256="f" * 64)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path)
+
+    def test_real_spec_sha_refuses_a_selection_made_on_another_python(self):
+        sha = spec_sha256()
+        for version in ([3, 9], None):
+            path = write_selection(self.tmp / f"sel_{version}.json", sha, python_version=version)
+            with self.subTest(version=version):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    self.run_stage(path, sha=sha, out_dir=self.tmp)
+                self.assertIn("Python", str(ctx.exception))
+                self.assertFalse(self.marker(sha).exists())
+        # a dummy sha is a test run: the version is recorded, not enforced
+        path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, python_version=[3, 9])
         with self.assertRaises(AssertionError):
             self.run_stage(path)
 
@@ -743,6 +759,8 @@ class TestStageTests(StageFixture):
         self.assertEqual(doc["calibration"]["s_star_bps"], 1.0)
         self.assertEqual(doc["code_sha256"], lock.code_sha256())
         self.assertEqual(doc["train_part_sha256"], self.dataset.train_part_sha256)
+        self.assertEqual(doc["python_version"], list(sys.version_info[:2]))
+        self.assertEqual(doc["selection_file"], self.selection_path.resolve().name)
 
     def test_never_overwrites_the_holdout_file(self):
         with self.assertRaises(FileExistsError):
