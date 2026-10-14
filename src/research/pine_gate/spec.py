@@ -162,8 +162,12 @@ class FillConfig:
     latency_purpose: str = "entry"
     latency_success_only: bool = True
     latency_since: str = "2026-09-25"
-    # overshoot_since and latency_since are WIB calendar days (midnight at this offset),
-    # like the decision-level view's 2026-08-31
+    # Both calibration windows end at the holdout end (HOLDOUT_END, WIB midnight), so
+    # a later calibrate run reads the same rows: [since, until) on created_at/opened_at.
+    latency_until: str = "2026-10-14"
+    overshoot_until: str = "2026-10-14"
+    # the since and until dates are WIB calendar days (midnight at this offset), like
+    # the decision-level view's 2026-08-31
     since_utc_offset: str = "+07:00"
 
 
@@ -303,9 +307,11 @@ def _policies() -> Dict[str, Any]:
                 "contender counts with p = 1",
         "c0_training": "always long and always short per symbol on training (same clock, "
                        "offset 0); outside c0 tolerances the test stage refuses to run",
-        "holdout_lock": "under the spec sha256 the test runs once, next to its selection file, "
-                        "on the code (code_sha256) and the training data (train_data_sha256) "
-                        "the selection was made with",
+        "holdout_lock": "under the spec sha256 the test runs once, next to its selection file "
+                        "(links resolved), on the code (code_sha256) and the training data "
+                        "(train_data_sha256) the selection was made with; an exclusive run "
+                        "marker <data_dir>/holdout_runs/<spec_sha256>.json is written before "
+                        "any holdout data is read and refuses every later run",
         "eth_first_sensitivity": True,
     }
 

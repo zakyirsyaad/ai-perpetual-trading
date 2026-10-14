@@ -511,7 +511,80 @@ class LockTests(unittest.TestCase):
                   **kwargs):
         out = self.tmp / "out" if out_dir is None else out_dir
         data = _Untouchable() if dataset is None else dataset
+        kwargs.setdefault("data_dir", self.tmp / "data")
         return run_test_stage(data, selection, calib, out, sha, **kwargs)
+
+    def marker(self, sha):
+        return self.tmp / "data" / "holdout_runs" / f"{sha}.json"
+
+    def test_real_spec_sha_needs_a_data_dir_for_the_run_marker(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel.json", sha)
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp, data_dir=None)
+        self.assertIn("data_dir", str(ctx.exception))
+
+    def test_run_marker_is_written_before_any_holdout_data_is_read(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel" / "selection.json", sha)
+        with self.assertRaises(AssertionError):  # the marker is written, then the data read
+            self.run_stage(path, sha=sha, out_dir=self.tmp / "sel")
+        doc = json.loads(self.marker(sha).read_text())
+        self.assertEqual(doc["spec_sha256"], sha)
+        self.assertEqual(doc["selection_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(doc["code_sha256"], lock.code_sha256())
+        self.assertEqual(doc["out_dir"], str((self.tmp / "sel").resolve()))
+        self.assertTrue(doc["created_at"].endswith("+00:00"))
+
+    def test_a_loader_runs_only_after_the_marker_is_written(self):
+        path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
+        seen = []
+
+        def loader():
+            seen.append(self.marker(DUMMY_SHA).exists())
+            raise RuntimeError("stop after loading")
+
+        with self.assertRaises(RuntimeError):
+            self.run_stage(path, dataset=loader)
+        self.assertEqual(seen, [True])
+
+    def test_an_existing_run_marker_refuses_a_rerun_in_a_fresh_folder(self):
+        sha = spec_sha256()
+        first = write_selection(self.tmp / "a" / "selection.json", sha)
+        with self.assertRaises(AssertionError):
+            self.run_stage(first, sha=sha, out_dir=self.tmp / "a")
+        copy = self.tmp / "b" / "selection.json"
+        copy.parent.mkdir()
+        shutil.copyfile(first, copy)  # same spec, fresh folder, no holdout file anywhere
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(copy, sha=sha, out_dir=self.tmp / "b")
+        self.assertIn(str(self.marker(sha)), str(ctx.exception))
+        self.assertEqual(list((self.tmp / "b").glob("pine_gate_holdout_*.json")), [])
+
+    def test_a_refused_lock_check_writes_no_marker(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel.json", sha, code_sha256="f" * 64)
+        with self.assertRaises(HoldoutLockError):
+            self.run_stage(path, sha=sha, out_dir=self.tmp)
+        self.assertFalse(self.marker(sha).exists())
+
+    def test_a_symlinked_selection_is_judged_by_its_real_folder(self):
+        sha = spec_sha256()
+        real = write_selection(self.tmp / "sel" / "selection.json", sha)
+        link = self.tmp / "other" / "selection.json"
+        link.parent.mkdir()
+        link.symlink_to(real)
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(link, sha=sha, out_dir=self.tmp / "other")
+        self.assertIn("next to its selection file", str(ctx.exception))
+        dummy = write_selection(self.tmp / "dsel" / "selection.json", DUMMY_SHA)
+        (self.tmp / "dsel" / "pine_gate_holdout_20260101.json").write_text("{}")
+        dlink = self.tmp / "dother" / "selection.json"
+        dlink.parent.mkdir()
+        dlink.symlink_to(dummy)
+        with self.assertRaises(FileExistsError) as ctx:
+            self.run_stage(dlink, out_dir=self.tmp / "dother")
+        self.assertIn("pine_gate_holdout_20260101.json", str(ctx.exception))
 
     def test_lock_is_checked_before_any_holdout_data_is_read(self):
         with self.assertRaises(HoldoutLockError):

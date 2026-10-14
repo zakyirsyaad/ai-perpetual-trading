@@ -61,6 +61,9 @@ def _day_start_iso(day: str) -> str:
 
 DEFAULT_LATENCY_SINCE = _day_start_iso(_FILL.latency_since)
 DEFAULT_OVERSHOOT_SINCE = _day_start_iso(_FILL.overshoot_since)
+# Exclusive window ends (pre-registered): calibrate reads the same rows on any later day.
+DEFAULT_LATENCY_UNTIL = _day_start_iso(_FILL.latency_until)
+DEFAULT_OVERSHOOT_UNTIL = _day_start_iso(_FILL.overshoot_until)
 
 
 class TooManyPagesError(RuntimeError):
@@ -140,8 +143,10 @@ async def load_entry_latencies_ms(
     get_rows: GetRows,
     table: str = _FILL.latency_table,
     since_iso: str = DEFAULT_LATENCY_SINCE,
+    until_iso: str = DEFAULT_LATENCY_UNTIL,
 ) -> List[float]:
-    """Successful entry-call latencies in ms (finite and >= 0) since ``since_iso``."""
+    """Successful entry-call latencies in ms (finite and >= 0) created in
+    [``since_iso``, ``until_iso``)."""
     rows = await fetch_all(
         get_rows,
         table,
@@ -150,6 +155,7 @@ async def load_entry_latencies_ms(
             ("purpose", f"eq.{_FILL.latency_purpose}"),
             ("success", "eq.true"),
             ("created_at", f"gte.{since_iso}"),
+            ("created_at", f"lt.{until_iso}"),
         ],
     )
     latencies: List[float] = []
@@ -240,8 +246,10 @@ async def stop_overshoot_detail(
     trades_table: str,
     decisions_table: str,
     since_iso: str = DEFAULT_OVERSHOOT_SINCE,
+    until_iso: str = DEFAULT_OVERSHOOT_UNTIL,
 ) -> StopOvershootDetail:
-    """Overshoot (bps) of every reconstructable live stop-loss exit, plus the skipped count."""
+    """Overshoot (bps) of every reconstructable live stop-loss exit opened in
+    [``since_iso``, ``until_iso``), plus the skipped count."""
     trades = await fetch_all(
         get_rows,
         trades_table,
@@ -250,6 +258,7 @@ async def stop_overshoot_detail(
             ("reason", "eq.stop_loss"),
             ("exchange", "eq.bingx"),
             ("opened_at", f"gte.{since_iso}"),
+            ("opened_at", f"lt.{until_iso}"),
         ],
     )
     since = parse_iso_datetime(since_iso)
@@ -261,6 +270,7 @@ async def stop_overshoot_detail(
             ("select", "id,created_at,symbol,action," + json_select("pj_decision", "pj_technicals")),
             ("action", "in.(OPEN_LONG,OPEN_SHORT)"),
             ("created_at", f"gte.{lookback_iso}"),
+            ("created_at", f"lt.{until_iso}"),  # a matched decision precedes its trade
         ],
         page_size=DECISION_PAGE_SIZE,
     )
@@ -289,8 +299,10 @@ async def stop_overshoot_samples(
     trades_table: str,
     decisions_table: str,
     since_iso: str = DEFAULT_OVERSHOOT_SINCE,
+    until_iso: str = DEFAULT_OVERSHOOT_UNTIL,
 ) -> List[float]:
-    detail = await stop_overshoot_detail(get_rows, trades_table, decisions_table, since_iso)
+    detail = await stop_overshoot_detail(get_rows, trades_table, decisions_table, since_iso,
+                                         until_iso)
     return list(detail.samples)
 
 

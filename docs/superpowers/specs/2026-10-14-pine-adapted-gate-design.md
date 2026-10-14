@@ -114,8 +114,13 @@ no private endpoints, no restart. Apart from the research package and the unwire
   - `test` refuses to run unless that selection file exists and its recorded spec sha256
     matches the current spec. Only then does it load holdout outcomes, once. Under the spec
     sha256 it also requires the code sha256 and the training-data hash the selection recorded,
-    and writes the holdout file next to the selection file; any earlier holdout file there or in
-    the output folder refuses the run.
+    and writes the holdout file next to the selection file (its real folder, links resolved);
+    any earlier holdout file there or in the output folder refuses the run. Before any holdout
+    data is read it writes the run marker `<data dir>/holdout_runs/<spec sha256>.json` (spec,
+    selection-file and code sha256, time, output folder) exclusively; an existing marker refuses
+    the run, whatever folder the selection file was copied to.
+  - Runbook: the spec JSON, its sha256 and the selection file's sha256 are committed before
+    `test` runs; no local lock can stop a run on a second machine.
 - A bug found after the test stage is fixed in a new script version, everything is rerun, and the
   change is documented in the report.
 
@@ -136,7 +141,9 @@ no private endpoints, no restart. Apart from the research package and the unwire
   VST ETH 1m with volume (3m is aggregated from it), production BTC/ETH 1m. This is the forward
   dataset.
 - **Supabase (read-only):** `ai_decisions` (BTC, `exchange=bingx`, since 2026-08-31, including HOLD),
-  `trades` (BingX, including old ETH trades), `ai_call_metrics` (entry latency since 2026-09-25).
+  `trades` (BingX, including old ETH trades), `ai_call_metrics` (entry latency from 2026-09-25).
+  Both calibration windows end at the holdout end, 2026-10-14 00:00 WIB (exclusive), so a later
+  `calibrate` run reads the same rows.
 - VST volume is **not** real market volume (2026-10-14: VST hourly BTC volume was 1.6×–6.3×
   production, ratio unstable), so the volume profile always uses production volume.
 
@@ -254,7 +261,8 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
 ### 5.10 Execution model (the bot's, not TradingView's)
 
 - **Tick clock:** a tick starts 180 s after the previous one finishes; a tick with a candidate adds
-  an AI latency sampled from live entry calls; the order goes out at tick + latency + 5 s; 20
+  an AI latency sampled from live entry calls (successful entry calls from 2026-09-25 to
+  2026-10-14 00:00 WIB, exclusive); the order goes out at tick + latency + 5 s; 20
   seeded start offsets.
 - **Entry:** close of the 1m bar containing the order time, +0.25 bps adverse. Cooldown 5 minutes
   after each entry (one entry per 5m signal bar).
@@ -262,8 +270,8 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
   levels is a stop (the count is reported; if > 2% of trades, an upper bound with them as wins is
   reported too). Gaps fill at the bar open.
 - **Fills:** stop at level − s\*; take-profit at level − 0.25 bps; time stop at 60 minutes, at that
-  1m close − 0.25 bps. s\* is the median stop overshoot of live `stop_loss` exits since 2026-09-12,
-  each stop level reconstructed from its stored decision (AI stop, ATR at decision, 0.4% cap),
+  1m close − 0.25 bps. s\* is the median stop overshoot of live `stop_loss` exits opened from
+  2026-09-12 to 2026-10-14 00:00 WIB (exclusive), each stop level reconstructed from its stored decision (AI stop, ATR at decision, 0.4% cap),
   rounded up to 0.5 bp. If fewer than 15 stops can be reconstructed, s\* = 1 bp. Sensitivity
   0/1/2 bps.
 - **Fees:** 0.035% per side; sensitivity 0.05%.

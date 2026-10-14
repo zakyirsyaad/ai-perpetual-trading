@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from research.pine_gate import calibrate
-from research.pine_gate.spec import FillConfig
+from research.pine_gate.spec import HOLDOUT_END, FillConfig
 from research.pine_gate.timeparse import parse_iso_datetime
 from research.pine_gate.calibrate import (
     MAX_PAGES,
@@ -29,7 +29,7 @@ def iso(dt):
 
 
 class FakeRows:
-    """Async stand-in for SupabaseTradeStore._get_rows: eq./gte./in. filters,
+    """Async stand-in for SupabaseTradeStore._get_rows: eq./gte./lt./in. filters,
     order, limit and offset over in-memory tables."""
 
     def __init__(self, tables):
@@ -56,6 +56,10 @@ class FakeRows:
                 bound = parse_iso_datetime(value[4:])
                 rows = [r for r in rows if parse_iso_datetime(r.get(key)) is not None
                         and parse_iso_datetime(r.get(key)) >= bound]
+            elif value.startswith("lt."):
+                bound = parse_iso_datetime(value[3:])
+                rows = [r for r in rows if parse_iso_datetime(r.get(key)) is not None
+                        and parse_iso_datetime(r.get(key)) < bound]
             elif value.startswith("in.("):
                 allowed = value[4:-1].split(",")
                 rows = [r for r in rows if r.get(key) in allowed]
@@ -107,6 +111,11 @@ def stop_trade(idx, direction, entry, exit_, opened_at, symbol="BTC/USDT"):
     }
 
 
+def created_at_filters(params, column="created_at"):
+    """Every filter on ``column`` in request order (a window has two)."""
+    return [value for key, value in params if key == column]
+
+
 class LatencyTests(unittest.TestCase):
     def test_latencies_filter_entry_success_since(self):
         rows = [
@@ -119,16 +128,19 @@ class LatencyTests(unittest.TestCase):
             metric("2026-09-29T00:00:00+00:00", float("nan"), idx=6),
             metric("2026-09-29T00:00:00+00:00", -3.0, idx=7),
             metric("2026-09-29T00:00:00+00:00", None, idx=8),
+            metric("2026-10-13T16:59:59+00:00", 1100.0, idx=10),  # 2026-10-13 23:59:59 WIB
+            metric("2026-10-13T17:00:00+00:00", 9999.0, idx=11),  # 2026-10-14 00:00 WIB: after
         ]
         fake = FakeRows({"ai_call_metrics": rows})
 
         result = asyncio.run(load_entry_latencies_ms(fake, "ai_call_metrics"))
 
-        self.assertEqual(result, [1000.0, 1500.0, 2500.5])
+        self.assertEqual(result, [1000.0, 1500.0, 2500.5, 1100.0])
         params = dict(fake.calls[0][1])
         self.assertEqual(params["purpose"], "eq.entry")
         self.assertEqual(params["success"], "eq.true")
-        self.assertEqual(params["created_at"], "gte.2026-09-25T00:00:00+07:00")
+        self.assertEqual(created_at_filters(fake.calls[0][1]),
+                         ["gte.2026-09-25T00:00:00+07:00", "lt.2026-10-14T00:00:00+07:00"])
 
     def test_paging_returns_all_rows_across_pages(self):
         rows = [
@@ -180,10 +192,24 @@ class StopReconstructionTests(unittest.TestCase):
         trade_params = dict(fake.calls[0][1])
         self.assertEqual(trade_params["reason"], "eq.stop_loss")
         self.assertEqual(trade_params["exchange"], "eq.bingx")
-        self.assertEqual(trade_params["opened_at"], "gte.2026-09-12T00:00:00+07:00")
+        self.assertEqual(created_at_filters(fake.calls[0][1], "opened_at"),
+                         ["gte.2026-09-12T00:00:00+07:00", "lt.2026-10-14T00:00:00+07:00"])
         decision_params = dict(fake.calls[1][1])
         self.assertEqual(decision_params["action"], "in.(OPEN_LONG,OPEN_SHORT)")
-        self.assertEqual(decision_params["created_at"], "gte.2026-09-11T00:00:00+07:00")
+        self.assertEqual(created_at_filters(fake.calls[1][1]),
+                         ["gte.2026-09-11T00:00:00+07:00", "lt.2026-10-14T00:00:00+07:00"])
+
+    def test_stop_exits_opened_from_the_holdout_end_are_left_out(self):
+        late = datetime(2026, 10, 13, 17, 0, tzinfo=timezone.utc)  # 2026-10-14 00:00 WIB
+        trades = [stop_trade(1, "LONG", 100.0, 99.5, T0), stop_trade(2, "LONG", 100.0, 99.0, late)]
+        decisions = [
+            decision(10, T0 - timedelta(seconds=30), "BTC/USDT", "OPEN_LONG", 0.30, 0.1, 100.0),
+            decision(11, late - timedelta(seconds=30), "BTC/USDT", "OPEN_LONG", 0.30, 0.1, 100.0),
+        ]
+        _, detail = self._run(trades, decisions)
+        self.assertEqual(len(detail.samples), 1)
+        self.assertAlmostEqual(detail.samples[0], 20.0, places=6)
+        self.assertEqual(detail.skipped, 0)
 
     def test_latest_matching_decision_in_window_is_used(self):
         trades = [stop_trade(1, "LONG", 100.0, 99.5, T0)]
@@ -376,6 +402,13 @@ class CalibrationPolicyTests(unittest.TestCase):
         self.assertEqual(fill.since_utc_offset, "+07:00")
         self.assertEqual(calibrate.DEFAULT_OVERSHOOT_SINCE, "2026-09-12T00:00:00+07:00")
         self.assertEqual(calibrate.DEFAULT_LATENCY_SINCE, "2026-09-25T00:00:00+07:00")
+
+    def test_both_calibration_windows_end_at_the_holdout_end(self):
+        fill = FillConfig()
+        self.assertEqual((fill.latency_until, fill.overshoot_until), ("2026-10-14", "2026-10-14"))
+        for until in (calibrate.DEFAULT_LATENCY_UNTIL, calibrate.DEFAULT_OVERSHOOT_UNTIL):
+            self.assertEqual(until, "2026-10-14T00:00:00+07:00")
+            self.assertEqual(parse_iso_datetime(until), HOLDOUT_END)
 
 
 class SStarTests(unittest.TestCase):

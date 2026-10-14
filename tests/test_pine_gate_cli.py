@@ -208,8 +208,9 @@ class TestCommandTest(Dirs):
             order.append(("load", until_ms))
             return "dataset"
 
-        def stage(dataset, path, calib_obj, out_dir, sha, seed):
-            order.append(("stage", dataset, seed, calib_obj.latencies_ms))
+        def stage(loader, path, calib_obj, out_dir, sha, seed, data_dir):
+            order.append(("stage", data_dir, seed, calib_obj.latencies_ms))
+            self.assertEqual(loader(), "dataset")  # loaded only once test_stage asks
             return Path(out_dir) / "pine_gate_holdout_20261014.json"
 
         with mock.patch.object(cli_stages, "load_selection_checked", lock), \
@@ -218,11 +219,12 @@ class TestCommandTest(Dirs):
             code, out, err = run_cli(self.base_args() + [
                 "test", "--selection", str(selection_path), "--calibration", str(calib)])
         self.assertEqual(code, 0, err)
-        self.assertEqual([step[0] for step in order], ["lock", "load", "stage"])
+        self.assertEqual([step[0] for step in order], ["lock", "stage", "load"])
         self.assertEqual(order[0][2], spec_sha256())
-        self.assertIsNone(order[1][1])
-        self.assertEqual(order[2][2], 3)
-        self.assertEqual(order[2][3], (1000.0, 2000.0))
+        self.assertEqual(order[1][1], self.data)  # the run marker goes under --data-dir
+        self.assertEqual(order[1][2], 3)
+        self.assertEqual(order[1][3], (1000.0, 2000.0))
+        self.assertIsNone(order[2][1])
         self.assertIn("pine_gate_holdout_20261014.json", out)
 
     def test_test_command_refuses_when_a_holdout_file_exists_before_loading(self):
