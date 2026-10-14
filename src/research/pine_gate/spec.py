@@ -1,0 +1,254 @@
+"""Pre-registered constants for the Pine-adapted gate research (Phase 1).
+
+Every number the evaluation depends on lives here. ``spec_sha256()`` is
+recorded before any outcome is computed and later locks the holdout: the
+holdout test refuses to run unless the selection file carries the same hash.
+Research code; the bot never imports it. Standard library only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+SPEC_VERSION = "pine-gate-phase1-v1"
+
+WIB = timezone(timedelta(hours=7))
+
+
+def _wib(year: int, month: int, day: int) -> datetime:
+    return datetime(year, month, day, tzinfo=WIB)
+
+
+def ms(dt: datetime) -> int:
+    """UTC epoch milliseconds of a timezone-aware datetime."""
+    return int(dt.timestamp() * 1000)
+
+
+TRAIN_START = _wib(2025, 8, 1)
+TRAIN_END = _wib(2026, 8, 5)
+BLOCKS: Tuple[Tuple[datetime, datetime], ...] = (
+    (TRAIN_START, _wib(2025, 11, 1)),
+    (_wib(2025, 11, 1), _wib(2026, 2, 1)),
+    (_wib(2026, 2, 1), _wib(2026, 5, 4)),
+    (_wib(2026, 5, 4), TRAIN_END),
+)
+CSCV_BLOCKS = 8
+HOLDOUT_START = TRAIN_END
+HOLDOUT_END = _wib(2026, 10, 14)
+LAST20_START = _wib(2026, 9, 16)
+LAST20_END = _wib(2026, 10, 13)
+PURGE_MINUTES = 60
+EMBARGO_MINUTES = 60
+
+
+@dataclass(frozen=True)
+class ExecConfig:
+    bracket_pct: float = 0.20
+    entry_slip_bps: float = 0.25
+    tp_slip_bps: float = 0.25
+    time_stop_min: int = 60
+    fee_pct: float = 0.035
+    tick_s: int = 180
+    idle_tick_s: int = 2
+    order_delay_s: int = 5
+    cooldown_min: int = 5
+    notional_usdt: float = 25_000.0
+    funding_blackout_s: int = 600
+
+
+@dataclass(frozen=True)
+class GuardConfig:
+    max_stops: int = 12
+    max_consecutive_losses: int = 15
+    max_drawdown_usdt: float = 1500.0
+    max_entries: int = 34
+    max_volume_usdt: float = 1_000_000.0
+
+
+@dataclass(frozen=True)
+class SelectionConfig:
+    min_tp_sl: int = 1000
+    min_supply_per_day: float = 10.0
+    z: float = 2.0
+    blocks_above_half: int = 3
+    top_n: int = 5
+    neighbour_min: int = 4
+    neighbour_tolerance_pts: float = 3.0
+    pbo_max: float = 0.5
+    vol_high_pct: float = 67.0
+    vol_lookback_1h: int = 720
+    vp_bin_bps: float = 5.0
+    trend_band_atr: float = 0.25
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    c_grid: Tuple[float, ...] = (0.01, 0.1, 1.0)
+    threshold_hi: float = 0.70
+    threshold_lo: float = 0.50
+    threshold_step: float = 0.01
+    fallback_threshold: float = 0.5
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    min_tp_sl: int = 60
+    alpha: float = 0.05
+    min_wr: float = 57.0
+    half_min_wr: float = 50.0
+    robust_overshoot_bps: float = 2.0
+    robust_min_wr: float = 55.0
+    offsets: int = 20
+    offsets_min_pass: int = 15
+    min_supply_per_day: float = 10.0
+    bootstrap_n: int = 10_000
+    permutation_shifts: int = 1000
+    c1_seeds: int = 200
+
+
+TRENDS = ("E200", "H1", "H4")
+ENTRIES = ("P35", "P40", "B12", "B24")
+STRENGTHS = ("OFF", "ADX", "ADX_DI")
+VOLS = ("OFF", "HIGH", "NOT_HIGH")
+VPS = ("OFF", "ON")
+
+CONTENDER3_FEATURES = (
+    "trend_strength", "rsi_side", "adx", "di_diff_side",
+    "vol_pct", "poc_dist_side", "hour_sin", "hour_cos",
+)
+
+
+@dataclass(frozen=True, order=True)
+class RuleSpec:
+    trend: str
+    entry: str
+    strength: str
+    vol: str = "OFF"
+    vp: str = "OFF"
+
+    def key(self) -> str:
+        return "|".join((self.trend, self.entry, self.strength, self.vol, self.vp))
+
+
+def stage1_rules() -> Tuple[RuleSpec, ...]:
+    """The 36 base rules, filters off."""
+    return tuple(
+        RuleSpec(trend, entry, strength)
+        for trend in TRENDS
+        for entry in ENTRIES
+        for strength in STRENGTHS
+    )
+
+
+def stage2_variants(base: RuleSpec) -> Tuple[RuleSpec, ...]:
+    """The 3 x 2 volatility x volume-profile variants of ``base`` (includes it)."""
+    return tuple(
+        RuleSpec(base.trend, base.entry, base.strength, vol, vp)
+        for vol in VOLS
+        for vp in VPS
+    )
+
+
+def stage1_neighbours(base: RuleSpec) -> Tuple[RuleSpec, ...]:
+    """Rules differing from ``base`` in exactly one Stage-1 dimension (7)."""
+    out = []
+    for trend in TRENDS:
+        if trend != base.trend:
+            out.append(RuleSpec(trend, base.entry, base.strength))
+    for entry in ENTRIES:
+        if entry != base.entry:
+            out.append(RuleSpec(base.trend, entry, base.strength))
+    for strength in STRENGTHS:
+        if strength != base.strength:
+            out.append(RuleSpec(base.trend, base.entry, strength))
+    return tuple(out)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def spec_document() -> Dict[str, Any]:
+    """Every pre-registered constant as plain JSON data; a fresh dict per call."""
+    return {
+        "version": SPEC_VERSION,
+        "exec": asdict(ExecConfig()),
+        "guards": asdict(GuardConfig()),
+        "selection": asdict(SelectionConfig()),
+        "model": asdict(ModelConfig()),
+        "gate": asdict(GateConfig()),
+        "grid": {
+            "trends": list(TRENDS),
+            "entries": list(ENTRIES),
+            "strengths": list(STRENGTHS),
+            "vols": list(VOLS),
+            "vps": list(VPS),
+            "stage1_rules": len(stage1_rules()),
+            "stage2_variants_per_base": len(VOLS) * len(VPS),
+        },
+        "segments": {
+            "train_start": _iso(TRAIN_START),
+            "train_end": _iso(TRAIN_END),
+            "blocks": [[_iso(a), _iso(b)] for a, b in BLOCKS],
+            "cscv_blocks": CSCV_BLOCKS,
+            "holdout_start": _iso(HOLDOUT_START),
+            "holdout_end": _iso(HOLDOUT_END),
+            "last20_start": _iso(LAST20_START),
+            "last20_end": _iso(LAST20_END),
+            "purge_minutes": PURGE_MINUTES,
+            "embargo_minutes": EMBARGO_MINUTES,
+        },
+        "contender2": {
+            "near_mean_max_abs_stretch_atr": 0.75,
+            "closed_3m_bars": 39,
+            "ema_period": 21,
+            "atr_period": 14,
+            "implementation": "bot.strategy.indicators + build_setup_profile",
+            "direction": {
+                "source": "H1",
+                "ema_fast": 20,
+                "ema_slow": 50,
+                "band_atr": 0.25,
+                "atr_period": 14,
+                "neutral": "no entry",
+            },
+            "tuning": "none",
+        },
+        "contender3": {
+            "primary_rule": "chosen trend + entry of contender 1, strength OFF, no filters",
+            "fallback_primary": "best-ranked Stage-1 base rule",
+            "features": list(CONTENDER3_FEATURES),
+            "label": "bracket trade gross return > 0",
+            "model": "L2 logistic regression",
+            "sample_weights": "uniqueness (inverse average concurrency)",
+            "standardisation": "training means and standard deviations",
+        },
+        "reference": {
+            "trend": "EMA125 on 5m",
+            "rsi": {"period": 5, "long_below": 40, "short_above": 55},
+            "adx": {"length": 11, "smoothing": 11, "min": 20, "via": "ta.dmi(11, 11)"},
+        },
+        "controls": {
+            "c0": "always long and always short on the same tick clock",
+            "c0_wr_tolerance_pts": 3.0,
+            "c0_gross_tolerance_bps": 2.0,
+            "c1": "contender entry times with a random side",
+            "c1_seeds": GateConfig().c1_seeds,
+            "permutation": "trend-label series shifted by whole days",
+            "permutation_shifts": GateConfig().permutation_shifts,
+            "permutation_k_min": 7,
+            "permutation_k_max": "D - 7",
+        },
+    }
+
+
+def spec_sha256(doc: Optional[Dict[str, Any]] = None) -> str:
+    """sha256 of the canonical JSON of ``doc`` (default: the current spec)."""
+    if doc is None:
+        doc = spec_document()
+    payload = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
