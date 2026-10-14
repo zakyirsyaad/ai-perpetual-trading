@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from research.pine_gate import cli, cli_common, cli_stages
+from research.pine_gate import lock as pine_lock
 from research.pine_gate.bars import (
     day_path,
     funding_path,
@@ -196,7 +197,8 @@ class TestCommandTest(Dirs):
         calib = self.write_calibration()
         cal = calibration_doc()
         selection = {"seed": 3, "s_star_bps": cal["s_star_bps"], "n_latencies": 2,
-                     "latencies_sha256": cal["latencies_sha256"]}
+                     "latencies_sha256": cal["latencies_sha256"],
+                     "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True}
         order = []
 
         def lock(path, sha):
@@ -238,6 +240,27 @@ class TestCommandTest(Dirs):
         self.assertEqual(code, 1)
         self.assertIn("holdout file already exists", err)
         load.assert_not_called()
+
+    def test_test_command_refuses_other_code_or_a_failed_training_c0_before_loading(self):
+        calib = self.write_calibration()
+        cal = calibration_doc()
+        base = {"seed": 0, "s_star_bps": cal["s_star_bps"], "n_latencies": 2,
+                "latencies_sha256": cal["latencies_sha256"],
+                "code_sha256": pine_lock.code_sha256(), "c0_training_pass": True}
+        cases = ((dict(base, code_sha256="f" * 64), "code sha256"),
+                 (dict(base, c0_training_pass=False), "fill model invalid on training C0"))
+        for selection, text in cases:
+            with self.subTest(text=text), \
+                    mock.patch.object(cli_stages, "load_selection_checked",
+                                      lambda p, s, doc=selection: doc), \
+                    mock.patch.object(cli_stages, "load_dataset",
+                                      side_effect=AssertionError("holdout data loaded")) as load:
+                code, _, err = run_cli(self.base_args() + [
+                    "test", "--selection", str(self.out / "sel.json"),
+                    "--calibration", str(calib)])
+                self.assertEqual(code, 2, err)
+                self.assertIn(text, err)
+                load.assert_not_called()
 
     def test_calibration_with_a_wrong_latency_hash_is_refused(self):
         doc = calibration_doc()
@@ -755,8 +778,8 @@ class ReportCommandTest(Dirs):
         newest = self.out / "pine_gate_selection_20261014.json"
         newest.write_text(json.dumps({"data_sha256": "abc"}), encoding="utf-8")
         holdout = self.out / "pine_gate_holdout_20261014.json"
-        holdout.write_text(json.dumps({"chosen": "c2", "selection_file": newest.name}),
-                           encoding="utf-8")
+        holdout.write_text(json.dumps({"chosen": "c2", "selection_file": newest.name,
+                                       "data_sha256": "def"}), encoding="utf-8")
         (self.out / "pine_gate_vst_BTC-USDT_20261014.json").write_text(
             json.dumps({"n": 5, "passed": True}), encoding="utf-8")
         (self.out / "pine_gate_decisions_20261014.json").write_text(
@@ -772,12 +795,14 @@ class ReportCommandTest(Dirs):
         self.assertEqual(code, 0, err)
         results = captured["results"]
         self.assertEqual(results["selection"], {"data_sha256": "abc"})
-        self.assertEqual(results["holdout"], {"chosen": "c2", "selection_file": newest.name})
+        self.assertEqual(results["holdout"], {"chosen": "c2", "selection_file": newest.name,
+                                              "data_sha256": "def"})
         self.assertEqual(results["vst"], {"BTC-USDT": {"n": 5, "passed": True}})
         self.assertEqual(results["decisions"], {"A": {"n": 1}})
         sha = results["sha256"]
         self.assertEqual(sha["spec"], spec_sha256())
         self.assertEqual(sha["data"], "abc")
+        self.assertEqual(sha["data_holdout"], "def")
         self.assertEqual(sha["selection"], hashlib.sha256(newest.read_bytes()).hexdigest())
         self.assertEqual(sha["holdout"], hashlib.sha256(holdout.read_bytes()).hexdigest())
         self.assertEqual(len(sha["code"]), 64)

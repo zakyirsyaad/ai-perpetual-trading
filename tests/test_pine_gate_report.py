@@ -19,7 +19,8 @@ from research.pine_gate.report import (
 
 BTC, ETH = "BTC-USDT", "ETH-USDT"
 RULE = "E200|P35|ADX|OFF|OFF"
-SHA = {name: str(i) * 64 for i, name in enumerate(("spec", "data", "selection", "holdout", "code"))}
+SHA = {name: str(i) * 64 for i, name in enumerate(("spec", "data", "data_holdout", "selection",
+                                                     "holdout", "code"))}
 STUB_VERDICT = "KALIMAT-VONIS-UJI"
 
 
@@ -93,7 +94,8 @@ def make_holdout(passed=True, c0_ok=True, tp=120, sl=80):
         "chosen": "c2" if passed else None, "symbols_to_trade": winners,
         "period": {"start_ms": 1, "end_ms": 2, "last20_start_ms": 1, "last20_end_ms": 2},
         "spec_sha256": SHA["spec"], "selection_sha256": SHA["selection"],
-        "created_at": "2026-10-14T00:00:00+00:00",
+        "created_at": "2026-10-14T00:00:00+00:00", "code_sha256": SHA["code"],
+        "data_sha256": SHA["data_holdout"],
     }
 
 
@@ -123,7 +125,11 @@ def make_selection():
         "meta_model": {"threshold": 0.6, "C": 0.1}, "chosen_C": 0.1,
         "cv_logloss": {"0.1": [0.69, 0.68, 0.67, 0.69], "1.0": [0.70, 0.69, 0.68, 0.70]},
         "reliability": [[0.52, 0.50, 100], [0.61, 0.58, 80]], "n_oof": 180,
-        "n_candidates": 200, "spec_sha256": SHA["spec"],
+        "n_candidates": 200, "spec_sha256": SHA["spec"], "code_sha256": SHA["code"],
+        "c0_training": {s: {"long": {"n": 900, "wr": 50.4, "gross_bps": -0.6},
+                            "short": {"n": 900, "wr": 49.1, "gross_bps": -0.9}}
+                        for s in (BTC, ETH)},
+        "c0_training_pass": True,
     }
 
 
@@ -214,6 +220,40 @@ class RenderMarkdownTests(unittest.TestCase):
 
         self.assertIn("TIDAK COCOK", integritas)
         self.assertNotIn("TIDAK COCOK", section(render_markdown(make_results()), "Integritas"))
+
+    def test_integritas_shows_the_recorded_code_shas_and_whether_they_match(self, _):
+        results = make_results()
+        integritas = section(render_markdown(results), "Integritas")
+        self.assertIn("kode di file seleksi", integritas)
+        self.assertIn("kode di file uji", integritas)
+        self.assertIn(f"`{SHA['code']}`", integritas)
+        self.assertNotIn("TIDAK COCOK", integritas)
+        results["holdout"]["code_sha256"] = "f" * 64
+        integritas = section(render_markdown(results), "Integritas")
+        self.assertIn("kode file seleksi = kode file uji | TIDAK COCOK", integritas)
+
+    def test_header_shows_the_holdout_data_sha256(self, _):
+        header = render_markdown(make_results()).split("## Ringkasan")[0]
+        self.assertIn(f"- sha256 data_holdout: `{SHA['data_holdout']}`", header)
+
+    def test_training_c0_is_reported_with_its_verdict(self, _):
+        results = make_results()
+        tahap = section(render_markdown(results), "Tahap latih")
+        self.assertIn("C0 pada data latih", tahap)
+        self.assertIn("50.4%", tahap)
+        self.assertIn("-0.90", tahap)
+        self.assertNotIn("model fill tidak valid", tahap)
+        results["selection"]["c0_training_pass"] = False
+        tahap = section(render_markdown(results), "Tahap latih")
+        self.assertIn("model fill tidak valid pada data latih", tahap)
+
+    def test_spa_is_described_as_direction_value_on_the_same_entries(self, _):
+        tahap = section(render_markdown(make_results()), "Tahap latih")
+        self.assertIn("nilai arah vs sisi acak pada entri yang sama", tahap)
+
+    def test_decision_supply_is_labelled_uncorrected(self, _):
+        text = section(render_markdown(make_results()), "Keputusan AI")
+        self.assertIn("belum dikoreksi untuk tick saat posisi terbuka", text)
 
     def test_results_without_any_key_still_render(self, _):
         self.assertEqual(headings(render_markdown({})), list(SECTION_TITLES))

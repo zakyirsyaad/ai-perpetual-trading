@@ -303,13 +303,22 @@ def spec_document() -> Dict[str, Any]:
             "stable_area": "at least 4 of 7 stage-1 neighbours within 3 WR points below the chosen "
                            "base rule, else the next in rank",
             "overfitting": "PBO by CSCV on 8 CSCV blocks over all evaluated rules must be < 0.5; "
-                           "Hansen SPA against a random-entry benchmark with the same bracket is reported",
+                           "Hansen SPA of each evaluated rule's direction value is reported: per "
+                           "training trading day the mean over its trades of gross bps (rule side) "
+                           "minus gross bps (seeded random side, one draw per trade, same entry "
+                           "bar and bracket), 0 on a day without trades",
             "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
                                "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
             "contender_choice_order": ["most symbols passed", "higher pooled WR lower bound",
                                        "simpler (c2, c1, c3)"],
             "c1_c3_must_beat_c2_holdout_wr": True,
-            "holm": "Holm correction across the 3 contenders within each symbol",
+            "holm": "Holm correction across the 3 contenders within each symbol; an absent "
+                    "contender counts with p = 1",
+            "c0_training": "always long and always short per symbol on training (same clock, "
+                           "offset 0); outside c0 tolerances the test stage refuses to run",
+            "holdout_lock": "under the spec sha256 the test runs once, next to its selection file, "
+                            "on the code (code_sha256) and the training data (train_data_sha256) "
+                            "the selection was made with",
             "eth_first_sensitivity": True,
         },
         "grid": {

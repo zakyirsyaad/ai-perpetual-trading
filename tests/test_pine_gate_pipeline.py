@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from research.pine_gate import pipeline
+from research.pine_gate import lock, pipeline
 from research.pine_gate.bars import (
     day_path,
     funding_path,
@@ -23,7 +23,8 @@ from research.pine_gate.bars import (
 from research.pine_gate.calibrate import Calibration
 from research.pine_gate.features import FeatureFrame
 from research.pine_gate.metalabel import FEATURES, MetaModel
-from research.pine_gate.outcomes import bracket_outcome
+from research.pine_gate.holdout_gate import c0_side_ok
+from research.pine_gate.outcomes import bracket_outcome, gross_bps
 from research.pine_gate.pipeline import (
     SYMBOLS,
     TRAIN_DATA_UNTIL_MS,
@@ -40,6 +41,7 @@ from research.pine_gate.pipeline import (
 from research.pine_gate.rules import contender2_signal, rule_signal
 from research.pine_gate.selection import Selection, summarize
 from research.pine_gate.simulate import in_entry_window
+from research.pine_gate.stats import mean_gross_bps, win_rate
 from research.pine_gate.spec import (
     BLOCKS,
     TRAIN_END,
@@ -559,6 +561,67 @@ class TrainStageTests(PipelineFixture):
         with self.assertRaises(ValueError):
             train_stage(self.dataset, CALIB, self.tmp / "badsha", "abc",
                         segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer())
+
+
+class IntegrityRecordTests(PipelineFixture):
+    """What the selection file records for the holdout to check (A1, A4, A5, A7)."""
+
+    def test_selection_records_the_code_sha256(self):
+        self.assertEqual(self.selection["code_sha256"], lock.code_sha256())
+        self.assertRegex(self.selection["code_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_training_c0_is_recorded_per_symbol_and_side(self):
+        c0 = self.selection["c0_training"]
+        self.assertEqual(sorted(c0), sorted(SYMBOLS))
+        markets = {s: self.dataset.markets[s] for s in SYMBOLS}
+        verdict = True
+        for symbol in SYMBOLS:
+            for name, side in (("long", 1), ("short", -1)):
+                trades = pipeline.simulate_training(
+                    lambda s, t, side=side: side, (markets[symbol],), TEST_SEGMENTS, CALIB,
+                    seed=3, exec_cfg=ExecConfig(), guard_cfg=GuardConfig(),
+                )
+                cell = c0[symbol][name]
+                self.assertGreater(cell["n"], 0)
+                self.assertEqual(cell, {"n": len(trades), "wr": win_rate(trades),
+                                        "gross_bps": mean_gross_bps(trades)})
+                verdict = verdict and c0_side_ok(cell["wr"], cell["gross_bps"])
+        self.assertIs(self.selection["c0_training_pass"], verdict)
+
+    def test_spa_series_is_the_rule_side_minus_a_random_side_on_the_same_entries(self):
+        rule = RuleSpec("H1", "B12", "OFF")
+        markets = tuple(pipeline.fresh_markets(self.dataset, ExecConfig()))
+        trades = pipeline.simulate_training(
+            rule_signal_fn(rule, self.dataset.frames), markets, TEST_SEGMENTS, CALIB, seed=3,
+            exec_cfg=ExecConfig(), guard_cfg=GuardConfig(),
+        )
+        self.assertTrue(trades)
+        days = pipeline.trading_days(TEST_SEGMENTS.train_start_ms, TEST_SEGMENTS.train_end_ms)
+        rng = random.Random(3)
+        by_day = {}
+        for t in trades:
+            market = next(m for m in markets if m.symbol == t.symbol)
+            idx = list(market.bars_1m.open_ms).index(t.entry_ms - MIN)
+            side = rng.choice((1, -1))
+            o = market.outcomes.get(idx, side)
+            other = gross_bps(o, side, CALIB.s_star_bps, ExecConfig())
+            by_day.setdefault(t.wib_day, []).append(t.gross_bps - other)
+        expected = [sum(by_day[d]) / len(by_day[d]) if d in by_day else 0.0 for d in days]
+        series = pipeline.direction_series(trades, markets, days, seed=3,
+                                           overshoot_bps=CALIB.s_star_bps, exec_cfg=ExecConfig())
+        self.assertEqual(len(series), len(days))
+        for got, want in zip(series, expected):
+            self.assertAlmostEqual(got, want, places=9)
+        self.assertTrue(any(v != 0.0 for v in series))
+        self.assertEqual(pipeline.direction_series([], markets, days, seed=3,
+                                                   overshoot_bps=1.0, exec_cfg=ExecConfig()),
+                         [0.0] * len(days))
+
+    def test_training_part_hash_of_a_longer_load_equals_the_training_hash(self):
+        self.assertEqual(self.dataset.train_part_sha256, self.dataset.train_data_sha256)
+        longer = load_dataset(self.data_dir, until_ms=wib(2026, 8, 7, 12), start_day=FIRST_DAY)
+        self.assertNotEqual(longer.train_data_sha256, self.dataset.train_data_sha256)
+        self.assertEqual(longer.train_part_sha256, self.dataset.train_data_sha256)
 
 
 class TrainingSimulationTests(PipelineFixture):

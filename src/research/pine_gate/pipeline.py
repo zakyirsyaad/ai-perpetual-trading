@@ -32,6 +32,7 @@ from .bars import (
     bars_from_rows,
     day_path,
     entry_index_for,
+    index_closing_at,
     funding_path,
     interval_to_ms,
     load_days,
@@ -44,13 +45,16 @@ from .bars import (
 from .calibrate import Calibration
 from .features import FeatureFrame, Snapshot
 from .fileio import exists_message, write_json_exclusive
+from .holdout_gate import c0_side_ok
 from .lock import (
     HoldoutLockError,
     MetaTrainer,
+    RunSettings,
     Segments,
     TimeRange,
     check_spec_run,
     check_spec_sha,
+    code_sha256,
     equal_ranges,
     latencies_sha256,
     load_selection_checked,
@@ -76,7 +80,7 @@ from .spec import (
     ms,
     stage1_rules,
 )
-from .stats import mean_gross_bps, spa_pvalue, trades_per_trading_day
+from .stats import mean_gross_bps, spa_pvalue, trades_per_trading_day, win_rate
 
 SYMBOLS: Tuple[str, ...] = ("BTC-USDT", "ETH-USDT")  # tick order: BTC first
 
@@ -122,6 +126,9 @@ class Dataset:
     missing_warmups: Tuple[str, ...] = ()
     # sha256 over the arrays actually kept after the cut: 1m bars, warm-ups, funding times
     train_data_sha256: str = ""
+    # the same hash over those arrays cut at TRAIN_DATA_UNTIL_MS: for a training load it
+    # equals train_data_sha256; the holdout compares it with the selection's (spec 5.1)
+    train_part_sha256: str = ""
 
 
 def _file_sha256(path: Path) -> str:
@@ -179,15 +186,33 @@ def _read_funding(path: Path, until_ms: Optional[int]) -> Tuple[int, ...]:
     return tuple(sorted(t for t in raw if until_ms is None or t < until_ms))
 
 
+def _training_part_sha256(
+    bars: Bars, warmups: Mapping[str, Optional[Bars]], funding: Sequence[int]
+) -> str:
+    """``_content_sha256`` of the arrays cut as a training load cuts them."""
+    cut = TRAIN_DATA_UNTIL_MS
+    part = {k: None if w is None else slice_until(w, cut) for k, w in warmups.items()}
+    return _content_sha256(slice_until(bars, cut), part, [t for t in funding if t < cut])
+
+
+@dataclass(frozen=True)
+class _Loaded:
+    frame: FeatureFrame
+    market: Market
+    lines: List[str]  # "relative_path:sha256" of every file read
+    missing: List[str]  # warm-up files not found
+    content: str  # sha256 of the arrays kept after the cut
+    train_part: str  # the same over the training part
+
+
 def _load_symbol(
     data_dir: Path,
     symbol: str,
     days: Tuple[date, date],
     until_ms: Optional[int],
     exec_cfg: ExecConfig,
-) -> Tuple[FeatureFrame, Market, List[str], List[str], str]:
-    """One symbol's frame and market, its file hash lines, missing warm-ups and the
-    sha256 of the arrays kept after the cut."""
+) -> _Loaded:
+    """One symbol's frame and market with the hashes of what was read and kept."""
     start_day, end_day = days
     bars = load_days(data_dir, "prod", symbol, "1m", start_day, end_day)
     if until_ms is not None:
@@ -211,7 +236,8 @@ def _load_symbol(
     lines.append(_file_line(data_dir, fpath))
     frame = FeatureFrame.build(symbol, bars, warmups["1h"], warmups["4h"])
     market = Market(symbol, bars, OutcomeCache(bars, exec_cfg), funding)
-    return frame, market, lines, missing, _content_sha256(bars, warmups, funding)
+    return _Loaded(frame, market, lines, missing, _content_sha256(bars, warmups, funding),
+                   _training_part_sha256(bars, warmups, funding))
 
 
 def load_dataset(
@@ -232,30 +258,22 @@ def load_dataset(
     end_ms = until_ms if until_ms is not None else ms(HOLDOUT_END)
     last = wib_day(end_ms - 1)
     cfg = exec_cfg if exec_cfg is not None else ExecConfig()
-    frames: Dict[str, FeatureFrame] = {}
-    markets: Dict[str, Market] = {}
-    lines: List[str] = []
-    missing: List[str] = []
-    contents: List[str] = []
-    for symbol in SYMBOLS:
-        frame, market, sym_lines, sym_missing, content = _load_symbol(
-            data_dir, symbol, (first, last), until_ms, cfg
-        )
-        frames[symbol], markets[symbol] = frame, market
-        lines.extend(sym_lines)
-        missing.extend(sym_missing)
-        contents.append(f"{symbol}:{content}")
-    digest = hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
-    content_digest = hashlib.sha256("\n".join(contents).encode("utf-8")).hexdigest()
+    loaded = {s: _load_symbol(data_dir, s, (first, last), until_ms, cfg) for s in SYMBOLS}
+    lines = sorted(line for x in loaded.values() for line in x.lines)
     loaded_until = until_ms if until_ms is not None else wib_day_start_ms(last + timedelta(1))
     return Dataset(
-        frames=MappingProxyType(frames),
-        markets=MappingProxyType(markets),
-        data_sha256=digest,
+        frames=MappingProxyType({s: x.frame for s, x in loaded.items()}),
+        markets=MappingProxyType({s: x.market for s, x in loaded.items()}),
+        data_sha256=_text_sha256(lines),
         loaded_until_ms=loaded_until,
-        missing_warmups=tuple(missing),
-        train_data_sha256=content_digest,
+        missing_warmups=tuple(m for x in loaded.values() for m in x.missing),
+        train_data_sha256=_text_sha256([f"{s}:{x.content}" for s, x in loaded.items()]),
+        train_part_sha256=_text_sha256([f"{s}:{x.train_part}" for s, x in loaded.items()]),
     )
+
+
+def _text_sha256(lines: Sequence[str]) -> str:
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- signals
@@ -271,12 +289,6 @@ def rule_signal_fn(rule: RuleSpec, frames: Mapping[str, FeatureFrame]) -> Signal
 
 def contender2_fn(frames: Mapping[str, FeatureFrame]) -> SignalFn:
     return lambda symbol, t: contender2_signal(frames[symbol].snapshot(t))
-
-
-def _random_side_fn(seed: int) -> SignalFn:
-    """Benchmark: a seeded random side on every call (always-long's every entry tick)."""
-    rng = random.Random(seed)
-    return lambda symbol, t: rng.choice((1, -1))
 
 
 # --------------------------------------------------------------------------- regimes
@@ -377,10 +389,11 @@ class _Context:
     sel_cfg: SelectionConfig
     model_cfg: ModelConfig
 
-    def run(self, signal: SignalFn, start_ms: Optional[int] = None) -> List[Trade]:
+    def run(self, signal: SignalFn, start_ms: Optional[int] = None,
+            markets: Optional[Sequence[Market]] = None) -> List[Trade]:
         return simulate_training(
-            signal, self.markets, self.segments, self.calib, seed=self.seed,
-            exec_cfg=self.exec_cfg, guard_cfg=self.guard_cfg, start_ms=start_ms,
+            signal, self.markets if markets is None else markets, self.segments, self.calib,
+            seed=self.seed, exec_cfg=self.exec_cfg, guard_cfg=self.guard_cfg, start_ms=start_ms,
         )
 
     def train_days(self) -> List[date]:
@@ -441,23 +454,64 @@ def _evaluator(ctx: _Context) -> Callable[[RuleSpec], RuleResult]:
     return evaluate
 
 
-def _daily_gross(trades: Sequence[Trade], days: Sequence[date]) -> List[float]:
-    """Mean gross bps of each listed day's trades; 0.0 on a day without trades."""
+def direction_series(
+    trades: Sequence[Trade],
+    markets: Sequence[Market],
+    days: Sequence[date],
+    *,
+    seed: int,
+    overshoot_bps: float,
+    exec_cfg: ExecConfig,
+) -> List[float]:
+    """The value of a rule's direction per listed day (the SPA benchmark, final ruling).
+
+    For each trade, in order, a seeded random side (``random.Random(seed)``, one draw
+    per trade, as C1) is bracketed from the same entry bar through the market's
+    outcome cache; the day's value is the mean over its trades of (rule gross bps -
+    random-side gross bps). A day without trades is 0.0 for both sides, so 0.0; a
+    trade whose random-side bracket is unresolved is left out of its day."""
+    rng = random.Random(seed)
+    by_symbol = {m.symbol: m for m in markets}
     by_day: Dict[date, List[float]] = {}
     for t in trades:
-        by_day.setdefault(t.wib_day, []).append(t.gross_bps)
+        market = by_symbol[t.symbol]
+        idx = index_closing_at(market.bars_1m, t.entry_ms)
+        if idx is None:
+            raise ValueError(f"{t.symbol}: no 1m bar closes at {t.entry_ms}")
+        side = rng.choice((1, -1))
+        other = market.outcomes.get(idx, side)
+        if other is not None:
+            diff = t.gross_bps - gross_bps(other, side, overshoot_bps, exec_cfg)
+            by_day.setdefault(t.wib_day, []).append(diff)
     return [statistics.fmean(by_day[d]) if d in by_day else 0.0 for d in days]
 
 
 def _spa(ctx: _Context, results: Mapping[str, RuleResult], spa_n: int) -> float:
-    """Hansen SPA of every evaluated rule against the random-side benchmark."""
+    """Hansen SPA over every evaluated rule of its direction value against a random
+    side on its own entries (``direction_series``)."""
     days = ctx.train_days()
-    bench = _daily_gross(ctx.run(_random_side_fn(ctx.seed)), days)
-    diff = {}
-    for key, r in results.items():
-        series = _daily_gross(r.trades, days)
-        diff[key] = [a - b for a, b in zip(series, bench)]
+    diff = {key: direction_series(r.trades, ctx.markets, days, seed=ctx.seed,
+                                  overshoot_bps=ctx.calib.s_star_bps, exec_cfg=ctx.exec_cfg)
+            for key, r in results.items()}
     return spa_pvalue(diff, n=spa_n, seed=ctx.seed)
+
+
+def c0_training(ctx: _Context) -> Dict[str, Any]:
+    """Always long and always short per symbol on training (spec 5.9, final ruling).
+
+    Same clock and settings as the rule runs (offset 0, purge), each symbol on its own
+    clock as in the holdout. ``c0_training_pass`` uses criterion 9's tolerances; a
+    real holdout run refuses to start when it is false."""
+    cells: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    passed = True
+    for market in ctx.markets:
+        cells[market.symbol] = {}
+        for name, side in (("long", 1), ("short", -1)):
+            trades = ctx.run(lambda symbol, t, side=side: side, markets=(market,))
+            cell = {"n": len(trades), "wr": win_rate(trades), "gross_bps": mean_gross_bps(trades)}
+            cells[market.symbol][name] = cell
+            passed = passed and c0_side_ok(cell["wr"], cell["gross_bps"])
+    return {"c0_training": cells, "c0_training_pass": passed}
 
 
 def _primary_rule(sel: Selection, cfg: SelectionConfig) -> Optional[RuleSpec]:
@@ -636,32 +690,40 @@ def train_stage(
     check_spec_sha(spec_sha)
     settings = run_settings(segments, exec_cfg, guard_cfg, sel_cfg, model_cfg, meta_trainer)
     check_spec_run(spec_sha, settings)
-    seg = settings.segments
-    _check_dataset(dataset, seg)
+    _check_dataset(dataset, settings.segments)
     check_purge_covers(calib, settings.exec_cfg)
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{SELECTION_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
     if path.exists():  # fail before hours of work; the final write checks again
         raise FileExistsError(exists_message(path, "selection"))
-    ctx = _Context(
-        frames=dataset.frames, markets=fresh_markets(dataset, settings.exec_cfg),
-        segments=seg, calib=calib, seed=seed, exec_cfg=settings.exec_cfg,
-        guard_cfg=settings.guard_cfg, sel_cfg=settings.sel_cfg, model_cfg=settings.model_cfg,
-    )
+    ctx = _context(dataset, calib, seed, settings)
     sel = select(_evaluator(ctx), ctx.sel_cfg)
     primary = _primary_rule(sel, ctx.sel_cfg)
     extra = {
-        "spec_sha256": spec_sha,
-        "data_sha256": dataset.data_sha256,
-        "train_data_sha256": dataset.train_data_sha256,
-        "data_loaded_until_ms": dataset.loaded_until_ms,
-        "missing_warmups": list(dataset.missing_warmups),
-        "created_at": created.isoformat(),
-        "spa_p": _spa(ctx, sel.results, spa_n),
-        "spa_n": spa_n,
-        "regime_counts": regime_counts(ctx.frames, seg.train_start_ms, seg.train_end_ms),
+        "spec_sha256": spec_sha, "created_at": created.isoformat(),
+        "code_sha256": code_sha256(), **_data_record(dataset), **c0_training(ctx),
+        "spa_p": _spa(ctx, sel.results, spa_n), "spa_n": spa_n,
+        "regime_counts": regime_counts(ctx.frames, ctx.segments.train_start_ms,
+                                       ctx.segments.train_end_ms),
         **settings.record(),
         **_contender3(ctx, primary, settings.meta_trainer),
     }
     write_json_exclusive(path, _selection_document(ctx, sel, primary, extra), "selection")
     return path
+
+
+def _context(dataset: Dataset, calib: Calibration, seed: int, settings: RunSettings) -> _Context:
+    return _Context(
+        frames=dataset.frames, markets=fresh_markets(dataset, settings.exec_cfg),
+        segments=settings.segments, calib=calib, seed=seed, exec_cfg=settings.exec_cfg,
+        guard_cfg=settings.guard_cfg, sel_cfg=settings.sel_cfg, model_cfg=settings.model_cfg,
+    )
+
+
+def _data_record(dataset: Dataset) -> Dict[str, Any]:
+    return {
+        "data_sha256": dataset.data_sha256,
+        "train_data_sha256": dataset.train_data_sha256,
+        "data_loaded_until_ms": dataset.loaded_until_ms,
+        "missing_warmups": list(dataset.missing_warmups),
+    }

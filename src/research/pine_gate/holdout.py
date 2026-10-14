@@ -9,8 +9,11 @@ read the holdout. It replays the holdout [2026-08-05, 2026-10-14) WIB with entry
 ticks blocked in the final 65 minutes, runs contenders 1-3 and the controls,
 applies the nine gate criteria per symbol, chooses what moves on and writes
 ``pine_gate_holdout_<YYYYMMDD>.json``. The holdout runs once: any existing
-holdout file in ``out_dir``, of any date, refuses the run, and a run under the
-current spec sha256 must use the seed recorded in the selection file.
+holdout file in ``out_dir`` or next to the selection file, of any date, refuses
+the run. A run under the current spec sha256 must also use the seed recorded in
+the selection file, run on the code that trained (``code_sha256``), follow a
+training C0 that passed, write next to its selection file and read holdout data
+whose training part is the data the selection was trained on.
 
 Every per-symbol number comes from that symbol's trades inside the joint
 one-position run over BTC and ETH (BTC first), except the C0 controls, which
@@ -49,7 +52,14 @@ from .holdout_replay import (
     symbol_metrics,
     trades_of,
 )
-from .lock import HoldoutLockError, check_spec_sha, latencies_sha256, load_selection_checked
+from .lock import (
+    HoldoutLockError,
+    check_spec_sha,
+    code_sha256,
+    is_spec_sha,
+    latencies_sha256,
+    load_selection_checked,
+)
 from .outcomes import OutcomeCache
 from .pipeline import SYMBOLS, Dataset, check_purge_covers
 from .rules import reference_signal
@@ -169,12 +179,17 @@ def _p_c0(h: Holdout, runs: Mapping[str, _Runs], c0) -> Dict[str, Dict[str, floa
     return out
 
 
-def _holm_by_symbol(p_c0: Mapping[str, Mapping[str, float]]) -> Dict[str, Dict[str, float]]:
-    """Holm within each symbol across the contenders present."""
+def _holm_by_symbol(
+    p_c0: Mapping[str, Mapping[str, float]], family: int
+) -> Dict[str, Dict[str, float]]:
+    """Holm within each symbol over a family of ``family`` contenders (spec: 3): an
+    absent contender counts with p = 1, so skipping one never relaxes the others."""
+    pads = {f"<absent {k}>": 1.0 for k in range(max(0, family - len(p_c0)))}
     out: Dict[str, Dict[str, float]] = {name: {} for name in p_c0}
     for s in SYMBOLS:
-        for name, value in holm({name: p[s] for name, p in p_c0.items()}).items():
-            out[name][s] = value
+        adjusted = holm({**{name: p[s] for name, p in p_c0.items()}, **pads})
+        for name in p_c0:
+            out[name][s] = adjusted[name]
     return out
 
 
@@ -367,7 +382,7 @@ def _evaluate(h: Holdout, selection: Mapping[str, Any]) -> Dict[str, Any]:
     c0_doc = _c0_doc(h, c0)
     runs = {c.name: _run_contender(h, c) for c in contenders}
     p_c0 = _p_c0(h, runs, c0)
-    p_holm = _holm_by_symbol(p_c0)
+    p_holm = _holm_by_symbol(p_c0, h.gate_cfg.holm_family)
     docs, all_verdicts = {}, []
     for c in contenders:
         r = runs[c.name]
@@ -482,15 +497,50 @@ def _check_holdout_dataset(dataset: Dataset, period: HoldoutPeriod) -> None:
             raise ValueError(f"dataset lacks {symbol}")
 
 
-def refuse_any_holdout(out_dir: Path) -> None:
-    """The holdout runs once: any earlier holdout file, of any date, refuses the run."""
-    existing = sorted(Path(out_dir).glob(f"{HOLDOUT_PREFIX}*.json"))
+def refuse_any_holdout(out_dir: Path, *more_dirs: Path) -> None:
+    """The holdout runs once: any earlier holdout file, of any date, in ``out_dir`` or
+    ``more_dirs`` (the selection file's folder) refuses the run."""
+    existing = sorted({p for d in (out_dir, *more_dirs)
+                       for p in Path(d).glob(f"{HOLDOUT_PREFIX}*.json")})
     if existing:
         names = ", ".join(str(p) for p in existing)
         raise FileExistsError(
             f"holdout file already exists: {names}; the holdout runs once, so re-running "
             "means removing it deliberately"
         )
+
+
+def _check_locked_run(path: Path, selection: Mapping[str, Any], out_dir: Path) -> None:
+    """Under the current spec sha256: the code that trained, a passing training C0 and
+    the holdout file next to its selection file."""
+    recorded, current = selection.get("code_sha256"), code_sha256()
+    if recorded != current:
+        raise HoldoutLockError(f"{path}: code sha256 {recorded!r} differs from the current "
+                               f"code {current}; the holdout runs on the code that trained")
+    if selection.get("c0_training_pass") is not True:
+        raise HoldoutLockError(f"{path}: fill model invalid on training C0; fix before test")
+    if Path(out_dir).resolve() != Path(path).parent.resolve():
+        raise HoldoutLockError(f"{out_dir}: a locked holdout file is written next to its "
+                               f"selection file, in {Path(path).parent}")
+
+
+def check_ready(path: Path, selection: Mapping[str, Any], calib: Calibration,
+                spec_sha: str, out_dir: Path) -> None:
+    """Every check that needs no holdout data: no earlier holdout file, the selection's
+    calibration and, under the current spec sha256, ``_check_locked_run``."""
+    refuse_any_holdout(out_dir, Path(path).parent)
+    check_calibration(path, selection, calib)
+    if is_spec_sha(spec_sha):
+        _check_locked_run(path, selection, out_dir)
+
+
+def _check_training_part(path: Path, selection: Mapping[str, Any], dataset: Dataset,
+                         spec_sha: str) -> None:
+    """Under the current spec sha256 the holdout data, cut at the training boundary,
+    must be the data the selection was trained on."""
+    if is_spec_sha(spec_sha) and dataset.train_part_sha256 != selection.get("train_data_sha256"):
+        raise HoldoutLockError(f"{path}: the training part of the holdout data differs from "
+                               "the data the selection was trained on")
 
 
 def _context(dataset: Dataset, settings: _StageSettings, calib: Calibration, seed: int) -> Holdout:
@@ -510,6 +560,8 @@ def _provenance(
     return {
         "data_sha256": dataset.data_sha256,
         "data_content_sha256": dataset.train_data_sha256,
+        "train_part_sha256": dataset.train_part_sha256,
+        "code_sha256": code_sha256(),
         "data_loaded_until_ms": dataset.loaded_until_ms,
         "missing_warmups": list(dataset.missing_warmups),
         "seed": seed,
@@ -539,20 +591,20 @@ def test_stage(
     """Run the holdout once and write its file; returns the path.
 
     The lock comes first: nothing of the holdout is read unless the selection file
-    passes ``load_selection_checked`` and matches ``calib`` (s*, latency sample).
-    Injected settings and counts are for tests and are refused under the current
-    spec sha256, as is a seed other than the selection's. Any existing
-    ``pine_gate_holdout_*.json`` in ``out_dir`` refuses the run.
+    passes ``load_selection_checked`` and ``check_ready``. Injected settings and
+    counts are for tests and are refused under the current spec sha256, as is a
+    seed other than the selection's. Any existing ``pine_gate_holdout_*.json`` in
+    ``out_dir`` or next to the selection file refuses the run.
     """
     selection = load_selection_checked(selection_path, spec_sha)
-    check_calibration(selection_path, selection, calib)
     check_spec_sha(spec_sha)
     counts = {"offsets": offsets, "permutation_shifts": permutation_shifts,
               "c1_seeds": c1_seeds, "bootstrap_n": bootstrap_n}
     settings = _settings(period, exec_cfg, guard_cfg, gate_cfg, counts)
     _check_spec_run(spec_sha, settings, selection, seed)
-    refuse_any_holdout(out_dir)
+    check_ready(selection_path, selection, calib, spec_sha, out_dir)
     _check_holdout_dataset(dataset, settings.period)
+    _check_training_part(selection_path, selection, dataset, spec_sha)
     check_purge_covers(calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
     created = datetime.now(timezone.utc)
@@ -562,6 +614,6 @@ def test_stage(
     doc.update(_provenance(dataset, calib, settings, seed))
     doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).name,
                 "selection_sha256": selection_sha, "created_at": created.isoformat()})
-    refuse_any_holdout(out_dir)  # again after the work: a concurrent run may have written
+    refuse_any_holdout(out_dir, Path(selection_path).parent)  # a concurrent run may have written
     write_json_exclusive(path, doc, "holdout")
     return path

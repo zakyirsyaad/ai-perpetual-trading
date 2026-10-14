@@ -53,7 +53,7 @@ SECTION_TITLES: Tuple[str, ...] = (
     "Biaya kadens dan guard",
     "Kesimpulan",
 )
-SHA_KEYS: Tuple[str, ...] = ("spec", "data", "selection", "holdout", "code")
+SHA_KEYS: Tuple[str, ...] = ("spec", "data", "data_holdout", "selection", "holdout", "code")
 CONTENDER_LABELS = {
     "c1": "Kontender 1 (struktur Pine)",
     "c2": "Kontender 2 (logika bot)",
@@ -365,12 +365,17 @@ def _match(a: Any, b: Any) -> str:
 def _integrity(results: Mapping[str, Any]) -> Lines:
     sha, sel = _mapping(results.get("sha256")), _mapping(results.get("selection"))
     hold = _mapping(results.get("holdout"))
-    rows = [[key, f"`{sha[key]}`" if sha.get(key) else NOT_AVAILABLE] for key in SHA_KEYS]
+    rows = [[key, _sha_cell(sha.get(key))] for key in SHA_KEYS]
+    rows += [["kode di file seleksi", _sha_cell(sel.get("code_sha256"))],
+             ["kode di file uji", _sha_cell(hold.get("code_sha256"))]]
     checks = [
         ["spec di file seleksi = spec saat ini", _match(sel.get("spec_sha256"), sha.get("spec"))],
         ["spec di file uji = spec saat ini", _match(hold.get("spec_sha256"), sha.get("spec"))],
         ["file seleksi yang dipakai uji = file seleksi", _match(hold.get("selection_sha256"),
                                                                 sha.get("selection"))],
+        ["kode file seleksi = kode file uji", _match(sel.get("code_sha256"),
+                                                     hold.get("code_sha256"))],
+        ["kode saat ini = kode file uji", _match(sha.get("code"), hold.get("code_sha256"))],
     ]
     facts = [["s* (overshoot stop, bps)", fmt_bps(sel.get("s_star_bps"))],
              ["jumlah stop untuk s*", fmt_int(sel.get("n_stops"))],
@@ -380,6 +385,10 @@ def _integrity(results: Mapping[str, Any]) -> Lines:
              ["periode uji (ms UTC)", _period_text(hold.get("period"))]]
     return (_table(["Berkas", "sha256"], rows) + _table(["Pemeriksaan", "Hasil"], checks)
             + _table(["Parameter", "Nilai"], facts))
+
+
+def _sha_cell(value: Any) -> str:
+    return f"`{value}`" if value else NOT_AVAILABLE
 
 
 def _period_text(period: Any) -> str:
@@ -434,11 +443,27 @@ def _training(selection: Any) -> Lines:
         f"- Aturan dinilai: {len(rules)}; stabil: {_yes_no(sel.get('stable'))}; pasokan "
         f"membatasi: {_yes_no(sel.get('supply_limited'))}.",
         f"- PBO (CSCV): {fmt_dec(sel.get('pbo'), 2)} (lulus jika < 0.5: {_yes_no(sel.get('pbo_pass'))}).",
-        f"- SPA p: {fmt_p(sel.get('spa_p'))} ({fmt_int(sel.get('spa_n'))} replikasi).", ""]
+        f"- SPA p: {fmt_p(sel.get('spa_p'))} ({fmt_int(sel.get('spa_n'))} replikasi; nilai arah vs "
+        "sisi acak pada entri yang sama).", ""]
     headers = ["Aturan", "n TP+SL", "WR", "batas bawah", "gross bps", "net/1M", "transaksi/hari",
                "memenuhi syarat"]
-    return facts + ["Lima aturan teratas pada data latih (WR, net/1M, pasokan):", ""] + _table(
-        headers, rows)
+    return (facts + ["Lima aturan teratas pada data latih (WR, net/1M, pasokan):", ""]
+            + _table(headers, rows) + _training_c0(sel))
+
+
+def _training_c0(sel: Mapping[str, Any]) -> Lines:
+    """C0 on training: always long / always short per symbol and the verdict."""
+    rows = [[f"{s} {side}", fmt_wr(_get(c, side, "wr")), fmt_bps(_get(c, side, "gross_bps")),
+             fmt_int(_get(c, side, "n"))]
+            for s, c in sorted(_mapping(sel.get("c0_training")).items())
+            for side in ("long", "short")]
+    if not rows:
+        return [f"C0 pada data latih: {NOT_AVAILABLE}.", ""]
+    line = ("C0 pada data latih wajar (50 ± 3% WR, |gross| ≤ 2 bps)."
+            if sel.get("c0_training_pass") is True else
+            "**PERINGATAN: model fill tidak valid pada data latih** (C0 di luar 50 ± 3% WR atau "
+            "|gross| di atas 2 bps); uji tidak boleh dijalankan sebelum diperbaiki.")
+    return [line, ""] + _table(["C0 pada data latih", "WR", "gross bps", "n"], rows)
 
 
 def _yes_no(value: Any) -> str:
@@ -626,8 +651,9 @@ def _decisions_section(buckets: Any) -> Lines:
     if not rows:
         return _unavailable()
     headers = ["Bucket", "Definisi", "n", "TP", "SL", "time", "WR", "gross bps", "net/1M",
-               "transaksi/hari"]
-    return ["Keputusan AI BTC tersimpan, dengan bracket 0.20% / 0.20%:", ""] + _table(headers, rows)
+               "transaksi/hari (belum dikoreksi)"]
+    return ["Keputusan AI BTC tersimpan, dengan bracket 0.20% / 0.20%. Transaksi/hari belum "
+            "dikoreksi untuk tick saat posisi terbuka (spec 5.13).", ""] + _table(headers, rows)
 
 
 # --------------------------------------------------------------------------- cadence and guards

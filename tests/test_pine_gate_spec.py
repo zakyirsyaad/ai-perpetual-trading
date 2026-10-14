@@ -246,6 +246,10 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertTrue(policies["eth_first_sensitivity"])
         self.assertIn("WR - 2 * SE", policies["selection_rank"])
         self.assertIn("8 CSCV blocks", policies["overfitting"])
+        self.assertIn("seeded random side", policies["overfitting"])
+        self.assertIn("p = 1", policies["holm"])
+        self.assertIn("c0_training", policies)
+        self.assertIn("code_sha256", policies["holdout_lock"])
 
     def test_each_call_returns_a_fresh_document(self):
         first = spec_document()

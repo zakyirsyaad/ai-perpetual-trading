@@ -112,7 +112,10 @@ no private endpoints, no restart. Apart from the research package and the unwire
     `~/replay/out/pine_gate_selection_<date>.json` with the chosen rule, the frozen model
     (coefficients, scaler, threshold), the training metrics and the spec sha256.
   - `test` refuses to run unless that selection file exists and its recorded spec sha256
-    matches the current spec. Only then does it load holdout outcomes, once.
+    matches the current spec. Only then does it load holdout outcomes, once. Under the spec
+    sha256 it also requires the code sha256 and the training-data hash the selection recorded,
+    and writes the holdout file next to the selection file; any earlier holdout file there or in
+    the output folder refuses the run.
 - A bug found after the test stage is fixed in a new script version, everything is rerun, and the
   change is documented in the report.
 
@@ -202,8 +205,10 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
    changed) have a training WR no more than 3 points below the chosen base rule's; otherwise move
    to the next in rank.
 6. **Overfitting checks:** the probability of backtest overfitting over all evaluated rules,
-   computed by CSCV on the 8 training blocks, must be < 0.5; Hansen's SPA against a random-entry
-   benchmark with the same bracket is reported.
+   computed by CSCV on the 8 training blocks, must be < 0.5; Hansen's SPA of each rule's
+   direction value is reported: per training trading day, the mean over its trades of the rule
+   side's gross minus a seeded random side's gross on the same entry bar and bracket (0 on a day
+   without trades).
 7. Freeze the choice in the selection file (5.1).
 
 ### 5.7 Contender 2 — the bot's own logic, fixed
@@ -238,7 +243,8 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
 - **Reference:** the Pine script's numbers as written (EMA125, RSI5 40/55, ADX(11) > 20 via
   `ta.dmi(11, 11)`), reported only.
 - **C0:** always long and always short on the same tick clock — must show 50 ± 3% WR and gross
-  within ±2 bps, or the fill model is fixed before anything else is read.
+  within ±2 bps, or the fill model is fixed before anything else is read. It runs on training in
+  `train` too; a failing training C0 makes `test` refuse to run.
 - **C1:** a contender's entry times with a random side (200 seeds) — the value of the direction.
 - **Permutation:** the trend-label series shifted by whole days k ∈ [7, D − 7], 1,000 shifts, timing
   and outcomes fixed.
@@ -270,7 +276,7 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
 ### 5.11 Holdout gate
 
 The three contenders are each run once on the holdout. Within each symbol, p-values are
-Holm-corrected for the three. A contender **passes the gate for a symbol** when all of these hold:
+Holm-corrected for the three (an absent contender counts with p = 1). A contender **passes the gate for a symbol** when all of these hold:
 
 1. At least 60 take-profit + stop-loss trades for that symbol.
 2. Holm-adjusted p < 0.05, one-sided, WR above C0's WR (the mean of always-long and always-short over

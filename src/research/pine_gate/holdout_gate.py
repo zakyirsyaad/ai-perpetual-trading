@@ -76,10 +76,15 @@ def _robust(ev: Mapping[str, Any], cfg: GateConfig) -> bool:
     return _at_least(ev["wr_overshoot"], cfg.robust_min_wr) and passing >= cfg.offsets_min_pass
 
 
+def c0_side_ok(wr: Optional[float], gross_bps: Optional[float]) -> bool:
+    """One C0 side (always long or always short) is sane: WR 50 +- 3, |gross| <= 2 bps."""
+    return (_within(wr, C0_CENTRE_WR, C0_WR_TOLERANCE_PTS)
+            and _within(gross_bps, 0.0, C0_GROSS_TOLERANCE_BPS))
+
+
 def _controls(ev: Mapping[str, Any]) -> bool:
     """C0 long and short each at 50 +- 3 WR and |gross| <= 2 bps; PBO for c1/c3."""
-    c0_ok = all(_within(ev[f"c0_{side}_wr"], C0_CENTRE_WR, C0_WR_TOLERANCE_PTS)
-                and _within(ev[f"c0_{side}_gross"], 0.0, C0_GROSS_TOLERANCE_BPS)
+    c0_ok = all(c0_side_ok(ev[f"c0_{side}_wr"], ev[f"c0_{side}_gross"])
                 for side in ("long", "short"))
     pbo_ok = ev["contender"] not in PBO_CONTENDERS or ev["pbo_pass"] is True
     return c0_ok and pbo_ok

@@ -17,7 +17,7 @@ from research.pine_gate.bars import (
     write_day,
 )
 from research.pine_gate.calibrate import Calibration
-from research.pine_gate import holdout
+from research.pine_gate import holdout, lock
 from research.pine_gate.holdout import test_stage as run_test_stage
 from research.pine_gate.holdout_replay import (
     HoldoutPeriod,
@@ -338,6 +338,23 @@ class SupplyCriterionTests(unittest.TestCase):
         self.assertIsNone(holdout._pooled_lower_bound(h, runs, none))
 
 
+class HolmFamilyTests(unittest.TestCase):
+    """Holm runs over the spec's family of three even when a contender is absent (A3)."""
+
+    def test_absent_contenders_count_with_p_one(self):
+        p = {"c2": {BTC: 0.01, ETH: 0.40}, "c3": {BTC: 0.02, ETH: 0.03}}
+        out = holdout._holm_by_symbol(p, family=3)
+        self.assertAlmostEqual(out["c2"][BTC], 0.03)  # 3 x 0.01, not 2 x 0.01
+        self.assertAlmostEqual(out["c3"][BTC], 0.04)  # 2 x 0.02
+        self.assertAlmostEqual(out["c3"][ETH], 0.09)
+        self.assertAlmostEqual(out["c2"][ETH], 0.80)
+        self.assertEqual(sorted(out), ["c2", "c3"])
+        alone = holdout._holm_by_symbol({"c2": {BTC: 0.2, ETH: 0.5}}, family=3)
+        self.assertEqual(alone, {"c2": {BTC: 0.6000000000000001, ETH: 1.0}})
+        full = {n: {BTC: 0.01, ETH: 0.01} for n in ("c1", "c2", "c3")}
+        self.assertAlmostEqual(holdout._holm_by_symbol(full, family=3)["c1"][BTC], 0.03)
+
+
 class SmallHelperTests(unittest.TestCase):
     def test_permutation_p_is_conservative_about_missing_wr(self):
         self.assertEqual(holdout._shifted_p(None, [10.0, 20.0]), 1.0)
@@ -434,7 +451,9 @@ def write_selection(path, sha, **override):
     doc = {"spec_sha256": sha, **spec_run_record(), "contender1": RULE, "primary_rule": RULE,
            "pbo": 0.2, "pbo_pass": True, "s_star_bps": 1.0, "n_stops": 20, "n_latencies": 3,
            "meta_model": meta_model_dict(), "seed": 0,
-           "latencies_sha256": latencies_sha256(CALIB.latencies_ms)}
+           "latencies_sha256": latencies_sha256(CALIB.latencies_ms),
+           "code_sha256": lock.code_sha256(), "c0_training_pass": True,
+           "train_data_sha256": "e" * 64}
     doc.update(override)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc))
@@ -480,8 +499,11 @@ class LockTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_stage(self, selection, calib=CALIB, sha=DUMMY_SHA, **kwargs):
-        return run_test_stage(_Untouchable(), selection, calib, self.tmp / "out", sha, **kwargs)
+    def run_stage(self, selection, calib=CALIB, sha=DUMMY_SHA, out_dir=None, dataset=None,
+                  **kwargs):
+        out = self.tmp / "out" if out_dir is None else out_dir
+        data = _Untouchable() if dataset is None else dataset
+        return run_test_stage(data, selection, calib, out, sha, **kwargs)
 
     def test_lock_is_checked_before_any_holdout_data_is_read(self):
         with self.assertRaises(HoldoutLockError):
@@ -535,7 +557,7 @@ class LockTests(unittest.TestCase):
         # the recorded seed passes this check and goes on to read the dataset
         path = write_selection(self.tmp / "sel_ok.json", sha, seed=3)
         with self.assertRaises(AssertionError):
-            self.run_stage(path, sha=sha, seed=3)
+            self.run_stage(path, sha=sha, seed=3, out_dir=self.tmp)
         # a dummy sha may pick any seed
         path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, seed=3)
         with self.assertRaises(AssertionError):
@@ -550,6 +572,56 @@ class LockTests(unittest.TestCase):
         path = write_selection(self.tmp / "sel_old.json", DUMMY_SHA, latencies_sha256=None)
         with self.assertRaises(HoldoutLockError):
             self.run_stage(path)
+
+    def test_real_spec_sha_refuses_a_selection_made_by_other_code(self):
+        sha = spec_sha256()
+        for code in ("f" * 64, None):
+            path = write_selection(self.tmp / f"sel_{code}.json", sha, code_sha256=code)
+            with self.subTest(code=code):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    self.run_stage(path, sha=sha, out_dir=self.tmp)
+                self.assertIn("code sha256", str(ctx.exception))
+        # a dummy sha is a test run: the code hash is recorded, not enforced
+        path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, code_sha256="f" * 64)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path)
+
+    def test_real_spec_sha_refuses_a_failed_training_c0(self):
+        sha = spec_sha256()
+        for value in (False, None):
+            path = write_selection(self.tmp / f"sel_{value}.json", sha, c0_training_pass=value)
+            with self.subTest(value=value):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    self.run_stage(path, sha=sha, out_dir=self.tmp)
+                self.assertIn("fill model invalid on training C0; fix before test",
+                              str(ctx.exception))
+
+    def test_real_spec_sha_writes_the_holdout_next_to_its_selection(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel" / "selection.json", sha)
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp / "elsewhere")
+        self.assertIn("next to its selection file", str(ctx.exception))
+        with self.assertRaises(AssertionError):  # same folder: goes on to the data
+            self.run_stage(path, sha=sha, out_dir=self.tmp / "sel" / ".")
+
+    def test_a_holdout_file_next_to_the_selection_refuses_any_out_dir(self):
+        path = write_selection(self.tmp / "sel" / "selection.json", DUMMY_SHA)
+        old = self.tmp / "sel" / "pine_gate_holdout_20260101.json"
+        old.write_text("{}")
+        with self.assertRaises(FileExistsError) as ctx:
+            self.run_stage(path, out_dir=self.tmp / "fresh_out")
+        self.assertIn(old.name, str(ctx.exception))
+        self.assertFalse((self.tmp / "fresh_out").exists())
+
+    def test_real_spec_sha_refuses_holdout_data_whose_training_part_differs(self):
+        _build_shared()
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel.json", sha)  # train_data_sha256 "eee..."
+        with self.assertRaises(HoldoutLockError) as ctx:
+            self.run_stage(path, sha=sha, out_dir=self.tmp, dataset=_Shared.dataset)
+        self.assertIn("training part", str(ctx.exception))
+        self.assertEqual(list(self.tmp.glob("pine_gate_holdout_*.json")), [])
 
     def test_counts_must_be_positive_integers(self):
         path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
@@ -588,6 +660,8 @@ class TestStageTests(StageFixture):
         self.assertEqual(doc["period"], TEST_PERIOD.to_dict())
         self.assertEqual(doc["seed"], 2)
         self.assertEqual(doc["calibration"]["s_star_bps"], 1.0)
+        self.assertEqual(doc["code_sha256"], lock.code_sha256())
+        self.assertEqual(doc["train_part_sha256"], self.dataset.train_part_sha256)
 
     def test_never_overwrites_the_holdout_file(self):
         with self.assertRaises(FileExistsError):
@@ -774,6 +848,9 @@ class StageSkipTests(unittest.TestCase):
             doc = json.loads(path.read_text())
             self.assertEqual(sorted(doc["contenders"]), ["c2"])
             self.assertEqual(doc["skipped"], ["c1", "c3"])
+            for symbol in SYMBOLS:  # Holm still counts a family of three
+                row = doc["contenders"]["c2"]["symbols"][symbol]
+                self.assertAlmostEqual(row["p_holm"], min(1.0, 3 * row["p_c0"]))
         finally:
             shutil.rmtree(out, ignore_errors=True)
 

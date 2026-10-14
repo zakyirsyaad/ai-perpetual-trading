@@ -2,9 +2,10 @@
 
 Research code; the bot never imports it. Standard library only. ``test``
 enforces the holdout lock before any holdout data is read: the selection file
-must pass ``load_selection_checked`` under the current spec sha256, the
-calibration must be the one the selection was made with, and no holdout file
-may exist yet. Only then is the full dataset loaded.
+must pass ``load_selection_checked`` under the current spec sha256 and
+``check_ready`` (no holdout file yet, the selection's calibration, its code
+sha256 and a passing training C0, the output next to the selection file).
+Only then is the full dataset loaded.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import cli_common as common
 from .cli_checks import DECISIONS_PREFIX, VST_PREFIX
 from .calibrate import load_entry_latencies_ms, s_star, stop_overshoot_detail
-from .holdout import HOLDOUT_PREFIX, check_calibration, refuse_any_holdout, test_stage
+from .holdout import HOLDOUT_PREFIX, check_ready, test_stage
 from .lock import code_files, code_sha256, latencies_sha256, load_selection_checked
 from .pipeline import TRAIN_DATA_UNTIL_MS, load_dataset, train_stage
 from .report import write_report
@@ -79,8 +80,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     spec_sha = spec_sha256()
     selection = load_selection_checked(selection_path, spec_sha)  # the lock comes first
     calib = common.load_calibration_file(Path(args.calibration).expanduser())
-    check_calibration(selection_path, selection, calib)
-    refuse_any_holdout(args.out_dir)
+    check_ready(selection_path, selection, calib, spec_sha, args.out_dir)
     dataset = load_dataset(args.data_dir, None)
     print(test_stage(dataset, selection_path, calib, args.out_dir, spec_sha,
                      seed=selection.get("seed", 0)))
@@ -140,6 +140,7 @@ def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
         "sha256": {
             "spec": spec_sha256(),
             "data": common.as_mapping(selection).get("data_sha256"),
+            "data_holdout": holdout.get("data_sha256"),
             "selection": common.file_sha256(sel_path),
             "holdout": common.file_sha256(hold_path),
             "code": code_sha256(),
