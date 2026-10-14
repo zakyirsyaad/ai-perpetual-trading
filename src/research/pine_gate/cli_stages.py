@@ -140,7 +140,7 @@ def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
         "selection": selection,
         "holdout": holdout,
         "vst": vst,
-        "decisions": common.as_mapping(decisions).get("buckets"),
+        "decisions": decisions,  # the whole file: the report checks contender and selection
         "sha256": {
             "spec": spec_sha256(),
             "data": common.as_mapping(selection).get("data_sha256"),

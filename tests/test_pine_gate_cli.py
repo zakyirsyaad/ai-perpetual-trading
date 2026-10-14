@@ -757,7 +757,11 @@ class VstCheckCommandTest(Dirs):
         path = self.out / "pine_gate_vst_BTC-USDT_20261014.json"
         doc = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(set(doc), {"n", "n_either", "n_both", "n_prod", "n_vst", "side_agree",
-                                    "outcome_agree", "wr_prod", "wr_vst", "passed"})
+                                    "outcome_agree", "wr_prod", "wr_vst", "passed",
+                                    "contender", "selection_sha256"})
+        self.assertEqual(doc["contender"], "c1")
+        self.assertEqual(doc["selection_sha256"],
+                         hashlib.sha256((self.out / "s.json").read_bytes()).hexdigest())
         self.assertGreater(doc["n"], 100)
         self.assertEqual(doc["side_agree"], 1.0)  # identical prices on both sides
         self.assertIn("contender c1", out)
@@ -806,6 +810,8 @@ class DecisionsCommandTest(Dirs):
         self.assertEqual(code, 0, err)
         doc = json.loads((self.out / "pine_gate_decisions_20261014.json").read_text("utf-8"))
         self.assertEqual(doc["contender"], "c2")
+        self.assertEqual(doc["selection_sha256"],
+                         hashlib.sha256((self.out / "s.json").read_bytes()).hexdigest())
         self.assertEqual((doc["n_rows"], doc["n_outside_data"]), (2, 1))
         self.assertEqual(doc["n_fallback_latency"], 1)
         self.assertEqual(set(doc["buckets"]), {"A", "B", "E", "F"})
@@ -875,7 +881,7 @@ class ReportCommandTest(Dirs):
         (self.out / "pine_gate_vst_BTC-USDT_20261014.json").write_text(
             json.dumps({"n": 5, "passed": True}), encoding="utf-8")
         (self.out / "pine_gate_decisions_20261014.json").write_text(
-            json.dumps({"buckets": {"A": {"n": 1}}}), encoding="utf-8")
+            json.dumps({"contender": "c2", "buckets": {"A": {"n": 1}}}), encoding="utf-8")
         captured = {}
 
         def fake_write(results, out_dir):
@@ -890,7 +896,7 @@ class ReportCommandTest(Dirs):
         self.assertEqual(results["holdout"], {"chosen": "c2", "selection_file": newest.name,
                                               "data_sha256": "def"})
         self.assertEqual(results["vst"], {"BTC-USDT": {"n": 5, "passed": True}})
-        self.assertEqual(results["decisions"], {"A": {"n": 1}})
+        self.assertEqual(results["decisions"], {"contender": "c2", "buckets": {"A": {"n": 1}}})
         sha = results["sha256"]
         self.assertEqual(sha["spec"], spec_sha256())
         self.assertEqual(sha["data"], "abc")

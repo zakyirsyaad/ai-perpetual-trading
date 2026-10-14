@@ -6,7 +6,9 @@ holdout test: the selection file must pass the holdout lock, and a holdout file
 in ``--out-dir`` must exist that was made from that selection file under the
 current spec (``require_holdout_run``). Both checks come before any data is
 loaded or Supabase is called. The contender is the one the holdout chose
-unless ``--contender`` names another. Supabase is read-only, through
+unless ``--contender`` names another. Both outputs record that ``contender`` and
+the selection file's ``selection_sha256``, so the report can refuse an output that
+belongs to another contender or selection. Supabase is read-only, through
 ``cli_common.make_get_rows``.
 """
 
@@ -93,7 +95,16 @@ def require_holdout_run(out_dir: Path, selection_path: Path) -> Dict[str, Any]:
     return doc
 
 
-def locked_selection(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
+@dataclass(frozen=True)
+class Locked:
+    """The checked selection, its file sha256 and the contender under test."""
+
+    selection: Dict[str, Any]
+    selection_sha256: str
+    name: str
+
+
+def locked_selection(args: argparse.Namespace) -> Locked:
     """The checked selection and the contender name, before any data is touched."""
     selection_path = Path(args.selection).expanduser()
     selection = load_selection_checked(selection_path, spec_sha256())
@@ -101,7 +112,7 @@ def locked_selection(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
     name = args.contender or holdout.get("chosen")
     if name not in CONTENDERS:
         raise common.CliError("the holdout chose no contender; pass --contender c1|c2|c3")
-    return selection, name
+    return Locked(selection, common.file_sha256(selection_path), name)
 
 
 def chosen_from_selection(selection: Mapping[str, Any], name: str) -> Chosen:
@@ -204,8 +215,8 @@ def overlap_times(a: Bars, b: Bars) -> range:
 
 
 def cmd_vst_check(args: argparse.Namespace) -> int:
-    selection, name = locked_selection(args)
-    chosen = chosen_from_selection(selection, name)
+    locked = locked_selection(args)
+    chosen = chosen_from_selection(locked.selection, locked.name)
     path = common.stamped_path(args.out_dir, f"{VST_PREFIX}{args.symbol}_")
     if path.exists():
         raise FileExistsError(f"{path}: already exists; remove it deliberately to write again")
@@ -220,7 +231,9 @@ def cmd_vst_check(args: argparse.Namespace) -> int:
     times = [t for t in overlap_times(bars, vst)
              if snapshot_valid(chosen, prod, prod, t) and snapshot_valid(chosen, vst_frame, prod, t)]
     agreement = vst_agreement(prod, vst_frame, signal_for(chosen), times, ExecConfig())
-    common.write_json_exclusive(path, asdict(agreement), "vst-check")
+    doc = {**asdict(agreement), "contender": chosen.name,
+           "selection_sha256": locked.selection_sha256}
+    common.write_json_exclusive(path, doc, "vst-check")
     print(f"vst-check {args.symbol} contender {chosen.name}: n {agreement.n}, either "
           f"{agreement.n_either}, both {agreement.n_both}, side agree {agreement.side_agree}, "
           f"outcome agree {agreement.outcome_agree}, "
@@ -316,7 +329,8 @@ def _live_decisions() -> Tuple[List[dict], Dict[str, float]]:
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
-    selection, name = locked_selection(args)
+    locked = locked_selection(args)
+    selection, name = locked.selection, locked.name
     chosen_from_selection(selection, name)  # refuse early when it is absent
     overshoot = _s_star(selection)
     path = common.stamped_path(args.out_dir, DECISIONS_PREFIX)
@@ -342,6 +356,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     buckets = decision_buckets(placed.rows, lambda r: placed.ticks[r], signal, outcome_for)
     doc = {
         "contender": name,
+        "selection_sha256": locked.selection_sha256,
         "symbol": DECISIONS_SYMBOL,
         "since": DECISIONS_SINCE,
         "n_read": len(raw),

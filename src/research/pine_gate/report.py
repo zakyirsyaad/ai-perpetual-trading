@@ -346,10 +346,11 @@ def _honesty_lines() -> Lines:
 
 def _ringkasan(results: Mapping[str, Any]) -> Lines:
     holdout = results.get("holdout")
-    lines = _c0_warning(holdout)
+    lines = _provenance_warning(results) + _c0_warning(holdout)
     if not isinstance(holdout, Mapping) or not holdout:
         return lines + _unavailable("Hasil periode uji") + _economics_lines() + _honesty_lines()
-    outcome = [] if lines else _summary_outcome(summarize_for_verdict(results))  # a failed C0 voids the results
+    # a failed C0 voids the results
+    outcome = [] if c0_failed_symbols(holdout) else _summary_outcome(summarize_for_verdict(results))
     return lines + outcome + _economics_lines() + _summary_table(holdout) + _honesty_lines()
 
 
@@ -633,23 +634,76 @@ def _controls_section(holdout: Any) -> Lines:
 # --------------------------------------------------------------------------- checks
 
 
-def _vst_section(vst: Any) -> Lines:
+def _provenance_problem(doc: Any, results: Mapping[str, Any]) -> Optional[str]:
+    """Why a check output does not belong to this report's holdout, else ``None``.
+
+    vst-check and decisions record the ``contender`` they scored and the
+    ``selection_sha256`` they were run under; both must match the holdout's chosen
+    contender and the selection file of this report (spec 5.12, 5.13)."""
+    chosen, contender = _get(results.get("holdout"), "chosen"), _get(doc, "contender")
+    if contender is None or contender != chosen:
+        return (f"kontender {contender or NA} bukan kontender pilihan periode uji "
+                f"({chosen or NA})")
+    selection_sha = _get(results.get("sha256"), "selection")
+    if not selection_sha or _get(doc, "selection_sha256") != selection_sha:
+        return "sha256 file seleksi berbeda dari file seleksi laporan ini"
+    return None
+
+
+def _checked_vst(results: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """VST outputs that belong to this report, and ``{symbol: reason}`` for the rest."""
+    kept: Dict[str, Any] = {}
+    skipped: Dict[str, str] = {}
+    for symbol, doc in sorted(_mapping(results.get("vst")).items()):
+        problem = _provenance_problem(doc, results)
+        if problem is None:
+            kept[symbol] = doc
+        else:
+            skipped[symbol] = problem
+    return kept, skipped
+
+
+def _decisions_problem(results: Mapping[str, Any]) -> Optional[str]:
+    doc = results.get("decisions")
+    return None if doc is None else _provenance_problem(doc, results)
+
+
+def _provenance_warning(results: Mapping[str, Any]) -> Lines:
+    reasons = [f"VST {symbol}: {why}" for symbol, why in _checked_vst(results)[1].items()]
+    problem = _decisions_problem(results)
+    if problem is not None:
+        reasons.append(f"Keputusan AI: {problem}")
+    if not reasons:
+        return []
+    return [f"**PERINGATAN: hasil pemeriksaan dilewati** ({'; '.join(reasons)}). Bagian itu "
+            "tidak ditampilkan karena tidak berasal dari kontender dan file seleksi periode "
+            "uji ini.", ""]
+
+
+def _skipped_lines(reasons: Sequence[str]) -> Lines:
+    return [f"Hasil dilewati — {why}." for why in reasons] + [""] if reasons else []
+
+
+def _vst_section(results: Mapping[str, Any]) -> Lines:
+    kept, skipped = _checked_vst(results)
     rows = []
-    for symbol, a in sorted(_mapping(vst).items()):
+    for symbol, a in kept.items():
         diff = None
         if _num(_get(a, "wr_prod")) is not None and _num(_get(a, "wr_vst")) is not None:
             diff = abs(a["wr_prod"] - a["wr_vst"])
-        rows.append([symbol, fmt_int(_get(a, "n")), fmt_share(_get(a, "side_agree")),
-                     fmt_share(_get(a, "outcome_agree")), fmt_wr(_get(a, "wr_prod")),
-                     fmt_wr(_get(a, "wr_vst")), fmt_dec(diff), _yes_no(_get(a, "passed"))])
+        rows.append([_label(str(_get(a, "contender"))), symbol, fmt_int(_get(a, "n")),
+                     fmt_share(_get(a, "side_agree")), fmt_share(_get(a, "outcome_agree")),
+                     fmt_wr(_get(a, "wr_prod")), fmt_wr(_get(a, "wr_vst")), fmt_dec(diff),
+                     _yes_no(_get(a, "passed"))])
+    skipped_lines = _skipped_lines([f"VST {s}: {why}" for s, why in skipped.items()])
     if not rows:
-        return _unavailable()
+        return skipped_lines + _unavailable()
     note = [f"Ambang (spec 5.12): arah sinyal sama ≥ {SIDE_AGREE_MIN:.0%}, hasil bracket sama "
             f"≥ {OUTCOME_AGREE_MIN:.0%}, selisih WR ≤ {WR_DIFF_MAX_PTS:.0f} poin. Jika gagal, "
             "pembacaan maju di VST yang menentukan.", ""]
-    headers = ["Simbol", "tick", "arah sama", "hasil sama", "WR produksi", "WR VST",
-               "selisih WR (poin)", "lulus"]
-    return note + _table(headers, rows)
+    headers = ["Kontender", "Simbol", "tick", "arah sama", "hasil sama", "WR produksi",
+               "WR VST", "selisih WR (poin)", "lulus"]
+    return skipped_lines + note + _table(headers, rows)
 
 
 BUCKET_NOTES = {
@@ -660,19 +714,24 @@ BUCKET_NOTES = {
 }
 
 
-def _decisions_section(buckets: Any) -> Lines:
+def _decisions_section(results: Mapping[str, Any]) -> Lines:
+    problem = _decisions_problem(results)
+    if problem is not None:
+        return _skipped_lines([f"keputusan AI: {problem}"]) + _unavailable()
+    doc = results.get("decisions")
+    contender = _label(str(_get(doc, "contender")))
     rows = []
     for key in ("A", "B", "E", "F"):
-        b = _mapping(_get(buckets, key))
+        b = _mapping(_get(doc, "buckets", key))
         if b:
-            rows.append([key, BUCKET_NOTES[key], fmt_int(b.get("n")), fmt_int(b.get("tp")),
-                         fmt_int(b.get("sl")), fmt_int(b.get("time")), fmt_wr(b.get("wr")),
-                         fmt_bps(b.get("gross")), fmt_money(_net(b.get("gross"))),
-                         fmt_dec(b.get("trades_per_day"))])
+            rows.append([contender, key, BUCKET_NOTES[key], fmt_int(b.get("n")),
+                         fmt_int(b.get("tp")), fmt_int(b.get("sl")), fmt_int(b.get("time")),
+                         fmt_wr(b.get("wr")), fmt_bps(b.get("gross")),
+                         fmt_money(_net(b.get("gross"))), fmt_dec(b.get("trades_per_day"))])
     if not rows:
         return _unavailable()
-    headers = ["Bucket", "Definisi", "n", "TP", "SL", "time", "WR", "gross bps", "net/1M",
-               "transaksi/hari (belum dikoreksi)"]
+    headers = ["Kontender", "Bucket", "Definisi", "n", "TP", "SL", "time", "WR", "gross bps",
+               "net/1M", "transaksi/hari (belum dikoreksi)"]
     return ["Keputusan AI BTC tersimpan, dengan bracket 0.20% / 0.20%. Transaksi/hari belum "
             "dikoreksi untuk tick saat posisi terbuka (spec 5.13).", ""] + _table(headers, rows)
 
@@ -751,8 +810,8 @@ def _render(results: Mapping[str, Any], verdict: str) -> str:
     bodies = (
         _ringkasan(results), _integrity(results), _regime(selection), _training(selection),
         _metalabel(selection), _holdout_section(holdout), _gate_section(holdout),
-        _controls_section(holdout), _vst_section(results.get("vst")),
-        _decisions_section(results.get("decisions")), _cadence_section(holdout),
+        _controls_section(holdout), _vst_section(results),
+        _decisions_section(results), _cadence_section(holdout),
         _kesimpulan(verdict),
     )
     lines = _sha_header(results)
@@ -764,9 +823,11 @@ def _render(results: Mapping[str, Any], verdict: str) -> str:
 def render_markdown(results: Mapping[str, Any]) -> str:
     """The report, sections in ``SECTION_TITLES`` order under the sha256 header.
 
-    ``results``: {"selection", "holdout" (or None), "vst" ({symbol: agreement} or {}),
-    "decisions" (buckets or None), "sha256" ({"spec", "data", "selection", "holdout",
-    "code"})}. The Kesimpulan paragraph is ``verdict_sentence`` over
+    ``results``: {"selection", "holdout" (or None), "vst" ({symbol: vst-check output} or
+    {}), "decisions" (the decisions output with "buckets", or None), "sha256" ({"spec",
+    "data", "selection", "holdout", "code"})}. A VST or decisions output whose
+    ``contender`` is not the holdout's ``chosen``, or whose ``selection_sha256`` is not
+    ``sha256["selection"]``, is skipped with a warning at the top of Ringkasan. The Kesimpulan paragraph is ``verdict_sentence`` over
     ``summarize_for_verdict(results)``. ``results`` is not modified."""
     return _render(results, verdict_sentence(summarize_for_verdict(results)))
 

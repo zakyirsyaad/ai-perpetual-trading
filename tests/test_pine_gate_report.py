@@ -137,9 +137,10 @@ def make_selection():
     }
 
 
-def agreement(passed=True):
+def agreement(passed=True, contender="c2"):
     return {"n": 5000, "side_agree": 0.982, "outcome_agree": 0.961, "wr_prod": 54.0,
-            "wr_vst": 53.0, "passed": passed}
+            "wr_vst": 53.0, "passed": passed, "contender": contender,
+            "selection_sha256": SHA["selection"]}
 
 
 def buckets():
@@ -148,9 +149,13 @@ def buckets():
     return {k: dict(base) for k in ("A", "B", "E", "F")}
 
 
+def decisions_doc(contender="c2"):
+    return {"contender": contender, "selection_sha256": SHA["selection"], "buckets": buckets()}
+
+
 def make_results(passed=True, c0_ok=True):
     return {"selection": make_selection(), "holdout": make_holdout(passed, c0_ok),
-            "vst": {BTC: agreement()}, "decisions": buckets(), "sha256": dict(SHA)}
+            "vst": {BTC: agreement()}, "decisions": decisions_doc(), "sha256": dict(SHA)}
 
 
 def headings(text):
@@ -303,7 +308,7 @@ class RenderMarkdownTests(unittest.TestCase):
         results = {"selection": {"contender1": None, "rules": {}}, "holdout": {"contenders": {}},
                    "vst": {BTC: {"n": 0, "side_agree": None, "outcome_agree": None,
                                  "wr_prod": None, "wr_vst": None, "passed": False}},
-                   "decisions": {"A": {"n": 0, "wr": None, "gross": None}},
+                   "decisions": {"buckets": {"A": {"n": 0, "wr": None, "gross": None}}},
                    "sha256": {"spec": "a" * 64}}
 
         text = render_markdown(results)
@@ -363,6 +368,55 @@ class RenderMarkdownTests(unittest.TestCase):
         self.assertIn("98.2%", vst)
         self.assertIn("96.1%", vst)
         self.assertIn("97%", vst)
+
+    def test_vst_and_decision_tables_show_the_contender(self, _):
+        text = render_markdown(make_results())
+
+        for title in ("VST vs produksi", "Keputusan AI"):
+            rows = [line for line in section(text, title).splitlines()
+                    if line.startswith("| ") and "---" not in line]
+            self.assertIn("Kontender", rows[0], title)  # header
+            self.assertTrue(all("Kontender 2" in row for row in rows[1:]), (title, rows))
+
+    def assert_checks_skipped(self, results, reason):
+        text = render_markdown(results)
+        body = section(text, "Ringkasan").split("\n", 1)[1].strip()
+        self.assertTrue(body.startswith("**PERINGATAN"), body[:80])
+        warning = body.split("\n\n", 1)[0]
+        self.assertIn("VST", warning)
+        self.assertIn("Keputusan AI", warning)
+        self.assertIn(reason, warning)
+        vst, ai = section(text, "VST vs produksi"), section(text, "Keputusan AI")
+        self.assertNotIn("98.2%", vst)
+        self.assertIn("dilewati", vst)
+        self.assertNotIn("| A |", ai)
+        self.assertIn("dilewati", ai)
+
+    def test_check_outputs_for_another_contender_are_skipped_with_a_top_warning(self, _):
+        results = make_results()
+        results["vst"] = {BTC: agreement(contender="c1")}
+        results["decisions"] = decisions_doc(contender="c1")
+
+        self.assert_checks_skipped(results, "c1")
+
+    def test_check_outputs_from_another_selection_file_are_skipped(self, _):
+        results = make_results()
+        results["vst"][BTC]["selection_sha256"] = "f" * 64
+        results["decisions"]["selection_sha256"] = "f" * 64
+
+        self.assert_checks_skipped(results, "sha256")
+
+    def test_check_outputs_without_provenance_are_skipped(self, _):
+        results = make_results()
+        for doc in (results["vst"][BTC], results["decisions"]):
+            del doc["contender"], doc["selection_sha256"]
+
+        self.assert_checks_skipped(results, "kontender")
+
+    def test_check_outputs_are_skipped_when_the_holdout_chose_no_contender(self, _):
+        results = make_results(passed=False)  # chosen is None
+
+        self.assert_checks_skipped(results, "c2")
 
     def test_ai_buckets_show_all_four_with_net_per_1m(self, _):
         ai = section(render_markdown(make_results()), "Keputusan AI")
@@ -595,7 +649,7 @@ class WriteReportTests(unittest.TestCase):
 
     def test_nan_in_results_is_refused_and_leaves_no_files(self):
         results = make_results()
-        results["decisions"]["A"]["gross"] = float("nan")
+        results["decisions"]["buckets"]["A"]["gross"] = float("nan")
 
         with self.assertRaises(ValueError):
             write_report(results, self.out, now=self.NOW)
