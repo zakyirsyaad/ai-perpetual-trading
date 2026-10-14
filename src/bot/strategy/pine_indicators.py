@@ -144,7 +144,9 @@ def dmi(
     up = high - prev high, down = prev low - low;
     +DM = up if up > down and up > 0 else 0 (-DM mirrored);
     +DI = 100 * rma(+DM) / rma(TR); DX = 100 * |+DI - -DI| / ((+DI + -DI) or 1);
-    ADX = rma(DX, adx_len). A zero true range gives DI 0.0, so flat bars give ADX 0.0.
+    ADX = rma(DX, adx_len). TR starts at bar 1 here (Pine's ta.dmi uses ta.tr, na on bar 0),
+    while ``atr`` keeps bar 0 = high - low. A zero true range gives DI 0.0, so flat bars
+    give ADX 0.0.
     Default warm-up is 8 * max(di_len, adx_len) for all three outputs.
     """
     _require_period(di_len)
@@ -158,7 +160,10 @@ def dmi(
         plus_dm[i] = up if up > down and up > 0.0 else 0.0
         minus_dm[i] = down if down > up and down > 0.0 else 0.0
 
-    tr_avg = _rma_raw(true_range(highs, lows, closes), di_len)
+    # Pine's ta.dmi smooths the built-in ta.tr, which is na on bar 0 (unlike ta.atr),
+    # so TR and both DM series all start at bar 1 and seed at the same index.
+    tr_from_bar_one: Series = [None, *true_range(highs, lows, closes)[1:]][:count]
+    tr_avg = _rma_raw(tr_from_bar_one, di_len)
     plus_avg = _rma_raw(plus_dm, di_len)
     minus_avg = _rma_raw(minus_dm, di_len)
 

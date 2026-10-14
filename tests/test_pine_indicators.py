@@ -109,11 +109,15 @@ class PineIndicatorTests(unittest.TestCase):
         lows = [8.0, 9.0, 8.0]
         closes = [9.0, 11.0, 9.0]
         plus_di, minus_di, adx = dmi(highs, lows, closes, 2, 2, min_bars=1)
-        # TR = [2, 3, 3]; +DM = [-, 2, 0]; -DM = [-, 0, 1]
-        # rma(TR,2) idx1 = 2.5, idx2 = 2.75; rma(+DM,2) idx2 = (2+0)/2 -> seed 1.0 at idx2
+        # TR = [2, 3, 3] but Pine's ta.dmi smooths ta.tr, na on bar 0 -> TR[1..2] = [3, 3];
+        # +DM = [-, 2, 0]; -DM = [-, 0, 1]. All three RMAs seed at idx2:
+        # rma(TR) = 3.0, rma(+DM) = (2+0)/2 = 1.0, rma(-DM) = (0+1)/2 = 0.5
         self.assertIsNone(plus_di[1])
-        self.assertAlmostEqual(plus_di[2], 100 * 1.0 / 2.75)
-        self.assertAlmostEqual(minus_di[2], 100 * 0.5 / 2.75)
+        self.assertIsNone(minus_di[1])
+        self.assertAlmostEqual(plus_di[2], 100 * 1.0 / 3.0)
+        self.assertAlmostEqual(minus_di[2], 100 * 0.5 / 3.0)
+        # DX = 100*|33.33-16.67|/50 = 33.33; ADX (adx_len=2) not seeded until 2 DX values
+        self.assertIsNone(adx[2])
 
     def test_percent_rank(self) -> None:
         self.assertEqual(percent_rank([1, 2, 3, 4, 5], 4)[4], 100.0)
