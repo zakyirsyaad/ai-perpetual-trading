@@ -48,9 +48,13 @@ def make_dataset(seed=11, days=SYNTH_DAYS):
     hours = WARMUP_DAYS * 24
     rows_1h = walk_rows(rng, START_1M - hours * HOUR, HOUR, hours, 60_000.0, 0.004)
     warmup_1h = bars_from_rows(rows_1h, HOUR)
-    warmup_4h = aggregate(warmup_1h, H4)
     rows_1m = walk_rows(rng, START_1M, MIN, days * 1440, rows_1h[-1][4], 0.0006)
-    return bars_from_rows(rows_1m, MIN), warmup_1h, warmup_4h
+    bars_1m = bars_from_rows(rows_1m, MIN)
+    # Native 4h bars up to the one straddling START_1M (16:00-20:00 UTC), built
+    # from the same prices so they agree with the 1m data.
+    all_4h = aggregate(concat(warmup_1h, aggregate(bars_1m, HOUR)), H4)
+    warmup_4h = slice_until(all_4h, START_1M + H4 - 1)
+    return bars_1m, warmup_1h, warmup_4h
 
 
 def replace_bars(bars, start_ms, end_ms, transform):
@@ -158,23 +162,60 @@ class SyntheticFrameTest(unittest.TestCase):
         self.assertEqual(with_warmup.h1_ema20, pine.ema(closes_1h, 20)[-1])
         self.assertEqual(with_warmup.h1_ema50, pine.ema(closes_1h, 50)[-1])
 
-        # 4h: the native bar of the partial 16:00 bucket must not be used either.
-        self.assertEqual(self.w4h.open_ms[-1], START_1M - 5 * HOUR)
-        closes_4h = list(self.w4h.close)
-        self.assertEqual(with_warmup.h4_ema20, pine.ema(closes_4h, 20)[-1])
+        # 4h: 1m data starts mid-bucket (17:00 UTC), so aggregation drops the
+        # partial 16:00 bucket and the native 16:00 bar fills it, read from 20:00.
+        first_agg_4h = START_1M + 3 * HOUR
+        agg_4h = aggregate(self.bars, H4)
+        self.assertEqual(agg_4h.open_ms[0], first_agg_4h)
+        self.assertEqual(self.w4h.open_ms[-1], START_1M - HOUR)
+        native_4h = list(self.w4h.close)
+        for when in (first_agg_4h - 1, first_agg_4h, first_agg_4h + 2 * HOUR,
+                     first_agg_4h + H4 - 1):
+            expected = native_4h if when >= first_agg_4h else native_4h[:-1]
+            s = self.full.snapshot(when)
+            self.assertEqual(s.h4_ema20, pine.ema(expected, 20)[-1], when)
+        after = self.full.snapshot(first_agg_4h + H4)
+        self.assertEqual(after.h4_ema50, pine.ema(native_4h + [agg_4h.close[0]], 50)[-1])
 
-        # Warm-up bars at or after the first 1m bar's bucket are dropped.
+        # Warm-up bars at or after the first aggregated open are dropped.
         overlap_1h = bars_from_rows(
             [(START_1M + k * HOUR, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(5)], HOUR
         )
         overlap_4h = bars_from_rows(
-            [(START_1M - HOUR + k * H4, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(3)], H4
+            [(first_agg_4h + k * H4, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(3)], H4
         )
         noisy = FeatureFrame.build(
             "BTC-USDT", self.bars, concat(self.w1h, overlap_1h), concat(self.w4h, overlap_4h)
         )
-        for when in (t, START_1M + DAY):
+        for when in (t, first_agg_4h, first_agg_4h + H4, START_1M + DAY):
             self.assertEqual(noisy.snapshot(when), self.full.snapshot(when))
+
+    def test_native_bar_fills_partial_leading_hour(self):
+        late = START_1M + 30 * MIN  # 1m data starts at 17:30 UTC
+        bars = _from(self.bars, late)
+        first_agg_1h = START_1M + HOUR
+        self.assertEqual(aggregate(bars, HOUR).open_ms[0], first_agg_1h)
+        native_17 = aggregate(slice_until(self.bars, first_agg_1h), HOUR)
+        w1h = concat(self.w1h, _from(native_17, START_1M))  # native bars incl. 17:00
+        frame = FeatureFrame.build("BTC-USDT", bars, w1h, self.w4h)
+
+        native = list(w1h.close)
+        agg_1h = aggregate(bars, HOUR)
+        for when in (first_agg_1h - 1, first_agg_1h, first_agg_1h + 30 * MIN,
+                     first_agg_1h + HOUR - 1):
+            expected = native if when >= first_agg_1h else native[:-1]
+            self.assertEqual(frame.snapshot(when).h1_ema20, pine.ema(expected, 20)[-1], when)
+        self.assertEqual(frame.snapshot(first_agg_1h + HOUR).h1_ema50,
+                         pine.ema(native + [agg_1h.close[0]], 50)[-1])
+
+        garbage = bars_from_rows(
+            [(first_agg_1h + k * HOUR, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(4)], HOUR
+        )
+        noisy = FeatureFrame.build("BTC-USDT", bars, concat(w1h, garbage), self.w4h)
+        for when in (first_agg_1h, first_agg_1h + 2 * HOUR, START_1M + DAY):
+            self.assertEqual(noisy.snapshot(when), frame.snapshot(when))
+            truncated = FeatureFrame.build("BTC-USDT", slice_until(bars, when), w1h, self.w4h)
+            self.assertEqual(truncated.snapshot(when), frame.snapshot(when))
 
     def test_stretch_matches_bot_setup_profile(self):
         t = START_1M + DAY + 37 * MIN

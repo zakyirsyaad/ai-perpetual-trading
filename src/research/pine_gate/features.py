@@ -199,7 +199,13 @@ def _head(bars: Bars, end: int) -> Bars:
 
 
 def _htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
-    """Native warm-up bars strictly before the first 1m bar's bucket, then aggregated."""
+    """Native warm-up bars before the first aggregated bar, then the aggregated bars.
+
+    ``aggregate`` drops a partial leading bucket (1m data starting mid-bucket), so
+    the native bar of that bucket is kept and fills the seam. With no aggregated
+    bar yet the whole warm-up is used; ``last_closed_index`` still hides any bar
+    not closed at the snapshot time.
+    """
     aggregated = aggregate(bars_1m, interval_ms)
     if warmup is None:
         return aggregated
@@ -207,10 +213,10 @@ def _htf_bars(bars_1m: Bars, warmup: Optional[Bars], interval_ms: int) -> Bars:
         raise ValueError(
             f"warm-up interval {warmup.interval_ms} ms, expected {interval_ms} ms"
         )
-    if not len(bars_1m):
+    if not len(aggregated):
         return warmup
-    first_bucket = bars_1m.open_ms[0] // interval_ms * interval_ms
-    return concat(_head(warmup, bisect_left(warmup.open_ms, first_bucket)), aggregated)
+    keep = bisect_left(warmup.open_ms, aggregated.open_ms[0])
+    return concat(_head(warmup, keep), aggregated)
 
 
 def _poc(
