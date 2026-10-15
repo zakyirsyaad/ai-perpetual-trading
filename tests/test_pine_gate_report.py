@@ -124,6 +124,7 @@ def make_selection():
         "contender1": RULE, "top": top, "stable": True, "pbo": 0.31, "pbo_pass": True,
         "supply_limited": False, "primary_rule": RULE, "s_star_bps": 1.0, "n_stops": 20,
         "n_latencies": 100, "seed": 0, "spa_p": 0.04, "spa_n": 2000,
+        "purge_tick_minutes": 75,
         "rules": {k: rule_metrics() for k in top},
         "regime_counts": {s: {t: {"2025-08": regime_cell(), "2025-09": regime_cell(40)}
                               for t in ("E200", "H1", "H4")} for s in (BTC, ETH)},
@@ -284,6 +285,14 @@ class RenderMarkdownTests(unittest.TestCase):
         tahap = section(render_markdown(results), "Tahap latih")
         self.assertIn("tak terdefinisi: kurang dari dua aturan dengan ≥ 1.000 TP+SL", tahap)
         self.assertIn("kriteria 9 gagal untuk kontender 1 dan 3", tahap)
+
+    def test_training_shows_the_tick_time_purge(self, _):
+        results = make_results()
+        tahap = section(render_markdown(results), "Tahap latih")
+        self.assertIn("- Purge waktu tick sebelum tiap batas blok: 75 menit", tahap)
+        del results["selection"]["purge_tick_minutes"]
+        tahap = section(render_markdown(results), "Tahap latih")
+        self.assertIn(f"- Purge waktu tick sebelum tiap batas blok: {report.NA} menit", tahap)
 
     def test_spa_is_described_as_direction_value_on_the_same_entries(self, _):
         tahap = section(render_markdown(make_results()), "Tahap latih")

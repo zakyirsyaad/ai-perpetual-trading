@@ -15,10 +15,10 @@ from .calibrate import Calibration
 from .features import FeatureFrame
 from .metalabel import MetaModel, candidate_features
 from .pipeline import (
-    PURGE_TICK_MINUTES,
     Dataset,
     contender2_fn,
     fresh_markets,
+    purge_tick_minutes,
     rule_signal_fn,
 )
 from .rules import contender2_signal, rule_signal, trend_label
@@ -90,9 +90,9 @@ class HoldoutPeriod:
     def length_days(self) -> int:
         return (self.end_ms - self.start_ms) // _MS_PER_DAY
 
-    def blocked_windows(self) -> Tuple[Tuple[int, int], ...]:
-        """No entry tick in the final 65 minutes, so every trade exits before the end."""
-        return ((self.end_ms - PURGE_TICK_MINUTES * _MS_PER_MIN, self.end_ms),)
+    def blocked_windows(self, purge_minutes: int) -> Tuple[Tuple[int, int], ...]:
+        """No entry tick in the final ``purge_minutes``, so every trade exits before the end."""
+        return ((self.end_ms - purge_minutes * _MS_PER_MIN, self.end_ms),)
 
     def days(self) -> List[date]:
         return trading_days(self.start_ms, self.end_ms)
@@ -139,22 +139,26 @@ def simulate_holdout(
     offset_s: int = 0,
     latencies_ms: Optional[Sequence[float]] = None,
     allow_zero_latency: bool = False,
+    purge_minutes: Optional[int] = None,
 ) -> List[Trade]:
-    """The one-position replay over the holdout with the final-65-minute block."""
+    """The one-position replay over the holdout with no entry tick in the final
+    ``purge_minutes`` (default ``purge_tick_minutes`` of ``calib`` and ``exec_cfg``)."""
+    purge = purge_tick_minutes(calib, exec_cfg) if purge_minutes is None else purge_minutes
     return simulate(
         signal, markets, period.start_ms, period.end_ms,
         exec_cfg=exec_cfg, guard_cfg=guard_cfg,
         latencies_ms=calib.latencies_ms if latencies_ms is None else latencies_ms,
         seed=seed,
         overshoot_bps=calib.s_star_bps if overshoot_bps is None else overshoot_bps,
-        offset_s=offset_s, blocked_entry_windows=period.blocked_windows(),
+        offset_s=offset_s, blocked_entry_windows=period.blocked_windows(purge),
         allow_zero_latency=allow_zero_latency,
     )
 
 
 @dataclass(frozen=True)
 class Holdout:
-    """One holdout stage's inputs; ``run`` replays a signal with its defaults."""
+    """One holdout stage's inputs; ``run`` replays a signal with its defaults, every
+    run with the stage's one ``purge_tick_minutes`` (the selection's)."""
 
     frames: Mapping[str, FeatureFrame]
     markets: Tuple[Market, ...]  # SYMBOLS order
@@ -166,11 +170,13 @@ class Holdout:
     gate_cfg: GateConfig
     days: Tuple[date, ...]
     last20_days: Tuple[date, ...]
+    purge_tick_minutes: int
 
     def run(self, signal: SignalFn, **kwargs: Any) -> List[Trade]:
         """``simulate_holdout`` with this stage's defaults; ``kwargs`` override them."""
         markets = kwargs.pop("markets", self.markets)
-        options = {"seed": self.seed, "exec_cfg": self.exec_cfg, "guard_cfg": self.guard_cfg}
+        options = {"seed": self.seed, "exec_cfg": self.exec_cfg, "guard_cfg": self.guard_cfg,
+                   "purge_minutes": self.purge_tick_minutes}
         options.update(kwargs)
         return simulate_holdout(signal, markets, self.period, self.calib, **options)
 

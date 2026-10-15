@@ -181,7 +181,10 @@ no private endpoints, no restart. Apart from the research package and the unwire
 
 Features may look back across a boundary; outcomes may not. A trade must enter at least 60 minutes
 before any block or segment boundary (purge), and the model's validation folds also skip the first
-60 minutes after a boundary (embargo).
+60 minutes after a boundary (embargo). The purge gates the entry tick, so its length is derived
+from the calibration as 60 minutes plus the worst calibrated AI latency, the order delay and one 1m
+fill bar, rounded up to whole minutes (`purge_tick_minutes`, 75 for the live sample), which the
+selection file records and the test stage must reuse.
 
 ### 5.4 Indicators
 

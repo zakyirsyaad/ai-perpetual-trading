@@ -47,6 +47,7 @@ from research.pine_gate.pipeline import (
     Segments,
     contender2_fn,
     load_dataset,
+    purge_tick_minutes,
     rule_signal_fn,
 )
 from research.pine_gate.spec import (
@@ -285,7 +286,7 @@ class PeriodTests(unittest.TestCase):
         self.assertEqual((p.last20_start_ms, p.last20_end_ms), (ms(LAST20_START), ms(LAST20_END)))
         self.assertEqual(len(p.last20_days()), 20)
         self.assertEqual(p.length_days(), 70)
-        self.assertEqual(p.blocked_windows(), ((ms(HOLDOUT_END) - 65 * MIN, ms(HOLDOUT_END)),))
+        self.assertEqual(p.blocked_windows(75), ((ms(HOLDOUT_END) - 75 * MIN, ms(HOLDOUT_END)),))
         self.assertEqual(p.mid_ms, ms(HOLDOUT_START) + 35 * DAY)
 
     def test_period_must_be_ordered_and_contain_last20(self):
@@ -458,7 +459,8 @@ def write_selection(path, sha, **override):
            "meta_model": meta_model_dict(), "seed": 0,
            "latencies_sha256": latencies_sha256(CALIB.latencies_ms),
            "code_sha256": lock.code_sha256(), "c0_training_pass": True,
-           "train_data_sha256": "e" * 64, "python_version": list(sys.version_info[:2])}
+           "train_data_sha256": "e" * 64, "python_version": list(sys.version_info[:2]),
+           "purge_tick_minutes": purge_tick_minutes(CALIB, ExecConfig())}
     doc.update(override)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc))
@@ -799,6 +801,26 @@ class LockTests(unittest.TestCase):
                 self.assertIn("fill model invalid on training C0; fix before test",
                               str(ctx.exception))
 
+    def test_real_spec_sha_refuses_a_recorded_purge_other_than_the_calibration_gives(self):
+        sha = spec_sha256()
+        self.assertEqual(purge_tick_minutes(CALIB, ExecConfig()), 62)
+        for recorded in (75, 65, None, "62"):
+            path = write_selection(self.tmp / f"sel_{recorded}.json", sha,
+                                   purge_tick_minutes=recorded)
+            with self.subTest(recorded=recorded):
+                with self.assertRaises(HoldoutLockError) as ctx:
+                    self.run_stage(path, sha=sha, out_dir=self.tmp)
+                self.assertIn("purge", str(ctx.exception))
+                self.assertFalse(self.marker(sha).exists())
+        # the derived value passes and goes on to read the dataset
+        path = write_selection(self.tmp / "sel_ok.json", sha)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path, sha=sha, out_dir=self.tmp)
+        # a dummy sha is a test run: the purge is recorded, not enforced
+        path = write_selection(self.tmp / "sel_dummy.json", DUMMY_SHA, purge_tick_minutes=75)
+        with self.assertRaises(AssertionError):
+            self.run_stage(path)
+
     def test_real_spec_sha_writes_the_holdout_next_to_its_selection(self):
         sha = spec_sha256()
         path = write_selection(self.tmp / "sel" / "selection.json", sha)
@@ -1097,14 +1119,24 @@ class StageSkipTests(unittest.TestCase):
 
 
 class HoldoutSimulationTests(StageFixture):
-    def test_no_entry_in_the_final_65_minutes_and_none_before_the_start(self):
+    def test_no_entry_in_the_final_purge_and_none_before_the_start(self):
         markets = holdout_markets(self.dataset, ExecConfig())
         trades = simulate_holdout(lambda s, t: 1, markets, TEST_PERIOD, CALIB, seed=0,
                                   exec_cfg=ExecConfig(), guard_cfg=NO_GUARDS)
         self.assertGreater(len(trades), 100)
         self.assertTrue(all(t.symbol == BTC for t in trades))
         self.assertTrue(all(t.signal_ms >= TEST_PERIOD.start_ms for t in trades))
-        self.assertTrue(all(t.signal_ms < TEST_PERIOD.end_ms - 65 * MIN for t in trades))
+        self.assertTrue(all(t.signal_ms < TEST_PERIOD.end_ms - 62 * MIN for t in trades))
+        self.assertTrue(all(t.exit_ms <= TEST_PERIOD.end_ms for t in trades))
+
+    def test_the_stage_blocks_the_derived_purge_before_the_holdout_end(self):
+        slow = replace(CALIB, latencies_ms=(13 * MIN,))
+        settings = holdout._settings(TEST_PERIOD, None, NO_GUARDS, None, {})
+        h = holdout._context(self.dataset, settings, slow, 0)
+        self.assertEqual(h.purge_tick_minutes, 75)
+        trades = h.run(lambda s, t: 1)
+        self.assertTrue(trades)
+        self.assertTrue(all(t.signal_ms < TEST_PERIOD.end_ms - 75 * MIN for t in trades))
         self.assertTrue(all(t.exit_ms <= TEST_PERIOD.end_ms for t in trades))
 
 
