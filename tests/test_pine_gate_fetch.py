@@ -23,6 +23,8 @@ from research.pine_gate.fetch import (
     VST_HOST,
     MAX_BODY_BYTES,
     MAX_FUNDING_REQUESTS,
+    MAX_WARMUP_BARS_PER_REQUEST,
+    TRANSIENT_BACKOFF_SECONDS,
     ExchangeError,
     HttpStatusError,
     IncompleteDayError,
@@ -104,6 +106,14 @@ def full_klines(params, index):
 
 def ok(data):
     return {"code": 0, "data": data}
+
+
+RETRY_LATER = {"code": 100410, "msg": "请稍后重试"}
+
+
+def backoffs(sleeps):
+    """The backoff sleeps only, without the 1 s request gaps."""
+    return [s for s in sleeps.calls if s > fetch.MIN_REQUEST_GAP_SECONDS]
 
 
 class FetchWindowTest(unittest.TestCase):
@@ -278,6 +288,75 @@ class FetchDayTest(unittest.TestCase):
 
         with self.assertRaises(KeyError):
             fetch_day(FakeHttp(respond), PROD_HOST, "BTC-USDT", DAY1, sleep=noop)
+
+
+class TransientCodeTest(unittest.TestCase):
+    """In-body code 100410 ("please retry later") is retried with backoff (R-a)."""
+
+    def test_backoff_schedule_is_five_fifteen_forty_five(self):
+        self.assertEqual(tuple(TRANSIENT_BACKOFF_SECONDS), (5, 15, 45))
+
+    def test_day_retried_with_backoff_then_succeeds(self):
+        def respond(params, index):
+            return RETRY_LATER if index < 2 else ok(klines_for(params))
+
+        fake, sleeps = FakeHttp(respond), Sleeps()
+        rows = fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=sleeps)
+        self.assertEqual(len(rows), 1440)
+        self.assertEqual(len(fake.calls), 3)
+        self.assertEqual(backoffs(sleeps), [5, 15])
+
+    def test_day_fails_after_the_last_backoff(self):
+        fake, sleeps = FakeHttp(lambda p, i: RETRY_LATER), Sleeps()
+        with self.assertRaisesRegex(ExchangeError, "100410"):
+            fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=sleeps)
+        self.assertEqual(len(fake.calls), 4)
+        self.assertEqual(backoffs(sleeps), [5, 15, 45])
+
+    def test_other_exchange_codes_still_fail_at_once(self):
+        fake, sleeps = FakeHttp(lambda p, i: {"code": 100400, "msg": "bad"}), Sleeps()
+        with self.assertRaises(ExchangeError):
+            fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=sleeps)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(backoffs(sleeps), [])
+
+    def test_it_is_not_a_rate_limit_and_the_range_goes_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d1, d2 = date(2026, 7, 1), date(2026, 7, 2)
+            bad_start = wib_day_start_ms(d1)
+
+            def respond(params, index):
+                if int(params["startTime"]) == bad_start:
+                    return RETRY_LATER
+                return ok(klines_for(params))
+
+            result = sync_days(FakeHttp(respond), PROD_HOST, "prod", "BTC-USDT", d1, d2,
+                               Path(tmp), sleep=noop)
+        self.assertEqual(result, SyncResult(fetched=1, skipped=0, failed=(d1,)))
+
+    def test_funding_window_is_retried_with_backoff(self):
+        def respond(params, index):
+            return RETRY_LATER if index < 3 else ok([funding_row(HOUR)])
+
+        fake, sleeps = FakeHttp(respond), Sleeps()
+        got = fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 10 * HOUR, sleep=sleeps)
+        self.assertEqual(got, [HOUR])
+        self.assertEqual(len(fake.calls), 4)
+        self.assertEqual(backoffs(sleeps), [5, 15, 45])
+
+    def test_funding_window_fails_after_the_last_backoff(self):
+        fake, sleeps = FakeHttp(lambda p, i: RETRY_LATER), Sleeps()
+        with self.assertRaisesRegex(ExchangeError, "100410"):
+            fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 10 * HOUR, sleep=sleeps)
+        self.assertEqual(len(fake.calls), 4)
+
+    def test_warmup_window_is_retried_with_backoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sleeps = Sleeps()
+            fake = FakeHttp(lambda p, i: RETRY_LATER if i == 0 else ok(klines_for(p)))
+            sync_warmup(fake, PROD_HOST, "BTC-USDT", "1h", 0, 10 * HOUR,
+                        Path(tmp) / "w.csv.gz", sleep=sleeps)
+        self.assertEqual(backoffs(sleeps), [5])
 
 
 def no_network():
@@ -513,25 +592,43 @@ class SyncWarmupTest(unittest.TestCase):
 
     def test_splits_into_windows_and_writes_one_file(self):
         start = 0
-        end = 3000 * HOUR  # 3,000 1h bars -> windows of 1440, 1440, 120
+        end = 2500 * HOUR  # 2,500 1h bars -> windows of 1000, 1000, 500
         fake = FakeHttp(full_klines)
         sleeps = Sleeps()
         sync_warmup(fake, PROD_HOST, "BTC-USDT", "1h", start, end, self.path, sleep=sleeps)
-        self.assertEqual([c[1]["limit"] for c in fake.calls], ["1440", "1440", "120"])
+        self.assertEqual([c[1]["limit"] for c in fake.calls], ["1000", "1000", "500"])
         self.assertEqual(
             [(int(c[1]["startTime"]), int(c[1]["endTime"])) for c in fake.calls],
             [
-                (0, 1440 * HOUR - 1),
-                (1440 * HOUR, 2880 * HOUR - 1),
-                (2880 * HOUR, 3000 * HOUR - 1),
+                (0, 1000 * HOUR - 1),
+                (1000 * HOUR, 2000 * HOUR - 1),
+                (2000 * HOUR, 2500 * HOUR - 1),
             ],
         )
         self.assertTrue(all(c[1]["interval"] == "1h" for c in fake.calls))
         rows = read_day(self.path)
-        self.assertEqual(len(rows), 3000)
-        self.assertEqual(rows[-1][0], 2999 * HOUR)
+        self.assertEqual(len(rows), 2500)
+        self.assertEqual(rows[-1][0], 2499 * HOUR)
         self.assertEqual(len(sleeps.calls), 2)
         self.assertTrue(all(s >= 1.0 for s in sleeps.calls))
+
+    def test_works_against_a_venue_that_returns_at_most_1000_bars(self):
+        def capped(params, index):
+            return ok(klines_for(params)[:MAX_WARMUP_BARS_PER_REQUEST])
+
+        for interval, step in (("1h", HOUR), ("4h", 4 * HOUR)):
+            with self.subTest(interval=interval):
+                path = self.path.with_name(f"{interval}.csv.gz")
+                fake = FakeHttp(capped)
+                sync_warmup(fake, PROD_HOST, "BTC-USDT", interval, 0, 2300 * step, path,
+                            sleep=noop)
+                self.assertEqual(len(read_day(path)), 2300)
+                self.assertTrue(all(int(c[1]["limit"]) <= 1000 for c in fake.calls))
+
+    def test_one_minute_day_fetch_keeps_1440_bars(self):
+        fake = FakeHttp(full_klines)
+        fetch_day(fake, PROD_HOST, "BTC-USDT", DAY1, sleep=noop)
+        self.assertEqual(fake.calls[0][1]["limit"], "1440")
 
     def test_four_hour_bars(self):
         fake = FakeHttp(full_klines)
@@ -586,23 +683,42 @@ class FundingTest(unittest.TestCase):
         self.assertEqual(params["symbol"], "BTC-USDT")
         self.assertEqual(headers, HEADERS)
 
-    def test_full_window_is_split_not_paginated(self):
-        times = [i * 8 * HOUR for i in range(1200)]
+    def test_long_range_is_fetched_in_windows_of_at_most_30_days(self):
+        times = [i * 8 * HOUR for i in range(1200)]  # 400 days
         fake = self.server(times)
         sleeps = Sleeps()
         got = fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 1200 * 8 * HOUR, sleep=sleeps)
         self.assertEqual(got, times)
-        self.assertEqual(len(fake.calls), 3)
-        for _, params, _ in fake.calls:
-            self.assertIn("startTime", params)
-            self.assertIn("endTime", params)
         windows = [(int(c[1]["startTime"]), int(c[1]["endTime"])) for c in fake.calls]
-        halves = windows[1:]
-        self.assertEqual(halves[0][0], windows[0][0])
-        self.assertEqual(halves[0][1] + 1, halves[1][0])
-        self.assertEqual(halves[1][1], windows[0][1])
-        self.assertEqual(len(sleeps.calls), 2)
+        self.assertEqual(len(windows), 14)  # ceil(400 / 30)
+        self.assertEqual(windows[0][0], 0)
+        self.assertEqual(windows[-1][1], 1200 * 8 * HOUR)
+        for (_, previous_end), (start, _) in zip(windows, windows[1:]):
+            self.assertEqual(previous_end + 1, start)
+        self.assertTrue(all(end - start + 1 <= 30 * DAY for start, end in windows))
+        self.assertEqual(len(sleeps.calls), 13)
         self.assertTrue(all(s >= 1.0 for s in sleeps.calls))
+
+    def test_a_venue_that_truncates_long_windows_at_their_start_loses_nothing(self):
+        times = [i * 8 * HOUR for i in range(360)]  # 120 days
+
+        def truncating(params, index):
+            start, end = int(params["startTime"]), int(params["endTime"])
+            if end - start + 1 > 30 * DAY:  # silently drops the start of a long window
+                start = end + 1 - 30 * DAY
+            return ok([funding_row(t) for t in times if start <= t <= end])
+
+        got = fetch_funding_times(FakeHttp(truncating), PROD_HOST, "BTC-USDT", 0,
+                                  360 * 8 * HOUR, sleep=noop)
+        self.assertEqual(got, times)
+
+    def test_a_window_that_fills_the_limit_is_still_split_in_two(self):
+        times = list(range(1500))  # a funding time every millisecond, one 30-day window
+        fake = self.server(times)
+        got = fetch_funding_times(fake, PROD_HOST, "BTC-USDT", 0, 1499, sleep=noop)
+        self.assertEqual(got, times)
+        windows = [(int(c[1]["startTime"]), int(c[1]["endTime"])) for c in fake.calls]
+        self.assertEqual(windows, [(0, 1499), (0, 749), (750, 1499)])
 
     def test_unsorted_rows_are_sorted(self):
         fake = FakeHttp(lambda p, i: ok([funding_row(3 * HOUR), funding_row(HOUR)]))
