@@ -187,6 +187,8 @@ class FakeMetaTrainer:
             "reliability": [(0.5, 0.5, 1)],
             "supply_oof_at_threshold": 11.5,
             "supply_final_at_threshold": 12.25,
+            "threshold_admits_all": False,
+            "threshold_supply_met": True,
         }
         return model, diagnostics
 
@@ -444,6 +446,8 @@ class TrainStageTests(PipelineFixture):
         self.assertEqual(sel["reliability"], [[0.5, 0.5, 1]])
         self.assertEqual(sel["supply_oof_at_threshold"], 11.5)
         self.assertEqual(sel["supply_final_at_threshold"], 12.25)
+        self.assertIs(sel["threshold_admits_all"], False)
+        self.assertIs(sel["threshold_supply_met"], True)
         self.assertEqual(sel["configs"]["selection"]["min_tp_sl"], 1)
         self.assertEqual(sel["segments"]["train_end_ms"], ms(TRAIN_END))
         self.assertIn("created_at", sel)
@@ -557,7 +561,7 @@ class TrainStageTests(PipelineFixture):
             "selection": dict(sel_cfg=LENIENT_SEL),
             "exec": dict(exec_cfg=replace(ExecConfig(), fee_pct=0.05)),
             "guard": dict(guard_cfg=NO_GUARDS),
-            "model": dict(model_cfg=replace(ModelConfig(), threshold_hi=0.8)),
+            "model": dict(model_cfg=replace(ModelConfig(), quantile_hi=98)),
             "meta_trainer": dict(meta_trainer=FakeMetaTrainer()),
         }
         for name, kwargs in cases.items():
@@ -803,6 +807,8 @@ class PrimaryRuleTests(unittest.TestCase):
         out = pipeline._contender3(None, None, FakeMetaTrainer())
         self.assertIsNone(out["meta_model"])
         self.assertEqual(out["n_candidates"], 0)
+        self.assertIsNone(out["threshold_admits_all"])
+        self.assertIsNone(out["threshold_supply_met"])
 
 
 class RegimeCountTests(PipelineFixture):
@@ -873,7 +879,7 @@ class HoldoutLockTests(unittest.TestCase):
     def test_load_selection_refuses_one_changed_config_field(self):
         for section, field, value in (("exec", "fee_pct", 0.05), ("guard", "max_entries", 35),
                                       ("selection", "min_tp_sl", 1),
-                                      ("model", "threshold_hi", 0.8)):
+                                      ("model", "quantile_hi", 98)):
             doc = spec_doc("c" * 64)
             doc["configs"][section][field] = value
             self.write(doc)

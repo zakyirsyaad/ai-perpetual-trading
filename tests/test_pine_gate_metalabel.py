@@ -2,7 +2,7 @@ import json
 import math
 import random
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
 from unittest import mock
 
 from research.pine_gate import metalabel
@@ -15,6 +15,7 @@ from research.pine_gate.metalabel import (
     candidate_features,
     choose_C,
     choose_threshold,
+    threshold_candidates,
     fit_logistic,
     reliability,
     train_meta,
@@ -335,21 +336,60 @@ class ReliabilityTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
-    def test_threshold_scan_highest_meeting_supply_else_half(self):
+    PROBS = [i / 100 for i in range(101)]  # quantile k% of these is exactly k / 100
+
+    def test_candidates_are_the_distinct_oof_quantiles_from_the_99th_down(self):
+        got = threshold_candidates(self.PROBS, CFG)
+        self.assertEqual(len(got), 99)
+        for value, k in zip(got, range(99, 0, -1)):
+            self.assertAlmostEqual(value, k / 100)
+        tied = [0.2] * 50 + [0.6] * 50
+        self.assertEqual(threshold_candidates(tied, CFG)[0], 0.6)
+        self.assertEqual(threshold_candidates(tied, CFG)[-1], 0.2)
+        self.assertEqual(threshold_candidates(tied, CFG),
+                         sorted(set(threshold_candidates(tied, CFG)), reverse=True))
+        self.assertEqual(threshold_candidates([0.4], CFG), [0.4])
+
+    def test_threshold_scan_takes_the_highest_quantile_meeting_supply(self):
         asked = []
 
         def supply(p):
             asked.append(p)
             return 12.0 if p <= 0.63 + 1e-9 else 5.0
 
-        self.assertAlmostEqual(choose_threshold(supply, CFG), 0.63)
-        self.assertAlmostEqual(asked[0], 0.70)
-        self.assertEqual(len(asked), 8)
-        self.assertAlmostEqual(choose_threshold(lambda p: 10.0, CFG), 0.70)
+        self.assertAlmostEqual(choose_threshold(self.PROBS, supply, CFG), 0.63)
+        self.assertAlmostEqual(asked[0], 0.99)
+        self.assertEqual(len(asked), 37)
+        self.assertAlmostEqual(choose_threshold(self.PROBS, lambda p: 10.0, CFG), 0.99)
+
+    def test_weak_signal_probabilities_below_half_still_get_a_supplied_threshold(self):
+        rng = random.Random(5)
+        probs = [rng.uniform(0.46, 0.49) for _ in range(400)]
+
+        def supply(p):  # trades per day: one per ten admitted candidates
+            return sum(1 for v in probs if v >= p) / 10.0
+
+        p = choose_threshold(probs, supply, CFG)
+        self.assertLess(p, 0.5)
+        self.assertGreater(p, min(probs))
+        self.assertGreaterEqual(supply(p), CFG.threshold_min_supply_per_day)
+        self.assertLess(supply(threshold_candidates(probs, CFG)[
+            threshold_candidates(probs, CFG).index(p) - 1]), CFG.threshold_min_supply_per_day)
+
+    def test_no_quantile_meeting_supply_admits_every_candidate(self):
         calls = []
-        self.assertEqual(choose_threshold(lambda p: calls.append(p) or 9.99, CFG), 0.5)
-        self.assertEqual(len(calls), 21)
-        self.assertAlmostEqual(calls[-1], 0.50)
+        p = choose_threshold(self.PROBS, lambda p: calls.append(p) or 9.99, CFG)
+        self.assertEqual(p, min(self.PROBS))
+        self.assertEqual(len(calls), 99)
+        self.assertAlmostEqual(calls[-1], 0.01)
+
+    def test_threshold_scan_validates_its_inputs(self):
+        with self.assertRaises(ValueError):
+            choose_threshold([], lambda p: 10.0, CFG)
+        for bad in (dict(quantile_hi=100), dict(quantile_lo=0), dict(quantile_step=0),
+                    dict(quantile_hi=10, quantile_lo=20), dict(quantile_step=1.5)):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                threshold_candidates(self.PROBS, replace(CFG, **bad))
 
 
 class CrossValidationTests(unittest.TestCase):
@@ -443,8 +483,11 @@ class TrainMetaTests(unittest.TestCase):
         self.assertEqual(diag["chosen_C"], model.C)
         self.assertEqual(set(diag["cv_logloss"]), set(CFG.c_grid))
         self.assertEqual(seen[0], {(r[0], r[1]): r[2] for r in diag["oof"]})
-        expected = choose_threshold(lambda p: supply_for(seen[0], p), CFG)
+        expected = choose_threshold(list(seen[0].values()), lambda p: supply_for(seen[0], p),
+                                    CFG)
         self.assertAlmostEqual(model.threshold, expected)
+        self.assertFalse(diag["threshold_admits_all"])
+        self.assertTrue(diag["threshold_supply_met"])
         self.assertGreater(model.coef[0], 0.0)
         self.assertEqual(sum(n for _, _, n in diag["reliability"]), len(diag["oof"]))
         # The final scaler is fit on every training candidate.
@@ -469,10 +512,34 @@ class TrainMetaTests(unittest.TestCase):
         self.assertEqual(diag["supply_final_at_threshold"], supply_for(final, model.threshold))
         self.assertIn((final, model.threshold), calls[:-2])  # computed inside train_meta
 
-    def test_train_meta_falls_back_when_supply_is_short(self):
+    def test_train_meta_admits_every_candidate_when_supply_is_short(self):
         cands = make_candidates(per_block=60)
-        model, _ = train_meta(cands, lambda oof, p: 0.0, CFG)
-        self.assertEqual(model.threshold, CFG.fallback_threshold)
+        model, diag = train_meta(cands, lambda oof, p: 0.0, CFG)
+        self.assertEqual(model.threshold, min(row[2] for row in diag["oof"]))
+        self.assertTrue(diag["threshold_admits_all"])
+        self.assertFalse(diag["threshold_supply_met"])
+
+    def test_train_meta_weak_signal_below_half_meets_supply(self):
+        rng = random.Random(11)
+        cands = []
+        for block, (start, end) in enumerate(zip(BLOCK_STARTS, BLOCK_ENDS)):
+            span = end - start - 2 * HOUR
+            for i in range(120):
+                t = start + (i * span) // 120
+                x = tuple(rng.gauss(0.0, 1.0) for _ in FEATURES)
+                p = 1.0 / (1.0 + math.exp(-(-0.4 + 0.15 * x[0])))  # base rate ~0.4, weak
+                label = 1 if rng.random() < p else 0
+                cands.append(Candidate("BTC-USDT", t, 1, x, label, t, t + 30 * MIN, block))
+
+        def supply_for(probs, p):
+            return sum(1 for v in probs.values() if v >= p) / 10.0
+
+        model, diag = train_meta(cands, supply_for, CFG)
+        self.assertLess(max(row[2] for row in diag["oof"]), 0.5)
+        self.assertLess(model.threshold, 0.5)
+        self.assertGreaterEqual(diag["supply_oof_at_threshold"], CFG.threshold_min_supply_per_day)
+        self.assertTrue(diag["threshold_supply_met"])
+        self.assertFalse(diag["threshold_admits_all"])
 
     def test_duplicate_candidate_keys_are_rejected(self):
         cands = make_candidates(per_block=60)

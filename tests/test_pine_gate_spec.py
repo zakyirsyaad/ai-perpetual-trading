@@ -94,8 +94,8 @@ class ConfigTests(unittest.TestCase):
             pbo_max=0.5, vol_high_pct=67.0, vol_lookback_1h=720, vp_bin_bps=5.0,
             trend_band_atr=0.25))
         self.assertEqual(dataclasses.asdict(ModelConfig()), dict(
-            c_grid=(10.0, 100.0, 1000.0), threshold_hi=0.70, threshold_lo=0.50,
-            threshold_step=0.01, fallback_threshold=0.5, threshold_min_supply_per_day=10.0))
+            c_grid=(0.1, 1.0, 10.0, 100.0, 1000.0), quantile_hi=99, quantile_lo=1,
+            quantile_step=1, threshold_min_supply_per_day=10.0))
         self.assertEqual(dataclasses.asdict(GateConfig()), dict(
             min_tp_sl=60, alpha=0.05, min_wr=57.0, half_min_wr=50.0,
             robust_overshoot_bps=2.0, robust_min_wr=55.0, offsets=20, offsets_min_pass=15,
@@ -241,6 +241,10 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertEqual(doc["fill"]["latency_table"], "ai_call_metrics")
         self.assertEqual(doc["gate"]["holm_family"], 3)
         self.assertEqual(doc["model"]["threshold_min_supply_per_day"], 10.0)
+        self.assertEqual(doc["model"]["c_grid"], [0.1, 1.0, 10.0, 100.0, 1000.0])
+        self.assertEqual((doc["model"]["quantile_hi"], doc["model"]["quantile_lo"],
+                          doc["model"]["quantile_step"]), (99, 1, 1))
+        self.assertIn("minimum out-of-fold probability", doc["policies"]["model_threshold"])
         policies = doc["policies"]
         self.assertEqual(policies["contender_choice_order"], [
             "most symbols passed", "higher pooled WR lower bound", "simpler (c2, c1, c3)"])

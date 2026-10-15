@@ -22,11 +22,12 @@ import math
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .bars import wib_hour
 from .features import Snapshot
 from .spec import BLOCKS, CONTENDER3_FEATURES, EMBARGO_MINUTES, TRENDS, ModelConfig, ms
+from .stats import quantile_sorted
 
 FEATURES: Tuple[str, ...] = CONTENDER3_FEATURES
 
@@ -433,16 +434,41 @@ def reliability(
     return [(s / n, hits / n, n) for s, hits, n in sums if n]
 
 
-def choose_threshold(supply_at: Callable[[float], float], cfg: ModelConfig) -> float:
-    """First p from threshold_hi down to threshold_lo whose supply meets the floor."""
-    if cfg.threshold_step <= 0 or cfg.threshold_hi < cfg.threshold_lo:
-        raise ValueError("threshold scan needs hi >= lo and a positive step")
-    steps = int(round((cfg.threshold_hi - cfg.threshold_lo) / cfg.threshold_step))
-    for i in range(steps + 1):
-        p = round(cfg.threshold_hi - i * cfg.threshold_step, 10)
+def _check_quantile_scan(cfg: ModelConfig) -> None:
+    hi, lo, step = cfg.quantile_hi, cfg.quantile_lo, cfg.quantile_step
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (hi, lo, step)):
+        raise ValueError(f"quantile scan needs whole percentiles, got {(hi, lo, step)!r}")
+    if not (1 <= lo <= hi <= 99 and step >= 1):
+        raise ValueError(f"quantile scan needs 1 <= lo <= hi <= 99 and step >= 1, "
+                         f"got {(hi, lo, step)!r}")
+
+
+def threshold_candidates(probs: Iterable[float], cfg: ModelConfig) -> List[float]:
+    """The distinct percentiles of ``probs`` from ``quantile_hi`` down to ``quantile_lo``
+    in ``quantile_step``-point steps, descending (linear interpolation between order
+    statistics)."""
+    _check_quantile_scan(cfg)
+    ordered = sorted(probs)
+    if not ordered:
+        raise ValueError("the threshold scan needs at least one out-of-fold probability")
+    out: List[float] = []
+    for pct in range(cfg.quantile_hi, cfg.quantile_lo - 1, -cfg.quantile_step):
+        value = quantile_sorted(ordered, pct / 100.0)
+        if not out or value < out[-1]:
+            out.append(value)
+    return out
+
+
+def choose_threshold(
+    probs: Iterable[float], supply_at: Callable[[float], float], cfg: ModelConfig
+) -> float:
+    """The highest ``threshold_candidates`` value whose supply meets the floor; if none
+    does, the minimum probability (every candidate is admitted)."""
+    values = list(probs)
+    for p in threshold_candidates(values, cfg):
         if supply_at(p) >= cfg.threshold_min_supply_per_day:
             return p
-    return cfg.fallback_threshold
+    return min(values)
 
 
 def train_meta(
@@ -450,7 +476,8 @@ def train_meta(
     supply_for: Callable[[Mapping[Key, float], float], float],
     cfg: ModelConfig,
 ) -> Tuple[MetaModel, Dict[str, Any]]:
-    """Choose C, scan the threshold on out-of-fold probabilities, refit on all.
+    """Choose C, scan the threshold over the out-of-fold probabilities' percentiles,
+    refit on all.
 
     ``supply_for(oof_probs, p)`` returns the trades per trading day of the
     caller's one-position simulation when only out-of-fold candidates with
@@ -466,16 +493,20 @@ def train_meta(
     chosen = _best_C(losses, sizes)
     pairs = oof_by_c[chosen]
     oof = MappingProxyType({(c.symbol, c.t_ms): p for c, p in pairs})
-    threshold = choose_threshold(lambda p: supply_for(oof, p), cfg)
+    threshold = choose_threshold(oof.values(), lambda p: supply_for(oof, p), cfg)
     model = replace(_fit_candidates(list(candidates), chosen), threshold=threshold)
     final = MappingProxyType({(c.symbol, c.t_ms): model.prob(c.x) for c in candidates})
+    supply_oof = supply_for(oof, threshold)
     diagnostics = {
         "cv_logloss": losses,
         "fold_sizes": list(sizes),
         "chosen_C": chosen,
         "oof": [[c.symbol, c.t_ms, p, c.label] for c, p in pairs],
         "reliability": reliability([p for _, p in pairs], [c.label for c, _ in pairs]),
-        "supply_oof_at_threshold": supply_for(oof, threshold),
+        "supply_oof_at_threshold": supply_oof,
         "supply_final_at_threshold": supply_for(final, threshold),
+        # p* at the minimum out-of-fold probability: contender 3 is its primary rule
+        "threshold_admits_all": threshold <= min(oof.values()),
+        "threshold_supply_met": supply_oof >= cfg.threshold_min_supply_per_day,
     }
     return model, diagnostics

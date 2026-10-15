@@ -121,13 +121,15 @@ class SelectionConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    # C of the mean-log-loss objective (spec 5.8): C_mean ~ C_sum * sum(w), so the grid
-    # sits about 1,000x above the old sum-objective grid (0.01, 0.1, 1).
-    c_grid: Tuple[float, ...] = (10.0, 100.0, 1000.0)
-    threshold_hi: float = 0.70
-    threshold_lo: float = 0.50
-    threshold_step: float = 0.01
-    fallback_threshold: float = 0.5
+    # C of the mean-log-loss objective (spec 5.8). With standardised features and
+    # p ~ 0.5 (information I ~ 0.25) a coefficient shrinks by about I / (I + 1/C):
+    # 0.02, 0.2, 0.7, 0.96 and 0.996 across the grid, so validation has a real choice.
+    c_grid: Tuple[float, ...] = (0.1, 1.0, 10.0, 100.0, 1000.0)
+    # Threshold candidates: the out-of-fold probabilities' percentiles from
+    # quantile_hi down to quantile_lo in quantile_step-point steps (spec 5.8).
+    quantile_hi: int = 99
+    quantile_lo: int = 1
+    quantile_step: int = 1
     threshold_min_supply_per_day: float = 10.0
 
 
@@ -325,8 +327,14 @@ def _policies() -> Dict[str, Any]:
                        "training trading day the mean over its trades of gross bps (rule side) "
                        "minus gross bps (seeded random side, one draw per trade, same entry "
                        "bar and bracket), 0 on a day without trades",
-        "model_threshold": "highest p* at which the out-of-fold (B2-B4) one-position simulation "
-                           "still delivers threshold_min_supply_per_day; none -> fallback_threshold",
+        "model_threshold": "candidates are the out-of-fold (B2-B4) probabilities' "
+                           "percentiles from quantile_hi down to quantile_lo in "
+                           "quantile_step-point steps (linear interpolation between order "
+                           "statistics; distinct values, descending); p* is the first whose "
+                           "one-position simulation on the out-of-fold predictions still "
+                           "delivers threshold_min_supply_per_day; if none does, p* is the "
+                           "minimum out-of-fold probability (every candidate admitted, so "
+                           "contender 3 equals its primary rule, and the report says so)",
         "meta_model_objective": "L2 logistic minimising sum(w * logloss) / sum(w) + "
                                 "|beta|^2 / (2C), intercept unpenalised, w = uniqueness "
                                 "weights, so C means the same at every sample size; the "

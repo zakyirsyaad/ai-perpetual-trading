@@ -452,7 +452,8 @@ def _contender3(
 ) -> Dict[str, Any]:
     empty = {"meta_model": None, "cv_logloss": None, "cv_fold_sizes": None, "chosen_C": None,
              "reliability": None, "n_oof": 0, "n_candidates": 0,
-             "supply_oof_at_threshold": None, "supply_final_at_threshold": None}
+             "supply_oof_at_threshold": None, "supply_final_at_threshold": None,
+             "threshold_admits_all": None, "threshold_supply_met": None}
     if primary is None:
         return empty
     candidates = meta_candidates(ctx, primary)
@@ -469,6 +470,10 @@ def _contender3(
         # final refit's own (no labels), to show whether the refit keeps the supply.
         "supply_oof_at_threshold": diag.get("supply_oof_at_threshold"),
         "supply_final_at_threshold": diag.get("supply_final_at_threshold"),
+        # p* at the minimum OOF probability (no percentile met the supply floor):
+        # contender 3 then admits every candidate of its primary rule
+        "threshold_admits_all": diag.get("threshold_admits_all"),
+        "threshold_supply_met": diag.get("threshold_supply_met"),
     }
 
 

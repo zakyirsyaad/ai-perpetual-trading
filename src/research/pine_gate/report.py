@@ -435,16 +435,30 @@ def _metalabel(selection: Any) -> Lines:
     rel_rows = [[fmt_dec(r[0], 3), fmt_dec(r[1], 3), fmt_int(r[2])]
                 for r in (sel.get("reliability") or []) if len(r) == 3]
     head = [f"- C terpilih: {fmt_dec(sel.get('chosen_C'), 3)}; ambang probabilitas: "
-            f"{fmt_dec(dig(sel, 'meta_model', 'threshold'), 2)}; kandidat: "
+            f"{fmt_dec(dig(sel, 'meta_model', 'threshold'), 4)}; kandidat: "
             f"{fmt_int(sel.get('n_candidates'))}; prediksi di luar sampel: {fmt_int(sel.get('n_oof'))}.",
             f"- pasokan pada ambang (trade/hari, B2–B4): luar sampel "
             f"{fmt_dec(sel.get('supply_oof_at_threshold'))}; model akhir "
             f"{fmt_dec(sel.get('supply_final_at_threshold'))}.",
+            *_admits_all_lines(sel),
             "", "Log-loss validasi per lipatan (jendela memanjang B1–B4); rata-rata dibobot "
             "ukuran lipatan, sama dengan pemilihan C:", ""]
     return (head + md_table(["C", "log-loss per lipatan", "rata-rata"], loss_rows)
             + ["Kalibrasi (prediksi vs frekuensi teramati):", ""]
             + md_table(["rata-rata prediksi", "frekuensi teramati", "n"], rel_rows))
+
+
+def _admits_all_lines(sel: Mapping[str, Any]) -> Lines:
+    """Spec 5.8: when no out-of-fold percentile meets the supply floor, p* is the
+    minimum out-of-fold probability and contender 3 is its primary rule."""
+    lines = []
+    if sel.get("threshold_supply_met") is False:
+        lines.append("- tidak ada persentil probabilitas luar sampel yang mencapai pasokan "
+                     "minimum pada ambang ini.")
+    if sel.get("threshold_admits_all") is True:
+        lines.append("- ambang menerima semua kandidat: kontender 3 sama dengan aturan "
+                     "primernya.")
+    return lines
 
 
 def _pooled_loss(losses: Any, sizes: Any) -> Optional[float]:

@@ -290,6 +290,26 @@ class RenderMarkdownTests(unittest.TestCase):
         self.assertIn("pasokan pada ambang (trade/hari, B2–B4): luar sampel 11.4; "
                       "model akhir 13.2", meta)
 
+    def test_meta_section_shows_the_threshold_to_four_decimals(self, _):
+        results = make_results()
+        results["selection"]["meta_model"]["threshold"] = 0.48731
+        meta = section(render_markdown(results), "Model meta-labeling")
+        self.assertIn("ambang probabilitas: 0.4873;", meta)
+        self.assertNotIn("menerima semua kandidat", meta)
+
+    def test_meta_section_says_when_the_threshold_admits_every_candidate(self, _):
+        results = make_results()
+        results["selection"].update(threshold_admits_all=True, threshold_supply_met=False)
+        meta = section(render_markdown(results), "Model meta-labeling")
+        self.assertIn("tidak ada persentil probabilitas luar sampel yang mencapai pasokan "
+                      "minimum", meta)
+        self.assertIn("ambang menerima semua kandidat: kontender 3 sama dengan aturan "
+                      "primernya", meta)
+        results["selection"].update(threshold_admits_all=True, threshold_supply_met=True)
+        meta = section(render_markdown(results), "Model meta-labeling")
+        self.assertNotIn("tidak ada persentil", meta)
+        self.assertIn("ambang menerima semua kandidat", meta)
+
     def test_overshoot_sensitivity_is_reported(self, _):
         text = section(render_markdown(make_results()), "Biaya kadens dan guard")
         self.assertIn("overshoot stop", text)

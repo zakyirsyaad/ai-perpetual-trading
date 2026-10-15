@@ -410,3 +410,14 @@ def spa_pvalue(
         if stat >= observed:
             hits += 1
     return (1 + hits) / (1 + n)
+
+
+def quantile_sorted(values: Sequence[float], q: float) -> Optional[float]:
+    """Linear interpolation between order statistics of ``values``, which must be
+    sorted ascending; ``None`` for no values."""
+    if not values:
+        return None
+    pos = q * (len(values) - 1)
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(values) - 1)
+    return values[lo] + (pos - lo) * (values[hi] - values[lo])

@@ -82,6 +82,7 @@ from .stats import (
     day_aggregates,
     holm,
     permutation_p,
+    quantile_sorted as _quantile,
     win_rate,
     wr_lower_bound,
 )
@@ -281,17 +282,6 @@ def _entry_index(market: Market, trade: Trade) -> int:
     if i is None:
         raise ValueError(f"{trade.symbol}: no 1m bar closes at {trade.entry_ms}")
     return i
-
-
-def _quantile(values: Sequence[float], q: float) -> Optional[float]:
-    """Linear interpolation between order statistics of ``values``, which must be
-    sorted ascending; ``None`` for no values."""
-    if not values:
-        return None
-    pos = q * (len(values) - 1)
-    lo = math.floor(pos)
-    hi = min(lo + 1, len(values) - 1)
-    return values[lo] + (pos - lo) * (values[hi] - values[lo])
 
 
 def _random_side_wr(market: Market, entries: Sequence[int], seed: int) -> Optional[float]:
