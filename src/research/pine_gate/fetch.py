@@ -11,7 +11,8 @@ Rules enforced here:
   funding fetch;
 * at least ``MIN_REQUEST_GAP_SECONDS`` between two requests of one job;
 * every parsed row is validated and a violation raises ``ExchangeError``;
-* only transport errors, short windows and HTTP 5xx are retried; HTTP
+* only transport errors, short windows and HTTP 5xx are retried quickly, and the
+  in-body code 100410 ("please retry later") is retried with a 5/15/45 s backoff; HTTP
   403/418/429 raise ``RateLimitedError``, which is never retried and stops the
   job; a range stops after ``MAX_CONSECUTIVE_FAILED_DAYS`` failed days in a row;
 * a day is stored only when it holds exactly 1,440 consecutive 1m bars, and a
@@ -50,6 +51,10 @@ HEADERS = {"X-SOURCE-KEY": "BX-AI-SKILL"}
 MIN_REQUEST_GAP_SECONDS = 1.0
 MAX_KLINES_PER_REQUEST = 1440
 MAX_FUNDING_PER_REQUEST = 1000
+MAX_WARMUP_BARS_PER_REQUEST = 1000
+MAX_FUNDING_WINDOW_DAYS = 30
+TRANSIENT_BACKOFF_SECONDS = (5, 15, 45)
+TRANSIENT_EXCHANGE_CODE = 100410
 BARS_PER_DAY = 1440
 DEFAULT_RETRIES = 3
 REQUEST_TIMEOUT_SECONDS = 20
@@ -71,6 +76,11 @@ _log = logging.getLogger(__name__)
 
 class ExchangeError(RuntimeError):
     """The exchange answered with an error or with data that fails validation."""
+
+
+class TransientExchangeError(ExchangeError):
+    """In-body code 100410 ("please retry later"); retried with backoff, then an
+    ordinary failure. It is not a rate limit and never stops a job."""
 
 
 class IncompleteDayError(RuntimeError):
@@ -202,9 +212,12 @@ def _get_data_list(http_get: HttpGet, url: str, params: Mapping[str, str]) -> li
     if not isinstance(payload, Mapping):
         raise ExchangeError("response is not a JSON object")
     code = payload.get("code")
-    # TODO(verify): an in-body rate-limit code (the review suggests 100410) should raise
-    # RateLimitedError and stop the job. No BingX error-code reference in this repo
-    # confirms 100410 or any other in-body rate-limit code, so nothing is mapped yet.
+    # Code 100410 ("请稍后重试", "please retry later") is a transient in-body answer: the
+    # VPS run of 2026-10-15 had 11 days fail on it after the quick retries, and a plain
+    # re-run filled them. It is retried with backoff (``_call_with_retries``) and is
+    # not a rate limit, so nothing stops the job.
+    if code == TRANSIENT_EXCHANGE_CODE:
+        raise TransientExchangeError(f"exchange code {code!r}: {str(payload.get('msg'))[:100]}")
     if code != 0:
         raise ExchangeError(f"exchange code {code!r}: {str(payload.get('msg'))[:100]}")
     data = payload.get("data")
@@ -298,17 +311,24 @@ def _retryable(exc: BaseException) -> bool:
     return isinstance(exc, (httpx.TransportError, IncompleteDayError))
 
 
-def _call_with_retries(attempt: Callable[[], Any], retries: int) -> Any:
-    """Up to ``retries`` attempts; only ``_retryable`` errors try again."""
+def _call_with_retries(attempt: Callable[[], Any], retries: int, sleep: Sleep) -> Any:
+    """Up to ``retries`` attempts for ``_retryable`` errors, and, separately, one more
+    attempt after each ``TRANSIENT_BACKOFF_SECONDS`` sleep for code 100410."""
     if retries < 1:
         raise ValueError("retries must be at least 1")
-    for k in range(retries):
+    waits = list(TRANSIENT_BACKOFF_SECONDS)
+    quick_left = retries
+    while True:
         try:
             return attempt()
-        except (httpx.TransportError, IncompleteDayError, HttpStatusError) as exc:
-            if not _retryable(exc) or k == retries - 1:
+        except TransientExchangeError:
+            if not waits:
                 raise
-    raise AssertionError("unreachable")  # pragma: no cover
+            sleep(waits.pop(0))
+        except (httpx.TransportError, IncompleteDayError, HttpStatusError) as exc:
+            quick_left -= 1
+            if not _retryable(exc) or quick_left <= 0:
+                raise
 
 
 def _fetch_complete_window(
@@ -319,6 +339,7 @@ def _fetch_complete_window(
     start_ms: int,
     end_ms: int,
     retries: int,
+    sleep: Sleep,
 ) -> List[Row]:
     expected = (end_ms - start_ms + 1) // interval_to_ms(interval)
 
@@ -330,7 +351,7 @@ def _fetch_complete_window(
             )
         return rows
 
-    return _call_with_retries(attempt, retries)
+    return _call_with_retries(attempt, retries, sleep)
 
 
 def fetch_day(
@@ -343,8 +364,9 @@ def fetch_day(
 ) -> List[Row]:
     """Fetch one WIB day of 1m bars; exactly 1,440 consecutive bars or an error.
 
-    Up to ``retries`` attempts in total (at least one second apart), then the
-    last error is raised (``IncompleteDayError`` for a short day).
+    Up to ``retries`` attempts in total (at least one second apart), plus the
+    100410 backoff retries, then the last error is raised (``IncompleteDayError``
+    for a short day).
     """
     start_ms = wib_day_start_ms(day)
     return _fetch_complete_window(
@@ -355,6 +377,7 @@ def fetch_day(
         start_ms,
         start_ms + _MS_PER_DAY - 1,
         retries,
+        sleep,
     )
 
 
@@ -441,8 +464,9 @@ def sync_warmup(
 ) -> None:
     """Fetch native bars with open time in ``[start_ms, end_ms)`` into one gz file.
 
-    Windows of at most 1,440 bars are requested in order; the file is written
-    only when every bar of the range was received.
+    Windows of at most ``MAX_WARMUP_BARS_PER_REQUEST`` bars are requested in order
+    (the venue returns at most 1,000 bars for 1h and 4h; 1,440-bar windows came
+    back short on the VPS); the file is written only when every bar was received.
     """
     interval_ms = interval_to_ms(interval)
     if start_ms % interval_ms or end_ms % interval_ms or end_ms <= start_ms:
@@ -451,14 +475,14 @@ def sync_warmup(
         )
     _check_span_ms(start_ms, end_ms)
     paced = _throttled(http_get, sleep)
-    window_ms = MAX_KLINES_PER_REQUEST * interval_ms
+    window_ms = MAX_WARMUP_BARS_PER_REQUEST * interval_ms
     rows: List[Row] = []
     cursor = start_ms
     while cursor < end_ms:
         window_end = min(cursor + window_ms, end_ms)
         rows.extend(
             _fetch_complete_window(
-                paced, host, symbol, interval, cursor, window_end - 1, DEFAULT_RETRIES
+                paced, host, symbol, interval, cursor, window_end - 1, DEFAULT_RETRIES, sleep
             )
         )
         cursor = window_end
@@ -483,7 +507,7 @@ class _RequestBudget:
 
 def _funding_window(
     http_get: HttpGet, host: str, symbol: str, start_ms: int, end_ms: int,
-    budget: _RequestBudget,
+    budget: _RequestBudget, sleep: Sleep,
 ) -> List[int]:
     budget.take()
     params = {
@@ -492,7 +516,8 @@ def _funding_window(
         "endTime": str(end_ms),
         "limit": str(MAX_FUNDING_PER_REQUEST),
     }
-    data = _get_data_list(http_get, host + FUNDING_PATH, params)
+    data = _call_with_retries(
+        lambda: _get_data_list(http_get, host + FUNDING_PATH, params), 1, sleep)
     times: List[int] = []
     for raw in data:
         if not isinstance(raw, Mapping) or "fundingTime" not in raw:
@@ -509,8 +534,8 @@ def _funding_window(
         # The answer may have been cut at the limit: split the window by time
         # and fetch both halves with fixed bounds.
         middle = (start_ms + end_ms) // 2
-        return (_funding_window(http_get, host, symbol, start_ms, middle, budget)
-                + _funding_window(http_get, host, symbol, middle + 1, end_ms, budget))
+        return (_funding_window(http_get, host, symbol, start_ms, middle, budget, sleep)
+                + _funding_window(http_get, host, symbol, middle + 1, end_ms, budget, sleep))
     return times
 
 
@@ -524,16 +549,26 @@ def fetch_funding_times(
 ) -> List[int]:
     """Funding times (UTC ms) inside ``[start_ms, end_ms]``, sorted, no duplicates.
 
-    Each request carries both bounds and asks for at most 1,000 rows; a window
-    that fills the limit is split in two rather than paginated, with at most
+    The range is fetched in fixed windows of at most ``MAX_FUNDING_WINDOW_DAYS`` days
+    (the venue silently truncates longer windows at their start). Each request
+    carries both bounds and asks for at most 1,000 rows; a window that fills the
+    limit is split in two rather than paginated, with at most
     ``MAX_FUNDING_REQUESTS`` requests in all.
     """
     _check_host(host)
     if end_ms < start_ms:
         raise ValueError(f"end_ms {end_ms} is before start_ms {start_ms}")
     _check_span_ms(start_ms, end_ms)
-    return _funding_window(_throttled(http_get, sleep), host, symbol, start_ms, end_ms,
-                           _RequestBudget(MAX_FUNDING_REQUESTS))
+    paced = _throttled(http_get, sleep)
+    budget = _RequestBudget(MAX_FUNDING_REQUESTS)
+    window_ms = MAX_FUNDING_WINDOW_DAYS * _MS_PER_DAY
+    times: List[int] = []
+    cursor = start_ms
+    while cursor <= end_ms:
+        window_end = min(cursor + window_ms - 1, end_ms)
+        times.extend(_funding_window(paced, host, symbol, cursor, window_end, budget, sleep))
+        cursor = window_end + 1
+    return times
 
 
 def _reason(exc: BaseException) -> str:
