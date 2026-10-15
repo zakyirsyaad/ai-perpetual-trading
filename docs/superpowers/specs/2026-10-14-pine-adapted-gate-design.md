@@ -123,7 +123,10 @@ no private endpoints, no restart. Apart from the research package and the unwire
     days, warm-ups readable, funding at the cadence of 5.2) without computing anything, and a
     training-only load (cut at the training end + 60 minutes) must hash to the selection's
     training data. Only then is the marker (spec, selection-file and code sha256, time, output
-    folder) written exclusively and the holdout loaded.
+    folder) written exclusively and the holdout loaded. Right before the evaluation, after the
+    full load and its checks, `<data dir>/holdout_runs/<spec sha256>.started.json` (time) is
+    written exclusively; a marker without it is a failure before any holdout result, and the
+    report's integrity table says whether evaluation started.
   - Every random draw of a spec run uses seed 0, recorded in the spec document; `train` and
     `test` refuse any other seed under the spec sha256.
   - `vst-check` and `decisions` (5.12, 5.13) run only after `test`: the holdout file next to
@@ -267,13 +270,19 @@ from the last closed 5m bar (and the last closed 1h/4h bar where needed).
   by uniqueness (the inverse of their average concurrency). The fit minimises
   Σ w·logloss / Σ w + ‖β‖² / (2C), intercept unpenalised: the data term is the weighted mean
   log-loss, so C regularises a one-block fold and the four-block refit alike. The penalty
-  C ∈ {10, 100, 1000} (the mean data term makes C ≈ C_sum × Σw, so this grid sits about 1,000×
-  above the sum-objective grid {0.01, 0.1, 1}) is chosen by expanding-window validation over
-  B1–B4 (fit on B1…Bk, validate
-  on Bk+1) with the 5.3 purge and embargo, on mean log-loss.
-- **Threshold:** the highest probability p\* at which the one-position simulation on the
-  out-of-fold predictions (B2–B4) still delivers ≥ 10 trades per trading day; if none does,
-  p\* = 0.5. The final model is refitted on all training data and frozen with its scaler and p\*.
+  C ∈ {0.1, 1, 10, 100, 1000} is chosen by expanding-window validation over B1–B4 (fit on
+  B1…Bk, validate on Bk+1) with the 5.3 purge and embargo, on mean log-loss; ties go to the
+  smaller C. With standardised features and p ≈ 0.5 (information I ≈ 0.25) a coefficient
+  shrinks by about I / (I + 1/C): roughly 0.02, 0.2, 0.7, 0.96 and 0.996 across the grid, so
+  validation has a real choice between a collapsed and a nearly unpenalised fit.
+- **Threshold:** the candidates are the out-of-fold (B2–B4) probabilities' percentiles from
+  the 99th down to the 1st in 1-point steps (linear interpolation between order statistics;
+  distinct values, descending). p\* is the highest candidate at which the one-position
+  simulation on the out-of-fold predictions still delivers ≥ 10 trades per trading day, so
+  the cut follows the supply target and the model's ranking, not where 0.5 sits relative to
+  the base rate. If none does, p\* is the minimum out-of-fold probability: every candidate is
+  admitted, contender 3 equals its primary rule, and the selection file
+  (`threshold_admits_all`, `threshold_supply_met`) and the report say so. The final model is refitted on all training data and frozen with its scaler and p\*.
   The selection file records, next to the out-of-fold supply at p\*, the supply at p\* of the
   final model's own probabilities on its training candidates (no labels are used), so a refit
   that selects a different share of candidates is visible.
@@ -334,7 +343,8 @@ Holm-corrected for the three (an absent contender counts with p = 1). A contende
 6. Robustness: WR ≥ 55% with 2 bps stop overshoot, and WR > 50% in at least 15 of 20 tick offsets.
 7. The edge has the claimed source: for contenders 1 and 2, trend permutation p < 0.05; for
    contender 3, the WR of the trades it takes is higher than the WR of its primary rule run on its
-   own over the same period (day-block bootstrap p < 0.05).
+   own over the same period (day-block bootstrap p < 0.05). A threshold that admits every
+   candidate (5.8) makes contender 3 its primary rule, so it cannot pass this criterion.
 8. Supply of the passing symbols combined: ≥ 10 trades per trading day on average, over the
    holdout and over its last 20 trading days.
 9. Controls behave as expected, and the training PBO was < 0.5 — this binds contenders 1 and 3
