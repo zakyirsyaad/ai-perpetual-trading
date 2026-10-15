@@ -6,8 +6,9 @@ must pass ``load_selection_checked`` under the current spec sha256 and
 ``check_ready`` (no holdout file yet, the selection's calibration, its code
 sha256 and a passing training C0, the output next to the selection file).
 ``test_stage`` then checks the data files and the training part, writes the run
-marker ``<data-dir>/holdout_runs/<spec_sha256>.json`` and only then loads the full
-dataset.
+marker ``<data-dir>/holdout_runs/<spec_sha256>.json``, only then loads the full
+dataset, and writes ``<spec_sha256>.started.json`` there right before the
+evaluation; the report shows whether evaluation started.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import cli_common as common
 from .cli_checks import DECISIONS_PREFIX, VST_PREFIX
 from .calibrate import load_entry_latencies_ms, s_star, stop_overshoot_detail
-from .holdout import HOLDOUT_PREFIX, check_ready, test_stage
+from .holdout import HOLDOUT_PREFIX, check_ready, holdout_run_status, test_stage
 from .lock import code_files, code_sha256, latencies_sha256, load_selection_checked
 from .dataset import DataSource
 from .pipeline import TRAIN_DATA_UNTIL_MS, load_dataset, train_stage
@@ -158,13 +159,16 @@ def gather_results(args: argparse.Namespace) -> Dict[str, Any]:
     selection = common.json_doc(sel_path)
     decisions = common.json_doc(_pick(args.decisions, args.out_dir, DECISIONS_PREFIX))
     vst = _vst_docs(args.out_dir, args.vst)
+    spec_sha = spec_sha256()
     return {
         "selection": selection,
         "holdout": holdout,
         "vst": vst,
         "decisions": decisions,  # the whole file: the report checks contender and selection
+        # the run marker without its .started file: a failure before evaluation
+        "holdout_run": holdout_run_status(args.data_dir, spec_sha),
         "sha256": {
-            "spec": spec_sha256(),
+            "spec": spec_sha,
             "data": common.as_mapping(selection).get("data_sha256"),
             "data_holdout": holdout.get("data_sha256"),
             "selection": common.file_sha256(sel_path),

@@ -1032,6 +1032,19 @@ class ReportCommandTest(Dirs):
         self.assertEqual(len(sha["code"]), 64)
         self.assertEqual(out.strip().splitlines(), [str(self.out / "r.md"),
                                                     str(self.out / "r.json")])
+        self.assertEqual(results["holdout_run"], {"marker": False, "started": False})
+
+    def test_report_records_whether_the_holdout_evaluation_started(self):
+        self.write_report_inputs()
+        runs = self.data / "holdout_runs"
+        runs.mkdir()
+        (runs / f"{spec_sha256()}.json").write_text("{}", encoding="utf-8")
+        code, err, results = self.gather()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(results["holdout_run"], {"marker": True, "started": False})
+        (runs / f"{spec_sha256()}.started.json").write_text("{}", encoding="utf-8")
+        code, err, results = self.gather()
+        self.assertEqual(results["holdout_run"], {"marker": True, "started": True})
 
 
     def write_report_inputs(self):

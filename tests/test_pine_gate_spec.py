@@ -245,6 +245,7 @@ class SpecDocumentTests(unittest.TestCase):
         self.assertEqual((doc["model"]["quantile_hi"], doc["model"]["quantile_lo"],
                           doc["model"]["quantile_step"]), (99, 1, 1))
         self.assertIn("minimum out-of-fold probability", doc["policies"]["model_threshold"])
+        self.assertIn("<spec_sha256>.started.json", doc["policies"]["holdout_lock"])
         policies = doc["policies"]
         self.assertEqual(policies["contender_choice_order"], [
             "most symbols passed", "higher pooled WR lower bound", "simpler (c2, c1, c3)"])

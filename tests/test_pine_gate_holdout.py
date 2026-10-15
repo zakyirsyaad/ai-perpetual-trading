@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -487,7 +488,7 @@ def _fill_shared():
     _Shared.out_dir = _Shared.tmp / "out"
     _Shared.path = run_test_stage(
         _Shared.dataset, _Shared.selection_path, CALIB, _Shared.out_dir, DUMMY_SHA, seed=2,
-        period=TEST_PERIOD, guard_cfg=NO_GUARDS, **SMALL,
+        period=TEST_PERIOD, guard_cfg=NO_GUARDS, data_dir=_Shared.tmp / "runs", **SMALL,
     )
     _Shared.doc = json.loads(_Shared.path.read_text())
 
@@ -542,6 +543,42 @@ class LockTests(unittest.TestCase):
 
     def marker(self, sha):
         return self.tmp / "data" / "holdout_runs" / f"{sha}.json"
+
+    def started(self, sha):
+        return self.tmp / "data" / "holdout_runs" / f"{sha}.started.json"
+
+    def test_a_fault_after_the_run_marker_leaves_no_started_file(self):
+        sha = spec_sha256()
+        path = write_selection(self.tmp / "sel" / "selection.json", sha)
+        with self.assertRaises(RuntimeError):  # the full load fails after the marker
+            self.run_stage(path, sha=sha, out_dir=self.tmp / "sel",
+                           dataset=_FakeSource(self.marker(sha)))
+        self.assertTrue(self.marker(sha).exists())
+        self.assertFalse(self.started(sha).exists())
+        self.assertEqual(holdout.holdout_run_status(self.tmp / "data", sha),
+                         {"marker": True, "started": False})
+
+    def test_evaluation_starts_after_the_started_file_is_written(self):
+        _build_shared()
+        path = write_selection(self.tmp / "sel.json", DUMMY_SHA)
+        seen = []
+
+        def evaluate(h, selection):
+            seen.append((self.marker(DUMMY_SHA).exists(), self.started(DUMMY_SHA).exists()))
+            raise RuntimeError("stop at evaluation")
+
+        with mock.patch.object(holdout, "_evaluate", side_effect=evaluate):
+            with self.assertRaises(RuntimeError):
+                self.run_stage(path, dataset=_Shared.dataset, period=TEST_PERIOD,
+                               guard_cfg=NO_GUARDS, **SMALL)
+        self.assertEqual(seen, [(True, True)])
+        doc = json.loads(self.started(DUMMY_SHA).read_text())
+        self.assertEqual(doc["spec_sha256"], DUMMY_SHA)
+        self.assertTrue(doc["created_at"].endswith("+00:00"))
+        self.assertEqual(holdout.holdout_run_status(self.tmp / "data", DUMMY_SHA),
+                         {"marker": True, "started": True})
+        self.assertEqual(holdout.holdout_run_status(self.tmp / "data", "a" * 64),
+                         {"marker": False, "started": False})
 
     def test_real_spec_sha_needs_a_data_dir_for_the_run_marker(self):
         sha = spec_sha256()
@@ -811,6 +848,13 @@ class StageFixture(unittest.TestCase):
 
 
 class TestStageTests(StageFixture):
+    def test_a_completed_run_leaves_the_marker_and_the_started_file(self):
+        runs = self.tmp / "runs" / "holdout_runs"
+        self.assertEqual(sorted(p.name for p in runs.iterdir()),
+                         [f"{DUMMY_SHA}.json", f"{DUMMY_SHA}.started.json"])
+        self.assertEqual(holdout.holdout_run_status(self.tmp / "runs", DUMMY_SHA),
+                         {"marker": True, "started": True})
+
     def test_file_name_and_provenance(self):
         self.assertTrue(self.path.name.startswith("pine_gate_holdout_"))
         self.assertRegex(self.path.name, r"^pine_gate_holdout_\d{8}\.json$")

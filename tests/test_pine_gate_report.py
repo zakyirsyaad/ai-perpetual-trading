@@ -245,6 +245,23 @@ class RenderMarkdownTests(unittest.TestCase):
         integritas = section(render_markdown(results), "Integritas")
         self.assertIn("kode file seleksi = kode file uji | TIDAK COCOK", integritas)
 
+    def test_integritas_says_whether_the_holdout_evaluation_started(self, _):
+        results = make_results()
+        cases = (({"marker": True, "started": True}, "ya"),
+                 ({"marker": True, "started": False},
+                  "tidak (penanda tanpa .started: gagal sebelum evaluasi)"),
+                 ({"marker": False, "started": False}, "tidak ada penanda run"))
+        for status, text in cases:
+            results["holdout_run"] = status
+            integritas = section(render_markdown(results), "Integritas")
+            with self.subTest(status):
+                self.assertIn(f"| evaluasi holdout dimulai (holdout_runs) | {text} |",
+                              integritas)
+        del results["holdout_run"]
+        integritas = section(render_markdown(results), "Integritas")
+        self.assertIn(f"| evaluasi holdout dimulai (holdout_runs) | {NOT_AVAILABLE} |",
+                      integritas)
+
     def test_header_shows_the_holdout_data_sha256(self, _):
         header = render_markdown(make_results()).split("## Ringkasan")[0]
         self.assertIn(f"- sha256 data_holdout: `{SHA['data_holdout']}`", header)

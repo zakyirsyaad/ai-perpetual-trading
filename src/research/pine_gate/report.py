@@ -325,6 +325,7 @@ def _integrity(results: Mapping[str, Any]) -> Lines:
         ["kode file seleksi = kode file uji", _match(sel.get("code_sha256"),
                                                      hold.get("code_sha256"))],
         ["kode saat ini = kode file uji", _match(sha.get("code"), hold.get("code_sha256"))],
+        ["evaluasi holdout dimulai (holdout_runs)", _run_started(results.get("holdout_run"))],
     ]
     facts = [["s* (overshoot stop, bps)", fmt_bps(sel.get("s_star_bps"))],
              ["jumlah stop untuk s*", fmt_int(sel.get("n_stops"))],
@@ -334,6 +335,17 @@ def _integrity(results: Mapping[str, Any]) -> Lines:
              ["periode uji (ms UTC)", _period_text(hold.get("period"))]]
     return (md_table(["Berkas", "sha256"], rows) + md_table(["Pemeriksaan", "Hasil"], checks)
             + md_table(["Parameter", "Nilai"], facts))
+
+
+def _run_started(status: Any) -> str:
+    """Spec 5.1: a run marker without its ``.started.json`` is a failure before the
+    holdout was evaluated."""
+    st = as_mapping(status)
+    if not isinstance(st.get("marker"), bool) or not isinstance(st.get("started"), bool):
+        return NOT_AVAILABLE
+    if not st["marker"]:
+        return "tidak ada penanda run"
+    return "ya" if st["started"] else "tidak (penanda tanpa .started: gagal sebelum evaluasi)"
 
 
 def _sha_cell(value: Any) -> str:
@@ -704,7 +716,8 @@ def render_markdown(results: Mapping[str, Any]) -> str:
 
     ``results``: {"selection", "holdout" (or None), "vst" ({symbol: vst-check output} or
     {}), "decisions" (the decisions output with "buckets", or None), "sha256" ({"spec",
-    "data", "selection", "holdout", "code"})}. A VST or decisions output whose
+    "data", "selection", "holdout", "code"}), optionally "holdout_run" ({"marker",
+    "started"}: this spec's run marker and evaluation-start file)}. A VST or decisions output whose
     ``contender`` is not the holdout's ``chosen``, or whose ``selection_sha256`` is not
     ``sha256["selection"]``, is skipped with a warning at the top of Ringkasan. The Kesimpulan paragraph is ``verdict_sentence`` over
     ``summarize_for_verdict(results)``. ``results`` is not modified."""

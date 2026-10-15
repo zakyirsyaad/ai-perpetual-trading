@@ -14,7 +14,8 @@ resolved), of any date, refuses the run, and so does an existing run marker
 ``<data_dir>/holdout_runs/<spec_sha256>.json`` (mandatory under the current spec
 sha256). Every data check that can refuse comes before the marker is written (the
 files checked without computing anything, the training part hashed from a
-training-only load), and the full holdout load after it. A run under the current
+training-only load), and the full holdout load after it; ``<spec_sha256>.started.json``
+next to the marker is written right before the evaluation. A run under the current
 spec sha256 must also use the seed recorded in the selection file (the spec seed),
 run on the code and the Python version that trained (``code_sha256``,
 ``python_version``), follow a training C0 that passed, write next to its selection
@@ -586,6 +587,26 @@ def run_marker_path(data_dir: Path, spec_sha: str) -> Path:
     return Path(data_dir) / HOLDOUT_RUNS_DIR / f"{spec_sha}.json"
 
 
+def run_started_path(data_dir: Path, spec_sha: str) -> Path:
+    """``<data_dir>/holdout_runs/<spec_sha256>.started.json``: written right before the
+    evaluation, so a marker without it is a failure before any holdout result."""
+    return Path(data_dir) / HOLDOUT_RUNS_DIR / f"{spec_sha}.started.json"
+
+
+def holdout_run_status(data_dir: Path, spec_sha: str) -> Dict[str, bool]:
+    """Whether this spec's run marker and its evaluation-start file exist."""
+    return {"marker": run_marker_path(data_dir, spec_sha).exists(),
+            "started": run_started_path(data_dir, spec_sha).exists()}
+
+
+def _mark_started(data_dir: Optional[Path], spec_sha: str) -> None:
+    if data_dir is not None:
+        write_json_exclusive(run_started_path(data_dir, spec_sha),
+                             {"spec_sha256": spec_sha,
+                              "created_at": datetime.now(timezone.utc).isoformat()},
+                             "holdout evaluation start")
+
+
 def _marker_refusal(path: Path) -> HoldoutLockError:
     return HoldoutLockError(f"{path}: this spec's holdout already started (run marker); the "
                             "holdout runs once, so re-running means removing it deliberately")
@@ -756,6 +777,7 @@ def test_stage(
         _check_training_part(selection_path, selection, dataset, spec_sha)
     created = datetime.now(timezone.utc)
     path = Path(out_dir) / f"{HOLDOUT_PREFIX}{created.astimezone(WIB):%Y%m%d}.json"
+    _mark_started(data_dir, spec_sha)  # the audit trail: evaluation begins now
     doc = _evaluate(_context(dataset, settings, calib, seed), selection)
     doc.update(_provenance(dataset, calib, settings, seed))
     doc.update({"spec_sha256": spec_sha, "selection_file": Path(selection_path).resolve().name,

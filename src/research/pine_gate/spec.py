@@ -355,7 +355,9 @@ def _policies() -> Dict[str, Any]:
                         "training part hashed from a training-only load) comes before the "
                         "exclusive run marker <data_dir>/holdout_runs/<spec_sha256>.json, "
                         "which is written before the holdout is loaded and refuses every "
-                        "later run",
+                        "later run; <data_dir>/holdout_runs/<spec_sha256>.started.json is "
+                        "written exclusively right before the evaluation, so a marker "
+                        "without it is a failure before any holdout result",
         "contender3_primary_fallback": "every Stage-1 rule ranking -inf: median block lower "
                                        "bound without the vote (none last) -> pooled WR -> "
                                        "Stage-1 order",
