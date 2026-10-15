@@ -418,6 +418,7 @@ class RenderMarkdownTests(unittest.TestCase):
             self.assertIn(label, header)
         self.assertNotIn("| tick |", header)
         self.assertIn("| 410 | 377 | 395 | 388 |", vst)
+        self.assertIn("Tick saat kedua sisi datar (tanpa sinyal) tidak dihitung.", vst)
 
     def test_gate_reports_criterion_2_under_a_five_day_block_bootstrap(self, _):
         gerbang = section(render_markdown(make_results()), "Gerbang")

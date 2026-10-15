@@ -103,7 +103,8 @@ def vst_section(results: Mapping[str, Any]) -> Lines:
     note = [f"Ambang (spec 5.12): arah sinyal sama ≥ {SIDE_AGREE_MIN:.0%} dari tick saat salah "
             f"satu sisi bersinyal, hasil bracket sama ≥ {OUTCOME_AGREE_MIN:.0%} dari tick saat "
             f"keduanya bersinyal searah, selisih WR ≤ {WR_DIFF_MAX_PTS:.0f} poin (WR tiap sisi "
-            "pada tick sinyalnya sendiri). Jika gagal, pembacaan maju di VST yang menentukan.",
+            "pada tick sinyalnya sendiri). Tick saat kedua sisi datar (tanpa sinyal) tidak "
+            "dihitung. Jika gagal, pembacaan maju di VST yang menentukan.",
             ""]
     headers = ["Kontender", "Simbol", "tick salah satu sinyal", "tick sinyal searah",
                "sinyal produksi", "sinyal VST", "arah sama", "hasil sama", "WR produksi",
