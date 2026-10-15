@@ -430,7 +430,10 @@ def _training(selection: Any) -> Lines:
         f"- PBO (CSCV, aturan dengan ≥ 1.000 TP+SL): {fmt_dec(sel.get('pbo'), 2)} (lulus jika "
         f"< 0.5: {yes_no(sel.get('pbo_pass'))}){PBO_UNDEFINED if sel.get('pbo_reason') else ''}.",
         f"- SPA p: {fmt_p(sel.get('spa_p'))} ({fmt_int(sel.get('spa_n'))} replikasi; nilai arah vs "
-        "sisi acak pada entri yang sama).", ""]
+        "sisi acak pada entri yang sama).",
+        f"- Purge waktu tick sebelum tiap batas blok: {fmt_int(sel.get('purge_tick_minutes'))} "
+        "menit (time stop 60 menit + latensi terburuk kalibrasi, jeda order dan satu bar 1m).",
+        ""]
     headers = ["Aturan", "n TP+SL", "WR", "batas bawah", "gross bps", "net/1M", "transaksi/hari",
                "memenuhi syarat"]
     return (facts + ["Lima aturan teratas pada data latih (WR, net/1M, pasokan):", ""]

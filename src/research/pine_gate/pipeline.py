@@ -6,9 +6,9 @@ Research code; the bot never imports it. Standard library only.
 cuts every bar series at ``until_ms``. ``train_stage``
 refuses a dataset loaded past the training end + 60 minutes, so no holdout bar
 can reach a feature, a trade or the model. It simulates every rule with entry
-ticks blocked in the 65 minutes before each block end (purge), runs the
+ticks blocked in the ``purge_tick_minutes`` before each block end (purge), runs the
 two-stage selection, fits contender 3's meta-model and writes a selection file
-that records the spec sha256. The lock the test stage must pass
+that records the spec sha256 and the purge length. The lock the test stage must pass
 (``load_selection_checked``) and the run settings it binds live in ``lock``.
 """
 
@@ -75,10 +75,6 @@ _MS_PER_HOUR = 60 * _MS_PER_MIN
 _MS_PER_DAY = 24 * _MS_PER_HOUR
 _BAR_5M_MS = 5 * _MS_PER_MIN
 
-# Task 8 ruling: the purge gates the TICK time, so it is 5 minutes longer than
-# PURGE_MINUTES; a tick at B - 65 min fills by about B - 63 min and its 60-minute
-# time stop exits before B.
-PURGE_TICK_MINUTES = PURGE_MINUTES + 5
 REGIME_MIN_N = 60
 SELECTION_PREFIX = "pine_gate_selection_"
 # HoldoutLockError, Segments, equal_ranges, latencies_sha256 and load_selection_checked
@@ -88,9 +84,20 @@ SELECTION_PREFIX = "pine_gate_selection_"
 # --------------------------------------------------------------------------- segments
 
 
-def purge_windows(segments: Segments) -> Tuple[TimeRange, ...]:
-    """Blocked entry-tick windows [B - 65 min, B) before every block end B."""
-    purge = PURGE_TICK_MINUTES * _MS_PER_MIN
+def purge_tick_minutes(calib: Calibration, exec_cfg: ExecConfig) -> int:
+    """The purge in TICK time, from the hash-locked latency sample (purge ruling).
+
+    A trade from tick t fills by t + worst latency + order delay + one 1m bar and
+    its time stop exits PURGE_MINUTES later, so the window is PURGE_MINUTES plus that
+    lead, rounded up to whole minutes (an empty sample counts as 0 latency)."""
+    lead_ms = (max(calib.latencies_ms, default=0.0) + exec_cfg.order_delay_s * 1000
+               + _MS_PER_MIN)
+    return PURGE_MINUTES + math.ceil(lead_ms / _MS_PER_MIN)
+
+
+def purge_windows(segments: Segments, purge_minutes: int) -> Tuple[TimeRange, ...]:
+    """Blocked entry-tick windows [B - purge_minutes, B) before every block end B."""
+    purge = purge_minutes * _MS_PER_MIN
     return tuple((end - purge, end) for _, end in segments.block_bounds_ms)
 
 
@@ -183,7 +190,8 @@ def simulate_training(
     guard_cfg: GuardConfig,
     start_ms: Optional[int] = None,
 ) -> List[Trade]:
-    """The one-position replay over training with the block-end purge."""
+    """The one-position replay over training with the block-end purge
+    (``purge_tick_minutes`` of ``calib`` and ``exec_cfg``)."""
     return simulate(
         signal,
         markets,
@@ -195,7 +203,7 @@ def simulate_training(
         seed=seed,
         overshoot_bps=calib.s_star_bps,
         offset_s=0,
-        blocked_entry_windows=purge_windows(segments),
+        blocked_entry_windows=purge_windows(segments, purge_tick_minutes(calib, exec_cfg)),
     )
 
 
@@ -250,15 +258,29 @@ def _check_warmups(spec_sha: str, dataset: Dataset) -> None:
 
 def check_purge_covers(calib: Calibration, exec_cfg: ExecConfig) -> None:
     """The purge must outlast the longest trade a tick can open (worst latency, the
-    order delay, the fill bar and the time stop), or a trade could cross a block end."""
+    order delay, the fill bar and the time stop), or a trade could cross a block end.
+
+    ``purge_tick_minutes`` covers any latency by construction; this asserts that
+    invariant, which only a time stop longer than PURGE_MINUTES can break."""
+    purge = purge_tick_minutes(calib, exec_cfg)
     worst_latency = max(calib.latencies_ms, default=0.0)
     longest_ms = (worst_latency + exec_cfg.order_delay_s * 1000 + _MS_PER_MIN
                   + exec_cfg.time_stop_min * _MS_PER_MIN)
-    if longest_ms > PURGE_TICK_MINUTES * _MS_PER_MIN:
+    if longest_ms > purge * _MS_PER_MIN:
         raise ValueError(
             f"a trade can last {longest_ms / _MS_PER_MIN:.1f} min from its tick, longer than "
-            f"the {PURGE_TICK_MINUTES}-minute purge"
+            f"the {purge}-minute purge"
         )
+
+
+def check_recorded_purge(path: Path, selection: Mapping[str, Any], calib: Calibration,
+                         exec_cfg: ExecConfig) -> None:
+    """The holdout must purge as training did: the selection's ``purge_tick_minutes``
+    must equal the value the (hash-locked) calibration gives."""
+    recorded, derived = selection.get("purge_tick_minutes"), purge_tick_minutes(calib, exec_cfg)
+    if type(recorded) is not int or recorded != derived:
+        raise HoldoutLockError(f"{path}: the selection's purge_tick_minutes {recorded!r} "
+                               f"differs from the calibration's {derived}")
 
 
 def fresh_markets(dataset: Dataset, exec_cfg: ExecConfig) -> Tuple[Market, ...]:
@@ -417,7 +439,7 @@ def meta_candidates(ctx: _Context, primary: RuleSpec) -> List[Candidate]:
     latencies = ctx.calib.latencies_ms
     latency = int(round(statistics.median(latencies))) if latencies else 0
     delay = latency + ctx.exec_cfg.order_delay_s * 1000
-    windows = purge_windows(ctx.segments)
+    windows = purge_windows(ctx.segments, purge_tick_minutes(ctx.calib, ctx.exec_cfg))
     out: List[Candidate] = []
     for market in ctx.markets:
         for c in _five_minute_closes(ctx.segments.train_start_ms, ctx.segments.train_end_ms):
@@ -525,6 +547,7 @@ def _selection_document(
         "n_stops": ctx.calib.n_stops,
         "n_latencies": len(ctx.calib.latencies_ms),
         "latencies_sha256": latencies_sha256(ctx.calib.latencies_ms),
+        "purge_tick_minutes": purge_tick_minutes(ctx.calib, ctx.exec_cfg),
         "seed": ctx.seed,
         "rules": {k: _rule_metrics(r, ctx.sel_cfg) for k, r in sorted(sel.results.items())},
     }

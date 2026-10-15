@@ -6,8 +6,9 @@ Research code; the bot never imports it. Standard library only.
 selection file must exist and carry the current spec sha256 of a spec run) and
 that the calibration is the one the selection was made with; only then does it
 read the holdout. It replays the holdout [2026-08-05, 2026-10-14) WIB with entry
-ticks blocked in the final 65 minutes, runs contenders 1-3 and the controls,
-applies the nine gate criteria per symbol, chooses what moves on and writes
+ticks blocked in the final ``purge_tick_minutes`` (the selection's, refused under the
+current spec sha256 unless the calibration gives it), runs contenders 1-3 and the
+controls, applies the nine gate criteria per symbol, chooses what moves on and writes
 ``pine_gate_holdout_<YYYYMMDD>.json``. The holdout runs once: any existing
 holdout file in ``out_dir`` or next to the selection file (its real folder, links
 resolved), of any date, refuses the run, and so does an existing run marker
@@ -73,7 +74,8 @@ from .lock import (
 )
 from .outcomes import OutcomeCache
 from .dataset import TRAIN_DATA_UNTIL_MS, DataSource
-from .pipeline import SYMBOLS, Dataset, check_purge_covers
+from .pipeline import (SYMBOLS, Dataset, check_purge_covers, check_recorded_purge,
+                       purge_tick_minutes)
 from .rules import reference_signal
 from .simulate import Market, SignalFn, Trade
 from .spec import HOLDOUT_END, WIB, ExecConfig, GateConfig, GuardConfig, ms, spec_sha256
@@ -692,6 +694,7 @@ def _context(dataset: Dataset, settings: _StageSettings, calib: Calibration, see
         period=period, calib=calib, seed=seed, exec_cfg=settings.exec_cfg,
         guard_cfg=settings.guard_cfg, gate_cfg=settings.gate_cfg,
         days=tuple(period.days()), last20_days=tuple(period.last20_days()),
+        purge_tick_minutes=purge_tick_minutes(calib, settings.exec_cfg),
     )
 
 
@@ -726,6 +729,8 @@ def _start(data: HoldoutData, selection_path: Path, calib: Calibration, out_dir:
     _check_spec_run(spec_sha, settings, selection, seed)
     check_ready(selection_path, selection, calib, spec_sha, out_dir)
     check_purge_covers(calib, settings.exec_cfg)
+    if is_spec_sha(spec_sha):
+        check_recorded_purge(selection_path, selection, calib, settings.exec_cfg)
     permutation_ks(seed, 1, settings.period.length_days())  # fail early on a short holdout
     selection_sha = _selection_sha256(selection_path, selection)
     _check_marker_free(data_dir, spec_sha)

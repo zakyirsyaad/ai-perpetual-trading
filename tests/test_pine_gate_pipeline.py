@@ -34,6 +34,7 @@ from research.pine_gate.pipeline import (
     contender2_fn,
     load_dataset,
     load_selection_checked,
+    purge_tick_minutes,
     purge_windows,
     regime_counts,
     rule_signal_fn,
@@ -396,10 +397,26 @@ class SegmentTests(unittest.TestCase):
         for (_, end), (start, _) in zip(seg.cscv_bounds_ms, seg.cscv_bounds_ms[1:]):
             self.assertEqual(end, start)
 
-    def test_purge_windows_are_65_minutes_before_every_block_end(self):
-        windows = purge_windows(Segments.spec())
+    def test_purge_windows_span_the_given_minutes_before_every_block_end(self):
+        windows = purge_windows(Segments.spec(), 75)
         self.assertEqual(
-            windows, tuple((ms(b) - 65 * MIN, ms(b)) for _, b in BLOCKS)
+            windows, tuple((ms(b) - 75 * MIN, ms(b)) for _, b in BLOCKS)
+        )
+
+    def test_purge_tick_minutes_is_derived_from_the_worst_calibrated_latency(self):
+        # 60 + ceil((latency + order delay + one 1m bar) / 1 min)
+        slow = replace(CALIB, latencies_ms=(30_000.0, 13 * MIN))
+        self.assertEqual(purge_tick_minutes(slow, ExecConfig()), 75)
+        live = replace(CALIB, latencies_ms=(54_000.0, 227_000.0, 808_500.0))
+        self.assertEqual(purge_tick_minutes(live, ExecConfig()), 75)
+        self.assertEqual(purge_tick_minutes(CALIB, ExecConfig()), 62)  # 40 s worst
+        empty = replace(CALIB, latencies_ms=())
+        self.assertEqual(purge_tick_minutes(empty, ExecConfig()), 62)  # max taken as 0
+        exact = replace(CALIB, latencies_ms=(55_000.0,))  # 55 + 5 + 60 s = 2 min exactly
+        self.assertEqual(purge_tick_minutes(exact, ExecConfig()), 62)
+        self.assertEqual(
+            purge_windows(Segments.spec(), purge_tick_minutes(slow, ExecConfig())),
+            tuple((ms(b) - 75 * MIN, ms(b)) for _, b in BLOCKS),
         )
 
     def test_segments_must_tile_training(self):
@@ -475,7 +492,7 @@ class TrainStageTests(PipelineFixture):
     def test_contender3_candidates_are_inside_training_and_outside_purge(self):
         candidates = self.trainer.candidates
         self.assertTrue(candidates)
-        windows = purge_windows(TEST_SEGMENTS)
+        windows = purge_windows(TEST_SEGMENTS, purge_tick_minutes(CALIB, ExecConfig()))
         keys = set()
         for c in candidates:
             self.assertGreaterEqual(c.t_ms, TEST_SEGMENTS.train_start_ms)
@@ -535,13 +552,23 @@ class TrainStageTests(PipelineFixture):
             train_stage(self.dataset, CALIB, self.tmp / "real", self.sha,
                         segments=TEST_SEGMENTS)
 
-    def test_train_stage_refuses_latencies_the_purge_cannot_cover(self):
-        slow = replace(CALIB, latencies_ms=(30_000.0, 5 * 60_000.0))
+    def test_train_stage_runs_on_a_slow_calibration_and_records_its_purge(self):
+        # The live sample's worst latency (808.5 s) once refused train outright.
+        slow = replace(CALIB, latencies_ms=(30_000.0, 13 * MIN))
+        path = train_stage(self.dataset, slow, self.tmp / "slow", self.sha, seed=3,
+                           segments=TEST_SEGMENTS, sel_cfg=LENIENT_SEL, spa_n=200,
+                           meta_trainer=FakeMetaTrainer())
+        self.assertEqual(json.loads(path.read_text())["purge_tick_minutes"], 75)
+        self.assertEqual(self.selection["purge_tick_minutes"], 62)  # the fixture's 40 s
+
+    def test_purge_covers_every_latency_by_construction(self):
+        for latencies in ((), (64_000.0,), (13 * MIN,), (808_500.0,), (3 * HOUR,)):
+            with self.subTest(latencies=latencies):
+                pipeline.check_purge_covers(replace(CALIB, latencies_ms=latencies),
+                                            ExecConfig())
+        # The invariant still holds the time stop to PURGE_MINUTES.
         with self.assertRaises(ValueError):
-            train_stage(self.dataset, slow, self.tmp / "slow", self.sha,
-                        segments=TEST_SEGMENTS, meta_trainer=FakeMetaTrainer())
-        live_worst = replace(CALIB, latencies_ms=(64_000.0,))
-        pipeline.check_purge_covers(live_worst, ExecConfig())  # live max: fits
+            pipeline.check_purge_covers(CALIB, replace(ExecConfig(), time_stop_min=61))
 
     def test_shared_fixture_file_is_refused_under_the_real_spec_sha(self):
         real = spec_sha256()
@@ -716,13 +743,27 @@ class TrainingSimulationTests(PipelineFixture):
         late = [t for t in trades if any(b - 2 * HOUR <= t.signal_ms < b
                                          for _, b in TEST_SEGMENTS.block_bounds_ms)]
         self.assertTrue(late)
-        windows = purge_windows(TEST_SEGMENTS)
+        windows = purge_windows(TEST_SEGMENTS, purge_tick_minutes(CALIB, ExecConfig()))
         for t in trades:
             self.assertFalse(any(a <= t.signal_ms < b for a, b in windows))
             for start, end in TEST_SEGMENTS.block_bounds_ms:
                 if start <= t.entry_ms < end:
                     self.assertLessEqual(t.exit_ms, end)
                     self.assertLessEqual(t.entry_ms, end - 60 * MIN)
+
+    def test_a_slow_latency_widens_the_training_purge_to_75_minutes(self):
+        slow = replace(CALIB, latencies_ms=(13 * MIN,))
+        markets = [self.dataset.markets[s] for s in SYMBOLS]
+        trades = pipeline.simulate_training(
+            lambda symbol, t: 1, markets, TEST_SEGMENTS, slow, seed=1,
+            exec_cfg=ExecConfig(), guard_cfg=NO_GUARDS,
+        )
+        self.assertTrue(trades)
+        for t in trades:
+            for start, end in TEST_SEGMENTS.block_bounds_ms:
+                self.assertFalse(end - 75 * MIN <= t.signal_ms < end)
+                if start <= t.signal_ms < end:
+                    self.assertLessEqual(t.exit_ms, end)
 
 
 def _empty_results(sel_cfg):
