@@ -957,7 +957,10 @@ class DecisionsCommandTest(Dirs):
 class ReportCommandTest(Dirs):
     def test_report_surfaces_not_implemented_as_one_line(self):
         write_lock_files(self)
-        code, out, err = run_cli(self.base_args() + ["report"])
+        stub = mock.patch("research.pine_gate.report.verdict_sentence",
+                          side_effect=NotImplementedError("verdict_sentence is not written"))
+        with stub:
+            code, out, err = run_cli(self.base_args() + ["report"])
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertEqual(len(err.strip().splitlines()), 1)

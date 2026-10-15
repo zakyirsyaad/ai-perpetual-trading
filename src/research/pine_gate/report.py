@@ -198,12 +198,29 @@ def verdict_sentence(summary: dict) -> str:
     - gate failed: must contain "tidak lulus";
     - not enough data: must contain "data belum cukup".
     """
-    # TODO(user): write the three sentences (5-10 lines). Guidance:
-    #   - passed: the edge is present and consistent with the target, but a true 60% has a
-    #     95% interval of about 54-66% at 250-500 trades; the 60% verdict comes later.
-    #   - failed: the bot is unchanged and K2 continues; name the symbols that failed.
-    #   - insufficient: say what is missing (holdout not run, or under 60 TP+SL trades).
-    raise NotImplementedError("verdict_sentence is the user's contribution (TODO(user))")
+    if summary.get("c0_valid") is False:
+        return ("Kontrol C0 gagal, jadi model pengisian (fill model) tidak valid: hasil "
+                "kontender tidak boleh dibaca dan bot tidak diubah sampai model itu diperbaiki.")
+    outcome = summary.get("outcome")
+    if outcome == "passed":
+        figures = "; ".join(
+            f"{s}: WR {fmt_wr(summary['wr'].get(s))} (batas bawah "
+            f"{fmt_wr(summary['lower_bound'].get(s))}, {summary['n_tp_sl'].get(s, 0)} TP+SL)"
+            for s in summary.get("symbols", []))
+        others = ", ".join(summary.get("failed_symbols", []))
+        return (f"{contender_label(summary.get('contender'))} lulus gerbang untuk "
+                f"{figures}. Artinya edge terlihat dan konsisten dengan target, tetapi ini "
+                "belum bukti 60%: dengan 250-500 trade, WR 60% yang sebenarnya punya rentang "
+                "95% sekitar 54-66%, jadi vonis 60% baru diambil setelah sekitar 600 trade "
+                "per simbol (holdout + forward + live)."
+                + (f" {others} tidak lulus dan tidak ditradingkan." if others else ""))
+    if outcome == "failed":
+        names = ", ".join(summary.get("failed_symbols", [])) or "semua simbol"
+        return (f"Tidak ada kontender yang melewati gerbang: {names} tidak lulus. Bot tidak "
+                "diubah, sampel K2 berjalan terus, dan bos menerima tabel WR vs pasokan per "
+                "kontender dan simbol di atas.")
+    return ("Hasil belum bisa disimpulkan karena data belum cukup: holdout belum dijalankan "
+            "atau belum ada kontender dengan minimal 60 trade TP+SL pada satu simbol pun.")
 
 
 # --------------------------------------------------------------------------- header and summary
