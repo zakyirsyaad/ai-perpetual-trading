@@ -21,7 +21,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from .fileio import write_exclusive
 from .spec import WIB, ms
@@ -47,6 +47,10 @@ class MissingDayError(FileNotFoundError):
 
 class DayShapeError(ValueError):
     """A day file does not hold exactly its own WIB day of bars."""
+
+
+class UnreadableDayError(ValueError):
+    """A day file is corrupt or malformed (bad gzip, wrong field count, non-numeric)."""
 
 
 @dataclass(frozen=True)
@@ -98,12 +102,8 @@ def _check_bar(t: int, o: float, h: float, low: float, c: float, v: float) -> No
         raise ValueError(f"bar at {t} has a negative volume")
 
 
-def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
-    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``.
-
-    Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
-    gap, duplicate or disorder raises ``BarGapError``."""
-    out = _empty(interval_ms)
+def _validated(rows: Iterable[Row], interval_ms: int) -> Iterator[Row]:
+    """Each row as ``(int, float, ...)`` after ``_check_bar`` and the spacing check."""
     previous = None
     for row in rows:
         t = int(row[0])
@@ -114,6 +114,27 @@ def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
         o, h, low, c, v = (float(x) for x in row[1:6])
         _check_bar(t, o, h, low, c, v)
         previous = t
+        yield t, o, h, low, c, v
+
+
+def check_rows(rows: Iterable[Row], interval_ms: int) -> None:
+    """Raise exactly what ``bars_from_rows`` would, without building ``Bars``."""
+    for _ in _validated(rows, interval_ms):
+        pass
+
+
+def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
+    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``.
+
+    Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
+    gap, duplicate or disorder raises ``BarGapError``."""
+    return _build(_validated(rows, interval_ms), interval_ms)
+
+
+def _build(rows: Iterable[Row], interval_ms: int) -> Bars:
+    """``Bars`` from rows already validated (no check of its own)."""
+    out = _empty(interval_ms)
+    for t, o, h, low, c, v in rows:
         out.open_ms.append(t)
         out.open.append(o)
         out.high.append(h)
@@ -289,7 +310,7 @@ def write_day_exclusive(path: Path, rows: Sequence[Row]) -> bool:
 
 
 def read_day(path: Path) -> List[Row]:
-    """Read a day file; raise ``ValueError`` when it is corrupt or malformed."""
+    """Read a day file; raise ``UnreadableDayError`` when it is corrupt or malformed."""
     path = Path(path)
     rows: List[Row] = []
     try:
@@ -300,7 +321,7 @@ def read_day(path: Path) -> List[Row]:
                     continue
                 fields = line.split(",")
                 if len(fields) != _ROW_FIELDS:
-                    raise ValueError(
+                    raise UnreadableDayError(
                         f"{path}:{line_no}: expected {_ROW_FIELDS} fields, got {len(fields)}"
                     )
                 try:
@@ -315,9 +336,11 @@ def read_day(path: Path) -> List[Row]:
                         )
                     )
                 except ValueError as exc:
-                    raise ValueError(f"{path}:{line_no}: non-numeric field ({exc})") from exc
+                    raise UnreadableDayError(
+                        f"{path}:{line_no}: non-numeric field ({exc})"
+                    ) from exc
     except (EOFError, zlib.error, UnicodeDecodeError, gzip.BadGzipFile) as exc:
-        raise ValueError(f"{path}: corrupt day file ({exc})") from exc
+        raise UnreadableDayError(f"{path}: corrupt day file ({exc})") from exc
     return rows
 
 
@@ -331,9 +354,11 @@ def load_days(
 ) -> Bars:
     """Load the inclusive WIB day range into one ``Bars``.
 
-    Raises ``MissingDayError`` listing every missing day before reading any file,
-    ``DayShapeError`` when a file does not hold exactly its own WIB day of bars
-    (spec 5.2: 1,440 1m bars) and ``BarGapError`` when the bars do not join.
+    Raises ``MissingDayError`` listing every missing day before reading any file;
+    then, per day through ``read_valid_day``, ``UnreadableDayError`` for a corrupt
+    file, ``DayShapeError`` when a file does not hold exactly its own WIB day of
+    bars (spec 5.2: 1,440 1m bars), and ``BarGapError`` or ``ValueError`` for an
+    invalid bar. Each bar is checked once: whole, consecutive days join by shape.
     """
     if end_day < start_day:
         raise ValueError(f"end_day {end_day} is before start_day {start_day}")
@@ -349,12 +374,23 @@ def load_days(
     interval_ms = interval_to_ms(interval)
     rows: List[Row] = []
     for day, path in zip(days, paths):
-        day_rows = read_day(path)
-        problem = day_shape_problem(day_rows, day, interval_ms)
-        if problem is not None:
-            raise DayShapeError(f"{path} ({day.isoformat()}): {problem}")
-        rows.extend(day_rows)
-    return bars_from_rows(rows, interval_ms)
+        rows.extend(read_valid_day(path, day, interval_ms))
+    return _build(rows, interval_ms)
+
+
+def read_valid_day(path: Path, day: date, interval_ms: int) -> List[Row]:
+    """The rows of one day file, as ``load_days`` and ``check-data`` both accept them.
+
+    Raises ``UnreadableDayError`` for a corrupt file, ``DayShapeError`` when it
+    does not hold exactly its own WIB day, and what ``check_rows`` raises
+    (``BarGapError`` or ``ValueError``) for an invalid bar.
+    """
+    rows = read_day(path)
+    problem = day_shape_problem(rows, day, interval_ms)
+    if problem is not None:
+        raise DayShapeError(f"{path} ({day.isoformat()}): {problem}")
+    check_rows(rows, interval_ms)
+    return rows
 
 
 def day_shape_problem(rows: Sequence[Row], day: date, interval_ms: int) -> Optional[str]:

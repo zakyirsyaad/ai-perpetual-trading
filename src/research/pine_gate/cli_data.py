@@ -18,29 +18,41 @@ import argparse
 import json
 import random
 from datetime import date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple,
+)
 
 import httpx
 
 from . import cli_common as common
 from .bars import (
     Bars,
+    DayShapeError,
     MissingDayError,
+    Row,
+    UnreadableDayError,
     aggregate,
-    day_shape_problem,
     bars_from_rows,
     day_path,
     funding_path,
     interval_to_ms,
     load_days,
     read_day,
+    read_valid_day,
     slice_until,
     warmup_path,
     wib_day,
     wib_day_start_ms,
 )
-from .features import FeatureFrame, htf_agreement
+from .features import (
+    VOLUME_REL_TOL,
+    VOLUME_WORST_REL_MAX,
+    FeatureFrame,
+    NoOverlapError,
+    htf_agreement,
+)
 from .fetch import (
     MIN_REQUEST_GAP_SECONDS,
     PROD_HOST,
@@ -64,6 +76,7 @@ NATIVE_AGREEMENT_MIN = 0.999
 # Per symbol: recorded and the next symbol goes on. RateLimitedError is not here.
 _NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.HTTPError)
 _MS_1M = 60_000
+_MINUTES_PER_DAY = 1440
 _LISTED_DAYS = 10
 
 Series = Tuple[Bars, Optional[Bars], Optional[Bars]]  # 1m bars, native 1h and 4h warm-up
@@ -220,27 +233,109 @@ def _listed(days: Sequence[date]) -> str:
     return shown + (", ..." if len(days) > _LISTED_DAYS else "")
 
 
-def _not_whole_day(path: Path, day: date) -> bool:
+ZERO_VOLUME_RUN_LIMIT = 60  # minutes; a run this long fails (stored data has none)
+
+
+class DayProblem(Enum):
+    """Why a stored 1m day is unusable; the value is its line text, in print order."""
+
+    UNREADABLE = "unreadable"
+    SHAPE = "not a whole WIB day (1440 bars)"
+    BARS = "invalid bars"
+    ZERO_VOLUME = f"a run of >= {ZERO_VOLUME_RUN_LIMIT} zero-volume minutes"
+
+
+class _ZeroRuns(NamedTuple):
+    longest: int  # longest run reaching into the day, the carried-in part included
+    carried: int  # how long the carried-in run grew here (0 if it did not go on)
+    open_after: int  # run still open at the day's end
+
+
+def _zero_volume_runs(rows: Sequence[Row], run_before: int) -> _ZeroRuns:
+    """Zero-volume runs of one day, continuing a run of ``run_before`` minutes.
+
+    A carried-in run counts only if it goes on here."""
+    longest, carried, run = 0, 0, run_before
+    continuing = run_before > 0
+    for row in rows:
+        if row[5] != 0.0:
+            run, continuing = 0, False
+            continue
+        run += 1
+        longest = max(longest, run)
+        if continuing:
+            carried = run
+    return _ZeroRuns(longest, carried, run)
+
+
+class _DayVerdict(NamedTuple):
+    problem: Optional[DayProblem]
+    zero_runs: _ZeroRuns  # all zero for a day with any other problem: it breaks a run
+
+
+_NO_RUNS = _ZeroRuns(0, 0, 0)
+
+
+def _day_verdict(path: Path, day: date, zero_run_before: int) -> _DayVerdict:
+    """What is wrong with one 1m day file, read once through ``read_valid_day`` (the
+    reader ``load_days`` uses). A long run of zero volume, counted across midnight,
+    skews every 24-hour POC that covers it while OHLC looks fine."""
     try:
-        return day_shape_problem(read_day(path), day, _MS_1M) is not None
-    except ValueError:  # a corrupt file is not a whole day either
-        return True
+        rows = read_valid_day(path, day, _MS_1M)
+    except UnreadableDayError:
+        return _DayVerdict(DayProblem.UNREADABLE, _NO_RUNS)
+    except DayShapeError:
+        return _DayVerdict(DayProblem.SHAPE, _NO_RUNS)
+    except ValueError:  # BarGapError or a bar check_rows rejects
+        return _DayVerdict(DayProblem.BARS, _NO_RUNS)
+    except OSError:  # present but not readable (permissions, I/O error)
+        return _DayVerdict(DayProblem.UNREADABLE, _NO_RUNS)
+    runs = _zero_volume_runs(rows, zero_run_before)
+    too_long = runs.longest >= ZERO_VOLUME_RUN_LIMIT
+    return _DayVerdict(DayProblem.ZERO_VOLUME if too_long else None, runs)
+
+
+def _symbol_day_problems(data_dir: Path, symbol: str, first: date,
+                         last: date) -> Tuple[List[date], Dict[date, DayProblem]]:
+    """Missing days and each stored day's problem; a zero-volume run that crosses
+    midnight is charged to every day it touches."""
+    missing: List[date] = []
+    problems: Dict[date, DayProblem] = {}
+    run, run_days = 0, []  # the open zero-volume run and the earlier days it covers
+    for d in _days(first, last):
+        path = day_path(data_dir, "prod", symbol, "1m", d)
+        if not path.exists():
+            missing.append(d)
+            run, run_days = 0, []
+            continue
+        verdict = _day_verdict(path, d, run)
+        if verdict.problem is not None:
+            problems[d] = verdict.problem
+        runs = verdict.zero_runs
+        if runs.carried >= ZERO_VOLUME_RUN_LIMIT:
+            for earlier in run_days:
+                problems.setdefault(earlier, DayProblem.ZERO_VOLUME)
+        whole_day_continued = run > 0 and runs.open_after == run + _MINUTES_PER_DAY
+        run_days = (run_days + [d] if whole_day_continued else [d]) if runs.open_after else []
+        run = runs.open_after
+    return missing, problems
 
 
 def days_check(data_dir: Path) -> Tuple[List[str], bool]:
     """Every WIB day of the training start .. the last holdout day, prod BTC/ETH 1m: each
-    day file exists and holds exactly its own day's 1,440 bars."""
+    day file exists, is readable, holds exactly its own day's 1,440 valid bars and has
+    no long run of zero volume (also across midnight)."""
     first, last = wib_day(ms(TRAIN_START)), wib_day(ms(HOLDOUT_END) - 1)
     lines: List[str] = []
     for symbol in SYMBOLS:
-        paths = {d: day_path(data_dir, "prod", symbol, "1m", d) for d in _days(first, last)}
-        missing = [d for d, p in paths.items() if not p.exists()]
-        broken = [d for d, p in paths.items() if p.exists() and _not_whole_day(p, d)]
+        missing, problems = _symbol_day_problems(data_dir, symbol, first, last)
         if missing:
             lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {_listed(missing)}")
-        if broken:
-            lines.append(f"  prod/{symbol}/1m not a whole WIB day (1440 bars) on "
-                         f"{len(broken)} days: {_listed(broken)}")
+        for kind in DayProblem:
+            days = sorted(d for d, problem in problems.items() if problem is kind)
+            if days:
+                lines.append(f"  prod/{symbol}/1m {kind.value} on {len(days)} days: "
+                             f"{_listed(days)}")
     verdict = "FAIL" if lines else "PASS"
     head = f"{verdict} complete days: prod BTC/ETH 1m {first}..{last}"
     return [head] + lines, not lines
@@ -270,37 +365,61 @@ def read_warmups(data_dir: Path, symbol: str) -> Tuple[Optional[Bars], Optional[
     return out[0], out[1]
 
 
-def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[str, bool]:
+def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str], bool]:
     """Native bars of ``native-check-fetch`` vs the bars aggregated from 1m day files.
 
-    Compared over their overlap; at least 99.9% must agree. A missing or empty
-    native file, missing 1m days or no overlap all FAIL: the aggregation is
-    unchecked then, which is never a pass.
+    Two gating lines over their overlap, each naming the WIB days it covers.
+    OHLC, which is all the 1h/4h features read: at least 99.9% of the bars must
+    agree. Volume: no feature reads 1h/4h volume, but this cross-checks the 1m
+    volume the POC reads, and BingX's native volume differs from the 1m sum in a
+    few bars, so only the worst relative difference is bounded
+    (``VOLUME_WORST_REL_MAX``; a NaN fails); the share within ``VOLUME_REL_TOL``
+    is shown for information. It covers only the native-check window (by
+    default 2025-08), cut to the 1m range (training start .. last holdout day);
+    ``days_check`` catches long zero-volume runs on every day, and a wider
+    window needs ``native-check-fetch --start/--end`` into a fresh file.
+    A missing, empty or unreadable native file, missing or unreadable 1m days
+    and no overlap all FAIL: the aggregation is unchecked then, which is never
+    a pass.
     """
-    label = f"native vs aggregated prod/{symbol}/{interval}"
+    where = f"vs aggregated prod/{symbol}/{interval}"
+    label = f"native check {where}"
     path = native_check_path(data_dir, symbol, interval)
     if not path.exists():
-        return f"FAIL {label}: {path.name} missing; run native-check-fetch", False
+        return [f"FAIL {label}: {path.name} missing; run native-check-fetch"], False
     step = interval_to_ms(interval)
-    native = bars_from_rows(read_day(path), step)
+    try:
+        native = bars_from_rows(read_day(path), step)
+    except (OSError, ValueError) as exc:
+        return [f"FAIL {label}: {path.name} unreadable ({common.one_line(exc)})"], False
     if not len(native):
-        return f"FAIL {label}: {path.name} holds no bars", False
+        return [f"FAIL {label}: {path.name} holds no bars"], False
     first = max(wib_day(native.open_ms[0]), wib_day(ms(TRAIN_START)))
-    last = wib_day(native.open_ms[-1] + step - 1)
+    last = min(wib_day(native.open_ms[-1] + step - 1), wib_day(ms(HOLDOUT_END) - 1))
     if last < first:
-        return f"FAIL {label}: no overlap with the 1m data (native bars precede it)", False
+        return [f"FAIL {label}: no overlap with the 1m data range "
+                f"(native bars lie outside it)"], False
     try:
         bars = load_days(data_dir, "prod", symbol, "1m", first, last)
     except MissingDayError as exc:
-        return f"FAIL {label}: {common.one_line(exc)}", False
-    aggregated = aggregate(bars, step)
-    shared = set(native.open_ms) & set(aggregated.open_ms)
-    if not shared:
-        return f"FAIL {label}: no overlap between the native and the aggregated bars", False
-    share = htf_agreement(native, aggregated)
-    ok = share >= NATIVE_AGREEMENT_MIN
-    return (f"{'PASS' if ok else 'FAIL'} {label}: {share:.4%} of {len(shared)} bars agree "
-            f"(need >= {NATIVE_AGREEMENT_MIN:.1%})"), ok
+        return [f"FAIL {label}: {common.one_line(exc)}"], False
+    except (OSError, ValueError) as exc:  # corrupt, mis-shaped, invalid or unreadable
+        return [f"FAIL {label}: 1m data unreadable ({common.one_line(exc)})"], False
+    try:
+        agreement = htf_agreement(native, aggregate(bars, step))
+    except NoOverlapError as exc:
+        return [f"FAIL {label}: {common.one_line(exc)}"], False
+    span = f"over {first}..{last}"
+    ohlc_ok = agreement.ohlc_share >= NATIVE_AGREEMENT_MIN
+    volume_ok = agreement.worst_volume_rel <= VOLUME_WORST_REL_MAX  # False for NaN
+    return [
+        (f"{'PASS' if ohlc_ok else 'FAIL'} native OHLC {where}: {agreement.ohlc_share:.4%} "
+         f"of {agreement.bars} bars agree {span} (need >= {NATIVE_AGREEMENT_MIN:.1%})"),
+        (f"{'PASS' if volume_ok else 'FAIL'} native volume {where}: worst relative "
+         f"difference {agreement.worst_volume_rel:.2e} (need <= {VOLUME_WORST_REL_MAX:.1e}) "
+         f"{span}; {agreement.volume_share:.4%} of {agreement.bars} bars within "
+         f"{VOLUME_REL_TOL:.0e}"),
+    ], ohlc_ok and volume_ok
 
 
 def load_training_series(data_dir: Path, symbol: str, last_day: Optional[date] = None) -> Series:
@@ -349,8 +468,8 @@ def cmd_check_data(args: argparse.Namespace) -> int:
         lines.append(line)
         all_ok = all_ok and ok
         for interval in WARMUP_INTERVALS:
-            line, ok = native_check(args.data_dir, symbol, interval)
-            lines.append(line)
+            native_lines, ok = native_check(args.data_dir, symbol, interval)
+            lines.extend(native_lines)
             all_ok = all_ok and ok
     try:
         series = {s: load_training_series(args.data_dir, s) for s in SYMBOLS}
