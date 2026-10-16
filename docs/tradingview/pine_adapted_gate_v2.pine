@@ -1,4 +1,5 @@
 //@version=5
+// Default = parameter beku Phase 1 (kontender 1: H4|P40|ADX|OFF|OFF). Parameter ini GAGAL uji holdout (2026-10-16); hanya untuk referensi, bukan sinyal.
 // =============================================================================
 // Pine-adapted gate v2 — alat bantu VISUAL (2026-10-14)
 // Spek: docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md (bagian 5.15)
@@ -50,19 +51,19 @@ strategy("Pine-adapted gate v2 (alat bantu visual)", shorttitle="PAG v2",
 
 // ---------------------------------------------------------------- input
 grpT = "Arah tren"
-trendSrc = input.string("H1", "Sumber tren", options=["E200", "H1", "H4"], group=grpT,
+trendSrc = input.string("H4", "Sumber tren", options=["E200", "H1", "H4"], group=grpT,
      tooltip="E200 = close vs EMA200 di chart 5m. H1/H4 = EMA20 vs EMA50 di candle 1 jam / 4 jam yang sudah tutup.")
 bandAtr = input.float(0.25, "Zona netral H1/H4 (x ATR14)", step=0.05, group=grpT)
 
 grpE = "Entry"
 entryType = input.string("Pullback", "Jenis entry", options=["Pullback", "Breakout"], group=grpE,
      tooltip="Pullback: masuk saat koreksi melawan tren (RSI14). Breakout: masuk saat close menembus high/low N candle sebelumnya, searah tren.")
-rsiBand = input.string("35/65", "Ambang RSI14 (pullback)", options=["35/65", "40/60"], group=grpE)
+rsiBand = input.string("40/60", "Ambang RSI14 (pullback)", options=["35/65", "40/60"], group=grpE)
 brkLen = input.int(12, "Panjang breakout (candle 5m)", options=[12, 24], group=grpE,
      tooltip="12 = high/low 1 jam terakhir, 24 = 2 jam terakhir.")
 
 grpS = "Kekuatan tren"
-strength = input.string("ADX>20+DI", "Filter kekuatan", options=["Mati", "ADX>20", "ADX>20+DI"], group=grpS,
+strength = input.string("ADX>20", "Filter kekuatan", options=["Mati", "ADX>20", "ADX>20+DI"], group=grpS,
      tooltip="ADX>20+DI: ADX(14) > 20 dan DI searah trade (DI+ > DI- untuk long, DI- > DI+ untuk short).")
 
 grpF = "Filter tahap 2"
