@@ -581,16 +581,42 @@ class CheckDataCommandTest(Dirs):
         self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: 2025-08-01",
                       lines)
 
-    def test_days_check_lists_a_day_whose_volume_is_all_zero(self):
+    def _days_check_with_day1(self, transform):
+        """days_check with day 1 of BTC rewritten row by row (day 2 untouched)."""
         from research.pine_gate import cli_data
 
         rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
-        zeroed = [r[:5] + (0.0,) if k < 1440 else r for k, r in enumerate(rows)]
-        write_prod_days(self.data, "BTC-USDT", zeroed)
+        write_prod_days(self.data, "BTC-USDT",
+                        [transform(k, r) if k < 1440 else r for k, r in enumerate(rows)])
         lines, ok = cli_data.days_check(self.data)
-        self.assertFalse(ok)
-        self.assertIn("  prod/BTC-USDT/1m zero total volume on 1 days: 2025-08-01", lines)
-        self.assertFalse(any("2025-08-02" in line and "zero" in line for line in lines))
+        self.assertFalse(ok)  # most days are missing in this fixture
+        self.assertFalse(any("2025-08-02" in line and "missing" not in line for line in lines),
+                         lines)
+        return lines
+
+    def test_days_check_lists_a_day_whose_volume_is_all_zero(self):
+        lines = self._days_check_with_day1(lambda k, r: r[:5] + (0.0,))
+        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 1 days: "
+                      "2025-08-01", lines)
+
+    def test_days_check_lists_a_partly_zeroed_day(self):
+        lines = self._days_check_with_day1(lambda k, r: r[:5] + (0.0,) if k >= 1080 else r)
+        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 1 days: "
+                      "2025-08-01", lines)
+
+    def test_days_check_tolerates_a_short_zero_volume_run(self):
+        lines = self._days_check_with_day1(lambda k, r: r[:5] + (0.0,) if k < 59 else r)
+        self.assertFalse(any("zero-volume" in line for line in lines), lines)
+
+    def test_days_check_lists_a_day_with_invalid_bars(self):
+        for bad in (lambda r: r[:5] + (float("nan"),),           # NaN volume
+                    lambda r: (r[0], r[1], r[3] * 0.5, r[3], r[4], r[5])):  # high below low
+            with self.subTest():
+                for path in self.data.glob("prod/BTC-USDT/1m/*"):
+                    path.unlink()
+                lines = self._days_check_with_day1(lambda k, r: bad(r) if k == 700 else r)
+                self.assertIn("  prod/BTC-USDT/1m invalid bars on 1 days: 2025-08-01", lines)
+                self.assertFalse(any("zero-volume" in line for line in lines), lines)
 
     def test_funding_check_needs_the_cadence_over_training_and_holdout(self):
         from research.pine_gate import cli_data
@@ -719,6 +745,22 @@ class CheckDataCommandTest(Dirs):
         self.assertFalse(ok)
         self.assertEqual(lines, ["FAIL native check vs aggregated prod/BTC-USDT/1h: "
                                  "native and aggregated bars share no open time"])
+
+    def test_a_native_file_past_the_last_holdout_day_is_compared_over_the_overlap(self):
+        from research.pine_gate import cli_data
+
+        _, count = self._write_native(lambda i, r: r)
+        path = cli_data.native_check_path(self.data, "BTC-USDT", "1h")
+        rows = read_day(path)
+        # one more contiguous day of native bars with no 1m file, past the patched end
+        later = [(rows[-1][0] + k * HOUR, 1.0, 1.0, 1.0, 1.0, 1.0) for k in range(1, 25)]
+        path.unlink()
+        write_day(path, rows + later)
+        end = datetime(2025, 8, 3, tzinfo=timezone(timedelta(hours=7)))
+        with mock.patch.object(cli_data, "HOLDOUT_END", end):
+            lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertTrue(ok, lines)
+        self.assertIn(f"of {count} bars agree over 2025-08-01..2025-08-02", lines[0])
 
     def test_a_corrupt_1m_day_is_named_as_such(self):
         cli_data, _ = self._write_native(lambda i, r: r)

@@ -27,6 +27,7 @@ from . import cli_common as common
 from .bars import (
     Bars,
     MissingDayError,
+    Row,
     aggregate,
     day_shape_problem,
     bars_from_rows,
@@ -226,36 +227,62 @@ def _listed(days: Sequence[date]) -> str:
     return shown + (", ..." if len(days) > _LISTED_DAYS else "")
 
 
-def _day_problems(path: Path, day: date) -> Tuple[bool, bool]:
-    """(not a whole WIB day, zero total volume) of one 1m day file, read once."""
+ZERO_VOLUME_RUN_MAX = 60  # minutes; the stored production data has none at all
+
+# Why a stored 1m day is unusable, in the order the lines are printed.
+_DAY_PROBLEMS = {
+    "shape": "not a whole WIB day (1440 bars)",
+    "bars": "invalid bars",
+    "zero_volume": f"a run of >= {ZERO_VOLUME_RUN_MAX} zero-volume minutes",
+}
+
+
+def _longest_zero_volume_run(rows: Sequence[Row]) -> int:
+    longest = run = 0
+    for row in rows:
+        run = run + 1 if row[5] == 0.0 else 0
+        longest = max(longest, run)
+    return longest
+
+
+def _day_problem(path: Path, day: date) -> Optional[str]:
+    """The ``_DAY_PROBLEMS`` key of one 1m day file, read once, or ``None``.
+
+    A corrupt file is not a whole day; bars the loader would reject (non-finite,
+    high/low not bracketing, negative volume, a gap) are invalid; a long run of
+    zero volume skews every 24-hour POC that covers it while OHLC looks fine.
+    """
     try:
         rows = read_day(path)
-    except ValueError:  # a corrupt file is not a whole day either
-        return True, False
-    not_whole = day_shape_problem(rows, day, _MS_1M) is not None
-    return not_whole, not not_whole and sum(r[5] for r in rows) == 0.0
+    except ValueError:
+        return "shape"
+    if day_shape_problem(rows, day, _MS_1M) is not None:
+        return "shape"
+    try:
+        bars_from_rows(rows, _MS_1M)
+    except ValueError:
+        return "bars"
+    if _longest_zero_volume_run(rows) >= ZERO_VOLUME_RUN_MAX:
+        return "zero_volume"
+    return None
 
 
 def days_check(data_dir: Path) -> Tuple[List[str], bool]:
     """Every WIB day of the training start .. the last holdout day, prod BTC/ETH 1m: each
-    day file exists, holds exactly its own day's 1,440 bars and has some volume (a
-    zeroed volume column would leave the POC undefined while OHLC looks fine)."""
+    day file exists, holds exactly its own day's 1,440 valid bars and has no long run
+    of zero volume."""
     first, last = wib_day(ms(TRAIN_START)), wib_day(ms(HOLDOUT_END) - 1)
     lines: List[str] = []
     for symbol in SYMBOLS:
         paths = {d: day_path(data_dir, "prod", symbol, "1m", d) for d in _days(first, last)}
         missing = [d for d, p in paths.items() if not p.exists()]
-        problems = {d: _day_problems(p, d) for d, p in paths.items() if p.exists()}
-        broken = [d for d, (not_whole, _) in problems.items() if not_whole]
-        silent = [d for d, (_, zero) in problems.items() if zero]
+        found = {d: _day_problem(p, d) for d, p in paths.items() if p.exists()}
         if missing:
             lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {_listed(missing)}")
-        if broken:
-            lines.append(f"  prod/{symbol}/1m not a whole WIB day (1440 bars) on "
-                         f"{len(broken)} days: {_listed(broken)}")
-        if silent:
-            lines.append(f"  prod/{symbol}/1m zero total volume on {len(silent)} days: "
-                         f"{_listed(silent)}")
+        for kind, text in _DAY_PROBLEMS.items():
+            days = [d for d, problem in found.items() if problem == kind]
+            if days:
+                lines.append(f"  prod/{symbol}/1m {text} on {len(days)} days: {_listed(days)}")
     verdict = "FAIL" if lines else "PASS"
     head = f"{verdict} complete days: prod BTC/ETH 1m {first}..{last}"
     return [head] + lines, not lines
@@ -295,8 +322,9 @@ def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str],
     few bars, so only the worst relative difference is bounded
     (``VOLUME_WORST_REL_MAX``; a NaN fails); the share within ``VOLUME_REL_TOL``
     is shown for information. It covers only the native-check window (by
-    default 2025-08); ``days_check`` catches a zeroed volume on every day, and
-    a wider window needs ``native-check-fetch --start/--end`` into a fresh file.
+    default 2025-08), cut to the 1m range (training start .. last holdout day);
+    ``days_check`` catches long zero-volume runs on every day, and a wider
+    window needs ``native-check-fetch --start/--end`` into a fresh file.
     A missing, empty or unreadable native file, missing or unreadable 1m days
     and no overlap all FAIL: the aggregation is unchecked then, which is never
     a pass.
@@ -314,9 +342,10 @@ def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str],
     if not len(native):
         return [f"FAIL {label}: {path.name} holds no bars"], False
     first = max(wib_day(native.open_ms[0]), wib_day(ms(TRAIN_START)))
-    last = wib_day(native.open_ms[-1] + step - 1)
+    last = min(wib_day(native.open_ms[-1] + step - 1), wib_day(ms(HOLDOUT_END) - 1))
     if last < first:
-        return [f"FAIL {label}: no overlap with the 1m data (native bars precede it)"], False
+        return [f"FAIL {label}: no overlap with the 1m data range "
+                f"(native bars lie outside it)"], False
     try:
         bars = load_days(data_dir, "prod", symbol, "1m", first, last)
     except MissingDayError as exc:
