@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.wire import sse_event, sse_frame
+from bot.telemetry.ws import with_timeout
 
 LOGGER = logging.getLogger("volume_bot.telemetry")
 
@@ -168,7 +169,7 @@ class TelemetryServer:
         self, reader: asyncio.StreamReader
     ) -> tuple[str, str, dict[str, list[str]], dict[str, str]]:
         try:
-            raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), self._request_timeout)
+            raw = await with_timeout(reader.readuntil(b"\r\n\r\n"), self._request_timeout)
         except asyncio.LimitOverrunError:
             raise _HttpError(431, "request too large") from None
         lines = raw.decode("latin-1").split("\r\n")
@@ -252,7 +253,7 @@ class TelemetryServer:
             await writer.drain()
             while not reader.at_eof():
                 try:
-                    message = await asyncio.wait_for(queue.get(), self._ping_seconds)
+                    message = await with_timeout(queue.get(), self._ping_seconds)
                 except asyncio.TimeoutError:
                     writer.write(sse_event("ping", int(time.time() * 1000)))
                 else:
