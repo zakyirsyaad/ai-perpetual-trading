@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import type { BlockEvent, Meta, PricePoint } from "@/lib/types";
 import { fmtCall, fmtPrice } from "@/lib/format";
 import { barsForView, fillMarks, type BarSize } from "@/lib/ohlc";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { useSessionState } from "@/lib/useSessionState";
 import CandlePane from "./CandlePane";
 import styles from "./FlowChart.module.css";
 
@@ -34,11 +35,17 @@ export default function FlowChart({
   meta?: Meta | null;
   onNeedMoreTape?: () => void;
 }) {
-  const [interval, setIntervalId] = useState<BarSize>(DEFAULT_INTERVAL);
+  const [interval, setIntervalId] = useSessionState<BarSize>("chart.interval", DEFAULT_INTERVAL);
+  const [intervalCoin, setIntervalCoin] = useSessionState<string | null>("chart.intervalCoin", null);
 
+  // A different coin opens on the default interval; a remount of the same coin
+  // (the layout switching trees at the breakpoint) keeps the chosen one.
   useEffect(() => {
-    setIntervalId(DEFAULT_INTERVAL);
-  }, [meta?.coin]);
+    const coin = meta?.coin ?? null;
+    if (coin === null || coin === intervalCoin) return;
+    if (intervalCoin !== null) setIntervalId(DEFAULT_INTERVAL);
+    setIntervalCoin(coin);
+  }, [meta?.coin, intervalCoin, setIntervalId, setIntervalCoin]);
 
   useEffect(() => {
     if (interval !== "1s") onNeedMoreTape?.();

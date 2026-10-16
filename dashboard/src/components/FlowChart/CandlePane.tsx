@@ -168,9 +168,8 @@ export default function CandlePane({
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
-    const bars = toBars(candles);
     const stem = stemOf(candles);
-    if (!bars.length) {
+    if (!candles.length) {
       series.setData([]);
       stemRef.current = stem;
       lastTimeRef.current = 0;
@@ -179,8 +178,8 @@ export default function CandlePane({
     }
     const stemChanged = stemRef.current !== stem;
     const rangeChanged = rangeRef.current !== rangeKey;
-    const newest = candles[candles.length - 1]!.time;
-    const added = bars.length - barCountRef.current;
+    const newest = candles[candles.length - 1]!;
+    const added = candles.length - barCountRef.current;
     // update() only touches the newest bar, so it is safe only for the same coin
     // and interval, the same first bar, and zero or one new bar whose time does
     // not go back. Anything else redraws: an older newest bar would make
@@ -188,24 +187,23 @@ export default function CandlePane({
     // down, a shrunk series would keep stale bars, and a jump of several bars
     // would skip the ones in between.
     const canUpdate =
-      !stemChanged && !rangeChanged && Boolean(stem) && newest >= lastTimeRef.current && (added === 0 || added === 1);
+      !stemChanged && !rangeChanged && newest.time >= lastTimeRef.current && (added === 0 || added === 1);
     if (canUpdate) {
-      series.update(bars[bars.length - 1]!);
+      series.update(toBars([newest])[0]!);
     } else {
-      // A catch-up redraw keeps following the live edge only if the view was on it.
-      const followLive = added > 1 && atLiveEdge(chartRef.current, barCountRef.current);
+      // A new coin or interval always opens on the latest bars. Any other redraw
+      // (a catch-up of several bars, a tape whose oldest bar was trimmed or that
+      // was rebuilt) keeps following the live edge only if the view was on it,
+      // so a view scrolled back to an earlier entry stays where it is.
+      const followLive = rangeChanged || atLiveEdge(chartRef.current, barCountRef.current);
+      const bars = toBars(candles);
       series.setData(bars);
       stemRef.current = stem;
-      if (followLive && !rangeChanged && !stemChanged) {
-        showLatest(chartRef.current, bars.length, visibleBars);
-      }
-    }
-    lastTimeRef.current = newest;
-    barCountRef.current = bars.length;
-    if (rangeChanged || stemChanged) {
       rangeRef.current = rangeKey;
-      showLatest(chartRef.current, bars.length, visibleBars);
+      if (followLive) showLatest(chartRef.current, bars.length, visibleBars);
     }
+    lastTimeRef.current = newest.time;
+    barCountRef.current = candles.length;
   }, [candles, rangeKey, visibleBars]);
 
   useEffect(() => {

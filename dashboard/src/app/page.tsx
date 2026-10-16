@@ -140,9 +140,15 @@ export default function Page() {
   );
   const callFeed = (
     <div className={styles.slotFeed}>
-      <Feed events={sleeve.events} meta={meta} waiting={waiting} />
+      <Feed events={sleeve.events} meta={meta} waiting={waiting} variant="fill" />
     </div>
   );
+
+  // Until the browser reports its width, render only the shell: each panel then
+  // mounts once, in the tree that matches the screen.
+  if (isDesktop === null) {
+    return <div className="shell">{header}</div>;
+  }
 
   // The DOM order follows what is on screen at each breakpoint, so keyboard
   // focus and screen readers read the page in its visual order.

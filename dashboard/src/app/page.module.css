@@ -2,10 +2,9 @@
    coin tabs, the chart and the positions/trades/history book; the rail holds the
    daily volume, the token strip, the latest call and the call feed.
    Mobile (< 900px): page.tsx renders the slots flat in the stacked order
-   (header, volume, tokens, coins, chart, call, feed, book) so the DOM matches
-   the screen. Until hydration the page holds the prerendered desktop tree; the
-   display: contents and `order` rules below paint that tree in the same
-   stacked order meanwhile. */
+   (header, volume, tokens, coins, chart, call, feed, book), so the DOM order
+   is the screen order. Before the browser reports its width only the header
+   is rendered, so neither tree is ever painted at the wrong width. */
 
 .slotHeader {
   flex: none;
@@ -69,13 +68,6 @@
   flex-direction: column;
 }
 
-@media (min-width: 900px) {
-  .slotFeed > * {
-    flex: 1;
-    min-height: 0;
-  }
-}
-
 @media (min-width: 1440px) {
   .body {
     --rail-w: 400px;
@@ -89,21 +81,6 @@
 }
 
 @media (max-width: 899.98px) {
-  .body,
-  .work,
-  .rail {
-    display: contents;
-  }
-
-  .slotHeader { order: 1; }
-  .slotVolume { order: 2; }
-  .slotUsage { order: 3; }
-  .slotSleeves { order: 4; }
-  .chartWrap { order: 5; }
-  .slotDecision { order: 6; }
-  .slotFeed { order: 7; }
-  .slotBook { order: 8; }
-
   .chartWrap {
     flex: none;
     height: min(38vh, 320px);

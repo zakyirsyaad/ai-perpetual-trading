@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo } from "react";
 import type { BlockEvent, Meta, PricePoint, SleeveMeta } from "@/lib/types";
 import { closedLots, dayKey, groupByDay, lotVolume, tapeFills } from "@/lib/fills";
 import { roePct } from "@/lib/pnl";
@@ -19,6 +19,7 @@ import {
 } from "@/lib/format";
 import { Bone } from "@/components/Skeleton/Skeleton";
 import { cx } from "@/lib/cx";
+import { useSessionState } from "@/lib/useSessionState";
 import styles from "./Book.module.css";
 
 type Tab = "positions" | "trades" | "history";
@@ -54,8 +55,8 @@ export default function Book({
   /** "fill": on desktop the book fills its grid row instead of its fixed height. */
   variant?: "stack" | "fill";
 }) {
-  const [tab, setTab] = useState<Tab>("positions");
-  const [allMarkets, setAllMarkets] = useState(false);
+  const [tab, setTab] = useSessionState<Tab>("book.tab", "positions");
+  const [allMarkets, setAllMarkets] = useSessionState("book.allMarkets", false);
 
   const trades = useMemo(() => {
     const rows = [];

@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Bone } from "@/components/Skeleton/Skeleton";
 import type { UsageDay, UsageSummary } from "@/lib/bot-types";
 import { fmtCompact, fmtDay, fmtInt } from "@/lib/format";
 import { share, sumDays, todayOf, tokenMix, tokensPerTrade, type TokenMix } from "@/lib/usage";
 import { cx } from "@/lib/cx";
+import { useSessionState } from "@/lib/useSessionState";
 import styles from "./UsagePanel.module.css";
 
 export interface UsagePanelProps {
@@ -64,7 +65,7 @@ function DayRow({ day, today, widest }: { day: UsageDay; today: boolean; widest:
 }
 
 export default function UsagePanel({ usage, variant = "stack" }: UsagePanelProps) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useSessionState("usage.detailOpen", false);
 
   // Remembered per browser; the page is correct without it (private window, blocked storage).
   useEffect(() => {
