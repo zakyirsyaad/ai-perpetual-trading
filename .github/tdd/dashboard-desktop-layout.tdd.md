@@ -96,6 +96,18 @@ Verified after round 3: with Trades selected, the token detail open and the char
 
 Verified: prerendered HTML holds the header and the `.pending` placeholder; History + Detail open + 15m survive 1280 -> 375 -> 1280; no console error.
 
+## Round 5 (fourth code review of PR #38)
+
+- Chart: when one new bar arrives, the previous bar is refreshed too (`update()` on the last two bars), so ticks batched into the same render still reach its close and high.
+- Chart: a redraw while scrolled back anchors the view on the open time of its first visible bar (`indexShift`), covering prepended history, a trimmed oldest bar and a catch-up of several bars, not only a prepend. `drawnRef` (the drawn bars) replaces the separate last-time and bar-count refs.
+- FlowChart: the interval is stored with the coin it was picked on and derived during render, so a coin change no longer renders one frame with the previous coin's interval (two redraws and a needless tape load). Another coin opens on 5m; returning to the coin keeps its last pick.
+- `--rail-w` is shared by `.body` and `.pending` (with the 1440/1800 px overrides), so the placeholder rail is the real rail's width.
+- The token Detail toggle is read from `localStorage` in its initial state and kept in `useSessionState` (`usage.open`), so a remount at 900 px no longer paints it closed for a frame and a blocked storage still keeps it for the session. `useSessionState` now takes a lazy initial value like `useState`.
+- Mobile placeholder: the chart row reuses `--chart-h` (the chart's own height rule); the 425 px above it is documented as measured.
+- The placeholder has `role="status"`, so its label is announced. CLAUDE.md now says the prerender holds the header and the placeholder.
+
+Verified in the browser against the live feed: placeholder rail 400 px = real rail 400 px at 1500 px; BTC 15m -> ETH shows 5m -> BTC shows 15m; Detail open stays open across 1500 -> 375 with no closed frame recorded; chart 308.6 px = `max(240px, min(38vh, 320px))` at 375x812; no console error.
+
 ## Verification
 
 - `bunx tsc --noEmit -p .` (dashboard): clean.
@@ -114,7 +126,8 @@ Verified: prerendered HTML holds the header and the `.pending` placeholder; Hist
 - 926d296 `docs: round 2 of the dashboard layout TDD evidence`
 - c34a28d `fix: mount dashboard panels once and keep their state across the breakpoint` (round 3)
 - 79bf82a `docs: round 3 of the dashboard layout TDD evidence`
-- round 4: the commit titled `fix: keep the loading placeholder and a scrolled-back chart view` (its hash is recorded in the PR description)
+- 91ed01b `fix: keep the loading placeholder and a scrolled-back chart view` (round 4)
+- round 5: the commit titled `fix: refresh the closing bar, anchor the chart view by time and derive the interval` (its hash is recorded in the PR description)
 
 ## Deployment gate
 

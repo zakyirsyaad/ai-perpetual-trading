@@ -152,7 +152,7 @@ export default function Page() {
     return (
       <div className="shell">
         {header}
-        <div className={styles.pending} aria-busy="true" aria-label="Loading dashboard">
+        <div className={styles.pending} role="status" aria-busy="true" aria-label="Loading dashboard">
           <Bone className={styles.pendingWork} />
           <Bone className={styles.pendingRail} />
         </div>

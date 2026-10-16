@@ -74,6 +74,18 @@ function atLiveEdge(chart: IChartApi | null, count: number): boolean {
   return !range || range.to >= count - 1;
 }
 
+/**
+ * How many logical indices the bar at `from` moved between two drawings, found
+ * by its open time; null when there is nothing to anchor on.
+ */
+function indexShift(before: Candle[], after: Candle[], from: number): number | null {
+  if (!before.length) return null;
+  const at = Math.min(before.length - 1, Math.max(0, Math.round(from)));
+  const time = before[at]!.time;
+  const moved = after.findIndex((c) => c.time >= time);
+  return moved < 0 ? null : moved - at;
+}
+
 function showLatest(chart: IChartApi | null, count: number, visibleBars: number) {
   if (!chart || count <= 0) return;
   const to = count + 1;
@@ -96,9 +108,8 @@ export default function CandlePane({
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const entryLineRef = useRef<IPriceLine | null>(null);
   const stemRef = useRef("");
-  // Open time of the newest bar on the series: update() may only touch it or a later bar.
-  const lastTimeRef = useRef(0);
-  const barCountRef = useRef(0);
+  // The bars on the series: update() may only touch the newest of them or a later bar.
+  const drawnRef = useRef<Candle[]>([]);
   const rangeRef = useRef("");
   const formatRef = useRef(formatPrice);
   formatRef.current = formatPrice;
@@ -155,8 +166,7 @@ export default function CandlePane({
       markersRef.current = null;
       entryLineRef.current = null;
       stemRef.current = "";
-      lastTimeRef.current = 0;
-      barCountRef.current = 0;
+      drawnRef.current = [];
       rangeRef.current = "";
     };
   }, []);
@@ -172,49 +182,51 @@ export default function CandlePane({
     if (!candles.length) {
       series.setData([]);
       stemRef.current = stem;
-      lastTimeRef.current = 0;
-      barCountRef.current = 0;
+      drawnRef.current = [];
       return;
     }
     const stemChanged = stemRef.current !== stem;
     const rangeChanged = rangeRef.current !== rangeKey;
-    const newest = candles[candles.length - 1]!;
-    const added = candles.length - barCountRef.current;
-    // update() only touches the newest bar, so it is safe only for the same coin
-    // and interval, the same first bar, and zero or one new bar whose time does
-    // not go back. Anything else redraws: an older newest bar would make
-    // lightweight-charts throw "Cannot update oldest data" and take the page
+    const drawn = drawnRef.current;
+    const added = candles.length - drawn.length;
+    // With one new bar the previous one is refreshed too: ticks batched into the
+    // same render may still have moved its close or high.
+    const tail = candles.slice(added === 1 ? -2 : -1);
+    // update() only touches the newest bars, so it is safe only for the same coin
+    // and interval, the same first bar, and zero or one new bar, none of them
+    // older than the newest drawn bar. Anything else redraws: an older bar would
+    // make lightweight-charts throw "Cannot update oldest data" and take the page
     // down, a shrunk series would keep stale bars, and a jump of several bars
     // would skip the ones in between.
     const canUpdate =
-      !stemChanged && !rangeChanged && newest.time >= lastTimeRef.current && (added === 0 || added === 1);
+      !stemChanged &&
+      !rangeChanged &&
+      (added === 0 || added === 1) &&
+      tail[0]!.time >= (drawn[drawn.length - 1]?.time ?? 0);
     if (canUpdate) {
-      series.update(toBars([newest])[0]!);
+      for (const bar of toBars(tail)) series.update(bar);
     } else {
       // A new coin or interval always opens on the latest bars. Any other redraw
       // (a catch-up of several bars, a tape whose oldest bar was trimmed or that
       // was rebuilt) keeps following the live edge only if the view was on it,
       // so a view scrolled back to an earlier entry stays where it is.
-      const followLive = rangeChanged || atLiveEdge(chartRef.current, barCountRef.current);
+      const followLive = rangeChanged || atLiveEdge(chartRef.current, drawn.length);
       const kept = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
-      // Older history prepended in front of the drawn bars moves every logical
-      // index by that many bars; shift a scrolled-back view with them.
-      const oldFirst = Number(stemRef.current);
-      const prepended = stemChanged && !rangeChanged && Number.isFinite(oldFirst)
-        ? candles.findIndex((c) => c.time >= oldFirst)
-        : 0;
+      // Prepended history, a trimmed oldest bar or a catch-up of several bars
+      // moves the logical indices; anchor a scrolled-back view on the open time
+      // of its first bar instead.
+      const shift = kept && !followLive ? indexShift(drawn, candles, kept.from) : null;
       const bars = toBars(candles);
       series.setData(bars);
       stemRef.current = stem;
       rangeRef.current = rangeKey;
       if (followLive) {
         showLatest(chartRef.current, bars.length, visibleBars);
-      } else if (kept && prepended > 0) {
-        chartRef.current?.timeScale().setVisibleLogicalRange({ from: kept.from + prepended, to: kept.to + prepended });
+      } else if (kept && shift !== null) {
+        chartRef.current?.timeScale().setVisibleLogicalRange({ from: kept.from + shift, to: kept.to + shift });
       }
     }
-    lastTimeRef.current = newest.time;
-    barCountRef.current = candles.length;
+    drawnRef.current = candles;
   }, [candles, rangeKey, visibleBars]);
 
   useEffect(() => {

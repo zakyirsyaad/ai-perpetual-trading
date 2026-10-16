@@ -35,17 +35,15 @@ export default function FlowChart({
   meta?: Meta | null;
   onNeedMoreTape?: () => void;
 }) {
-  const [interval, setIntervalId] = useSessionState<BarSize>("chart.interval", DEFAULT_INTERVAL);
-  const [intervalCoin, setIntervalCoin] = useSessionState<string | null>("chart.intervalCoin", null);
-
-  // A different coin opens on the default interval; a remount of the same coin
-  // (the layout switching trees at the breakpoint) keeps the chosen one.
-  useEffect(() => {
-    const coin = meta?.coin ?? null;
-    if (coin === null || coin === intervalCoin) return;
-    if (intervalCoin !== null) setIntervalId(DEFAULT_INTERVAL);
-    setIntervalCoin(coin);
-  }, [meta?.coin, intervalCoin, setIntervalId, setIntervalCoin]);
+  // The interval belongs to the coin it was picked on: another coin opens on the
+  // default, and a remount of the same coin (the layout switching trees at the
+  // breakpoint) keeps the chosen one.
+  const [picked, setPicked] = useSessionState<{ coin: string | null; interval: BarSize }>("chart.interval", {
+    coin: null,
+    interval: DEFAULT_INTERVAL,
+  });
+  const interval = picked.coin === (meta?.coin ?? null) ? picked.interval : DEFAULT_INTERVAL;
+  const setIntervalId = (next: BarSize) => setPicked({ coin: meta?.coin ?? null, interval: next });
 
   useEffect(() => {
     if (interval !== "1s") onNeedMoreTape?.();

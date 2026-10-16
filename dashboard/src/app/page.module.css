@@ -11,8 +11,14 @@
   flex: none;
 }
 
-.body {
+/* Shared by the grid and its placeholder so the rail never changes width when
+   the real panels replace the placeholder. */
+.body,
+.pending {
   --rail-w: 380px; /* the width DecisionPanel and Feed were laid out for */
+}
+
+.body {
   flex: 1 1 0;
   min-height: 0;
   display: grid;
@@ -74,7 +80,7 @@
   flex: 1 1 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--rail-w, 380px);
+  grid-template-columns: minmax(0, 1fr) var(--rail-w);
   gap: 1px;
 }
 
@@ -84,29 +90,39 @@
 }
 
 @media (min-width: 1440px) {
-  .body {
+  .body,
+  .pending {
     --rail-w: 400px;
   }
 }
 
 @media (min-width: 1800px) {
-  .body {
+  .body,
+  .pending {
     --rail-w: 440px;
   }
 }
 
 @media (max-width: 899.98px) {
-  /* Stacked: the rail's panels then the chart, at about their mobile heights. */
+  /* One chart height for the chart and its placeholder row. */
+  .chartWrap,
+  .pending {
+    --chart-h: max(240px, min(38vh, 320px));
+  }
+
+  /* Stacked: what sits above the chart (volume, MiMo tokens and coin cards:
+     425px together at 375px wide, measured 2026-10-16, about 410px once two
+     coins have loaded; re-measure when one of them changes height), then the
+     chart itself. */
   .pending {
     flex: none;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: 425px 309px;
+    grid-template-rows: 425px var(--chart-h);
   }
 
   .chartWrap {
     flex: none;
-    height: min(38vh, 320px);
-    min-height: 240px;
+    height: var(--chart-h);
   }
 
   .slotDecision {
