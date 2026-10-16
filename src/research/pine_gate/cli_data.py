@@ -40,7 +40,7 @@ from .bars import (
     wib_day,
     wib_day_start_ms,
 )
-from .features import FeatureFrame, htf_agreement
+from .features import VOLUME_REL_TOL, FeatureFrame, htf_agreement
 from .fetch import (
     MIN_REQUEST_GAP_SECONDS,
     PROD_HOST,
@@ -61,6 +61,7 @@ WARMUP_INTERVALS = ("1h", "4h")
 NATIVE_CHECK_FILE = "native_check.csv.gz"
 NATIVE_CHECK_DEFAULT = (date(2025, 8, 1), date(2025, 9, 1))  # inside training
 NATIVE_AGREEMENT_MIN = 0.999
+NATIVE_VOLUME_MAX_REL = 1e-3  # loose: BingX native volume is off by up to 1.28e-4
 # Per symbol: recorded and the next symbol goes on. RateLimitedError is not here.
 _NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.HTTPError)
 _MS_1M = 60_000
@@ -273,11 +274,13 @@ def read_warmups(data_dir: Path, symbol: str) -> Tuple[Optional[Bars], Optional[
 def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str], bool]:
     """Native bars of ``native-check-fetch`` vs the bars aggregated from 1m day files.
 
-    Compared over their overlap; at least 99.9% must agree on OHLC, which is
-    all the 1h/4h features read. Volume agreement follows as an INFO line and
-    never fails the check: no feature reads 1h/4h volume (the POC uses 1m
-    volume), and BingX's native volume differs from the 1m sum in a few bars.
-    A missing or empty native file, missing 1m days or no overlap all FAIL: the
+    Two lines over their overlap, both gating. OHLC, which is all the 1h/4h
+    features read: at least 99.9% of the bars must agree. Volume: no feature
+    reads 1h/4h volume, but this is the only cross-check of the 1m volume the
+    POC reads, and BingX's native volume differs from the 1m sum by up to about
+    1e-4 in a few bars, so only the worst relative difference is bounded (a NaN
+    fails); the share agreeing within 1e-6 is shown for information. A missing
+    or empty native file, missing 1m days or no overlap all FAIL: the
     aggregation is unchecked then, which is never a pass.
     """
     where = f"vs aggregated prod/{symbol}/{interval}"
@@ -295,20 +298,18 @@ def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str],
         return [f"FAIL {label}: no overlap with the 1m data (native bars precede it)"], False
     try:
         bars = load_days(data_dir, "prod", symbol, "1m", first, last)
-    except MissingDayError as exc:
+        agreement = htf_agreement(native, aggregate(bars, step))
+    except (MissingDayError, ValueError) as exc:  # ValueError: no shared open time
         return [f"FAIL {label}: {common.one_line(exc)}"], False
-    aggregated = aggregate(bars, step)
-    if not set(native.open_ms) & set(aggregated.open_ms):
-        return [f"FAIL {label}: no overlap between the native and the aggregated bars"], False
-    agreement = htf_agreement(native, aggregated)
-    ok = agreement.ohlc_share >= NATIVE_AGREEMENT_MIN
+    ohlc_ok = agreement.ohlc_share >= NATIVE_AGREEMENT_MIN
+    volume_ok = agreement.worst_volume_rel <= NATIVE_VOLUME_MAX_REL  # False for NaN
     return [
-        (f"{'PASS' if ok else 'FAIL'} {label}: {agreement.ohlc_share:.4%} of "
+        (f"{'PASS' if ohlc_ok else 'FAIL'} {label}: {agreement.ohlc_share:.4%} of "
          f"{agreement.bars} bars agree (need >= {NATIVE_AGREEMENT_MIN:.1%})"),
-        (f"INFO native volume {where}: {agreement.volume_share:.4%} of {agreement.bars} "
-         f"bars agree, worst relative difference {agreement.worst_volume_rel:.2e} "
-         f"(not gated: no feature reads 1h/4h volume)"),
-    ], ok
+        (f"{'PASS' if volume_ok else 'FAIL'} native volume {where}: worst relative "
+         f"difference {agreement.worst_volume_rel:.2e} (need <= {NATIVE_VOLUME_MAX_REL:.1e}); "
+         f"{agreement.volume_share:.4%} of {agreement.bars} bars within {VOLUME_REL_TOL:.0e}"),
+    ], ohlc_ok and volume_ok
 
 
 def load_training_series(data_dir: Path, symbol: str, last_day: Optional[date] = None) -> Series:

@@ -1,3 +1,4 @@
+import math
 import random
 import unittest
 from array import array
@@ -446,6 +447,14 @@ class HtfAgreementTest(unittest.TestCase):
         self.assertGreater(agreement.worst_volume_rel, 0.0)
         later = htf_agreement(self.native, _from(self.native, POC_START + 6 * HOUR))
         self.assertEqual((later.bars, later.ohlc_share, later.volume_share), (4, 1.0, 1.0))
+
+    def test_a_nan_volume_makes_the_worst_difference_nan_wherever_it_sits(self):
+        for t in (POC_START, POC_START + 9 * HOUR):  # first and last pair
+            nan = replace_bars(self.native, t, t + HOUR,
+                               lambda r: (r[0], r[1], r[2], r[3], r[4], float("nan")))
+            agreement = htf_agreement(nan, self.native)
+            self.assertTrue(math.isnan(agreement.worst_volume_rel), t)
+            self.assertEqual(agreement.volume_share, 0.9)
 
     def test_zero_volume_on_both_sides_agrees(self):
         zero = replace_bars(self.native, POC_START, POC_START + 10 * HOUR,

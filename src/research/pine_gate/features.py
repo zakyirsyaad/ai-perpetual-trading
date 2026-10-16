@@ -339,7 +339,8 @@ class HtfAgreement:
     """Native vs aggregated higher-timeframe bars over their shared open times.
 
     OHLC is what the 1h/4h features read; volume is reported apart because no
-    feature reads 1h/4h volume (the POC uses 1m volume).
+    feature reads 1h/4h volume, but it is the only cross-check of the 1m volume
+    the POC reads. ``worst_volume_rel`` is NaN when any pair's is.
     """
 
     bars: int
@@ -377,4 +378,5 @@ def htf_agreement(native: Bars, aggregated: Bars) -> HtfAgreement:
     ohlc = sum(1 for i, j in pairs if _ohlc_agrees(native, i, aggregated, j))
     rel = [_relative_difference(native.volume[i], aggregated.volume[j]) for i, j in pairs]
     volume = sum(1 for r in rel if r <= VOLUME_REL_TOL)
-    return HtfAgreement(len(pairs), ohlc / len(pairs), volume / len(pairs), max(rel))
+    worst = math.nan if any(math.isnan(r) for r in rel) else max(rel)  # max() skips a NaN
+    return HtfAgreement(len(pairs), ohlc / len(pairs), volume / len(pairs), worst)

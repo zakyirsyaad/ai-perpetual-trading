@@ -627,55 +627,96 @@ class CheckDataCommandTest(Dirs):
         self.assertFalse(ok)
         self.assertTrue(lines[0].startswith("FAIL"), lines)
 
-    def _write_native(self, transform):
+    def _write_native(self, transform, symbol="BTC-USDT"):
         rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
-        write_prod_days(self.data, "BTC-USDT", rows)
+        write_prod_days(self.data, symbol, rows)
         from research.pine_gate import cli_data
         from research.pine_gate.bars import aggregate, bars_from_rows
 
         agg = aggregate(bars_from_rows(rows, MIN), HOUR)
         native = [transform(i, (agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i],
                                 agg.close[i], agg.volume[i])) for i in range(len(agg))]
-        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
+        write_day(cli_data.native_check_path(self.data, symbol, "1h"), native)
         return cli_data, len(agg)
+
+    @staticmethod
+    def _volume_times(factor):
+        return lambda i, r: r[:5] + (r[5] * (factor if i == 0 else 1.0),)
 
     def test_native_check_passes_when_native_bars_match(self):
         cli_data, count = self._write_native(lambda i, r: r)
         lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertTrue(ok, lines)
         self.assertEqual(len(lines), 2, lines)
-        self.assertTrue(lines[0].startswith("PASS"), lines)
-        self.assertIn("OHLC", lines[0])
+        self.assertTrue(lines[0].startswith("PASS native OHLC"), lines)
         self.assertIn(f"of {count} bars", lines[0])
-        self.assertTrue(lines[1].startswith("INFO"), lines)
+        self.assertTrue(lines[1].startswith("PASS native volume"), lines)
         self.assertIn("100.0000%", lines[1])
 
-    def test_native_check_reports_a_volume_difference_without_failing(self):
-        cli_data, count = self._write_native(
-            lambda i, r: r[:5] + (r[5] * (2.0 if i == 0 else 1.0),))
+    def test_native_check_passes_a_small_volume_difference(self):
+        # the VPS case: a few bars off by up to 1.28e-4, inside the 1e-3 bound
+        cli_data, count = self._write_native(self._volume_times(1 + 1.28e-4))
         lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertTrue(ok, lines)
-        self.assertTrue(lines[0].startswith("PASS"), lines)
-        self.assertTrue(lines[1].startswith("INFO"), lines)
-        self.assertIn(f"{(count - 1) / count:.4%}", lines[1])
+        self.assertTrue(lines[1].startswith("PASS native volume"), lines)
+        self.assertIn("worst relative difference 1.28e-04 (need <= 1.0e-03)", lines[1])
+        self.assertIn(f"{(count - 1) / count:.4%} of {count} bars within 1e-06", lines[1])
+
+    def test_native_check_fails_a_gross_volume_difference(self):
+        cli_data, _ = self._write_native(self._volume_times(2.0))
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertTrue(lines[0].startswith("PASS native OHLC"), lines)
+        self.assertTrue(lines[1].startswith("FAIL native volume"), lines)
         self.assertIn("worst relative difference 5.00e-01", lines[1])
-        self.assertIn("not gated", lines[1])
+
+    def test_native_check_fails_a_nan_worst_volume_difference(self):
+        from research.pine_gate.features import HtfAgreement
+
+        cli_data, _ = self._write_native(lambda i, r: r)
+        with mock.patch.object(cli_data, "htf_agreement",
+                               return_value=HtfAgreement(48, 1.0, 47 / 48, float("nan"))):
+            lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertTrue(lines[1].startswith("FAIL native volume"), lines)
 
     def test_native_check_fails_when_a_native_price_differs(self):
         cli_data, _ = self._write_native(
             lambda i, r: r[:2] + (r[2] * (1.01 if i == 0 else 1.0),) + r[3:])
         lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertFalse(ok)
-        self.assertTrue(lines[0].startswith("FAIL"), lines)
-        self.assertIn("OHLC", lines[0])
+        self.assertTrue(lines[0].startswith("FAIL native OHLC"), lines)
+        self.assertTrue(lines[1].startswith("PASS native volume"), lines)
 
-    def test_check_data_prints_the_volume_line_as_info(self):
-        cli_data, _ = self._write_native(
-            lambda i, r: r[:5] + (r[5] * (2.0 if i == 0 else 1.0),))
-        code, out, _ = run_cli(self.base_args() + ["check-data", "--truncation-times", "2"])
-        self.assertEqual(code, 1)  # other files are missing in this fixture
+    def _check_data_exit_code(self, transform):
+        """check-data's exit code with only the BTC 1h native check left real."""
+        cli_data, _ = self._write_native(transform)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cli_data, "SYMBOLS", ("BTC-USDT",)))
+            stack.enter_context(mock.patch.object(cli_data, "WARMUP_INTERVALS", ("1h",)))
+            stack.enter_context(mock.patch.object(cli_data, "days_check",
+                                                  return_value=(["PASS days"], True)))
+            stack.enter_context(mock.patch.object(cli_data, "funding_check",
+                                                  return_value=("PASS funding", True)))
+            stack.enter_context(mock.patch.object(cli_data, "load_training_series",
+                                                  return_value=None))
+            stack.enter_context(mock.patch.object(cli_data, "truncation_check",
+                                                  return_value=("PASS truncation", True)))
+            code, out, _ = run_cli(self.base_args() + ["check-data", "--truncation-times", "2"])
+        return code, out
+
+    def test_check_data_exit_code_follows_the_native_lines(self):
+        code, out = self._check_data_exit_code(self._volume_times(1 + 1.28e-4))
+        self.assertEqual(code, 0, out)
         self.assertIn("PASS native OHLC vs aggregated prod/BTC-USDT/1h", out)
-        self.assertIn("INFO native volume vs aggregated prod/BTC-USDT/1h", out)
+        self.assertIn("PASS native volume vs aggregated prod/BTC-USDT/1h", out)
+        code, out = self._check_data_exit_code(self._volume_times(2.0))
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL native volume", out)
+        code, out = self._check_data_exit_code(
+            lambda i, r: r[:4] + (r[4] * (1.01 if i == 0 else 1.0),) + r[5:])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL native OHLC", out)
 
     def test_truncation_times_must_be_positive(self):
         for value in ("0", "-3"):
