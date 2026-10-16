@@ -90,6 +90,9 @@ export default function CandlePane({
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const entryLineRef = useRef<IPriceLine | null>(null);
   const stemRef = useRef("");
+  // Open time of the newest bar on the series: update() may only touch it or a later bar.
+  const lastTimeRef = useRef(0);
+  const barCountRef = useRef(0);
   const rangeRef = useRef("");
   const formatRef = useRef(formatPrice);
   formatRef.current = formatPrice;
@@ -146,6 +149,8 @@ export default function CandlePane({
       markersRef.current = null;
       entryLineRef.current = null;
       stemRef.current = "";
+      lastTimeRef.current = 0;
+      barCountRef.current = 0;
       rangeRef.current = "";
     };
   }, []);
@@ -162,15 +167,25 @@ export default function CandlePane({
     if (!bars.length) {
       series.setData([]);
       stemRef.current = stem;
+      lastTimeRef.current = 0;
+      barCountRef.current = 0;
       return;
     }
     const stemChanged = stemRef.current !== stem;
-    if (!stemChanged && stem) {
+    const newest = candles[candles.length - 1]!.time;
+    // update() only touches the newest bar. Redraw when the newest bar is older
+    // than the one drawn (a rebuilt or trimmed tape: lightweight-charts would throw
+    // "Cannot update oldest data" and take the page down) or when more than one
+    // bar was added since the last draw (the bars in between would be skipped).
+    const appendsAtMostOne = bars.length - barCountRef.current <= 1;
+    if (!stemChanged && stem && newest >= lastTimeRef.current && appendsAtMostOne) {
       series.update(bars[bars.length - 1]!);
     } else {
       series.setData(bars);
       stemRef.current = stem;
     }
+    lastTimeRef.current = newest;
+    barCountRef.current = bars.length;
     if (rangeRef.current !== rangeKey || stemChanged) {
       rangeRef.current = rangeKey;
       showLatest(chartRef.current, bars.length, visibleBars);
