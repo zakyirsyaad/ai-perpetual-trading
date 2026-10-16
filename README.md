@@ -419,7 +419,8 @@ change it needs a restart, so apply it with a flat position.
 The dashboard shows one card per traded symbol (`SYMBOLS`). To watch another market without
 trading it, list it in `TELEMETRY_SYMBOLS`, for example `TELEMETRY_SYMBOLS=BTC/USDT,ETH/USDT`
 while `SYMBOLS=BTC/USDT`. The extra symbol gets price and candles only: no AI decision, no
-fills, always flat. The traded `SYMBOLS` are always shown first even if you leave them out, and
+new fills, always flat (closed trades of that coin still inside the seeded history window since
+`VOLUME_CYCLE_STARTED_AT` may appear on its History and Trades tabs). The traded `SYMBOLS` are always shown first even if you leave them out, and
 nothing that trades reads this list. Like any `.env` change it needs a restart with a flat
 position.
 
