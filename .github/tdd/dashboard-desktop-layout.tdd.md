@@ -75,6 +75,17 @@ Findings and fixes:
 
 Verified after round 2: 1280x720 chart 346 px, calls feed 191 px, book 267 px, rail 380 px; mobile 375x812 DOM order header, volume, tokens, coins, chart, call, feed, book, with focus order Detail, BTC, ETH, chart intervals, Positions/Trades/History, and every panel at the same top/height/width as main; interval switches 5m -> 1m -> 15m -> 5m redraw cleanly with no console error and no hydration warning.
 
+## Round 3 (second code review of PR #38)
+
+Findings and fixes:
+- Switching trees remounted every panel: on a phone the prerendered desktop tree was mounted and then replaced, creating the chart twice, and crossing 900 px reset the Book tab, the all-markets toggle and the chart interval. `useIsDesktop` now reports `null` while prerendering and hydrating, so the page renders only its header until the browser reports its width and each panel mounts once, in the right tree (the prerendered HTML now holds only the header). The `display: contents` + `order` fallback that painted the desktop tree in stacked order is gone with it. `lib/useSessionState` keeps the Book tab, the all-markets toggle and the chart interval across a remount; FlowChart resets the interval only when the coin actually changes, not on every mount. (`feed.loadTape` was already guarded by its idle/loading/done status, so the second mount never sent a second request.)
+- After the tape reached `TAPE_CAP`, every new candle changed the first bar and snapped the view to the right edge. A redraw now follows the live edge only for a new coin or interval or when the view was already on the last bar (`atLiveEdge`); a view scrolled back to an earlier entry stays put.
+- The Feed is sized by its own `variant="fill"`, like Book; the page stylesheet no longer reaches into it.
+- `useIsDesktop` reuses one module-level `MediaQueryList` instead of creating one per snapshot.
+- `CandlePane` converts only the newest candle on the `update()` path; the full `toBars` runs only on a redraw. The always-true `Boolean(stem)` check is gone.
+
+Verified after round 3: with Trades selected, the token detail open and the chart on 15m, resizing 1280 -> 375 -> 1280 keeps all three; switching BTC -> ETH still resets the interval to 5m. Desktop 1280x720 and mobile 375x812 panel geometry unchanged from round 2 (the token detail open adds its own height). No hydration warning or chart error in the console.
+
 ## Verification
 
 - `bunx tsc --noEmit -p .` (dashboard): clean.
@@ -90,7 +101,9 @@ Verified after round 2: 1280x720 chart 346 px, calls feed 191 px, book 267 px, r
 - 9519f2f `fix: redraw the candle series instead of updating an older bar`
 - 779f123 `docs: TDD evidence for the dashboard desktop layout`
 - 1edac7d `fix: address PR #38 review on chart redraws, mobile order and the rail` (round 2)
-- the docs-only commit that records the round-2 hash makes no code change
+- 926d296 `docs: round 2 of the dashboard layout TDD evidence`
+- c34a28d `fix: mount dashboard panels once and keep their state across the breakpoint` (round 3)
+- the docs-only commit that records the round-3 hash makes no code change
 
 ## Deployment gate
 
