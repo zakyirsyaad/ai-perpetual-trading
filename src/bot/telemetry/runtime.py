@@ -26,8 +26,14 @@ _AI_STRATEGIES = {"grok", "ai_volume"}
 
 
 def build_meta(settings: Settings, *, now_ms: int | None = None) -> Meta:
-    """Dashboard header data. Carries no wallet and no credential of any kind."""
-    sleeves = [SleeveMeta(coin=coin_of(s), pair=pair_of(s), label=coin_of(s), wallet=None) for s in settings.symbols]
+    """Dashboard header data. Carries no wallet and no credential of any kind.
+
+    One sleeve per display symbol; the first traded symbol stays the default market.
+    """
+    sleeves = [
+        SleeveMeta(coin=coin_of(s), pair=pair_of(s), label=coin_of(s), wallet=None)
+        for s in settings.telemetry_display_symbols
+    ]
     first = sleeves[0]
     return Meta(
         model=settings.xai_model if settings.strategy_mode in _AI_STRATEGIES else "volume",
@@ -163,6 +169,9 @@ def build_telemetry(
     """Build the dashboard feed, or None when it is disabled or cannot be built."""
     if not settings.telemetry_enabled:
         return None
+    # Display symbols feed what the screen shows (sleeves, prices, candles). The observer keeps the
+    # traded symbols: the model never looked at a display-only symbol, so it must not show an AI hold.
+    display = settings.telemetry_display_symbols
     try:
         hub = TelemetryHub(build_meta(settings), TelemetryBus())
         server = TelemetryServer(
@@ -174,11 +183,11 @@ def build_telemetry(
         poller = MarketDataPoller(
             hub,
             client,
-            settings.symbols,
+            display,
             interval_seconds=settings.telemetry_price_interval_seconds,
         )
         stream = (
-            BookTickerFeed([pair_of(symbol) for symbol in settings.symbols], poller.on_stream_tick)
+            BookTickerFeed([pair_of(symbol) for symbol in display], poller.on_stream_tick)
             if settings.telemetry_price_stream
             else None
         )

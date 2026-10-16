@@ -128,6 +128,9 @@ class Settings(BaseSettings):
     # Live dashboard prices from BingX's public VST websocket, about every 0.4s instead of every
     # TELEMETRY_PRICE_INTERVAL_SECONDS. Off by default; polling stays on as the fallback either way.
     telemetry_price_stream: bool = Field(default=False, alias="TELEMETRY_PRICE_STREAM")
+    # Extra symbols the dashboard shows (price and candles only). Display-only: nothing that
+    # trades reads it. Empty = the traded SYMBOLS; see `telemetry_display_symbols`.
+    telemetry_symbols: Annotated[tuple[str, ...], NoDecode] = Field(default=(), alias="TELEMETRY_SYMBOLS")
     # Selective confluence entry (validated on 3m/5m; 1m is too noisy).
     confluence_enabled: bool = Field(default=True, alias="CONFLUENCE_ENABLED")
     confluence_min_agreement: float = Field(default=0.55, ge=0.0, le=1.0, alias="CONFLUENCE_MIN_AGREEMENT")
@@ -440,7 +443,7 @@ class Settings(BaseSettings):
             raise ValueError("Required credential is empty. Fill the matching key in .env.")
         return value.strip()
 
-    @field_validator("symbols", mode="before")
+    @field_validator("symbols", "telemetry_symbols", mode="before")
     @classmethod
     def parse_symbols(cls, value: Any) -> tuple[str, ...]:
         if isinstance(value, str):
@@ -634,6 +637,15 @@ class Settings(BaseSettings):
     def exchange_name(self) -> str:
         """Venue label written to storage, logs, and AI payloads."""
         return "bingx"
+
+    @property
+    def telemetry_display_symbols(self) -> tuple[str, ...]:
+        """Symbols the dashboard shows: SYMBOLS first, then TELEMETRY_SYMBOLS, without repeats.
+
+        The traded symbols are always included, so a symbol the bot trades can never disappear
+        from the dashboard. For the telemetry feed only; trading code must keep reading `symbols`.
+        """
+        return tuple(dict.fromkeys((*self.symbols, *self.telemetry_symbols)))
 
     @property
     def margin_mode(self) -> str:
