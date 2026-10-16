@@ -64,6 +64,7 @@ def price(mid: float = 100.0) -> PriceMessage:
 
 class ServerCase(unittest.IsolatedAsyncioTestCase):
     max_clients = 4
+    ping_seconds = 0.05
 
     async def asyncSetUp(self) -> None:
         self.hub = TelemetryHub(Meta.model_validate(SAMPLES["meta"]), TelemetryBus())
@@ -72,7 +73,7 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
             host="127.0.0.1",
             port=0,
             allowed_origin=ORIGIN,
-            ping_seconds=0.05,
+            ping_seconds=self.ping_seconds,
             request_timeout=0.3,
             max_clients=self.max_clients,
         )
@@ -258,6 +259,39 @@ class EventStreamTests(ServerCase):
         writer.close()
 
         self.assertNotIn(b"event: snapshot", rest)
+
+
+class CancellationTests(ServerCase):
+    # asyncio.wait_for (3.11 and earlier) returns a result that finished in the same loop
+    # tick as the cancel and drops the cancellation. These pin the server to with_timeout.
+    ping_seconds = 60.0  # keep an idle stream parked on its queue, never on a ping write
+
+    async def test_cancelling_a_request_read_is_never_swallowed_even_if_the_request_arrives_in_the_same_tick(self) -> None:
+        reader = asyncio.StreamReader()
+        task = asyncio.create_task(self.server._read_request(reader))
+        await asyncio.sleep(0.01)  # the read is now parked waiting for bytes
+
+        reader.feed_data(get("/"))
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_stopping_the_server_is_never_lost_to_a_message_arriving_in_the_same_tick(self) -> None:
+        reader, writer, _ = await open_events(self.port)
+        await next_frame(reader)
+        await asyncio.sleep(0.01)  # the stream is now parked on its message queue
+
+        self.hub.record_price(price())
+        stop = asyncio.ensure_future(self.server.stop())
+        try:
+            await asyncio.wait({stop}, timeout=1.0)
+
+            self.assertTrue(stop.done(), "stop() hung: the stream swallowed its cancellation")
+        finally:
+            stop.cancel()  # cancelling the gather re-cancels a stream that swallowed the first one
+            await asyncio.gather(stop, return_exceptions=True)
+            writer.close()
 
 
 class LifecycleTests(ServerCase):
