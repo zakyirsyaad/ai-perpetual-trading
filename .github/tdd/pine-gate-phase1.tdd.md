@@ -102,7 +102,7 @@ Progress of the suite during development: 900 tests before Task 1, 1,429 at the 
 - Two fixes found before any outcome was computed:
   - PR #32 (`79c9e14`): 100410 is "retry later", so back off 5/15/45 s; warm-up windows at most 1000 bars; funding windows at most 30 days (long BTC funding windows had been silently truncated at their start). The spec sha did not change.
   - PR #33 (`9b189cf`): the first `train` was refused by the purge check ("a trade can last 74.6 min from its tick, longer than the 65-minute purge"). Live latency sample: n 1,903, median 54 s, p90 106 s, p99 227 s, max 808.5 s. The purge is now derived from the calibration (75 minutes). Final code sha `e915262310aeea70e183db9b518d5a2bd5d2d33ca6eff0951b3cc559d272d0c5`. No outcome was computed in the refused run.
-- `check-data` (22:54 wall, 412 MB peak): PASS days, funding cadence, truncation invariance at 500 real times. FAIL native-vs-aggregated 1h/4h agreement (BTC 98.92% and 95.70%, ETH 99.60% and 98.92%, threshold 99.9%). Deviation ruling: OHLC is identical in 100% of the overlapping bars; only volume differs, in 2–8 bars per series, worst relative difference 1.28e-4 against a tolerance of 1e-6. The 1h and 4h features read OHLC only, higher-timeframe volume is unused, and the volume profile uses 1m volume, so the aggregation is valid for every feature used. The 99.9% threshold is a code-level integrity check, not spec-hashed and not a gate. Training proceeded without a code change (the report states the deviation). Follow-up still open: split `check-data` into a gating OHLC agreement and an informational volume agreement.
+- `check-data` (22:54 wall, 412 MB peak): PASS days, funding cadence, truncation invariance at 500 real times. FAIL native-vs-aggregated 1h/4h agreement (BTC 98.92% and 95.70%, ETH 99.60% and 98.92%, threshold 99.9%). Deviation ruling: OHLC is identical in 100% of the overlapping bars; only volume differs, in 2–8 bars per series, worst relative difference 1.28e-4 against a tolerance of 1e-6. The 1h and 4h features read OHLC only, higher-timeframe volume is unused, and the volume profile uses 1m volume, so the aggregation is valid for every feature used. The 99.9% threshold is a code-level integrity check, not spec-hashed and not a gate. Training proceeded without a code change (the report states the deviation). Follow-up done after the holdout (see Follow-ups): `check-data` now gates on OHLC agreement only and reports volume agreement as an INFO line.
 - `calibrate`: s* 1.0 bp (fallback: 13 rebuilt stops, below the 15 needed), 4 skipped, 1,903 latencies, written to `~/replay/out/pine_gate_calibration_20261016.json`. A collector cron line (`23 5 * * *`) was added; the existing six lines are unchanged.
 - `train` (3:28 wall, 359 MB peak): selection file `~/replay/out/pine_gate_selection_20261016.json`, sha256 `3687376145f2f111c976ed78b50e25b7e58be07308615387a7d3cdcee7a9e310`. Contender 1 frozen as `H4|P40|ADX|OFF|OFF` (training WR 50.5%, lower bound 48.9%, gross -0.44 bps, 14.6 trades/day); the top five all sit near 50% WR; stable; PBO 0.014; SPA p 0.0005; not supply-limited. Contender 3 primary `H4|P40|OFF|OFF|OFF`, C 10, p* 0.4945. Training C0 passed.
 - Pre-registration record posted on PR #31 before the test: https://github.com/zakyirsyaad/ai-perpetual-trading/pull/31#issuecomment-6203188477
@@ -128,4 +128,36 @@ No contender passed the staged gate. Out-of-sample gross edge is between about -
 
 ## Deployment gate
 
-Nothing was deployed to the bot. This branch changes documentation, the TradingView helper script defaults and this evidence file only; no Python code and no `.env` value changed. The research package ran on the VPS from a separate directory (`~/replay/pine_gate_repo/src`) under `nice -n 19`, and the pm2 app `ai-perp-volume` was neither restarted nor reconfigured. The only persistent VPS change is the daily collector cron line, which writes public market data to `~/replay/pine_gate/data/`. Any Phase 2 work (wiring a gate into `AIOrchestrator`) requires a contender that passes a new pre-registered holdout and a fresh decision from the user.
+Nothing was deployed to the bot. This branch changes documentation, the TradingView helper script defaults and this evidence file only; no Python code and no `.env` value changed. The research package ran on the VPS from a separate directory (`~/replay/pine_gate_repo/src`) under `nice -n 19`, and the pm2 app `ai-perp-volume` was neither restarted nor reconfigured. The only persistent VPS change was the daily collector cron line, which wrote public market data to `~/replay/pine_gate/data/`; it was removed on 2026-10-16 after the verdict (see Follow-ups). Any Phase 2 work (wiring a gate into `AIOrchestrator`) requires a contender that passes a new pre-registered holdout and a fresh decision from the user.
+
+## Follow-ups (2026-10-16, after the verdict)
+
+### Collector cron removed
+
+Nothing passed, so the forward VST ETH data the collector gathered for the section 5.12 check is no longer needed. The `23 5 * * *` `research.pine_gate.cli collect` line and its comment were removed from the VPS crontab; the remaining six lines are byte-identical to the backup taken before the line was added (`diff` against `~/replay/pine_gate/crontab.before` is empty), so the supervisor and `kline_keeper.py` lines are unchanged. The crontab with the collector is kept as `~/replay/pine_gate/crontab.with-collector-<timestamp>`. The data already collected stays in `~/replay/pine_gate/data/`.
+
+### `check-data`: OHLC gates, volume informs
+
+User journey: an operator runs `check-data` on complete data and gets FAIL on all four native-vs-aggregated lines, although the 1h/4h features read only OHLC and OHLC agrees in 100% of the bars. The step-9 ruling above had to overrule the tool by hand.
+
+RED (tests written first, before the implementation): `HtfAgreementTest` now expects `htf_agreement` to return an `HtfAgreement` with `bars`, `ohlc_share`, `volume_share` and `worst_volume_rel`, including the VPS case (OHLC identical, one bar's volume off by 1.28e-4); `CheckDataCommandTest` expects `native_check` to return a gating `PASS/FAIL native OHLC ...` line plus an `INFO native volume ...` line, a volume-only difference to pass, and a price difference to fail. Result: `FAILED (failures=6, errors=4)` (`AttributeError: 'float' object has no attribute 'ohlc_share'`; `AssertionError: False is not true : FAIL native vs aggregated prod/BTC-USDT/1h: 97.9167% of 48 bars agree (need >= 99.9%)`).
+
+GREEN:
+- `features.py`: frozen `HtfAgreement`; `_ohlc_agrees` (price tolerance 1e-9 unchanged) and `_relative_difference` (the measure `math.isclose` uses); volume still counts as agreeing within 1e-6.
+- `cli_data.native_check` returns `(lines, ok)`; `ok` depends on the OHLC share only (threshold 99.9% unchanged). Every missing-file, missing-day and no-overlap case still FAILs.
+- One test expectation was corrected during GREEN: the relative difference is taken against the larger value, so a 1.28e-4 increase reads as 1.28e-4 / (1 + 1.28e-4).
+
+Verification on the real VPS data (branch code copied to a temporary directory, run under `nice -n 19`, directory removed afterwards):
+
+| Series | OHLC (gated) | Volume (info) | Worst volume difference |
+|---|---|---|---|
+| BTC 1h | PASS 100.0000% of 744 | 98.9247% | 1.28e-04 |
+| BTC 4h | PASS 100.0000% of 186 | 95.6989% | 3.62e-05 |
+| ETH 1h | PASS 100.0000% of 744 | 99.5968% | 6.58e-05 |
+| ETH 4h | PASS 100.0000% of 186 | 98.9247% | 9.85e-06 |
+
+The volume shares match the figures behind the step-9 ruling exactly.
+
+Local: 1,548 tests OK, 89% total line coverage (`features.py` 99%), `compileall` clean, `git diff --check` clean.
+
+Lock note: `features.py` and `cli_data.py` are inside the code fingerprint, so `code_sha256` changes and the frozen selection file no longer matches current code. This is expected and harmless: the holdout already ran once and its run marker refuses any second test regardless. A future study needs its own pre-registration.

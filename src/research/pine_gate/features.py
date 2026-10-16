@@ -334,22 +334,38 @@ class FeatureFrame:
         return _poc(bars.low[first:end], bars.high[first:end], bars.volume[first:end], price)
 
 
-def _bar_agrees(native: Bars, i: int, aggregated: Bars, j: int) -> bool:
+@dataclass(frozen=True)
+class HtfAgreement:
+    """Native vs aggregated higher-timeframe bars over their shared open times.
+
+    OHLC is what the 1h/4h features read; volume is reported apart because no
+    feature reads 1h/4h volume (the POC uses 1m volume).
+    """
+
+    bars: int
+    ohlc_share: float
+    volume_share: float
+    worst_volume_rel: float
+
+
+def _ohlc_agrees(native: Bars, i: int, aggregated: Bars, j: int) -> bool:
     prices = (
         (native.open[i], aggregated.open[j]),
         (native.high[i], aggregated.high[j]),
         (native.low[i], aggregated.low[j]),
         (native.close[i], aggregated.close[j]),
     )
-    return all(
-        math.isclose(a, b, rel_tol=PRICE_REL_TOL, abs_tol=0.0) for a, b in prices
-    ) and math.isclose(
-        native.volume[i], aggregated.volume[j], rel_tol=VOLUME_REL_TOL, abs_tol=0.0
-    )
+    return all(math.isclose(a, b, rel_tol=PRICE_REL_TOL, abs_tol=0.0) for a, b in prices)
 
 
-def htf_agreement(native: Bars, aggregated: Bars) -> float:
-    """Share of open times present in both whose OHLC and volume agree."""
+def _relative_difference(a: float, b: float) -> float:
+    """|a - b| over the larger magnitude, the measure ``math.isclose`` compares."""
+    scale = max(abs(a), abs(b))
+    return 0.0 if scale == 0.0 else abs(a - b) / scale
+
+
+def htf_agreement(native: Bars, aggregated: Bars) -> HtfAgreement:
+    """OHLC and volume agreement of the open times present in both."""
     if native.interval_ms != aggregated.interval_ms:
         raise ValueError(
             f"interval mismatch: {native.interval_ms} ms vs {aggregated.interval_ms} ms"
@@ -358,5 +374,7 @@ def htf_agreement(native: Bars, aggregated: Bars) -> float:
     pairs = [(i, index[t]) for i, t in enumerate(native.open_ms) if t in index]
     if not pairs:
         raise ValueError("native and aggregated bars share no open time")
-    agreed = sum(1 for i, j in pairs if _bar_agrees(native, i, aggregated, j))
-    return agreed / len(pairs)
+    ohlc = sum(1 for i, j in pairs if _ohlc_agrees(native, i, aggregated, j))
+    rel = [_relative_difference(native.volume[i], aggregated.volume[j]) for i, j in pairs]
+    volume = sum(1 for r in rel if r <= VOLUME_REL_TOL)
+    return HtfAgreement(len(pairs), ohlc / len(pairs), volume / len(pairs), max(rel))

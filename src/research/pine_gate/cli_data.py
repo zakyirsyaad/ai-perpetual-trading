@@ -270,37 +270,45 @@ def read_warmups(data_dir: Path, symbol: str) -> Tuple[Optional[Bars], Optional[
     return out[0], out[1]
 
 
-def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[str, bool]:
+def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str], bool]:
     """Native bars of ``native-check-fetch`` vs the bars aggregated from 1m day files.
 
-    Compared over their overlap; at least 99.9% must agree. A missing or empty
-    native file, missing 1m days or no overlap all FAIL: the aggregation is
-    unchecked then, which is never a pass.
+    Compared over their overlap; at least 99.9% must agree on OHLC, which is
+    all the 1h/4h features read. Volume agreement follows as an INFO line and
+    never fails the check: no feature reads 1h/4h volume (the POC uses 1m
+    volume), and BingX's native volume differs from the 1m sum in a few bars.
+    A missing or empty native file, missing 1m days or no overlap all FAIL: the
+    aggregation is unchecked then, which is never a pass.
     """
-    label = f"native vs aggregated prod/{symbol}/{interval}"
+    where = f"vs aggregated prod/{symbol}/{interval}"
+    label = f"native OHLC {where}"
     path = native_check_path(data_dir, symbol, interval)
     if not path.exists():
-        return f"FAIL {label}: {path.name} missing; run native-check-fetch", False
+        return [f"FAIL {label}: {path.name} missing; run native-check-fetch"], False
     step = interval_to_ms(interval)
     native = bars_from_rows(read_day(path), step)
     if not len(native):
-        return f"FAIL {label}: {path.name} holds no bars", False
+        return [f"FAIL {label}: {path.name} holds no bars"], False
     first = max(wib_day(native.open_ms[0]), wib_day(ms(TRAIN_START)))
     last = wib_day(native.open_ms[-1] + step - 1)
     if last < first:
-        return f"FAIL {label}: no overlap with the 1m data (native bars precede it)", False
+        return [f"FAIL {label}: no overlap with the 1m data (native bars precede it)"], False
     try:
         bars = load_days(data_dir, "prod", symbol, "1m", first, last)
     except MissingDayError as exc:
-        return f"FAIL {label}: {common.one_line(exc)}", False
+        return [f"FAIL {label}: {common.one_line(exc)}"], False
     aggregated = aggregate(bars, step)
-    shared = set(native.open_ms) & set(aggregated.open_ms)
-    if not shared:
-        return f"FAIL {label}: no overlap between the native and the aggregated bars", False
-    share = htf_agreement(native, aggregated)
-    ok = share >= NATIVE_AGREEMENT_MIN
-    return (f"{'PASS' if ok else 'FAIL'} {label}: {share:.4%} of {len(shared)} bars agree "
-            f"(need >= {NATIVE_AGREEMENT_MIN:.1%})"), ok
+    if not set(native.open_ms) & set(aggregated.open_ms):
+        return [f"FAIL {label}: no overlap between the native and the aggregated bars"], False
+    agreement = htf_agreement(native, aggregated)
+    ok = agreement.ohlc_share >= NATIVE_AGREEMENT_MIN
+    return [
+        (f"{'PASS' if ok else 'FAIL'} {label}: {agreement.ohlc_share:.4%} of "
+         f"{agreement.bars} bars agree (need >= {NATIVE_AGREEMENT_MIN:.1%})"),
+        (f"INFO native volume {where}: {agreement.volume_share:.4%} of {agreement.bars} "
+         f"bars agree, worst relative difference {agreement.worst_volume_rel:.2e} "
+         f"(not gated: no feature reads 1h/4h volume)"),
+    ], ok
 
 
 def load_training_series(data_dir: Path, symbol: str, last_day: Optional[date] = None) -> Series:
@@ -349,8 +357,8 @@ def cmd_check_data(args: argparse.Namespace) -> int:
         lines.append(line)
         all_ok = all_ok and ok
         for interval in WARMUP_INTERVALS:
-            line, ok = native_check(args.data_dir, symbol, interval)
-            lines.append(line)
+            native_lines, ok = native_check(args.data_dir, symbol, interval)
+            lines.extend(native_lines)
             all_ok = all_ok and ok
     try:
         series = {s: load_training_series(args.data_dir, s) for s in SYMBOLS}

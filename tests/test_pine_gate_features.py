@@ -418,17 +418,40 @@ class HtfAgreementTest(unittest.TestCase):
                                                100.0, 0.01), HOUR)
 
     def test_identical_bars_agree_fully(self):
-        self.assertEqual(htf_agreement(self.native, self.native), 1.0)
+        agreement = htf_agreement(self.native, self.native)
+        self.assertEqual(agreement.bars, 10)
+        self.assertEqual(agreement.ohlc_share, 1.0)
+        self.assertEqual(agreement.volume_share, 1.0)
+        self.assertEqual(agreement.worst_volume_rel, 0.0)
 
-    def test_share_of_overlapping_bars_that_agree(self):
+    def test_price_and_volume_agreement_are_counted_apart(self):
         changed = replace_bars(self.native, POC_START + 2 * HOUR, POC_START + 3 * HOUR,
                                lambda r: (r[0], r[1], r[2], r[3], r[4] * 1.001, r[5]))
-        self.assertEqual(htf_agreement(self.native, changed), 0.9)
+        agreement = htf_agreement(self.native, changed)
+        self.assertEqual(agreement.ohlc_share, 0.9)
+        self.assertEqual(agreement.volume_share, 1.0)
+        # the VPS case: OHLC identical, one bar's volume off by 1.28e-4
+        volume = replace_bars(self.native, POC_START + 4 * HOUR, POC_START + 5 * HOUR,
+                              lambda r: (r[0], r[1], r[2], r[3], r[4], r[5] * (1 + 1.28e-4)))
+        agreement = htf_agreement(self.native, volume)
+        self.assertEqual(agreement.ohlc_share, 1.0)
+        self.assertEqual(agreement.volume_share, 0.9)
+        self.assertAlmostEqual(agreement.worst_volume_rel, 1.28e-4 / (1 + 1.28e-4), places=12)
+
+    def test_tolerances_and_partial_overlap(self):
         tiny = replace_bars(self.native, POC_START, POC_START + HOUR,
                             lambda r: (r[0], r[1], r[2], r[3], r[4], r[5] * (1 + 1e-8)))
-        self.assertEqual(htf_agreement(self.native, tiny), 1.0)
-        later = _from(self.native, POC_START + 6 * HOUR)
-        self.assertEqual(htf_agreement(self.native, later), 1.0)
+        agreement = htf_agreement(self.native, tiny)
+        self.assertEqual(agreement.volume_share, 1.0)
+        self.assertGreater(agreement.worst_volume_rel, 0.0)
+        later = htf_agreement(self.native, _from(self.native, POC_START + 6 * HOUR))
+        self.assertEqual((later.bars, later.ohlc_share, later.volume_share), (4, 1.0, 1.0))
+
+    def test_zero_volume_on_both_sides_agrees(self):
+        zero = replace_bars(self.native, POC_START, POC_START + 10 * HOUR,
+                            lambda r: (r[0], r[1], r[2], r[3], r[4], 0.0))
+        agreement = htf_agreement(zero, zero)
+        self.assertEqual((agreement.volume_share, agreement.worst_volume_rel), (1.0, 0.0))
 
     def test_no_overlap_raises(self):
         head = slice_until(self.native, POC_START + 3 * HOUR)

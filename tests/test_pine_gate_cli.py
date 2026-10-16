@@ -609,10 +609,11 @@ class CheckDataCommandTest(Dirs):
                         synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
         from research.pine_gate import cli_data
 
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertFalse(ok)
-        self.assertTrue(line.startswith("FAIL"), line)
-        self.assertIn("native-check-fetch", line)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("FAIL"), lines)
+        self.assertIn("native-check-fetch", lines[0])
 
     def test_native_check_without_overlap_fails(self):
         write_prod_days(self.data, "BTC-USDT",
@@ -622,38 +623,59 @@ class CheckDataCommandTest(Dirs):
         start = wib_day_start_ms(FIRST_DAY) + 5 * DAY  # no 1m day file covers it
         write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"),
                   [(start, 1.0, 1.0, 1.0, 1.0, 1.0)])
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertFalse(ok)
-        self.assertTrue(line.startswith("FAIL"), line)
+        self.assertTrue(lines[0].startswith("FAIL"), lines)
+
+    def _write_native(self, transform):
+        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
+        write_prod_days(self.data, "BTC-USDT", rows)
+        from research.pine_gate import cli_data
+        from research.pine_gate.bars import aggregate, bars_from_rows
+
+        agg = aggregate(bars_from_rows(rows, MIN), HOUR)
+        native = [transform(i, (agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i],
+                                agg.close[i], agg.volume[i])) for i in range(len(agg))]
+        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
+        return cli_data, len(agg)
 
     def test_native_check_passes_when_native_bars_match(self):
-        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
-        write_prod_days(self.data, "BTC-USDT", rows)
-        from research.pine_gate import cli_data
-        from research.pine_gate.bars import aggregate, bars_from_rows
+        cli_data, count = self._write_native(lambda i, r: r)
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertTrue(ok, lines)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith("PASS"), lines)
+        self.assertIn("OHLC", lines[0])
+        self.assertIn(f"of {count} bars", lines[0])
+        self.assertTrue(lines[1].startswith("INFO"), lines)
+        self.assertIn("100.0000%", lines[1])
 
-        agg = aggregate(bars_from_rows(rows, MIN), HOUR)
-        native = [(agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i], agg.close[i],
-                   agg.volume[i]) for i in range(len(agg))]
-        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
-        self.assertTrue(ok, line)
-        self.assertTrue(line.startswith("PASS"), line)
-        self.assertIn(f"of {len(agg)} bars", line)
+    def test_native_check_reports_a_volume_difference_without_failing(self):
+        cli_data, count = self._write_native(
+            lambda i, r: r[:5] + (r[5] * (2.0 if i == 0 else 1.0),))
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertTrue(ok, lines)
+        self.assertTrue(lines[0].startswith("PASS"), lines)
+        self.assertTrue(lines[1].startswith("INFO"), lines)
+        self.assertIn(f"{(count - 1) / count:.4%}", lines[1])
+        self.assertIn("worst relative difference 5.00e-01", lines[1])
+        self.assertIn("not gated", lines[1])
 
-    def test_native_check_fails_when_a_native_bar_differs(self):
-        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
-        write_prod_days(self.data, "BTC-USDT", rows)
-        from research.pine_gate import cli_data
-        from research.pine_gate.bars import aggregate, bars_from_rows
-
-        agg = aggregate(bars_from_rows(rows, MIN), HOUR)
-        native = [(agg.open_ms[i], agg.open[i], agg.high[i], agg.low[i], agg.close[i],
-                   agg.volume[i] * (2.0 if i == 0 else 1.0)) for i in range(len(agg))]
-        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"), native)
-        line, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+    def test_native_check_fails_when_a_native_price_differs(self):
+        cli_data, _ = self._write_native(
+            lambda i, r: r[:2] + (r[2] * (1.01 if i == 0 else 1.0),) + r[3:])
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
         self.assertFalse(ok)
-        self.assertTrue(line.startswith("FAIL"), line)
+        self.assertTrue(lines[0].startswith("FAIL"), lines)
+        self.assertIn("OHLC", lines[0])
+
+    def test_check_data_prints_the_volume_line_as_info(self):
+        cli_data, _ = self._write_native(
+            lambda i, r: r[:5] + (r[5] * (2.0 if i == 0 else 1.0),))
+        code, out, _ = run_cli(self.base_args() + ["check-data", "--truncation-times", "2"])
+        self.assertEqual(code, 1)  # other files are missing in this fixture
+        self.assertIn("PASS native OHLC vs aggregated prod/BTC-USDT/1h", out)
+        self.assertIn("INFO native volume vs aggregated prod/BTC-USDT/1h", out)
 
     def test_truncation_times_must_be_positive(self):
         for value in ("0", "-3"):
