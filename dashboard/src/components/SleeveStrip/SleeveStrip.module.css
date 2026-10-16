@@ -92,6 +92,60 @@
   letter-spacing: 0.04em;
 }
 
+/* Desktop tab row: one compact tab per coin, sized to its content. */
+@media (min-width: 900px) {
+  .tabs {
+    display: flex;
+    grid-template-columns: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tabs .card {
+    flex: 0 0 auto;
+    min-width: 200px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "top top"
+      "book pnl";
+    align-items: baseline;
+    gap: 5px 16px;
+    padding: 9px 16px 8px;
+  }
+
+  .tabs .card:last-child {
+    border-right: 1px solid var(--border);
+  }
+
+  .tabs .top {
+    grid-area: top;
+  }
+
+  .tabs .book {
+    grid-area: book;
+  }
+
+  .tabs .pnl {
+    grid-area: pnl;
+    font-size: 13px;
+    line-height: 1.25;
+  }
+
+  .tabs .call {
+    display: none;
+  }
+
+  .tabs .active {
+    box-shadow: inset 0 -3px 0 var(--ink);
+  }
+}
+
 @media (max-width: 899.98px) {
   .strip {
     display: flex;

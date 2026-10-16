@@ -7,6 +7,8 @@ import styles from "./VolumePanel.module.css";
 
 export interface VolumePanelProps {
   volume: VolumeSummary | null;
+  /** "rail": one column for the desktop side rail (mobile is unchanged). */
+  variant?: "band" | "rail";
 }
 
 const MAX_DAYS = 14;
@@ -15,7 +17,7 @@ function pct(part: number, whole: number): number {
   return whole > 0 ? Math.max(0, (part / whole) * 100) : 0;
 }
 
-export default function VolumePanel({ volume }: VolumePanelProps) {
+export default function VolumePanel({ volume, variant = "band" }: VolumePanelProps) {
   const target = volume?.dailyTargetUsd ?? 0;
   const todayPct = volume ? pct(volume.todayUsd, target) : 0;
   const reached = volume != null && target > 0 && volume.todayUsd >= target;
@@ -24,7 +26,7 @@ export default function VolumePanel({ volume }: VolumePanelProps) {
   const since = volume?.days[0]?.day;
 
   return (
-    <section className={styles.panel} aria-label="Trading volume">
+    <section className={variant === "rail" ? `${styles.panel} ${styles.rail}` : styles.panel} aria-label="Trading volume">
       <div className={styles.today}>
         <span className={styles.label}>Volume today</span>
         {volume ? (

@@ -9,6 +9,8 @@ import styles from "./UsagePanel.module.css";
 
 export interface UsagePanelProps {
   usage: UsageSummary | null;
+  /** "rail": compact layout for the desktop side rail (mobile is unchanged). */
+  variant?: "band" | "rail";
 }
 
 const MAX_DAYS = 14;
@@ -60,7 +62,7 @@ function DayRow({ day, today, widest }: { day: UsageDay; today: boolean; widest:
   );
 }
 
-export default function UsagePanel({ usage }: UsagePanelProps) {
+export default function UsagePanel({ usage, variant = "band" }: UsagePanelProps) {
   const [open, setOpen] = useState(false);
 
   // Remembered per browser; the page is correct without it (private window, blocked storage).
@@ -90,7 +92,7 @@ export default function UsagePanel({ usage }: UsagePanelProps) {
   const since = usage?.days[0]?.day;
 
   return (
-    <section className={styles.panel} aria-label="MiMo token usage">
+    <section className={variant === "rail" ? `${styles.panel} ${styles.rail}` : styles.panel} aria-label="MiMo token usage">
       <div className={styles.strip}>
         <span className={styles.label}>MiMo tokens</span>
         {today && todayMix ? (

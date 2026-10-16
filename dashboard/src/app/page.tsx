@@ -75,23 +75,26 @@ export default function Page() {
 
   return (
     <div className="shell">
-      <Header
-        connection={feed.connection}
-        unrealized={hasBooks ? pnl.unrealized : null}
-        realized={hasBooks ? pnl.realized : null}
-      />
-      <VolumePanel volume={volume} />
-      <UsagePanel usage={usage} />
-      <SleeveStrip
-        sleeves={feed.meta?.sleeves ?? []}
-        latestByCoin={latestByCoin}
-        lastCallByCoin={lastCallByCoin}
-        selected={coin}
-        onSelect={setPicked}
-        waiting={waiting}
-      />
-      <div className={styles.main}>
-        <div className={styles.left}>
+      <div className={styles.slotHeader}>
+        <Header
+          connection={feed.connection}
+          unrealized={hasBooks ? pnl.unrealized : null}
+          realized={hasBooks ? pnl.realized : null}
+        />
+      </div>
+      <div className={styles.body}>
+        <div className={styles.work}>
+          <div className={styles.slotSleeves}>
+            <SleeveStrip
+              sleeves={feed.meta?.sleeves ?? []}
+              latestByCoin={latestByCoin}
+              lastCallByCoin={lastCallByCoin}
+              selected={coin}
+              onSelect={setPicked}
+              waiting={waiting}
+              variant="tabs"
+            />
+          </div>
           <div className={styles.chartWrap}>
             <FlowChart
               tape={sleeve.tape ?? []}
@@ -101,22 +104,34 @@ export default function Page() {
               onNeedMoreTape={feed.loadTape}
             />
           </div>
+          <div className={styles.slotBook}>
+            <Book
+              sleeves={feed.meta?.sleeves ?? []}
+              latestByCoin={latestByCoin}
+              tapeByCoin={tapeByCoin}
+              selected={coin}
+              meta={meta}
+              onSelect={setPicked}
+              onNeedMoreTape={feed.loadTape}
+              waiting={waiting}
+            />
+          </div>
         </div>
-        <div className={styles.right}>
-          <DecisionPanel latest={sleeve.latest} meta={meta} waiting={waiting} />
-          <Feed events={sleeve.events} meta={meta} waiting={waiting} />
+        <div className={styles.rail}>
+          <div className={styles.slotVolume}>
+            <VolumePanel volume={volume} variant="rail" />
+          </div>
+          <div className={styles.slotUsage}>
+            <UsagePanel usage={usage} variant="rail" />
+          </div>
+          <div className={styles.slotDecision}>
+            <DecisionPanel latest={sleeve.latest} meta={meta} waiting={waiting} />
+          </div>
+          <div className={styles.slotFeed}>
+            <Feed events={sleeve.events} meta={meta} waiting={waiting} />
+          </div>
         </div>
       </div>
-      <Book
-        sleeves={feed.meta?.sleeves ?? []}
-        latestByCoin={latestByCoin}
-        tapeByCoin={tapeByCoin}
-        selected={coin}
-        meta={meta}
-        onSelect={setPicked}
-        onNeedMoreTape={feed.loadTape}
-        waiting={waiting}
-      />
     </div>
   );
 }

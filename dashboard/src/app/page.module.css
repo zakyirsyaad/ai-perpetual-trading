@@ -1,64 +1,114 @@
-/* Desktop (>= 900px): the shell is a fixed-height flex column
-   and this row is its only flexible child. */
+/* Desktop (>= 900px): header on top, then two columns. The work column holds the
+   coin tabs, the chart and the positions/trades/history book; the rail holds the
+   daily volume, the token strip, the latest call and the call feed.
+   Mobile (< 900px): every wrapper below is display: contents and `order` keeps
+   the original stacked sequence (header, volume, tokens, coins, chart, call,
+   feed, book). */
 
-.main {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: stretch;
+.slotHeader {
+  flex: none;
 }
 
-.left {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
+.body {
+  --rail-w: 360px;
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--rail-w);
+}
+
+.work {
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(240px, 1fr) minmax(200px, 40%);
+}
+
+.slotSleeves {
+  min-width: 0;
 }
 
 .chartWrap {
-  flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
-.right {
-  width: 380px;
-  flex: none;
+.slotBook {
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  background: var(--panel);
-  border-left: 1px solid var(--border);
-  overflow: hidden;
 }
 
-.right > :first-child {
+
+.rail {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+.slotVolume,
+.slotUsage,
+.slotDecision {
   flex: none;
 }
 
-.right > :last-child {
-  flex: 1;
-  min-height: 0;
+.slotFeed {
+  flex: 1 0 180px;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
 }
 
 @media (min-width: 900px) {
-  .main {
-    flex: 1 1 0;
+  /* The book's own fixed height is for the stacked mobile layout; here it fills its row. */
+  .work .slotBook > * {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
+
+  .slotFeed > * {
+    flex: 1;
+    min-height: 0;
+  }
+}
+
+@media (min-width: 1440px) {
+  .body {
+    --rail-w: 400px;
+  }
+}
+
+@media (min-width: 1800px) {
+  .body {
+    --rail-w: 440px;
   }
 }
 
 @media (max-width: 899.98px) {
-  .main {
-    flex: none;
-    flex-direction: column;
+  .body,
+  .work,
+  .rail {
+    display: contents;
   }
 
-  .left {
-    flex: none;
-  }
+  .slotHeader { order: 1; }
+  .slotVolume { order: 2; }
+  .slotUsage { order: 3; }
+  .slotSleeves { order: 4; }
+  .chartWrap { order: 5; }
+  .slotDecision { order: 6; }
+  .slotFeed { order: 7; }
+  .slotBook { order: 8; }
 
   .chartWrap {
     flex: none;
@@ -66,9 +116,14 @@
     min-height: 240px;
   }
 
-  .right {
-    width: 100%;
-    border-left: 0;
+  .slotDecision {
+    background: var(--panel);
     border-top: 1px solid var(--border);
+  }
+
+  .slotFeed {
+    flex: none;
+    min-height: 0;
+    background: var(--panel);
   }
 }

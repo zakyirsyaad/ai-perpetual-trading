@@ -204,6 +204,57 @@
   color: var(--muted);
 }
 
+/* Desktop side rail: today's total and the toggle on one line, the facts under it,
+   and the daily detail trimmed to the columns that fit 360-440px. */
+@media (min-width: 900px) {
+  .rail .strip {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "label big toggle"
+      "facts facts toggle";
+    align-items: baseline;
+    gap: 3px 10px;
+    padding: 8px 0 8px 16px;
+  }
+
+  .rail .label {
+    grid-area: label;
+  }
+
+  .rail .big {
+    grid-area: big;
+  }
+
+  .rail .facts {
+    grid-area: facts;
+  }
+
+  .rail .stripMix {
+    display: none;
+  }
+
+  .rail .toggle {
+    grid-area: toggle;
+    align-self: stretch;
+    padding: 0 16px 0 12px;
+  }
+
+  .rail .detail {
+    padding: 8px 16px 10px;
+  }
+
+  .rail .row {
+    grid-template-columns: 84px minmax(40px, 1fr) 52px 78px;
+    gap: 8px;
+  }
+
+  .rail .calls,
+  .rail .split {
+    display: none;
+  }
+}
+
 @media (max-width: 760px) {
   .strip {
     padding-left: 16px;
