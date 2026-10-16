@@ -202,6 +202,14 @@
   background: var(--hold-cell);
 }
 
+/* Desktop rail: the feed takes the height left under the call panel. */
+@media (min-width: 900px) {
+  .fill {
+    flex: 1;
+    min-height: 0;
+  }
+}
+
 @media (max-width: 899.98px) {
   .list {
     flex: none;

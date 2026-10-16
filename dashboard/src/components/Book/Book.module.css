@@ -132,6 +132,15 @@
   font-size: 12px;
 }
 
+/* Desktop grid row: the book takes the height its row gives it. */
+@media (min-width: 900px) {
+  .fill {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
+}
+
 @media (max-width: 899.98px) {
   .wrap {
     height: min(36vh, 260px);

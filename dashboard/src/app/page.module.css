@@ -1,74 +1,138 @@
-/* Desktop (>= 900px): the shell is a fixed-height flex column
-   and this row is its only flexible child. */
+/* Desktop (>= 900px): header on top, then two columns. The work column holds the
+   coin tabs, the chart and the positions/trades/history book; the rail holds the
+   daily volume, the token strip, the latest call and the call feed.
+   Mobile (< 900px): page.tsx renders the slots flat in the stacked order
+   (header, volume, tokens, coins, chart, call, feed, book), so the DOM order
+   is the screen order. Before the browser reports its width the page shows the
+   header and a `.pending` placeholder (sized here for either width), so neither
+   tree is ever painted at the wrong width. */
 
-.main {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: stretch;
+.slotHeader {
+  flex: none;
 }
 
-.left {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
+/* Shared by the grid and its placeholder so the rail never changes width when
+   the real panels replace the placeholder. */
+.body,
+.pending {
+  --rail-w: 380px; /* the width DecisionPanel and Feed were laid out for */
+}
+
+.body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--rail-w);
+}
+
+.work {
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(240px, 1fr) minmax(200px, 40%);
+}
+
+.slotSleeves {
+  min-width: 0;
 }
 
 .chartWrap {
-  flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
-.right {
-  width: 380px;
-  flex: none;
+.slotBook {
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  background: var(--panel);
-  border-left: 1px solid var(--border);
-  overflow: hidden;
 }
 
-.right > :first-child {
+.rail {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+.slotVolume,
+.slotUsage,
+.slotDecision {
   flex: none;
 }
 
-.right > :last-child {
-  flex: 1;
-  min-height: 0;
+.slotFeed {
+  flex: 1 0 180px;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
 }
 
-@media (min-width: 900px) {
-  .main {
-    flex: 1 1 0;
+/* Placeholder while the width is unknown: work column and rail on desktop. */
+.pending {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--rail-w);
+  gap: 1px;
+}
+
+.pending > * {
+  width: 100%;
+  height: 100%;
+}
+
+@media (min-width: 1440px) {
+  .body,
+  .pending {
+    --rail-w: 400px;
+  }
+}
+
+@media (min-width: 1800px) {
+  .body,
+  .pending {
+    --rail-w: 440px;
   }
 }
 
 @media (max-width: 899.98px) {
-  .main {
-    flex: none;
-    flex-direction: column;
+  /* One chart height for the chart and its placeholder row. */
+  .chartWrap,
+  .pending {
+    --chart-h: max(240px, min(38vh, 320px));
   }
 
-  .left {
+  /* Stacked: what sits above the chart (volume, MiMo tokens and coin cards:
+     425px together at 375px wide, measured 2026-10-16, about 410px once two
+     coins have loaded; re-measure when one of them changes height), then the
+     chart itself. */
+  .pending {
     flex: none;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 425px var(--chart-h);
   }
 
   .chartWrap {
     flex: none;
-    height: min(38vh, 320px);
-    min-height: 240px;
+    height: var(--chart-h);
   }
 
-  .right {
-    width: 100%;
-    border-left: 0;
+  .slotDecision {
+    background: var(--panel);
     border-top: 1px solid var(--border);
+  }
+
+  .slotFeed {
+    flex: none;
+    min-height: 0;
+    background: var(--panel);
   }
 }

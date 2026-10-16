@@ -6,6 +6,7 @@ import DecisionPanel from "@/components/DecisionPanel/DecisionPanel";
 import Feed from "@/components/Feed/Feed";
 import FlowChart from "@/components/FlowChart/FlowChart";
 import Header from "@/components/Header/Header";
+import { Bone } from "@/components/Skeleton/Skeleton";
 import SleeveStrip from "@/components/SleeveStrip/SleeveStrip";
 import UsagePanel from "@/components/UsagePanel/UsagePanel";
 import VolumePanel from "@/components/VolumePanel/VolumePanel";
@@ -13,6 +14,7 @@ import { lastMeaningfulCall } from "@/lib/format";
 import { portfolioPnl } from "@/lib/pnl";
 import { useFeed } from "@/lib/useFeed";
 import { useUsage } from "@/lib/useUsage";
+import { useIsDesktop } from "@/lib/useIsDesktop";
 import { useVolume } from "@/lib/useVolume";
 import type { BlockEvent, Meta, SleeveFeed } from "@/lib/types";
 import styles from "./page.module.css";
@@ -37,6 +39,7 @@ export default function Page() {
   const feed = useFeed(API_URL);
   const volume = useVolume(API_URL);
   const usage = useUsage(API_URL);
+  const isDesktop = useIsDesktop();
   const [picked, setPicked] = useState<string | null>(null);
 
   const coins = useMemo(() => {
@@ -73,15 +76,17 @@ export default function Page() {
   const hasBooks = coins.some((c) => latestByCoin[c]);
   const waiting = !feed.meta;
 
-  return (
-    <div className="shell">
+  const header = (
+    <div className={styles.slotHeader}>
       <Header
         connection={feed.connection}
         unrealized={hasBooks ? pnl.unrealized : null}
         realized={hasBooks ? pnl.realized : null}
       />
-      <VolumePanel volume={volume} />
-      <UsagePanel usage={usage} />
+    </div>
+  );
+  const sleeves = (
+    <div className={styles.slotSleeves}>
       <SleeveStrip
         sleeves={feed.meta?.sleeves ?? []}
         latestByCoin={latestByCoin}
@@ -89,24 +94,23 @@ export default function Page() {
         selected={coin}
         onSelect={setPicked}
         waiting={waiting}
+        variant="tabs"
       />
-      <div className={styles.main}>
-        <div className={styles.left}>
-          <div className={styles.chartWrap}>
-            <FlowChart
-              tape={sleeve.tape ?? []}
-              events={sleeve.events}
-              latest={sleeve.latest}
-              meta={meta}
-              onNeedMoreTape={feed.loadTape}
-            />
-          </div>
-        </div>
-        <div className={styles.right}>
-          <DecisionPanel latest={sleeve.latest} meta={meta} waiting={waiting} />
-          <Feed events={sleeve.events} meta={meta} waiting={waiting} />
-        </div>
-      </div>
+    </div>
+  );
+  const chart = (
+    <div className={styles.chartWrap}>
+      <FlowChart
+        tape={sleeve.tape ?? []}
+        events={sleeve.events}
+        latest={sleeve.latest}
+        meta={meta}
+        onNeedMoreTape={feed.loadTape}
+      />
+    </div>
+  );
+  const book = (
+    <div className={styles.slotBook}>
       <Book
         sleeves={feed.meta?.sleeves ?? []}
         latestByCoin={latestByCoin}
@@ -116,7 +120,79 @@ export default function Page() {
         onSelect={setPicked}
         onNeedMoreTape={feed.loadTape}
         waiting={waiting}
+        variant="fill"
       />
+    </div>
+  );
+  const volumePanel = (
+    <div className={styles.slotVolume}>
+      <VolumePanel volume={volume} variant="rail" />
+    </div>
+  );
+  const usagePanel = (
+    <div className={styles.slotUsage}>
+      <UsagePanel usage={usage} variant="rail" />
+    </div>
+  );
+  const decision = (
+    <div className={styles.slotDecision}>
+      <DecisionPanel latest={sleeve.latest} meta={meta} waiting={waiting} />
+    </div>
+  );
+  const callFeed = (
+    <div className={styles.slotFeed}>
+      <Feed events={sleeve.events} meta={meta} waiting={waiting} variant="fill" />
+    </div>
+  );
+
+  // Until the browser reports its width, render the header and a placeholder
+  // sized by CSS for either width: each panel then mounts once, in the tree that
+  // matches the screen.
+  if (isDesktop === null) {
+    return (
+      <div className="shell">
+        {header}
+        <div className={styles.pending} role="status" aria-busy="true" aria-label="Loading dashboard">
+          <Bone className={styles.pendingWork} />
+          <Bone className={styles.pendingRail} />
+        </div>
+      </div>
+    );
+  }
+
+  // The DOM order follows what is on screen at each breakpoint, so keyboard
+  // focus and screen readers read the page in its visual order.
+  if (!isDesktop) {
+    return (
+      <div className="shell">
+        {header}
+        {volumePanel}
+        {usagePanel}
+        {sleeves}
+        {chart}
+        {decision}
+        {callFeed}
+        {book}
+      </div>
+    );
+  }
+
+  return (
+    <div className="shell">
+      {header}
+      <div className={styles.body}>
+        <div className={styles.work}>
+          {sleeves}
+          {chart}
+          {book}
+        </div>
+        <div className={styles.rail}>
+          {volumePanel}
+          {usagePanel}
+          {decision}
+          {callFeed}
+        </div>
+      </div>
     </div>
   );
 }

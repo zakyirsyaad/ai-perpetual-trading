@@ -4,6 +4,7 @@ import type { BlockEvent, SleeveMeta } from "@/lib/types";
 import { displayCoin, fmtCoin, fmtPrice, fmtSignedUsd } from "@/lib/format";
 import TokenIcon from "@/components/TokenIcon/TokenIcon";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { cx } from "@/lib/cx";
 import styles from "./SleeveStrip.module.css";
 
 export default function SleeveStrip({
@@ -13,6 +14,7 @@ export default function SleeveStrip({
   selected,
   onSelect,
   waiting = false,
+  variant = "stack",
 }: {
   sleeves: SleeveMeta[];
   latestByCoin: Record<string, BlockEvent | null>;
@@ -20,11 +22,14 @@ export default function SleeveStrip({
   selected: string;
   onSelect: (coin: string) => void;
   waiting?: boolean;
+  /** "tabs": a compact two-line tab row on desktop (mobile keeps the cards). */
+  variant?: "stack" | "tabs";
 }) {
+  const stripClass = cx(styles.strip, variant === "tabs" && styles.tabs);
   if (!sleeves.length) {
     if (!waiting) return null;
     return (
-      <div className={styles.strip} aria-busy="true" aria-label="Loading markets" style={{ pointerEvents: "none" }}>
+      <div className={stripClass} aria-busy="true" aria-label="Loading markets" style={{ pointerEvents: "none" }}>
         {Array.from({ length: 5 }, (_, i) => (
           <div key={i} className={styles.card}>
             <span className={styles.top}>
@@ -40,7 +45,7 @@ export default function SleeveStrip({
   }
 
   return (
-    <div className={styles.strip}>
+    <div className={stripClass}>
       {sleeves.map((sleeve) => {
         const latest = latestByCoin[sleeve.coin] ?? null;
         const pos = latest?.position ?? null;

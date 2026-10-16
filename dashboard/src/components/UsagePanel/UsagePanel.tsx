@@ -1,14 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { Bone } from "@/components/Skeleton/Skeleton";
 import type { UsageDay, UsageSummary } from "@/lib/bot-types";
 import { fmtCompact, fmtDay, fmtInt } from "@/lib/format";
 import { share, sumDays, todayOf, tokenMix, tokensPerTrade, type TokenMix } from "@/lib/usage";
+import { cx } from "@/lib/cx";
+import { useSessionState } from "@/lib/useSessionState";
 import styles from "./UsagePanel.module.css";
 
 export interface UsagePanelProps {
   usage: UsageSummary | null;
+  /** "rail": compact layout for the desktop side rail (mobile is unchanged). */
+  variant?: "stack" | "rail";
 }
 
 const MAX_DAYS = 14;
@@ -60,17 +63,19 @@ function DayRow({ day, today, widest }: { day: UsageDay; today: boolean; widest:
   );
 }
 
-export default function UsagePanel({ usage }: UsagePanelProps) {
-  const [open, setOpen] = useState(false);
+function readStoredOpen(): boolean {
+  try {
+    return window.localStorage.getItem(STORAGE_KEY) === "1";
+  } catch {
+    return false; // storage unavailable: start closed
+  }
+}
 
-  // Remembered per browser; the page is correct without it (private window, blocked storage).
-  useEffect(() => {
-    try {
-      if (window.localStorage.getItem(STORAGE_KEY) === "1") setOpen(true);
-    } catch {
-      /* storage unavailable: stay closed */
-    }
-  }, []);
+export default function UsagePanel({ usage, variant = "stack" }: UsagePanelProps) {
+  // Remembered per browser and read on mount, so a remount at the breakpoint
+  // opens as it was (the panel only renders on the client, after the width is
+  // known). Without storage (private window) the session store still keeps it.
+  const [open, setOpen] = useSessionState("usage.open", readStoredOpen);
 
   const toggle = () => {
     const next = !open;
@@ -90,7 +95,7 @@ export default function UsagePanel({ usage }: UsagePanelProps) {
   const since = usage?.days[0]?.day;
 
   return (
-    <section className={styles.panel} aria-label="MiMo token usage">
+    <section className={cx(styles.panel, variant === "rail" && styles.rail)} aria-label="MiMo token usage">
       <div className={styles.strip}>
         <span className={styles.label}>MiMo tokens</span>
         {today && todayMix ? (

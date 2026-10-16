@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo } from "react";
 import type { BlockEvent, Meta, PricePoint, SleeveMeta } from "@/lib/types";
 import { closedLots, dayKey, groupByDay, lotVolume, tapeFills } from "@/lib/fills";
 import { roePct } from "@/lib/pnl";
@@ -18,6 +18,8 @@ import {
   txUrl,
 } from "@/lib/format";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { cx } from "@/lib/cx";
+import { useSessionState } from "@/lib/useSessionState";
 import styles from "./Book.module.css";
 
 type Tab = "positions" | "trades" | "history";
@@ -40,6 +42,7 @@ export default function Book({
   onSelect,
   onNeedMoreTape,
   waiting = false,
+  variant = "stack",
 }: {
   sleeves: SleeveMeta[];
   latestByCoin: Record<string, BlockEvent | null>;
@@ -49,9 +52,11 @@ export default function Book({
   onSelect: (coin: string) => void;
   onNeedMoreTape?: () => void;
   waiting?: boolean;
+  /** "fill": on desktop the book fills its grid row instead of its fixed height. */
+  variant?: "stack" | "fill";
 }) {
-  const [tab, setTab] = useState<Tab>("positions");
-  const [allMarkets, setAllMarkets] = useState(false);
+  const [tab, setTab] = useSessionState<Tab>("book.tab", "positions");
+  const [allMarkets, setAllMarkets] = useSessionState("book.allMarkets", false);
 
   const trades = useMemo(() => {
     const rows = [];
@@ -82,7 +87,7 @@ export default function Book({
   const today = dayKey(Date.now());
 
   return (
-    <section className={styles.wrap}>
+    <section className={cx(styles.wrap, variant === "fill" && styles.fill)}>
       <div className={styles.tabs} role="tablist" aria-label="Account book">
         <button
           type="button"

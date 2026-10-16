@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { BlockEvent, Meta } from "@/lib/types";
 import { fmtClock, fmtPrice, shortTx, txUrl } from "@/lib/format";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { cx } from "@/lib/cx";
 import styles from "./Feed.module.css";
 
 const ROW_H = 26;
@@ -53,10 +54,13 @@ export default function Feed({
   events,
   meta,
   waiting = false,
+  variant = "stack",
 }: {
   events: BlockEvent[];
   meta?: Meta | null;
   waiting?: boolean;
+  /** "fill": on desktop the feed fills the rail's remaining height. */
+  variant?: "stack" | "fill";
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [capacity, setCapacity] = useState(MAX_ROWS);
@@ -80,7 +84,7 @@ export default function Feed({
   const callRows = useMemo(() => events.filter(isCallRow), [events]);
 
   return (
-    <section className={styles.feed}>
+    <section className={cx(styles.feed, variant === "fill" && styles.fill)}>
       <div className={styles.railHead}>CALLS</div>
       <div className={styles.list} ref={listRef}>
         {waiting && callRows.length === 0 ? (
