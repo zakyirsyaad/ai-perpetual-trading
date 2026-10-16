@@ -204,5 +204,7 @@ Commit trail (branch `fix/pine-gate-check-data-volume-info`, PR #36):
 - 7df1ac0 `fix: validate every stored 1m day in check-data and cap the native window` (round 4)
 - a2fd0f5 `fix: carry zero-volume runs across midnight and name unreadable day files` (round 5)
 - 29a7dfd `fix: share day validation between load_days and check-data` (round 6)
+- c6e56a1 `fix: keep check-data running on OS errors and check each loaded bar once` (round 7)
+- the docs-only commit that adds the c6e56a1 line above records no code change
 
 Deployment gate (PR #36): research code only (`src/research/pine_gate/bars.py`, `features.py`, `cli_data.py`, their tests and docs); `bot` does not import `research`, so nothing is deployed and pm2 `ai-perp-volume` needs no restart. After merge, the VPS research copy `~/replay/pine_gate_repo/src` must be resynced from main before `check-data` runs there with these checks; until then it runs the Phase 1 code that produced the recorded results.
