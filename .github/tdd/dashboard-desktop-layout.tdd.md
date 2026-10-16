@@ -61,6 +61,20 @@ Mobile 375x812, element top / height / width, main vs this branch: Header 0/76/3
 
 After the `CandlePane` guard, three fresh loads at 1024x768 showed no `Cannot update oldest data` error and no Next.js issue badge.
 
+## Round 2 (code review of PR #38)
+
+Findings and fixes:
+- The `CandlePane` guard still allowed `update()` when the series shrank (`added <= 1` held for a negative count) or the coin/interval changed with the same first bar, so 1m -> 5m could leave 1m bars under one 5m bar. `update()` now needs the same coin and interval (`rangeKey`), the same first bar, a newest time that does not go back, and exactly zero or one new bar; everything else redraws with `setData`.
+- After a multi-bar catch-up (a throttled background tab) the redraw did not keep the view on the live edge. It now calls `showLatest` when the view was at the last bar before the redraw (`atLiveEdge`), and leaves a scrolled-back view alone.
+- Mobile reading and focus order followed the DOM (header, coins, chart, book, volume, ...) while CSS `order` painted another sequence. `useIsDesktop` (matchMedia via `useSyncExternalStore`, server snapshot = desktop) now renders the slots flat in the stacked order below 900 px; the `display: contents` + `order` rules stay as the paint for the prerendered desktop tree until hydration.
+- The rail is 380 px below 1440 px again, the width `DecisionPanel` and `Feed` were laid out for.
+- `Book` takes `variant="fill"` (styled in `Book.module.css`) instead of the page stylesheet overriding its root.
+- The rail's token detail keeps the per-day calls and input/output split on a second line instead of hiding them.
+- Variant names are uniform (default `stack`; `tabs`, `rail`, `fill`), and a `lib/cx.ts` helper joins the class names.
+- `pip check` is now run and recorded.
+
+Verified after round 2: 1280x720 chart 346 px, calls feed 191 px, book 267 px, rail 380 px; mobile 375x812 DOM order header, volume, tokens, coins, chart, call, feed, book, with focus order Detail, BTC, ETH, chart intervals, Positions/Trades/History, and every panel at the same top/height/width as main; interval switches 5m -> 1m -> 15m -> 5m redraw cleanly with no console error and no hydration warning.
+
 ## Verification
 
 - `bunx tsc --noEmit -p .` (dashboard): clean.
@@ -68,13 +82,15 @@ After the `CandlePane` guard, three fresh loads at 1024x768 showed no `Cannot up
 - `PYTHONPATH=src python -m unittest tests.test_dashboard_contract tests.test_dashboard_display_symbols tests.test_secret_hygiene`: 21 tests OK (wire contract unchanged).
 - `PYTHONPATH=src python -m compileall -q src tests`: clean. `git diff --check`: clean.
 - Full Python suite under coverage: 1,576 tests OK, 89% total line coverage (no Python file changed).
-- `pip check`: no dependency change in this PR (Python requirements and `dashboard/package.json` untouched).
+- `pip check`: `uv pip check --python .venv/bin/python` reports all installed packages compatible (no dependency changed in this PR).
 
 ## Commit trail
 
 - 4c0d5b5 `feat: give the dashboard a two-column desktop layout`
 - 9519f2f `fix: redraw the candle series instead of updating an older bar`
-- the docs-only commit that adds this file records no code change
+- 779f123 `docs: TDD evidence for the dashboard desktop layout`
+- 1edac7d `fix: address PR #38 review on chart redraws, mobile order and the rail` (round 2)
+- the docs-only commit that records the round-2 hash makes no code change
 
 ## Deployment gate
 
