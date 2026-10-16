@@ -581,6 +581,17 @@ class CheckDataCommandTest(Dirs):
         self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: 2025-08-01",
                       lines)
 
+    def test_days_check_lists_a_day_whose_volume_is_all_zero(self):
+        from research.pine_gate import cli_data
+
+        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
+        zeroed = [r[:5] + (0.0,) if k < 1440 else r for k, r in enumerate(rows)]
+        write_prod_days(self.data, "BTC-USDT", zeroed)
+        lines, ok = cli_data.days_check(self.data)
+        self.assertFalse(ok)
+        self.assertIn("  prod/BTC-USDT/1m zero total volume on 1 days: 2025-08-01", lines)
+        self.assertFalse(any("2025-08-02" in line and "zero" in line for line in lines))
+
     def test_funding_check_needs_the_cadence_over_training_and_holdout(self):
         from research.pine_gate import cli_data
         from research.pine_gate.spec import HOLDOUT_END, TRAIN_START, ms
@@ -669,6 +680,56 @@ class CheckDataCommandTest(Dirs):
         self.assertTrue(lines[0].startswith("PASS native OHLC"), lines)
         self.assertTrue(lines[1].startswith("FAIL native volume"), lines)
         self.assertIn("worst relative difference 5.00e-01", lines[1])
+
+    def test_native_lines_name_the_window_they_cover(self):
+        cli_data, _ = self._write_native(lambda i, r: r)
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertTrue(ok, lines)
+        for line in lines:
+            self.assertIn("over 2025-08-01..2025-08-02", line)
+
+    def test_a_corrupt_native_file_is_a_fail_line_not_an_abort(self):
+        from research.pine_gate import cli_data
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
+        path = cli_data.native_check_path(self.data, "BTC-USDT", "1h")
+        start = wib_day_start_ms(FIRST_DAY)
+        write_day(path, [(start, 2.0, 1.0, 1.5, 1.5, 1.0)])  # high below low
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("FAIL native check"), lines)
+        self.assertIn("native_check.csv.gz unreadable", lines[0])
+        code, out, err = run_cli(self.base_args() + ["check-data", "--truncation-times", "2"])
+        self.assertEqual(code, 1)
+        self.assertIn("native_check.csv.gz unreadable", out)
+        self.assertIn("FAIL truncation invariance", out)  # later checks still ran
+        self.assertNotIn("error:", err)
+
+    def test_native_bars_off_the_hour_share_no_open_time(self):
+        from research.pine_gate import cli_data
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
+        start = wib_day_start_ms(FIRST_DAY) + 30 * MIN  # half past: no 1h bucket opens there
+        write_day(cli_data.native_check_path(self.data, "BTC-USDT", "1h"),
+                  [(start, 1.0, 1.0, 1.0, 1.0, 1.0)])
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertEqual(lines, ["FAIL native check vs aggregated prod/BTC-USDT/1h: "
+                                 "native and aggregated bars share no open time"])
+
+    def test_a_corrupt_1m_day_is_named_as_such(self):
+        cli_data, _ = self._write_native(lambda i, r: r)
+        day = day_path(self.data, "prod", "BTC-USDT", "1m", FIRST_DAY)
+        day.write_bytes(b"not gzip")
+        lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+        self.assertFalse(ok)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("FAIL native check"), lines)
+        self.assertIn("1m data unreadable", lines[0])
+        self.assertNotIn("OHLC", lines[0])
 
     def test_native_check_fails_a_nan_worst_volume_difference(self):
         from research.pine_gate.features import HtfAgreement

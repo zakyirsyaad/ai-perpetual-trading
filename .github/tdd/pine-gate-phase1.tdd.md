@@ -146,10 +146,17 @@ Round 2 (code review of PR #36): an ungated volume line removed the only cross-c
 
 GREEN:
 - `features.py`: frozen `HtfAgreement`; `_ohlc_agrees` (price tolerance 1e-9 unchanged); `_relative_difference` (the measure `math.isclose` uses); the 1e-6 volume share is kept for information; `worst_volume_rel` is NaN when any pair's is.
-- `cli_data.native_check` returns `(lines, ok)` with two gating lines: OHLC share >= 99.9% (unchanged) and worst volume relative difference <= `NATIVE_VOLUME_MAX_REL` = 1e-3 (NaN fails). Every missing-file, missing-day and no-overlap case still FAILs; the duplicate set-intersection overlap check is gone, `htf_agreement`'s own `ValueError` is reported instead.
+- `cli_data.native_check` returns `(lines, ok)` with two gating lines: OHLC share >= 99.9% (unchanged) and worst volume relative difference <= 1e-3 (NaN fails). Every missing-file, missing-day and no-overlap case still FAILs; the duplicate set-intersection overlap check is gone.
 - `docs/superpowers/plans/2026-10-14-pine-gate-phase1.md`: the Interfaces line notes the new return type.
 
-Verification on the real VPS data (branch code copied to a temporary directory, run under `nice -n 19`, directory removed afterwards):
+Round 3 (second code review of PR #36): the native file was read outside the `try`, so one invalid native row aborted the whole `check-data` run with a single `error:` line; the widened `except ValueError` reported a corrupt 1m day as an OHLC disagreement; the volume cross-check covers only the native-check window (2025-08, about 31 of 439 days); and the two volume tolerances lived in different modules. RED first: a native file with high below low must give one `FAIL native check ... unreadable` line while `check-data` still runs its later checks; a non-gzip 1m day must read `1m data unreadable`, not OHLC; both native lines must name the WIB days they cover; `days_check` must list a day whose 1m volume is all zero; `htf_agreement` must raise a dedicated `NoOverlapError` (a `ValueError` subclass) and keep a plain `ValueError` for an interval mismatch; `VOLUME_REL_TOL` and `VOLUME_WORST_REL_MAX` must sit together in `features.py`. Result: `FAILED (failures=3, errors=2)` (`ValueError: bar at 1753981200000: high/low do not bracket open and close` escaping `native_check`; the `features` test module failing to import the new names).
+
+GREEN:
+- `native_check`: the native read is guarded (`... unreadable (...)`); `MissingDayError`, other `ValueError`s from `load_days` (`1m data unreadable`) and `NoOverlapError` each get their own message under the `native check` label; nothing else is caught, so a bug in `aggregate` still surfaces as a traceback. Both result lines carry `over <first>..<last>`. The docstring states the window and how to widen it (`native-check-fetch --start/--end` into a fresh file).
+- `days_check` reads each day file once (`_day_problems`) and also lists days whose total 1m volume is zero, so a zeroed volume column is caught on every day, not only inside the native window. A doubled volume outside the window is still caught only by widening that window.
+- `features.py`: `NoOverlapError`; `VOLUME_WORST_REL_MAX = 1e-3` next to `VOLUME_REL_TOL`; `cli_data.NATIVE_VOLUME_MAX_REL` removed. The observed worst difference (1.28e-4) is recorded here rather than in a code comment.
+
+Verification on the real VPS data (branch code copied to a temporary directory, run under `nice -n 19`, directory removed afterwards; round 3 run: `days_check` PASS over 2025-08-01..2026-10-13 with no zero-volume day, 3 s; the native lines cover 2025-08-01..2025-08-31 for 1h and ..2025-09-01 for 4h):
 
 | Series | OHLC (>= 99.9%) | Volume worst difference (<= 1e-3) | Volume within 1e-6 (info) |
 |---|---|---|---|
@@ -160,6 +167,6 @@ Verification on the real VPS data (branch code copied to a temporary directory, 
 
 The volume shares match the figures behind the step-9 ruling exactly; the worst difference (1.28e-4) is eight times inside the 1e-3 bound.
 
-Local: 1,551 tests OK, 89% total line coverage (`features.py` 99%, `cli_data.py` 94%), `compileall` clean, `git diff --check` clean, secret hygiene OK (`tests.test_secret_hygiene`), `pip check` clean (`uv pip check` locally: all 15 packages compatible; the VPS venv: no broken requirements). One earlier full run stalled past 600 s inside the telemetry `MarketDataPoller` tests (untouched here); the rerun finished in 146 s.
+Local (round 3): full suite 1,557 tests OK at 89% total line coverage (`features.py` 99%, `cli_data.py` 94%); one test for the `NoOverlapError` path in `native_check` was added afterwards and passes with its module (`tests.test_pine_gate_cli`). Round 2: 1,551 tests OK, 89%. Both rounds: `compileall` clean, `git diff --check` clean, secret hygiene OK (`tests.test_secret_hygiene`), `pip check` clean (`uv pip check` locally: all 15 packages compatible; the VPS venv: no broken requirements). One round-2 full run stalled past 600 s inside the telemetry `MarketDataPoller` tests (untouched here); the rerun finished in 146 s.
 
 Lock note: `features.py` and `cli_data.py` are inside the code fingerprint, so `code_sha256` changes and the frozen selection file no longer matches current code. This is expected and harmless: the holdout already ran once and its run marker refuses any second test regardless. A future study needs its own pre-registration.

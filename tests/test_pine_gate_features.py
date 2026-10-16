@@ -17,7 +17,10 @@ from research.pine_gate.bars import (
     slice_until,
 )
 from research.pine_gate.features import (
+    VOLUME_REL_TOL,
+    VOLUME_WORST_REL_MAX,
     FeatureFrame,
+    NoOverlapError,
     Snapshot,
     htf_agreement,
     htf_bars,
@@ -462,13 +465,20 @@ class HtfAgreementTest(unittest.TestCase):
         agreement = htf_agreement(zero, zero)
         self.assertEqual((agreement.volume_share, agreement.worst_volume_rel), (1.0, 0.0))
 
-    def test_no_overlap_raises(self):
+    def test_no_overlap_raises_its_own_error(self):
         head = slice_until(self.native, POC_START + 3 * HOUR)
         tail = _from(self.native, POC_START + 5 * HOUR)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(NoOverlapError):
             htf_agreement(head, tail)
-        with self.assertRaises(ValueError):
+        self.assertTrue(issubclass(NoOverlapError, ValueError))
+
+    def test_an_interval_mismatch_is_not_a_missing_overlap(self):
+        with self.assertRaises(ValueError) as caught:
             htf_agreement(self.native, aggregate(self.native, H4))
+        self.assertNotIsInstance(caught.exception, NoOverlapError)
+
+    def test_volume_tolerances_sit_together(self):
+        self.assertEqual((VOLUME_REL_TOL, VOLUME_WORST_REL_MAX), (1e-6, 1e-3))
 
 
 class HtfSeamTest(unittest.TestCase):

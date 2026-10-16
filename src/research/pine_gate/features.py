@@ -74,7 +74,8 @@ POC_WINDOW_MS = VP_PARAMS["ON"]["window_hours"] * _HOUR_MS
 POC_BARS = POC_WINDOW_MS // INTERVAL_1M
 
 PRICE_REL_TOL = 1e-9
-VOLUME_REL_TOL = 1e-6
+VOLUME_REL_TOL = 1e-6  # the share within it is informational
+VOLUME_WORST_REL_MAX = 1e-3  # the native check gates on the worst bar
 
 Column = Tuple[Optional[float], ...]
 
@@ -334,6 +335,10 @@ class FeatureFrame:
         return _poc(bars.low[first:end], bars.high[first:end], bars.volume[first:end], price)
 
 
+class NoOverlapError(ValueError):
+    """Native and aggregated bars share no open time."""
+
+
 @dataclass(frozen=True)
 class HtfAgreement:
     """Native vs aggregated higher-timeframe bars over their shared open times.
@@ -374,7 +379,7 @@ def htf_agreement(native: Bars, aggregated: Bars) -> HtfAgreement:
     index = {t: j for j, t in enumerate(aggregated.open_ms)}
     pairs = [(i, index[t]) for i, t in enumerate(native.open_ms) if t in index]
     if not pairs:
-        raise ValueError("native and aggregated bars share no open time")
+        raise NoOverlapError("native and aggregated bars share no open time")
     ohlc = sum(1 for i, j in pairs if _ohlc_agrees(native, i, aggregated, j))
     rel = [_relative_difference(native.volume[i], aggregated.volume[j]) for i, j in pairs]
     volume = sum(1 for r in rel if r <= VOLUME_REL_TOL)
