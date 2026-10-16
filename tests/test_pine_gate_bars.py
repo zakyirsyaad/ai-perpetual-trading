@@ -10,6 +10,7 @@ from research.pine_gate.bars import (
     MissingDayError,
     aggregate,
     bars_from_rows,
+    check_rows,
     concat,
     day_path,
     entry_index_for,
@@ -70,6 +71,20 @@ class BarsFromRowsTest(unittest.TestCase):
         rows = make_rows(T0, MIN, 3)
         with self.assertRaises(BarGapError):
             bars_from_rows([rows[1], rows[0], rows[2]], MIN)
+
+    def test_check_rows_validates_like_bars_from_rows_without_building(self):
+        rows = make_rows(T0, MIN, 4)
+        self.assertIsNone(check_rows(rows, MIN))
+        with self.assertRaises(BarGapError):
+            check_rows(rows[:2] + rows[3:], MIN)
+        for bad in ((T0, 1.0, 0.5, 0.8, 0.9, 1.0),            # high below open
+                    (T0, 1.0, 1.0, 1.0, 1.0, float("nan")),   # non-finite volume
+                    (T0, 1.0, 1.0, 1.0, 1.0, -1.0)):          # negative volume
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    check_rows([bad], MIN)
+                with self.assertRaises(ValueError):
+                    bars_from_rows([bad], MIN)
 
     def test_bars_are_frozen(self):
         bars = bars_from_rows(make_rows(T0, MIN, 1), MIN)

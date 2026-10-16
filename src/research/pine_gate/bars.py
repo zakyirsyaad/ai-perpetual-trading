@@ -21,7 +21,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from .fileio import write_exclusive
 from .spec import WIB, ms
@@ -98,12 +98,8 @@ def _check_bar(t: int, o: float, h: float, low: float, c: float, v: float) -> No
         raise ValueError(f"bar at {t} has a negative volume")
 
 
-def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
-    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``.
-
-    Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
-    gap, duplicate or disorder raises ``BarGapError``."""
-    out = _empty(interval_ms)
+def _validated(rows: Iterable[Row], interval_ms: int) -> Iterator[Row]:
+    """Each row as ``(int, float, ...)`` after ``_check_bar`` and the spacing check."""
     previous = None
     for row in rows:
         t = int(row[0])
@@ -114,6 +110,22 @@ def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
         o, h, low, c, v = (float(x) for x in row[1:6])
         _check_bar(t, o, h, low, c, v)
         previous = t
+        yield t, o, h, low, c, v
+
+
+def check_rows(rows: Iterable[Row], interval_ms: int) -> None:
+    """Raise exactly what ``bars_from_rows`` would, without building ``Bars``."""
+    for _ in _validated(rows, interval_ms):
+        pass
+
+
+def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
+    """Build ``Bars`` from rows sorted strictly ascending, spaced by ``interval_ms``.
+
+    Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
+    gap, duplicate or disorder raises ``BarGapError``."""
+    out = _empty(interval_ms)
+    for t, o, h, low, c, v in _validated(rows, interval_ms):
         out.open_ms.append(t)
         out.open.append(o)
         out.high.append(h)

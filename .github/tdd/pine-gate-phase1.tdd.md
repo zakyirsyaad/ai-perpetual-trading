@@ -128,7 +128,7 @@ No contender passed the staged gate. Out-of-sample gross edge is between about -
 
 ## Deployment gate
 
-Nothing was deployed to the bot. This branch changes documentation, the TradingView helper script defaults and this evidence file only; no Python code and no `.env` value changed. The research package ran on the VPS from a separate directory (`~/replay/pine_gate_repo/src`) under `nice -n 19`, and the pm2 app `ai-perp-volume` was neither restarted nor reconfigured. The only persistent VPS change was the daily collector cron line, which wrote public market data to `~/replay/pine_gate/data/`; it was removed on 2026-10-16 after the verdict (see Follow-ups). Any Phase 2 work (wiring a gate into `AIOrchestrator`) requires a contender that passes a new pre-registered holdout and a fresh decision from the user.
+Nothing was deployed to the bot. The results branch (PR #34) changed documentation, the TradingView helper script defaults and this evidence file only; no Python code and no `.env` value changed. The later Follow-ups (PR #36) change research code and carry their own deployment gate below. The research package ran on the VPS from a separate directory (`~/replay/pine_gate_repo/src`) under `nice -n 19`, and the pm2 app `ai-perp-volume` was neither restarted nor reconfigured. The only persistent VPS change was the daily collector cron line, which wrote public market data to `~/replay/pine_gate/data/`; it was removed on 2026-10-16 after the verdict (see Follow-ups). Any Phase 2 work (wiring a gate into `AIOrchestrator`) requires a contender that passes a new pre-registered holdout and a fresh decision from the user.
 
 ## Follow-ups (2026-10-16, after the verdict)
 
@@ -162,7 +162,13 @@ GREEN:
 - `native_check`: `last` is capped at the last holdout day, like `days_check`'s range.
 - `days_check`: `_day_problem` returns one key of `_DAY_PROBLEMS` (`shape`, `bars`, `zero_volume`) or `None`; it runs `bars_from_rows` on the rows it already read, and flags a run of at least `ZERO_VOLUME_RUN_MAX` = 60 zero-volume minutes (which also covers an all-zero day). One line per kind, as before.
 
-Verification on the real VPS data (branch code copied to a temporary directory, run under `nice -n 19`, directory removed afterwards; round 4 run: `days_check` PASS over 2025-08-01..2026-10-13 in 5 s, native lines unchanged; round 3 run: `days_check` PASS over 2025-08-01..2026-10-13 with no zero-volume day, 3 s; the native lines cover 2025-08-01..2025-08-31 for 1h and ..2025-09-01 for 4h):
+Round 5 (fourth code review of PR #36): an unreadable day file was still reported as "not a whole WIB day"; `ZERO_VOLUME_RUN_MAX = 60` failed at 60, so the name read as the largest run allowed; a zero-volume run crossing WIB midnight was split between two files and escaped the limit; and `days_check` built a full `Bars` per day only to validate it. RED first: a non-gzip day must be listed as `unreadable`; `ZERO_VOLUME_RUN_LIMIT` must be 60; 45 zero minutes either side of midnight must flag the second day; `bars.check_rows` must raise what `bars_from_rows` raises. Result: `FAILED (failures=2, errors=2)`. During GREEN two existing tests caught a bug in the first version: a run that ended exactly at the previous day's last minute flagged the next day, which has no zero volume; a carried-in run now counts only if it continues into the day.
+
+GREEN:
+- `bars.py`: `_validated` is the one place that checks spacing and `_check_bar`; `bars_from_rows` builds from it and `check_rows` only consumes it.
+- `days_check` walks each symbol's days in order, carrying the open zero-volume run across midnight (a missing or broken day resets it); `_day_verdict` returns a `_DayVerdict(problem, zero_run_after)`; problem kinds are `unreadable`, `shape`, `bars`, `zero_volume`; the limit is `ZERO_VOLUME_RUN_LIMIT` (a run this long fails).
+
+Verification on the real VPS data (branch code copied to a temporary directory, run under `nice -n 19`, directory removed afterwards; round 5 run: `days_check` PASS over 2025-08-01..2026-10-13 in 4 s, native lines unchanged; round 4 run: `days_check` PASS over 2025-08-01..2026-10-13 in 5 s, native lines unchanged; round 3 run: `days_check` PASS over 2025-08-01..2026-10-13 with no zero-volume day, 3 s; the native lines cover 2025-08-01..2025-08-31 for 1h and ..2025-09-01 for 4h):
 
 | Series | OHLC (>= 99.9%) | Volume worst difference (<= 1e-3) | Volume within 1e-6 (info) |
 |---|---|---|---|
@@ -173,6 +179,15 @@ Verification on the real VPS data (branch code copied to a temporary directory, 
 
 The volume shares match the figures behind the step-9 ruling exactly; the worst difference (1.28e-4) is eight times inside the 1e-3 bound.
 
-Local (round 4): full suite 1,562 tests OK at 89% total line coverage (`features.py` 99%, `cli_data.py` 95%). Round 3: full suite 1,557 tests OK at 89% total line coverage (`features.py` 99%, `cli_data.py` 94%); one test for the `NoOverlapError` path in `native_check` was added afterwards and passes with its module (`tests.test_pine_gate_cli`). Round 2: 1,551 tests OK, 89%. Both rounds: `compileall` clean, `git diff --check` clean, secret hygiene OK (`tests.test_secret_hygiene`), `pip check` clean (`uv pip check` locally: all 15 packages compatible; the VPS venv: no broken requirements). One round-2 full run stalled past 600 s inside the telemetry `MarketDataPoller` tests (untouched here); the rerun finished in 146 s.
+Local (round 5): full suite 1,565 tests OK at 89% total line coverage (`bars.py` 97%, `features.py` 99%, `cli_data.py` 96%). Round 4: full suite 1,562 tests OK at 89% total line coverage (`features.py` 99%, `cli_data.py` 95%). Round 3: full suite 1,557 tests OK at 89% total line coverage (`features.py` 99%, `cli_data.py` 94%); one test for the `NoOverlapError` path in `native_check` was added afterwards and passes with its module (`tests.test_pine_gate_cli`). Round 2: 1,551 tests OK, 89%. Both rounds: `compileall` clean, `git diff --check` clean, secret hygiene OK (`tests.test_secret_hygiene`), `pip check` clean (`uv pip check` locally: all 15 packages compatible; the VPS venv: no broken requirements). One round-2 full run stalled past 600 s inside the telemetry `MarketDataPoller` tests (untouched here); the rerun finished in 146 s.
 
-Lock note: `features.py` and `cli_data.py` are inside the code fingerprint, so `code_sha256` changes and the frozen selection file no longer matches current code. This is expected and harmless: the holdout already ran once and its run marker refuses any second test regardless. A future study needs its own pre-registration.
+Lock note: `bars.py`, `features.py` and `cli_data.py` are inside the code fingerprint, so `code_sha256` changes and the frozen selection file no longer matches current code. This is expected and harmless: the holdout already ran once and its run marker refuses any second test regardless. A future study needs its own pre-registration.
+
+Commit trail (branch `fix/pine-gate-check-data-volume-info`, PR #36):
+- a9c0091 `fix: gate check-data on native OHLC agreement, report volume as info` (round 1, plus the collector-cron record)
+- b5e6c91 `fix: bound native volume difference in check-data instead of ignoring it` (round 2)
+- 3fee2ec `fix: keep check-data running on unreadable native or 1m files` (round 3)
+- 7df1ac0 `fix: validate every stored 1m day in check-data and cap the native window` (round 4)
+- round 5: the commit that adds this line
+
+Deployment gate (PR #36): research code only (`src/research/pine_gate/bars.py`, `features.py`, `cli_data.py`, their tests and docs); `bot` does not import `research`, so nothing is deployed and pm2 `ai-perp-volume` needs no restart. After merge, the VPS research copy `~/replay/pine_gate_repo/src` must be resynced from main before `check-data` runs there with these checks; until then it runs the Phase 1 code that produced the recorded results.

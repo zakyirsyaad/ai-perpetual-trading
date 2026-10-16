@@ -19,7 +19,7 @@ import json
 import random
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import httpx
 
@@ -29,8 +29,9 @@ from .bars import (
     MissingDayError,
     Row,
     aggregate,
-    day_shape_problem,
     bars_from_rows,
+    check_rows,
+    day_shape_problem,
     day_path,
     funding_path,
     interval_to_ms,
@@ -227,64 +228,81 @@ def _listed(days: Sequence[date]) -> str:
     return shown + (", ..." if len(days) > _LISTED_DAYS else "")
 
 
-ZERO_VOLUME_RUN_MAX = 60  # minutes; the stored production data has none at all
+ZERO_VOLUME_RUN_LIMIT = 60  # minutes; a run this long fails (stored data has none)
 
 # Why a stored 1m day is unusable, in the order the lines are printed.
 _DAY_PROBLEMS = {
+    "unreadable": "unreadable",
     "shape": "not a whole WIB day (1440 bars)",
     "bars": "invalid bars",
-    "zero_volume": f"a run of >= {ZERO_VOLUME_RUN_MAX} zero-volume minutes",
+    "zero_volume": f"a run of >= {ZERO_VOLUME_RUN_LIMIT} zero-volume minutes",
 }
 
 
-def _longest_zero_volume_run(rows: Sequence[Row]) -> int:
-    longest = run = 0
+class _DayVerdict(NamedTuple):
+    problem: Optional[str]  # a ``_DAY_PROBLEMS`` key
+    zero_run_after: int  # zero-volume minutes running into the next day
+
+
+def _zero_volume_runs(rows: Sequence[Row], run_before: int) -> Tuple[int, int]:
+    """(longest zero-volume run reaching into ``rows``, run still open at the end).
+
+    A run carried in from the previous day counts only if it goes on here."""
+    longest, run = 0, run_before
     for row in rows:
         run = run + 1 if row[5] == 0.0 else 0
         longest = max(longest, run)
-    return longest
+    return longest, run
 
 
-def _day_problem(path: Path, day: date) -> Optional[str]:
-    """The ``_DAY_PROBLEMS`` key of one 1m day file, read once, or ``None``.
+def _day_verdict(path: Path, day: date, zero_run_before: int) -> _DayVerdict:
+    """What is wrong with one 1m day file, read once.
 
-    A corrupt file is not a whole day; bars the loader would reject (non-finite,
-    high/low not bracketing, negative volume, a gap) are invalid; a long run of
-    zero volume skews every 24-hour POC that covers it while OHLC looks fine.
+    Bars the loader would reject (non-finite, high/low not bracketing, negative
+    volume, a gap) are invalid; a long run of zero volume, counted across
+    midnight from the previous day, skews every 24-hour POC that covers it
+    while OHLC looks fine. A day with any other problem breaks the run.
     """
     try:
         rows = read_day(path)
     except ValueError:
-        return "shape"
+        return _DayVerdict("unreadable", 0)
     if day_shape_problem(rows, day, _MS_1M) is not None:
-        return "shape"
+        return _DayVerdict("shape", 0)
     try:
-        bars_from_rows(rows, _MS_1M)
+        check_rows(rows, _MS_1M)
     except ValueError:
-        return "bars"
-    if _longest_zero_volume_run(rows) >= ZERO_VOLUME_RUN_MAX:
-        return "zero_volume"
-    return None
+        return _DayVerdict("bars", 0)
+    longest, run_after = _zero_volume_runs(rows, zero_run_before)
+    return _DayVerdict("zero_volume" if longest >= ZERO_VOLUME_RUN_LIMIT else None, run_after)
 
 
 def days_check(data_dir: Path) -> Tuple[List[str], bool]:
     """Every WIB day of the training start .. the last holdout day, prod BTC/ETH 1m: each
-    day file exists, holds exactly its own day's 1,440 valid bars and has no long run
-    of zero volume."""
+    day file exists, is readable, holds exactly its own day's 1,440 valid bars and has
+    no long run of zero volume (also across midnight)."""
     first, last = wib_day(ms(TRAIN_START)), wib_day(ms(HOLDOUT_END) - 1)
     lines: List[str] = []
     for symbol in SYMBOLS:
-        paths = {d: day_path(data_dir, "prod", symbol, "1m", d) for d in _days(first, last)}
-        missing = [d for d, p in paths.items() if not p.exists()]
-        found = {d: _day_problem(p, d) for d, p in paths.items() if p.exists()}
+        missing: List[date] = []
+        found = {}
+        zero_run = 0
+        for d in _days(first, last):
+            path = day_path(data_dir, "prod", symbol, "1m", d)
+            if not path.exists():
+                missing.append(d)
+                zero_run = 0
+                continue
+            verdict = _day_verdict(path, d, zero_run)
+            found[d], zero_run = verdict.problem, verdict.zero_run_after
         if missing:
             lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {_listed(missing)}")
         for kind, text in _DAY_PROBLEMS.items():
             days = [d for d, problem in found.items() if problem == kind]
             if days:
                 lines.append(f"  prod/{symbol}/1m {text} on {len(days)} days: {_listed(days)}")
-    verdict = "FAIL" if lines else "PASS"
-    head = f"{verdict} complete days: prod BTC/ETH 1m {first}..{last}"
+    verdict_word = "FAIL" if lines else "PASS"
+    head = f"{verdict_word} complete days: prod BTC/ETH 1m {first}..{last}"
     return [head] + lines, not lines
 
 

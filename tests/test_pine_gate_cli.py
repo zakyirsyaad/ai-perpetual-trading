@@ -605,8 +605,33 @@ class CheckDataCommandTest(Dirs):
                       "2025-08-01", lines)
 
     def test_days_check_tolerates_a_short_zero_volume_run(self):
+        from research.pine_gate.cli_data import ZERO_VOLUME_RUN_LIMIT
+
+        self.assertEqual(ZERO_VOLUME_RUN_LIMIT, 60)  # a run this long fails
         lines = self._days_check_with_day1(lambda k, r: r[:5] + (0.0,) if k < 59 else r)
         self.assertFalse(any("zero-volume" in line for line in lines), lines)
+
+    def test_days_check_follows_a_zero_volume_run_across_midnight(self):
+        from research.pine_gate import cli_data
+
+        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
+        hole = range(1440 - 45, 1440 + 45)  # 45 minutes either side of WIB midnight
+        write_prod_days(self.data, "BTC-USDT",
+                        [r[:5] + (0.0,) if k in hole else r for k, r in enumerate(rows)])
+        lines, _ = cli_data.days_check(self.data)
+        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 1 days: "
+                      "2025-08-02", lines)
+
+    def test_days_check_names_an_unreadable_day_file(self):
+        from research.pine_gate import cli_data
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440))
+        day_path(self.data, "prod", "BTC-USDT", "1m", FIRST_DAY).write_bytes(b"not gzip")
+        lines, ok = cli_data.days_check(self.data)
+        self.assertFalse(ok)
+        self.assertIn("  prod/BTC-USDT/1m unreadable on 1 days: 2025-08-01", lines)
+        self.assertFalse(any("not a whole WIB day" in line for line in lines), lines)
 
     def test_days_check_lists_a_day_with_invalid_bars(self):
         for bad in (lambda r: r[:5] + (float("nan"),),           # NaN volume
