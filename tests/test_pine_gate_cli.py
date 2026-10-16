@@ -611,16 +611,62 @@ class CheckDataCommandTest(Dirs):
         lines = self._days_check_with_day1(lambda k, r: r[:5] + (0.0,) if k < 59 else r)
         self.assertFalse(any("zero-volume" in line for line in lines), lines)
 
-    def test_days_check_follows_a_zero_volume_run_across_midnight(self):
+    def _days_check_zeroed(self, zeroed, days=2, drop_day=None, short_day=None):
+        """days_check with BTC 1m rows ``zeroed`` (indices from FIRST_DAY 00:00 WIB)."""
         from research.pine_gate import cli_data
 
-        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), 2 * 1440)
-        hole = range(1440 - 45, 1440 + 45)  # 45 minutes either side of WIB midnight
-        write_prod_days(self.data, "BTC-USDT",
-                        [r[:5] + (0.0,) if k in hole else r for k, r in enumerate(rows)])
+        rows = synthetic_rows(wib_day_start_ms(FIRST_DAY), days * 1440)
+        rows = [r[:5] + (0.0,) if k in zeroed else r for k, r in enumerate(rows)]
+        if drop_day is not None:
+            rows = rows[:drop_day * 1440] + rows[(drop_day + 1) * 1440:]
+        if short_day is not None:
+            del rows[short_day * 1440]
+        write_prod_days(self.data, "BTC-USDT", rows)
         lines, _ = cli_data.days_check(self.data)
-        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 1 days: "
+        return lines
+
+    def test_days_check_follows_a_zero_volume_run_across_midnight(self):
+        lines = self._days_check_zeroed(range(1440 - 45, 1440 + 45))  # 45 min each side
+        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 2 days: "
+                      "2025-08-01, 2025-08-02", lines)
+
+    def test_a_run_crossing_midnight_lists_the_day_it_started_on(self):
+        lines = self._days_check_zeroed(range(1440 - 50, 1440 + 10))  # mostly on day 1
+        self.assertIn("  prod/BTC-USDT/1m a run of >= 60 zero-volume minutes on 2 days: "
+                      "2025-08-01, 2025-08-02", lines)
+
+    def test_a_missing_day_breaks_a_zero_volume_run(self):
+        lines = self._days_check_zeroed(set(range(1440 - 40, 1440)) | set(range(2880, 2920)),
+                                        days=3, drop_day=1)
+        self.assertIn("  prod/BTC-USDT/1m missing 437 days: 2025-08-02, 2025-08-04, "
+                      "2025-08-05, 2025-08-06, 2025-08-07, 2025-08-08, 2025-08-09, "
+                      "2025-08-10, 2025-08-11, 2025-08-12, ...", lines)
+        self.assertFalse(any("zero-volume" in line for line in lines), lines)
+
+    def test_a_broken_day_breaks_a_zero_volume_run(self):
+        lines = self._days_check_zeroed(set(range(1440 - 40, 1440)) | set(range(2880, 2920)),
+                                        days=3, short_day=1)
+        self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: "
                       "2025-08-02", lines)
+        self.assertFalse(any("zero-volume" in line for line in lines), lines)
+
+    def test_day_problem_kinds_are_an_enum_in_print_order(self):
+        from research.pine_gate.cli_data import DayProblem
+
+        self.assertEqual([k.name for k in DayProblem],
+                         ["UNREADABLE", "SHAPE", "BARS", "ZERO_VOLUME"])
+        self.assertEqual(DayProblem.ZERO_VOLUME.value, "a run of >= 60 zero-volume minutes")
+
+    def test_days_check_classifies_through_the_shared_reader(self):
+        from research.pine_gate import cli_data
+        from research.pine_gate.bars import DayShapeError
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 1440))
+        with mock.patch.object(cli_data, "read_valid_day", side_effect=DayShapeError("x")):
+            lines, _ = cli_data.days_check(self.data)
+        self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: "
+                      "2025-08-01", lines)
 
     def test_days_check_names_an_unreadable_day_file(self):
         from research.pine_gate import cli_data

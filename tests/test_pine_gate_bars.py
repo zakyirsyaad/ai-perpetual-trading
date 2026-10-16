@@ -1,6 +1,7 @@
 import gzip
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from research.pine_gate.bars import (
     BarGapError,
     DayShapeError,
     MissingDayError,
+    UnreadableDayError,
     aggregate,
     bars_from_rows,
     check_rows,
@@ -21,6 +23,7 @@ from research.pine_gate.bars import (
     last_closed_index,
     load_days,
     read_day,
+    read_valid_day,
     slice_until,
     warmup_path,
     wib_day,
@@ -336,6 +339,54 @@ class DayFilesTest(unittest.TestCase):
             path.write_bytes(b"not a gzip file")
             with self.assertRaises(ValueError):
                 read_day(path)
+
+    def test_an_unreadable_day_raises_its_own_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.csv.gz"
+            path.write_bytes(b"not a gzip file")
+            with self.assertRaises(UnreadableDayError):
+                read_day(path)
+            with gzip.open(path, "wt", encoding="utf-8") as fh:
+                fh.write("1,2,3,4,5,x\n")
+            with self.assertRaises(UnreadableDayError):
+                read_day(path)
+        self.assertTrue(issubclass(UnreadableDayError, ValueError))
+
+    def test_read_valid_day_returns_rows_or_the_typed_error(self):
+        d1 = date(2026, 1, 1)
+        good = make_rows(wib_day_start_ms(d1), HOUR, 24)
+        duplicated = list(good)
+        duplicated[5] = duplicated[4]
+        bad_bar = list(good)
+        bad_bar[3] = bad_bar[3][:5] + (-1.0,)
+        cases = {"short": (good[:23], DayShapeError), "duplicate": (duplicated, BarGapError),
+                 "negative volume": (bad_bar, ValueError)}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = day_path(Path(tmp), "prod", "BTC-USDT", "1h", d1)
+            write_day(path, good)
+            self.assertEqual(read_valid_day(path, d1, HOUR), good)
+            for name, (rows, error) in cases.items():
+                with self.subTest(name):
+                    write_day(path, rows)
+                    with self.assertRaises(error):
+                        read_valid_day(path, d1, HOUR)
+            path.write_bytes(b"not a gzip file")
+            with self.assertRaises(UnreadableDayError):
+                read_valid_day(path, d1, HOUR)
+
+    def test_load_days_reads_each_day_through_read_valid_day(self):
+        from research.pine_gate import bars as bars_module
+
+        d1 = date(2026, 1, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            write_day(day_path(base, "prod", "BTC-USDT", "1h", d1),
+                      make_rows(wib_day_start_ms(d1), HOUR, 24))
+            with mock.patch.object(bars_module, "read_valid_day",
+                                   side_effect=DayShapeError("from the shared reader")):
+                with self.assertRaises(DayShapeError) as ctx:
+                    load_days(base, "prod", "BTC-USDT", "1h", d1, d1)
+            self.assertIn("from the shared reader", str(ctx.exception))
 
     def test_read_day_missing_file_raises_file_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:

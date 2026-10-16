@@ -18,25 +18,29 @@ import argparse
 import json
 import random
 from datetime import date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple,
+)
 
 import httpx
 
 from . import cli_common as common
 from .bars import (
     Bars,
+    DayShapeError,
     MissingDayError,
     Row,
+    UnreadableDayError,
     aggregate,
     bars_from_rows,
-    check_rows,
-    day_shape_problem,
     day_path,
     funding_path,
     interval_to_ms,
     load_days,
     read_day,
+    read_valid_day,
     slice_until,
     warmup_path,
     wib_day,
@@ -72,6 +76,7 @@ NATIVE_AGREEMENT_MIN = 0.999
 # Per symbol: recorded and the next symbol goes on. RateLimitedError is not here.
 _NETWORK_ERRORS = (ExchangeError, IncompleteDayError, httpx.HTTPError)
 _MS_1M = 60_000
+_MINUTES_PER_DAY = 1440
 _LISTED_DAYS = 10
 
 Series = Tuple[Bars, Optional[Bars], Optional[Bars]]  # 1m bars, native 1h and 4h warm-up
@@ -230,51 +235,88 @@ def _listed(days: Sequence[date]) -> str:
 
 ZERO_VOLUME_RUN_LIMIT = 60  # minutes; a run this long fails (stored data has none)
 
-# Why a stored 1m day is unusable, in the order the lines are printed.
-_DAY_PROBLEMS = {
-    "unreadable": "unreadable",
-    "shape": "not a whole WIB day (1440 bars)",
-    "bars": "invalid bars",
-    "zero_volume": f"a run of >= {ZERO_VOLUME_RUN_LIMIT} zero-volume minutes",
-}
+
+class DayProblem(Enum):
+    """Why a stored 1m day is unusable; the value is its line text, in print order."""
+
+    UNREADABLE = "unreadable"
+    SHAPE = "not a whole WIB day (1440 bars)"
+    BARS = "invalid bars"
+    ZERO_VOLUME = f"a run of >= {ZERO_VOLUME_RUN_LIMIT} zero-volume minutes"
+
+
+class _ZeroRuns(NamedTuple):
+    longest: int  # longest run reaching into the day, the carried-in part included
+    carried: int  # how long the carried-in run grew here (0 if it did not go on)
+    open_after: int  # run still open at the day's end
+
+
+def _zero_volume_runs(rows: Sequence[Row], run_before: int) -> _ZeroRuns:
+    """Zero-volume runs of one day, continuing a run of ``run_before`` minutes.
+
+    A carried-in run counts only if it goes on here."""
+    longest, carried, run = 0, 0, run_before
+    continuing = run_before > 0
+    for row in rows:
+        if row[5] != 0.0:
+            run, continuing = 0, False
+            continue
+        run += 1
+        longest = max(longest, run)
+        if continuing:
+            carried = run
+    return _ZeroRuns(longest, carried, run)
 
 
 class _DayVerdict(NamedTuple):
-    problem: Optional[str]  # a ``_DAY_PROBLEMS`` key
-    zero_run_after: int  # zero-volume minutes running into the next day
+    problem: Optional[DayProblem]
+    zero_runs: _ZeroRuns  # all zero for a day with any other problem: it breaks a run
 
 
-def _zero_volume_runs(rows: Sequence[Row], run_before: int) -> Tuple[int, int]:
-    """(longest zero-volume run reaching into ``rows``, run still open at the end).
-
-    A run carried in from the previous day counts only if it goes on here."""
-    longest, run = 0, run_before
-    for row in rows:
-        run = run + 1 if row[5] == 0.0 else 0
-        longest = max(longest, run)
-    return longest, run
+_NO_RUNS = _ZeroRuns(0, 0, 0)
 
 
 def _day_verdict(path: Path, day: date, zero_run_before: int) -> _DayVerdict:
-    """What is wrong with one 1m day file, read once.
+    """What is wrong with one 1m day file, read once through ``read_valid_day`` (the
+    reader ``load_days`` uses). A long run of zero volume, counted across midnight,
+    skews every 24-hour POC that covers it while OHLC looks fine."""
+    try:
+        rows = read_valid_day(path, day, _MS_1M)
+    except UnreadableDayError:
+        return _DayVerdict(DayProblem.UNREADABLE, _NO_RUNS)
+    except DayShapeError:
+        return _DayVerdict(DayProblem.SHAPE, _NO_RUNS)
+    except ValueError:  # BarGapError or a bar check_rows rejects
+        return _DayVerdict(DayProblem.BARS, _NO_RUNS)
+    runs = _zero_volume_runs(rows, zero_run_before)
+    too_long = runs.longest >= ZERO_VOLUME_RUN_LIMIT
+    return _DayVerdict(DayProblem.ZERO_VOLUME if too_long else None, runs)
 
-    Bars the loader would reject (non-finite, high/low not bracketing, negative
-    volume, a gap) are invalid; a long run of zero volume, counted across
-    midnight from the previous day, skews every 24-hour POC that covers it
-    while OHLC looks fine. A day with any other problem breaks the run.
-    """
-    try:
-        rows = read_day(path)
-    except ValueError:
-        return _DayVerdict("unreadable", 0)
-    if day_shape_problem(rows, day, _MS_1M) is not None:
-        return _DayVerdict("shape", 0)
-    try:
-        check_rows(rows, _MS_1M)
-    except ValueError:
-        return _DayVerdict("bars", 0)
-    longest, run_after = _zero_volume_runs(rows, zero_run_before)
-    return _DayVerdict("zero_volume" if longest >= ZERO_VOLUME_RUN_LIMIT else None, run_after)
+
+def _symbol_day_problems(data_dir: Path, symbol: str, first: date,
+                         last: date) -> Tuple[List[date], Dict[date, DayProblem]]:
+    """Missing days and each stored day's problem; a zero-volume run that crosses
+    midnight is charged to every day it touches."""
+    missing: List[date] = []
+    problems: Dict[date, DayProblem] = {}
+    run, run_days = 0, []  # the open zero-volume run and the earlier days it covers
+    for d in _days(first, last):
+        path = day_path(data_dir, "prod", symbol, "1m", d)
+        if not path.exists():
+            missing.append(d)
+            run, run_days = 0, []
+            continue
+        verdict = _day_verdict(path, d, run)
+        if verdict.problem is not None:
+            problems[d] = verdict.problem
+        runs = verdict.zero_runs
+        if runs.carried >= ZERO_VOLUME_RUN_LIMIT:
+            for earlier in run_days:
+                problems.setdefault(earlier, DayProblem.ZERO_VOLUME)
+        whole_day_continued = run > 0 and runs.open_after == run + _MINUTES_PER_DAY
+        run_days = (run_days + [d] if whole_day_continued else [d]) if runs.open_after else []
+        run = runs.open_after
+    return missing, problems
 
 
 def days_check(data_dir: Path) -> Tuple[List[str], bool]:
@@ -284,25 +326,16 @@ def days_check(data_dir: Path) -> Tuple[List[str], bool]:
     first, last = wib_day(ms(TRAIN_START)), wib_day(ms(HOLDOUT_END) - 1)
     lines: List[str] = []
     for symbol in SYMBOLS:
-        missing: List[date] = []
-        found = {}
-        zero_run = 0
-        for d in _days(first, last):
-            path = day_path(data_dir, "prod", symbol, "1m", d)
-            if not path.exists():
-                missing.append(d)
-                zero_run = 0
-                continue
-            verdict = _day_verdict(path, d, zero_run)
-            found[d], zero_run = verdict.problem, verdict.zero_run_after
+        missing, problems = _symbol_day_problems(data_dir, symbol, first, last)
         if missing:
             lines.append(f"  prod/{symbol}/1m missing {len(missing)} days: {_listed(missing)}")
-        for kind, text in _DAY_PROBLEMS.items():
-            days = [d for d, problem in found.items() if problem == kind]
+        for kind in DayProblem:
+            days = sorted(d for d, problem in problems.items() if problem is kind)
             if days:
-                lines.append(f"  prod/{symbol}/1m {text} on {len(days)} days: {_listed(days)}")
-    verdict_word = "FAIL" if lines else "PASS"
-    head = f"{verdict_word} complete days: prod BTC/ETH 1m {first}..{last}"
+                lines.append(f"  prod/{symbol}/1m {kind.value} on {len(days)} days: "
+                             f"{_listed(days)}")
+    verdict = "FAIL" if lines else "PASS"
+    head = f"{verdict} complete days: prod BTC/ETH 1m {first}..{last}"
     return [head] + lines, not lines
 
 

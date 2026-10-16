@@ -49,6 +49,10 @@ class DayShapeError(ValueError):
     """A day file does not hold exactly its own WIB day of bars."""
 
 
+class UnreadableDayError(ValueError):
+    """A day file is corrupt or malformed (bad gzip, wrong field count, non-numeric)."""
+
+
 @dataclass(frozen=True)
 class Bars:
     interval_ms: int
@@ -301,7 +305,7 @@ def write_day_exclusive(path: Path, rows: Sequence[Row]) -> bool:
 
 
 def read_day(path: Path) -> List[Row]:
-    """Read a day file; raise ``ValueError`` when it is corrupt or malformed."""
+    """Read a day file; raise ``UnreadableDayError`` when it is corrupt or malformed."""
     path = Path(path)
     rows: List[Row] = []
     try:
@@ -312,7 +316,7 @@ def read_day(path: Path) -> List[Row]:
                     continue
                 fields = line.split(",")
                 if len(fields) != _ROW_FIELDS:
-                    raise ValueError(
+                    raise UnreadableDayError(
                         f"{path}:{line_no}: expected {_ROW_FIELDS} fields, got {len(fields)}"
                     )
                 try:
@@ -327,9 +331,11 @@ def read_day(path: Path) -> List[Row]:
                         )
                     )
                 except ValueError as exc:
-                    raise ValueError(f"{path}:{line_no}: non-numeric field ({exc})") from exc
+                    raise UnreadableDayError(
+                        f"{path}:{line_no}: non-numeric field ({exc})"
+                    ) from exc
     except (EOFError, zlib.error, UnicodeDecodeError, gzip.BadGzipFile) as exc:
-        raise ValueError(f"{path}: corrupt day file ({exc})") from exc
+        raise UnreadableDayError(f"{path}: corrupt day file ({exc})") from exc
     return rows
 
 
@@ -361,12 +367,23 @@ def load_days(
     interval_ms = interval_to_ms(interval)
     rows: List[Row] = []
     for day, path in zip(days, paths):
-        day_rows = read_day(path)
-        problem = day_shape_problem(day_rows, day, interval_ms)
-        if problem is not None:
-            raise DayShapeError(f"{path} ({day.isoformat()}): {problem}")
-        rows.extend(day_rows)
-    return bars_from_rows(rows, interval_ms)
+        rows.extend(read_valid_day(path, day, interval_ms))
+    return bars_from_rows(rows, interval_ms)  # also checks that the days join
+
+
+def read_valid_day(path: Path, day: date, interval_ms: int) -> List[Row]:
+    """The rows of one day file, as ``load_days`` and ``check-data`` both accept them.
+
+    Raises ``UnreadableDayError`` for a corrupt file, ``DayShapeError`` when it
+    does not hold exactly its own WIB day, and what ``check_rows`` raises
+    (``BarGapError`` or ``ValueError``) for an invalid bar.
+    """
+    rows = read_day(path)
+    problem = day_shape_problem(rows, day, interval_ms)
+    if problem is not None:
+        raise DayShapeError(f"{path} ({day.isoformat()}): {problem}")
+    check_rows(rows, interval_ms)
+    return rows
 
 
 def day_shape_problem(rows: Sequence[Row], day: date, interval_ms: int) -> Optional[str]:
