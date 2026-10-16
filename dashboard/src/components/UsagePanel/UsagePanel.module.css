@@ -244,14 +244,43 @@
     padding: 8px 16px 10px;
   }
 
+  /* Each day keeps every column: totals on the first line, calls and the
+     input/reasoning/output split on a second, muted line. */
   .rail .row {
     grid-template-columns: 84px minmax(40px, 1fr) 52px 78px;
-    gap: 8px;
+    grid-template-areas:
+      "day track num per"
+      "calls split split split";
+    row-gap: 2px;
+    column-gap: 8px;
+    padding: 4px 0;
   }
 
-  .rail .calls,
+  .rail .day {
+    grid-area: day;
+  }
+
+  .rail .rowTrack {
+    grid-area: track;
+  }
+
+  .rail .num {
+    grid-area: num;
+  }
+
+  .rail .perTrade {
+    grid-area: per;
+  }
+
+  .rail .calls {
+    grid-area: calls;
+    text-align: left;
+  }
+
   .rail .split {
-    display: none;
+    grid-area: split;
+    text-align: left;
+    white-space: nowrap;
   }
 }
 

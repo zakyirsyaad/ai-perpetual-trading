@@ -1,16 +1,18 @@
 /* Desktop (>= 900px): header on top, then two columns. The work column holds the
    coin tabs, the chart and the positions/trades/history book; the rail holds the
    daily volume, the token strip, the latest call and the call feed.
-   Mobile (< 900px): every wrapper below is display: contents and `order` keeps
-   the original stacked sequence (header, volume, tokens, coins, chart, call,
-   feed, book). */
+   Mobile (< 900px): page.tsx renders the slots flat in the stacked order
+   (header, volume, tokens, coins, chart, call, feed, book) so the DOM matches
+   the screen. Until hydration the page holds the prerendered desktop tree; the
+   display: contents and `order` rules below paint that tree in the same
+   stacked order meanwhile. */
 
 .slotHeader {
   flex: none;
 }
 
 .body {
-  --rail-w: 360px;
+  --rail-w: 380px; /* the width DecisionPanel and Feed were laid out for */
   flex: 1 1 0;
   min-height: 0;
   display: grid;
@@ -42,7 +44,6 @@
   flex-direction: column;
 }
 
-
 .rail {
   min-width: 0;
   min-height: 0;
@@ -69,13 +70,6 @@
 }
 
 @media (min-width: 900px) {
-  /* The book's own fixed height is for the stacked mobile layout; here it fills its row. */
-  .work .slotBook > * {
-    flex: 1;
-    height: auto;
-    min-height: 0;
-  }
-
   .slotFeed > * {
     flex: 1;
     min-height: 0;

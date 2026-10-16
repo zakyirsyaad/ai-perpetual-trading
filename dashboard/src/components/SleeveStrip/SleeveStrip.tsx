@@ -4,6 +4,7 @@ import type { BlockEvent, SleeveMeta } from "@/lib/types";
 import { displayCoin, fmtCoin, fmtPrice, fmtSignedUsd } from "@/lib/format";
 import TokenIcon from "@/components/TokenIcon/TokenIcon";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { cx } from "@/lib/cx";
 import styles from "./SleeveStrip.module.css";
 
 export default function SleeveStrip({
@@ -13,7 +14,7 @@ export default function SleeveStrip({
   selected,
   onSelect,
   waiting = false,
-  variant = "cards",
+  variant = "stack",
 }: {
   sleeves: SleeveMeta[];
   latestByCoin: Record<string, BlockEvent | null>;
@@ -22,9 +23,9 @@ export default function SleeveStrip({
   onSelect: (coin: string) => void;
   waiting?: boolean;
   /** "tabs": a compact two-line tab row on desktop (mobile keeps the cards). */
-  variant?: "cards" | "tabs";
+  variant?: "stack" | "tabs";
 }) {
-  const stripClass = variant === "tabs" ? `${styles.strip} ${styles.tabs}` : styles.strip;
+  const stripClass = cx(styles.strip, variant === "tabs" && styles.tabs);
   if (!sleeves.length) {
     if (!waiting) return null;
     return (

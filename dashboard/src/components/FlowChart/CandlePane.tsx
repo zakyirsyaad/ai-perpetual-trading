@@ -68,6 +68,12 @@ function stemOf(rows: Candle[]): string {
   return `${rows[0]!.time}`;
 }
 
+/** True when the visible range reaches the last of `count` drawn bars (or nothing is shown yet). */
+function atLiveEdge(chart: IChartApi | null, count: number): boolean {
+  const range = chart?.timeScale().getVisibleLogicalRange();
+  return !range || range.to >= count - 1;
+}
+
 function showLatest(chart: IChartApi | null, count: number, visibleBars: number) {
   if (!chart || count <= 0) return;
   const to = count + 1;
@@ -172,21 +178,31 @@ export default function CandlePane({
       return;
     }
     const stemChanged = stemRef.current !== stem;
+    const rangeChanged = rangeRef.current !== rangeKey;
     const newest = candles[candles.length - 1]!.time;
-    // update() only touches the newest bar. Redraw when the newest bar is older
-    // than the one drawn (a rebuilt or trimmed tape: lightweight-charts would throw
-    // "Cannot update oldest data" and take the page down) or when more than one
-    // bar was added since the last draw (the bars in between would be skipped).
-    const appendsAtMostOne = bars.length - barCountRef.current <= 1;
-    if (!stemChanged && stem && newest >= lastTimeRef.current && appendsAtMostOne) {
+    const added = bars.length - barCountRef.current;
+    // update() only touches the newest bar, so it is safe only for the same coin
+    // and interval, the same first bar, and zero or one new bar whose time does
+    // not go back. Anything else redraws: an older newest bar would make
+    // lightweight-charts throw "Cannot update oldest data" and take the page
+    // down, a shrunk series would keep stale bars, and a jump of several bars
+    // would skip the ones in between.
+    const canUpdate =
+      !stemChanged && !rangeChanged && Boolean(stem) && newest >= lastTimeRef.current && (added === 0 || added === 1);
+    if (canUpdate) {
       series.update(bars[bars.length - 1]!);
     } else {
+      // A catch-up redraw keeps following the live edge only if the view was on it.
+      const followLive = added > 1 && atLiveEdge(chartRef.current, barCountRef.current);
       series.setData(bars);
       stemRef.current = stem;
+      if (followLive && !rangeChanged && !stemChanged) {
+        showLatest(chartRef.current, bars.length, visibleBars);
+      }
     }
     lastTimeRef.current = newest;
     barCountRef.current = bars.length;
-    if (rangeRef.current !== rangeKey || stemChanged) {
+    if (rangeChanged || stemChanged) {
       rangeRef.current = rangeKey;
       showLatest(chartRef.current, bars.length, visibleBars);
     }

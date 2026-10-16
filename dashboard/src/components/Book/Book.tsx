@@ -18,6 +18,7 @@ import {
   txUrl,
 } from "@/lib/format";
 import { Bone } from "@/components/Skeleton/Skeleton";
+import { cx } from "@/lib/cx";
 import styles from "./Book.module.css";
 
 type Tab = "positions" | "trades" | "history";
@@ -40,6 +41,7 @@ export default function Book({
   onSelect,
   onNeedMoreTape,
   waiting = false,
+  variant = "stack",
 }: {
   sleeves: SleeveMeta[];
   latestByCoin: Record<string, BlockEvent | null>;
@@ -49,6 +51,8 @@ export default function Book({
   onSelect: (coin: string) => void;
   onNeedMoreTape?: () => void;
   waiting?: boolean;
+  /** "fill": on desktop the book fills its grid row instead of its fixed height. */
+  variant?: "stack" | "fill";
 }) {
   const [tab, setTab] = useState<Tab>("positions");
   const [allMarkets, setAllMarkets] = useState(false);
@@ -82,7 +86,7 @@ export default function Book({
   const today = dayKey(Date.now());
 
   return (
-    <section className={styles.wrap}>
+    <section className={cx(styles.wrap, variant === "fill" && styles.fill)}>
       <div className={styles.tabs} role="tablist" aria-label="Account book">
         <button
           type="button"
