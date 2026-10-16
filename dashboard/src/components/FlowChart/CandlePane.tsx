@@ -196,11 +196,22 @@ export default function CandlePane({
       // was rebuilt) keeps following the live edge only if the view was on it,
       // so a view scrolled back to an earlier entry stays where it is.
       const followLive = rangeChanged || atLiveEdge(chartRef.current, barCountRef.current);
+      const kept = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
+      // Older history prepended in front of the drawn bars moves every logical
+      // index by that many bars; shift a scrolled-back view with them.
+      const oldFirst = Number(stemRef.current);
+      const prepended = stemChanged && !rangeChanged && Number.isFinite(oldFirst)
+        ? candles.findIndex((c) => c.time >= oldFirst)
+        : 0;
       const bars = toBars(candles);
       series.setData(bars);
       stemRef.current = stem;
       rangeRef.current = rangeKey;
-      if (followLive) showLatest(chartRef.current, bars.length, visibleBars);
+      if (followLive) {
+        showLatest(chartRef.current, bars.length, visibleBars);
+      } else if (kept && prepended > 0) {
+        chartRef.current?.timeScale().setVisibleLogicalRange({ from: kept.from + prepended, to: kept.to + prepended });
+      }
     }
     lastTimeRef.current = newest.time;
     barCountRef.current = candles.length;

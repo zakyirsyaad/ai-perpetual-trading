@@ -86,6 +86,16 @@ Findings and fixes:
 
 Verified after round 3: with Trades selected, the token detail open and the chart on 15m, resizing 1280 -> 375 -> 1280 keeps all three; switching BTC -> ETH still resets the interval to 5m. Desktop 1280x720 and mobile 375x812 panel geometry unchanged from round 2 (the token detail open adds its own height). No hydration warning or chart error in the console.
 
+## Round 4 (third code review of PR #38)
+
+- The null-width branch rendered only the header, so the prerendered HTML lost its skeletons; it now renders a layout-neutral `.pending` placeholder (work column + rail on desktop, stacked blocks on mobile, sized by CSS).
+- A scrolled-back chart view now keeps the same candles when older history is prepended: the saved logical range is shifted by the number of bars added in front.
+- `useSessionState` writes the store from the committed value in an effect, not inside a state updater.
+- The token Detail toggle uses plain `useState` restored from `localStorage` only (one store, not two).
+- The CLAUDE.md note names the Detail toggle's `localStorage` and the deliberate interval reset on a coin change (`chart.intervalCoin`).
+
+Verified: prerendered HTML holds the header and the `.pending` placeholder; History + Detail open + 15m survive 1280 -> 375 -> 1280; no console error.
+
 ## Verification
 
 - `bunx tsc --noEmit -p .` (dashboard): clean.
@@ -103,7 +113,8 @@ Verified after round 3: with Trades selected, the token detail open and the char
 - 1edac7d `fix: address PR #38 review on chart redraws, mobile order and the rail` (round 2)
 - 926d296 `docs: round 2 of the dashboard layout TDD evidence`
 - c34a28d `fix: mount dashboard panels once and keep their state across the breakpoint` (round 3)
-- the docs-only commit that records the round-3 hash makes no code change
+- 79bf82a `docs: round 3 of the dashboard layout TDD evidence`
+- round 4: the commit titled `fix: keep the loading placeholder and a scrolled-back chart view` (its hash is recorded in the PR description)
 
 ## Deployment gate
 

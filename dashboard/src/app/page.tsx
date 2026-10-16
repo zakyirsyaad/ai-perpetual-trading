@@ -6,6 +6,7 @@ import DecisionPanel from "@/components/DecisionPanel/DecisionPanel";
 import Feed from "@/components/Feed/Feed";
 import FlowChart from "@/components/FlowChart/FlowChart";
 import Header from "@/components/Header/Header";
+import { Bone } from "@/components/Skeleton/Skeleton";
 import SleeveStrip from "@/components/SleeveStrip/SleeveStrip";
 import UsagePanel from "@/components/UsagePanel/UsagePanel";
 import VolumePanel from "@/components/VolumePanel/VolumePanel";
@@ -144,10 +145,19 @@ export default function Page() {
     </div>
   );
 
-  // Until the browser reports its width, render only the shell: each panel then
-  // mounts once, in the tree that matches the screen.
+  // Until the browser reports its width, render the header and a placeholder
+  // sized by CSS for either width: each panel then mounts once, in the tree that
+  // matches the screen.
   if (isDesktop === null) {
-    return <div className="shell">{header}</div>;
+    return (
+      <div className="shell">
+        {header}
+        <div className={styles.pending} aria-busy="true" aria-label="Loading dashboard">
+          <Bone className={styles.pendingWork} />
+          <Bone className={styles.pendingRail} />
+        </div>
+      </div>
+    );
   }
 
   // The DOM order follows what is on screen at each breakpoint, so keyboard
