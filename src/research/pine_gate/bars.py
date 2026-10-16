@@ -128,8 +128,13 @@ def bars_from_rows(rows: Iterable[Row], interval_ms: int) -> Bars:
 
     Every row is validated (``_check_bar``); a bad value raises ``ValueError`` and a
     gap, duplicate or disorder raises ``BarGapError``."""
+    return _build(_validated(rows, interval_ms), interval_ms)
+
+
+def _build(rows: Iterable[Row], interval_ms: int) -> Bars:
+    """``Bars`` from rows already validated (no check of its own)."""
     out = _empty(interval_ms)
-    for t, o, h, low, c, v in _validated(rows, interval_ms):
+    for t, o, h, low, c, v in rows:
         out.open_ms.append(t)
         out.open.append(o)
         out.high.append(h)
@@ -349,9 +354,11 @@ def load_days(
 ) -> Bars:
     """Load the inclusive WIB day range into one ``Bars``.
 
-    Raises ``MissingDayError`` listing every missing day before reading any file,
-    ``DayShapeError`` when a file does not hold exactly its own WIB day of bars
-    (spec 5.2: 1,440 1m bars) and ``BarGapError`` when the bars do not join.
+    Raises ``MissingDayError`` listing every missing day before reading any file;
+    then, per day through ``read_valid_day``, ``UnreadableDayError`` for a corrupt
+    file, ``DayShapeError`` when a file does not hold exactly its own WIB day of
+    bars (spec 5.2: 1,440 1m bars), and ``BarGapError`` or ``ValueError`` for an
+    invalid bar. Each bar is checked once: whole, consecutive days join by shape.
     """
     if end_day < start_day:
         raise ValueError(f"end_day {end_day} is before start_day {start_day}")
@@ -368,7 +375,7 @@ def load_days(
     rows: List[Row] = []
     for day, path in zip(days, paths):
         rows.extend(read_valid_day(path, day, interval_ms))
-    return bars_from_rows(rows, interval_ms)  # also checks that the days join
+    return _build(rows, interval_ms)
 
 
 def read_valid_day(path: Path, day: date, interval_ms: int) -> List[Row]:

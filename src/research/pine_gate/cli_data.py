@@ -288,6 +288,8 @@ def _day_verdict(path: Path, day: date, zero_run_before: int) -> _DayVerdict:
         return _DayVerdict(DayProblem.SHAPE, _NO_RUNS)
     except ValueError:  # BarGapError or a bar check_rows rejects
         return _DayVerdict(DayProblem.BARS, _NO_RUNS)
+    except OSError:  # present but not readable (permissions, I/O error)
+        return _DayVerdict(DayProblem.UNREADABLE, _NO_RUNS)
     runs = _zero_volume_runs(rows, zero_run_before)
     too_long = runs.longest >= ZERO_VOLUME_RUN_LIMIT
     return _DayVerdict(DayProblem.ZERO_VOLUME if too_long else None, runs)
@@ -388,7 +390,7 @@ def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str],
     step = interval_to_ms(interval)
     try:
         native = bars_from_rows(read_day(path), step)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         return [f"FAIL {label}: {path.name} unreadable ({common.one_line(exc)})"], False
     if not len(native):
         return [f"FAIL {label}: {path.name} holds no bars"], False
@@ -401,7 +403,7 @@ def native_check(data_dir: Path, symbol: str, interval: str) -> Tuple[List[str],
         bars = load_days(data_dir, "prod", symbol, "1m", first, last)
     except MissingDayError as exc:
         return [f"FAIL {label}: {common.one_line(exc)}"], False
-    except ValueError as exc:  # corrupt, mis-shaped or non-joining day files
+    except (OSError, ValueError) as exc:  # corrupt, mis-shaped, invalid or unreadable
         return [f"FAIL {label}: 1m data unreadable ({common.one_line(exc)})"], False
     try:
         agreement = htf_agreement(native, aggregate(bars, step))

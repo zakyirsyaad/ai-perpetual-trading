@@ -374,6 +374,21 @@ class DayFilesTest(unittest.TestCase):
             with self.assertRaises(UnreadableDayError):
                 read_valid_day(path, d1, HOUR)
 
+    def test_load_days_checks_each_bar_once(self):
+        from research.pine_gate import bars as bars_module
+
+        d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for d in (d1, d2):
+                write_day(day_path(base, "prod", "BTC-USDT", "1h", d),
+                          make_rows(wib_day_start_ms(d), HOUR, 24))
+            with mock.patch.object(bars_module, "_check_bar",
+                                   wraps=bars_module._check_bar) as checked:
+                bars = load_days(base, "prod", "BTC-USDT", "1h", d1, d2)
+        self.assertEqual(len(bars), 48)
+        self.assertEqual(checked.call_count, 48)
+
     def test_load_days_reads_each_day_through_read_valid_day(self):
         from research.pine_gate import bars as bars_module
 

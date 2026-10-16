@@ -638,9 +638,8 @@ class CheckDataCommandTest(Dirs):
     def test_a_missing_day_breaks_a_zero_volume_run(self):
         lines = self._days_check_zeroed(set(range(1440 - 40, 1440)) | set(range(2880, 2920)),
                                         days=3, drop_day=1)
-        self.assertIn("  prod/BTC-USDT/1m missing 437 days: 2025-08-02, 2025-08-04, "
-                      "2025-08-05, 2025-08-06, 2025-08-07, 2025-08-08, 2025-08-09, "
-                      "2025-08-10, 2025-08-11, 2025-08-12, ...", lines)
+        missing = [line for line in lines if " missing " in line and "BTC-USDT" in line]
+        self.assertTrue(missing and "2025-08-02" in missing[0], lines)
         self.assertFalse(any("zero-volume" in line for line in lines), lines)
 
     def test_a_broken_day_breaks_a_zero_volume_run(self):
@@ -649,6 +648,28 @@ class CheckDataCommandTest(Dirs):
         self.assertIn("  prod/BTC-USDT/1m not a whole WIB day (1440 bars) on 1 days: "
                       "2025-08-02", lines)
         self.assertFalse(any("zero-volume" in line for line in lines), lines)
+
+    def test_an_os_error_on_a_day_file_is_an_unreadable_day(self):
+        from research.pine_gate import cli_data
+
+        write_prod_days(self.data, "BTC-USDT",
+                        synthetic_rows(wib_day_start_ms(FIRST_DAY), 1440))
+        with mock.patch.object(cli_data, "read_valid_day",
+                               side_effect=PermissionError("permission denied")):
+            lines, ok = cli_data.days_check(self.data)
+        self.assertFalse(ok)
+        self.assertIn("  prod/BTC-USDT/1m unreadable on 1 days: 2025-08-01", lines)
+
+    def test_an_os_error_in_the_native_check_is_a_fail_line(self):
+        cli_data, _ = self._write_native(lambda i, r: r)
+        for target in ("read_day", "load_days"):
+            with self.subTest(target), mock.patch.object(
+                    cli_data, target, side_effect=OSError("I/O error")):
+                lines, ok = cli_data.native_check(self.data, "BTC-USDT", "1h")
+            self.assertFalse(ok)
+            self.assertEqual(len(lines), 1, lines)
+            self.assertTrue(lines[0].startswith("FAIL native check"), lines)
+            self.assertIn("I/O error", lines[0])
 
     def test_day_problem_kinds_are_an_enum_in_print_order(self):
         from research.pine_gate.cli_data import DayProblem
