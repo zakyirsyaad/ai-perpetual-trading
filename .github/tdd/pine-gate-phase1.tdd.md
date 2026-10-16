@@ -1,0 +1,131 @@
+# Pine Gate Phase 1 — TDD Evidence
+
+Offline evaluation of a Pine-adapted entry gate for the BingX VST bot. The work lives in `src/research/pine_gate/` and `src/bot/strategy/pine_indicators.py`. The bot never imports `research`, and `pine_indicators.py` is not wired into the live bot. Spec: `docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md`. Plan: `docs/superpowers/plans/2026-10-14-pine-gate-phase1.md`. Report (Indonesian): `docs/research/2026-10-16-pine-gate-phase1-report.md`.
+
+## User journey
+
+The manager asked on 14 October 2026 to adapt, not replace, a Pine trend/pullback script into the bot's gates, with TP = SL = 0.2% on BTC and ETH and a target win rate of at least 60% on each symbol., with a realistic net of about -210 per 1M volume at a 60% win rate.
+
+The decisions taken with the user:
+
+- Phase 1 is research only: it does not touch the live bot or `.env`, and no gate reaches the bot unless a candidate passes the locked holdout.
+- The evaluation is pre-registered. Every number is in `spec.py`, hashed as `spec_sha256()`, and the holdout (5 August – 14 October 2026) is read once, after the selection file is written.
+- Three contenders: (1) Pine structure, (2) the bot's current logic as a control, (3) a meta-labeling model on the contender 1 rule. Plus naive always-long and always-short controls (C0) that validate the fill model.
+- Production public klines are the data source because VST volume is not real (VST prices match production; volume does not).
+- The verdict sentence of the report (Indonesian) was left as a stub (ruling R7), then drafted at the user's request and approved by the user before commit.
+- The user approved the VPS run, approved merging PR #31 (the controller merged and ran it on the VPS), and asked for per-PR review waves (see Review gates).
+- Phase 2 (wiring any gate into the bot) is only triggered by a pass. Nothing passed.
+
+## RED evidence
+
+Each task started with a failing test. Excerpts come from the per-task reports.
+
+| Task | Module | RED excerpt |
+|---|---|---|
+| 1 | `pine_indicators` | `Ran 1 test ... FAILED (errors=1)` (module did not exist); fix round: DMI TR seed differed from Pine `ta.dmi` (no RED run recorded, verified by hand) |
+| 2 | `spec` | import error, no `research` package; fix round: `ImportError: CONTENDER_PREFERENCE etc. not defined`, then 22 tests OK |
+| 3 | `bars` | `ImportError` (1 error); second RED pass showed `load_days` signature errors until `interval_to_ms` was added |
+| 4 | `fetch` | no RED run: the module was written before its tests in one sitting (recorded as a process deviation, reviewed clean, 33 tests, 100% line coverage) |
+| 5 | `features` | `ModuleNotFoundError: No module named 'research.pine_gate.features'`; fix round: `AssertionError: 784.0343921079512 != 764.3571063396703` (4h/1h warm-up seam dropped the native bar of a partial leading bucket), `FAILED (failures=3)` |
+| 6 | `rules` | `ModuleNotFoundError: No module named 'research.pine_gate.rules'` |
+| 7 | `outcomes` | `ModuleNotFoundError: No module named 'research.pine_gate.outcomes'` |
+| 8 | `simulate` | `ModuleNotFoundError: No module named 'research.pine_gate.simulate'` |
+| 9 | `stats` | `ModuleNotFoundError: No module named 'research.pine_gate.stats'`; the dispatch formula for the SPA recentring failed the clear-winner test with p = 0.511, replaced by Hansen's (2005) consistent recentring |
+| 10 | `selection` | `ModuleNotFoundError: No module named 'research.pine_gate.selection'`; fix round: `FAIL: test_supply_limited_fallback - RuleSpec(E200,P35,ADX,OFF,OFF) unexpectedly found in sel.top`, `Ran 19 tests ... FAILED (failures=4)` |
+| 11 | `metalabel` | `ImportError: cannot import name 'metalabel' from 'research.pine_gate'` |
+| 12 | `calibrate` | `ModuleNotFoundError: No module named 'research.pine_gate.calibrate'` |
+| 13 | `pipeline` | `ImportError: cannot import name 'pipeline' from 'research.pine_gate'`; fix round (lock accepted injected configs under the real sha): `Ran 46 tests`, `FAILED (failures=9, errors=5)` |
+| 14 | `holdout` | `ImportError: cannot import name 'holdout' from 'research.pine_gate'`; fix round: `AssertionError: dataset.loaded_until_ms read before the lock refused`, `Ran 94 tests`, `FAILED (failures=6, errors=4)` |
+| 15 | `checks` | `ModuleNotFoundError: No module named 'research.pine_gate.checks'` |
+| 16 | `report` | `ImportError: cannot import name 'report' from 'research.pine_gate'`; fix round: `ERROR: test_non_finite_numbers_render_as_dash` (`round(inf)` overflows) |
+| 17 | `cli` | `ImportError: cannot import name 'cli' from 'research.pine_gate'`; fix round: `AssertionError: data loaded` in three vst-check/decisions tests |
+| Final fix wave | A (holdout integrity) | `KeyError: 'code_sha256'`, `KeyError: 'c0_training'`, `AttributeError: 'Dataset' object has no attribute 'train_part_sha256'`; real-sha lock cases `AssertionError: dataset.loaded_until_ms read before the lock refused` (5 subtests) |
+| Fingerprint fix | code sha | `AssertionError: Lists differ: ['bot/arena/setup_profile.py', 'bot/strategy/indicators.py'] != []` |
+| PR #31 wave 1 | meta-model M4 | `FAIL: test_fit_satisfies_first_order_conditions  AssertionError: 4.652389265024596 != 0.0 within 6 places`, `FAIL: test_the_penalty_means_the_same_at_every_weight_scale  AssertionError: 2.339352852923954 != 3.259937223452468`, `Ran 33 tests — FAILED (failures=3, errors=1)` |
+| PR #31 wave 2 | lock before data | under the real sha with `seed=1` the whole training ran, then failed inside the meta-model (`fold 1: 0 training, 0 validation candidates`) instead of refusing up front |
+| PR #31 follow-up | F2 / F3 | `ImportError: cannot import name 'threshold_candidates'`; `AttributeError: ... has no attribute 'holdout_run_status'`; behavioural RED `chosen C 10.0 ... threshold 0.5 supply_oof_at_threshold 2.7` against a floor of 10 trades/day |
+| PR #32 | fetch limits | `IncompleteDayError: BTC-USDT 1h 0..5183999999: got 1000 of 1440 bars`; `['1440', '1060'] != ['1000', '1000', '500']`; `ExchangeError: exchange code 100410`; funding `3 != 14` windows (11 failures/errors) |
+| PR #33 | purge from latency | `ValueError: a trade can last 74.1 min from its tick, longer than the 65-minute purge`; `65 != 75`; `Ran 201 tests ... FAILED (failures=5, errors=9)` |
+
+Honest gaps: Task 4 has no RED run, and Task 1's fix round has no recorded RED run. Both were flagged in the ledger and accepted by review. In the final fix wave two RED-phase tests reached the public BingX kline endpoint (no keys; one 109400 response); tests now block every `httpx` entry point.
+
+## GREEN implementation
+
+- `pine_indicators.py`: Pine-compatible RMA, EMA, RSI, ATR, DMI, causal, `None` until warmed up.
+- `spec.py`: every pre-registered number, hashed in `spec_sha256()`; rule semantics and policies are inside the hashed document.
+- `bars.py`, `fetch.py`: columnar bars, WIB day files, atomic writes, public production klines and funding (host allow-list, no redirects, at least 1 s between requests), daily collector with 7-day backfill.
+- `features.py`, `rules.py`, `outcomes.py`, `simulate.py`: look-ahead-free feature snapshots with a 24 h POC; the three contenders plus the reference; first-touch bracket outcomes with gap and stop overshoot; a tick-clock simulator with the bot's guards and timing.
+- `stats.py`, `selection.py`, `metalabel.py`: win-rate statistics with day-clustered SE, Holm, PBO and SPA; two-stage rule selection with block consistency; purged expanding-window logistic meta-model.
+- `calibrate.py`, `pipeline.py`, `holdout.py`, `lock.py`: latency and stop overshoot from live Supabase records (read-only); train stage; one-shot holdout with a run marker.
+- `checks.py`, `report.py`, `report_format.py`, `report_checks.py`, `cli*.py`: VST agreement, decision buckets, Indonesian report, CLI with exit codes 0/1/2.
+
+Holdout lock as built:
+
+- `<data_dir>/holdout_runs/<spec_sha>.json` is the run marker, written before the first holdout outcome is read; `.started.json` is its audit file.
+- The lock binds the spec sha, the code sha (research package, `pine_indicators.py`, `bot/strategy/indicators.py`, `bot/arena/setup_profile.py`), the Python version, the seed, the latency sample hash, the training data hash and the training C0 result.
+- The tick-time purge is derived from the calibrated latency: 60 + ceil((max latency + 5 s + one 1m bar) / 1 min) minutes.
+- Calibration windows end at 2026-10-14 00:00 WIB.
+
+## Verification
+
+Measured on this branch (docs-only changes on top of main `9b189cf`), Python 3.11.15:
+
+```text
+Full test suite: Ran 1529 tests in 83.7s, OK
+Line coverage: 89% (12,983 statements, 1,399 missed; required minimum: 80%)
+compileall: passed
+git diff --check: passed
+secret hygiene test (tests.test_secret_hygiene): passed
+pip check: not run (the interpreter used has no pip module)
+```
+
+Progress of the suite during development: 900 tests before Task 1, 1,429 at the first push of PR #31, 1,511 at merge.
+
+## Commit and PR trail
+
+- PR #31, merged as `151b9e8`: the research package, CLI, spec, tests (head before merge `c276805`). Core task commits include `6aff8d6` (indicators), `2b5a562` (spec), `d227b44` (bars), `7193c2b` (fetch), `390d824` (features), `6b11dd6` (rules), `ee48f23` (outcomes), `933c5bd` (simulate), `35727dc` (stats), `b2c5463` (selection), `6d537e0` (metalabel), `1dbd9e0` (calibrate), `6becda7` (train stage), `781d45f` (holdout), `04ef748` (checks), `2e4c125` (report), `b683141` (CLI). Fixes: `107e78d`, `70c67bc`, `6a42250`, `249954f`, `c6a22da`, `d01ae03`, `a347076`, `bbbb466`, final fix wave `d1c276b`, `24ce56b`, `4e30282`, `26a206c`, `a8022ff`, fingerprint `1f72232`, PR review wave 1 `9c3b06d`..`ab7b3a6`, wave 2 `36b5319`..`82b43fd`, follow-up `b8826ac`, `8b06e76`, `6b889dc`, `673b9be`, verdict sentence `c276805`.
+- PR #32, merged as `79c9e14` (fix commit `3c73de4`): BingX fetch limits found on the VPS.
+- PR #33, merged as `9b189cf` (fix commit `7d013bf`): tick-time purge derived from the calibrated latency.
+
+## Review gates
+
+- Per-task review (independent reviewer, fresh context, re-review after each fix round). Seven tasks needed a fix round: Task 1 (DMI TR seed), Task 2 (rule parameters and policies not in the hashed document), Task 5 (HTF warm-up seam), Task 10 (supply-limited pool admitted thin rules), Task 13 (lock accepted injected configs), Task 14 (one-shot holdout bypassable across days or seeds), Task 17 (vst-check and decisions could score holdout outcomes before `test`). Task 16 was approved with one Important (a vacuous NaN test), also fixed. All others were clean at first review.
+- Whole-branch review (Task 17 step 6): a code review plus a security review (no CRITICAL or HIGH; 3 MEDIUM, 6 LOW, 2 INFO) and a Python review (3 HIGH, about 11 MEDIUM, clean on Python 3.10). The code review found 6 Important (code sha not in the chain, out-dir bypass of the one-shot, Holm family ignored, C0 only in test, SPA bias, bucket supply uncorrected). One fix wave over the consolidated list: re-review 29 of 29 addressed, one residual Important (code sha missed two imported bot modules), fixed in `1f72232` with an AST guard test.
+- PR #31 review by the user's account (6 parallel reviewers): 2 HIGH (one-shot holdout only per folder plus open-ended calibration window; VST check passing with zero overlap), 5 MEDIUM, 20 LOW. Wave 1 fixed H1, H2, M1–M5, L4 (re-review clean). Wave 2 fixed the LOWs except L10–L12, which were documented as caveats (re-review clean). Follow-up review F1–F5: C grid, threshold scan, `.started` audit file, VST note fixed; the suite-runtime regression F5 was not reproducible (27–33 s plain) and is parked. Replies were posted on the PR threads.
+- Ruling that changed pre-registered numbers before registration: the meta-model C grid was rescaled to a weighted-mean objective, then widened (F1). The spec was not registered at that time, so no pre-registration was broken.
+
+## VPS run (2026-10-15 to 2026-10-16)
+
+- Code synced to `~/replay/pine_gate_repo/src` from main via `git archive`; VPS Python 3.10.12. Bot, `.env`, pm2 and `~/replay/kline_keeper.py` were not touched.
+- Pre-registration, 2026-10-15 20:47 WIB: `spec_sha256` `fd77d36af66167f071ec597efb9989d397c12b087202f7eab96b6f85aed0898c`, spec file `~/replay/pine_gate_spec_20261014.json`, code sha then `7131252f…`.
+- Data (step 9): production 1m BTC and ETH 2025-08-01 to 2026-10-13, 439 days each (11 days needed a re-run after BingX in-body code 100410); warm-up 1h 4,344 and 4h 1,086 bars per symbol; native check window 2025-08-01 to 2025-09-01; funding 1,317 times per symbol.
+- Two fixes found before any outcome was computed:
+  - PR #32 (`79c9e14`): 100410 is "retry later", so back off 5/15/45 s; warm-up windows at most 1000 bars; funding windows at most 30 days (long BTC funding windows had been silently truncated at their start). The spec sha did not change.
+  - PR #33 (`9b189cf`): the first `train` was refused by the purge check ("a trade can last 74.6 min from its tick, longer than the 65-minute purge"). Live latency sample: n 1,903, median 54 s, p90 106 s, p99 227 s, max 808.5 s. The purge is now derived from the calibration (75 minutes). Final code sha `e915262310aeea70e183db9b518d5a2bd5d2d33ca6eff0951b3cc559d272d0c5`. No outcome was computed in the refused run.
+- `check-data` (22:54 wall, 412 MB peak): PASS days, funding cadence, truncation invariance at 500 real times. FAIL native-vs-aggregated 1h/4h agreement (BTC 98.92% and 95.70%, ETH 99.60% and 98.92%, threshold 99.9%). Deviation ruling: OHLC is identical in 100% of the overlapping bars; only volume differs, in 2–8 bars per series, worst relative difference 1.28e-4 against a tolerance of 1e-6. The 1h and 4h features read OHLC only, higher-timeframe volume is unused, and the volume profile uses 1m volume, so the aggregation is valid for every feature used. The 99.9% threshold is a code-level integrity check, not spec-hashed and not a gate. Training proceeded without a code change (the report states the deviation). Follow-up still open: split `check-data` into a gating OHLC agreement and an informational volume agreement.
+- `calibrate`: s* 1.0 bp (fallback: 13 rebuilt stops, below the 15 needed), 4 skipped, 1,903 latencies, written to `~/replay/out/pine_gate_calibration_20261016.json`. A collector cron line (`23 5 * * *`) was added; the existing six lines are unchanged.
+- `train` (3:28 wall, 359 MB peak): selection file `~/replay/out/pine_gate_selection_20261016.json`, sha256 `3687376145f2f111c976ed78b50e25b7e58be07308615387a7d3cdcee7a9e310`. Contender 1 frozen as `H4|P40|ADX|OFF|OFF` (training WR 50.5%, lower bound 48.9%, gross -0.44 bps, 14.6 trades/day); the top five all sit near 50% WR; stable; PBO 0.014; SPA p 0.0005; not supply-limited. Contender 3 primary `H4|P40|OFF|OFF|OFF`, C 10, p* 0.4945. Training C0 passed.
+- Pre-registration record posted on PR #31 before the test: https://github.com/zakyirsyaad/ai-perpetual-trading/pull/31#issuecomment-6203188477
+- `test` (one run, 2:02 wall, 383 MB peak; run marker and `.started` file written): holdout file `~/replay/out/pine_gate_holdout_20261016.json`, sha256 `3459341410e5694a455594304baecf5966a7d362c298a4845069116f29c05702`. Nothing passed; chosen contender is None.
+
+| Contender | Symbol | WR | Lower bound | Gross bps | Net per 1M | Trades per day |
+|---|---|---|---|---|---|---|
+| 1 | BTC | 48.1% | 42.9 | -0.98 | -399 | 9.0 |
+| 1 | ETH | 52.2% | 44.2 | +0.26 | -337 | 3.8 |
+| 2 | BTC | 47.6% | 44.2 | -1.58 | -429 | 13.0 |
+| 2 | ETH | 50.7% | 45.6 | -0.33 | -366 | 6.2 |
+| 3 | BTC | 47.6% | 42.3 | -1.40 | -420 | 8.1 |
+| 3 | ETH | 56.8% | 47.4 | +2.05 | -247 | 3.9 |
+
+  The C0 controls behaved normally (WR 47.7–50.5%, gross -0.5 to -1.5 bps), so the fill model is valid.
+- `vst-check` and `decisions` were skipped: spec sections 5.12 and 5.13 apply to the chosen contender and none was chosen. The ETH VST check (plan step 14) is moot.
+- `report`: `~/replay/out/pine_gate_edge_20261016.md` and `.json` on the VPS; the Markdown copy is `docs/research/2026-10-16-pine-gate-phase1-report.md`.
+- Bot untouched: pm2 `ai-perp-volume` restarts were 25 before and after, with 0 ERROR lines.
+
+## Final verdict
+
+No contender passed the staged gate. Out-of-sample gross edge is between about -1.6 and +2.1 bps against a break-even near 7 bps round-trip fee, and the best net result (contender 3 on ETH) is -247 per 1M versus the live bot's -190 reference. The bot is unchanged and the current K2 configuration continues. Contender 1's frozen parameters are recorded in `docs/tradingview/pine_adapted_gate_v2.pine` as reference defaults only; they failed the holdout.
+
+## Deployment gate
+
+Nothing was deployed to the bot. This branch changes documentation, the TradingView helper script defaults and this evidence file only; no Python code and no `.env` value changed. The research package ran on the VPS from a separate directory (`~/replay/pine_gate_repo/src`) under `nice -n 19`, and the pm2 app `ai-perp-volume` was neither restarted nor reconfigured. The only persistent VPS change is the daily collector cron line, which writes public market data to `~/replay/pine_gate/data/`. Any Phase 2 work (wiring a gate into `AIOrchestrator`) requires a contender that passes a new pre-registered holdout and a fresh decision from the user.
