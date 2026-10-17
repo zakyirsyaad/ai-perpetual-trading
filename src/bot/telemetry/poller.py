@@ -18,6 +18,7 @@ from bot.exchange.contracts import FuturesExchangeProtocol
 from bot.telemetry.book_ticker import BookTick
 from bot.telemetry.hub import TelemetryHub
 from bot.telemetry.wire import PriceMessage
+from bot.telemetry.ws import with_timeout
 
 LOGGER = logging.getLogger("volume_bot.telemetry")
 
@@ -77,7 +78,7 @@ class MarketDataPoller:
 
     async def _guarded(self, key: str, label: str, symbol: str, action: Callable[[], Awaitable[None]]) -> None:
         try:
-            await asyncio.wait_for(action(), self._call_timeout)
+            await with_timeout(action(), self._call_timeout)
         except asyncio.CancelledError:
             raise
         except Exception:
