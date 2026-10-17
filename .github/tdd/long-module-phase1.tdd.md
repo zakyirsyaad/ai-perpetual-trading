@@ -1126,7 +1126,7 @@ Notes for later tasks:
 
 `train` and `test` make the Mode A backtest a pre-registered, one-shot experiment:
 
-- `research.mode_backtest.lock`: `LockError(message, problems=())` (a `RuntimeError`; `problems` holds one line per mismatch), `CODE_DIRS`, `CODE_EXTRA`, `code_files()`, `code_sha256()`, `python_version()` (`"3.10"`), `run_name(mode, pair)`, `lock_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_lock.json`), `marker_path(data_dir, mode, pair, lock_sha)` (`holdout_runs/mode_A_BTC-USDT_<sha>.json`), `existing_markers(data_dir, mode, pair)`, `read_lock(path)` (the document and the sha256 of its bytes), `check_lock(doc, *, config_sha, code_sha, train_manifest_sha, python)` and `claim_marker(path, doc)`.
+- `research.mode_backtest.lock`: `LockError(message, problems=())` (a `RuntimeError`; `problems` holds one line per mismatch), `CODE_DIRS`, `CODE_EXTRA`, `code_files()`, `code_sha256()`, `python_version()` (`"3.10"`), `run_name(mode, pair)`, `lock_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_lock.json`), `marker_path(data_dir, mode, pair, lock_sha)` (`holdout_runs/mode_A_BTC-USDT_<sha>.json`), `existing_markers(data_dir, mode, pair)`, `read_lock(path)` (the document and the sha256 of its bytes), `check_lock(doc, *, config_sha, code_sha, train_manifest_sha, python)` and `claim_marker(path, doc)`. Fix round 1 added `started_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_test_started.json`) and `claim_started(path, doc)`.
 - `research.mode_backtest.stages`: `StageError` (a `ValueError`, exit 1), `check_phase1`, `train_stage(config_path, data_dir, out_dir, mode, pair, now) -> Path` and `test_stage(...) -> Path`, each returning its result JSON.
 - `research.mode_backtest.cli`: `train` and `test`, each with `--mode --pair --config --data-dir --out-dir`. They print every file written (the test also its run marker), then the status line. A `LockError` prints its problems on stdout, then one `error:` line, and exits 2.
 - `bot.strategy.modes.config.load_modes_config_with_sha256(path)`: reads the file once and returns the config and the sha256 of those same bytes. `load_modes_config` now delegates to it.
@@ -1151,7 +1151,12 @@ Choices of mine, each pinned by a test:
 - **The fingerprint is everything Python loads when the package is imported**: 43 `CODE_EXTRA` files beside the two globs (49 outside the package in all). That includes the packages around each imported module, because their `__init__` runs first, so `bot/arena/__init__.py` and the arena modules it imports (`agents`, `attribution`, `expression_engine`, `factors`, `flow_signals`, `program_trader`, `signals`, then `bot/models.py`, `bot/data/market_signals.py`, `bot/volume/profile.py`) are fingerprinted too. Two imports sit inside functions the package never calls and only read the live settings and Supabase: `bot.config` in `pine_gate.cli_common.make_settings` and `bot.storage.supabase_trade_store` in `pine_gate.calibrate`. They are left out, as `tests/test_pine_gate_structure.py` leaves them out. The structure test checks the list twice: with a static AST walk of every import statement (relative imports, `from package import submodule`, imports inside functions and `TYPE_CHECKING`, parent packages), followed transitively, and with a fresh interpreter that imports every module of the package and lists the files Python loaded. `CODE_EXTRA` must also hold no module the package does not import, no duplicate and no globbed file. I did not replace `data.py`'s `cli_common` import: `cli.py` (`CliError`, `one_line`) and `step0.py` (`load_calibration_file`) import `cli_common` too, so the change would not shrink the fingerprint.
 - **The config is read once in `bot/strategy/modes/config.py`**: the only public way to parse bytes with the repeated-key refusal is a new function there, because `_parse_yaml` is private. The text is decoded as text mode reads it (line ends turned into `\n`), so `load_modes_config` behaves as before.
 - **`test` checks the lock's own record before the marker**: mode, pair, both stage bounds against the config, the three training metrics records (`mode_a_15m`, `mode_a`, `pembanding`), and the locked timeframe re-derived by `wants_5m` on the locked 15m run. The last check came from mutation testing: with only a "15m or 5m" check, a lock edited from 15m to 5m by hand ran the one-shot test on 5m (RED 2 below).
-- **Every refusal that can come before the marker does**: any marker of the mode and pair, whatever its lock (so `train` also refuses to make a new lock once the test ran: "a lock may be deleted and recreated only while no marker exists for it"), a test result of any date, any output of today, and a missing day or warm-up file (existence only, nothing read). A training file that has gone is a training-data mismatch (`LockError`, exit 2), not exit 1.
+- **The refusals before the claims, and only these** (as corrected in fix round 1, below):
+  - any marker of the mode and pair in the data folder, whatever its lock, or the start record next to the lock. So `train` also refuses to make a new lock once the test ran ("a lock may be deleted and recreated only while no marker exists for it");
+  - a test result of any date, or any output of today;
+  - a day or warm-up file that is missing or not a regular file. This checks names and file types only, one `stat` each; nothing is read.
+
+  The content of the test days is not checked before the claims. That is `verify-copy`'s job, which Task 16 runs right before `test`. A test day that fails to read after the claims ends the run with the one shot used up. A training file that has gone is a training-data mismatch (`LockError`, exit 2), not exit 1.
 - **The warm-up guard checks all six hourly inputs** of the selector at 00:00 WIB of the first training day, a superset of the ruling's two. One bar short of either warm-up (830 1h bars, or 400 4h bars, because the last 4h warm-up bar is still forming at 00:00 WIB) is refused with the series named.
 - **`train` refuses `mode.A_pullback_long.tf_pemicu: 5m`** (`StageError`): the procedure starts on 15m and reaches 5m only through the switch, and a 5m start would make the switch run 5m twice.
 - **Outputs**: run keys `A_15m_NAIK`, `A_5m_NAIK` and `D_3m_NAIK` name the CSVs (`mode_A_BTC-USDT_train_<date>_A_15m_NAIK.csv`) and the `runs` entries. The comparator rows are "D di NAIK". Every possible output is checked before any work, and the lock is written last. The JSON keys come out sorted (`fileio.json_text`), so `blocked` lists the gates alphabetically, not in gate order. The status lines are Indonesian, like the report, with every float as `repr`, so -149.63184210526315 shows in full while the table shows -150.
@@ -1275,8 +1280,87 @@ Verification:
 
 Notes for later tasks:
 
-- **Task 15**: document `train`/`test` in CLAUDE.md, with the lock in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them).
+- **Task 15**: document `train`/`test` in CLAUDE.md, with the lock and the start record in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them).
 - **Task 16**:
-  - Run `verify-copy` first. A data failure after the marker (a corrupt test day) leaves the marker in place and so uses up the one shot; only missing files are refused before it.
+  - Run `verify-copy` right before `test`. Before its claims, `test` checks only names and file types: every day and warm-up file must be a regular file, one `stat` each, nothing read. Content integrity comes from `verify-copy` alone. A test day that is a regular file but fails to read after the claims (the start record and the marker) ends the run with the one shot used up, whatever data folder a rerun names.
   - Keep the checkout unchanged between `train` and `test`: any change to the 61 fingerprinted files (12 package modules, 6 rule-core modules, 43 in `CODE_EXTRA`), the YAML, the training files or the Python minor version makes `test` exit 2. While no marker exists, the lock may be deleted and `train` re-run.
   - Run both stages with the same `--data-dir`, because the marker lives there.
+
+### Fix round 1 (task review)
+
+Two review findings, raised to Important by the controller because Task 16 relies on the one-shot guarantee:
+
+1. **The one-shot guard covered only the `--data-dir` it was given.**
+   - The marker lived only in `<data_dir>/holdout_runs`, and the out-dir check matched only a finished result. The training manifest uses relative paths, so the lock validates against any copy of the data.
+   - So a `test` that failed after claiming its marker (exit 1) could be run again with a fresh copy, the same out-dir and the same lock. It ran to the end (exit 0) and claimed a second marker.
+   - Fix (controller ruling): `test` now also claims, exclusively, the start record `mode_A_BTC-USDT_test_started.json` next to the lock. It holds the lock sha256, the resolved data folder, the time and the bindings. It is claimed in the same step as the marker, after every refusal and before any day of the test stage is read: the start record first, then the marker.
+   - When the start record exists, `test` and `train` both refuse (exit 2, "already ran"), whatever `--data-dir` names.
+   - New code: `lock.started_path` and `lock.claim_started`, which shares the exclusive claim with `claim_marker`; `stages._refuse_after_the_test` now takes the out folder too.
+2. **The day check before the marker used `exists()`.**
+   - A folder in place of a test day passed the check, the marker was claimed, and the run died on `[Errno 21] Is a directory`, using up the shot.
+   - Fix: every day and warm-up file must pass `is_file()` before the claims (one `stat` each, nothing read). A failure is refused with exit 1, naming each path relative to the data folder and why ("missing" or "no regular file").
+   - The "refusals before the claims" bullet above and the Task 16 note now say exactly what is checked: names and regular files only. The content comes from `verify-copy`.
+
+Tests (3 new, 4 extended):
+
+- `test_a_test_that_failed_after_its_claim_refuses_a_rerun_on_a_fresh_data_copy` reproduces the probe:
+  - a corrupt test day passes the checks because it is a regular file, so the first `test` claims and then fails (exit 1);
+  - a second `test`, with a fresh copy in another data folder and the same out-dir, exits 2 "already ran" and writes nothing: every file under the temporary root is unchanged, and the copy has no `holdout_runs`.
+- `test_a_folder_in_place_of_a_test_day_is_refused_before_the_marker`: exit 1 naming `prod/BTC-USDT/1m/2026-07-10.csv.gz`, with no marker, no start record and nothing written.
+- `test_the_start_record_sits_next_to_the_lock_and_is_claimed_once`.
+- Extended:
+  - `test_marker_is_written_before_any_test_day_is_read`: both records exist before every read of a test day, and the record holds the lock sha256, the resolved data folder and the time;
+  - `test_a_new_lock_is_refused_once_the_test_ran`: also on a fresh copy without markers;
+  - `test_a_missing_test_day_is_refused_before_the_marker`: also no start record;
+  - the result's `files` lists the start record.
+
+RED: the new and extended tests against the code of `488ab42` (paths shortened):
+
+```text
+======================================================================
+FAIL: test_a_test_that_failed_after_its_claim_refuses_a_rerun_on_a_fresh_data_copy (tests.test_mode_backtest_lock.TestStageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_lock.py", line 572, in test_a_test_that_failed_after_its_claim_refuses_a_rerun_on_a_fresh_data_copy
+    self.assertEqual(code, 2, err)
+AssertionError: 0 != 2 :
+
+======================================================================
+FAIL: test_a_folder_in_place_of_a_test_day_is_refused_before_the_marker (tests.test_mode_backtest_lock.TestStageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_lock.py", line 658, in test_a_folder_in_place_of_a_test_day_is_refused_before_the_marker
+    self.assertFalse(self.marker().exists())
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_a_new_lock_is_refused_once_the_test_ran (tests.test_mode_backtest_lock.TestStageTests) (data_dir='fresh_copy')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_lock.py", line 601, in test_a_new_lock_is_refused_once_the_test_ran
+    self.assertEqual(code, 2, err)
+AssertionError: 0 != 2 :
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.760s
+
+FAILED (failures=3)
+```
+
+The whole module failed with `FAILED (failures=5, errors=1)`. The error was that `lock.started_path` did not exist yet; the two other failures were the start record missing from `files` and from the marker-before-read probe.
+
+GREEN:
+
+- The covering command, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock tests.test_mode_backtest_cli tests.test_mode_backtest_structure -v`: `Ran 76 tests` / OK, and OK on 3.11.15 as well.
+- Full suite: `Ran 2261 tests` / OK.
+- Line and branch coverage of `lock.py`, `stages.py` and `cli.py`: 100 %.
+- `compileall` OK, `ruff` clean, `git diff --check` clean.
+- Mutation check on a full repo copy: all 7 bugs planted in the new guards are caught. They were: the start record ignored by the refusal, `exists()` in place of `is_file()`, the start record never claimed, the start record claimed after the test days are read, `train` looking for it in the data folder, a claim that is not exclusive, and the record written without its data folder.
+- End to end through `python -m research.mode_backtest` on a temporary synthetic copy:
+
+  | Case | Result |
+  |---|---|
+  | A folder in place of a test day | exit 1, nothing claimed, so the shot is not used |
+  | A corrupt regular file | the claims are made, then exit 1 |
+  | A fresh copy with the same out-dir | exit 2, "already ran (…/mode_A_BTC-USDT_test_started.json)" |
+  | `train` on the fresh copy after deleting the lock | exit 2 |

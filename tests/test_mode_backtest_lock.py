@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -163,6 +164,10 @@ class StageCase(unittest.TestCase):
         sha = hashlib.sha256(self.lock_file().read_bytes()).hexdigest()
         return lock.marker_path(self.data, MODE_A, SYMBOL, sha)
 
+    def started_record(self):
+        """The start record the test stage claims next to the lock, whatever the data copy."""
+        return self.out / "mode_A_BTC-USDT_test_started.json"
+
     def day_file(self, day):
         return self.data / "prod" / SYMBOL / "1m" / f"{day.isoformat()}.csv.gz"
 
@@ -271,6 +276,19 @@ class LockFileTests(unittest.TestCase):
         first = path.read_bytes()
         with self.assertRaises(lock.LockError) as caught:
             lock.claim_marker(path, {"lock_sha256": "other"})
+
+        self.assertEqual(read_json(path), {"lock_sha256": SHA})
+        self.assertEqual(path.read_bytes(), first)
+        self.assertIn("already ran", str(caught.exception))
+
+    def test_the_start_record_sits_next_to_the_lock_and_is_claimed_once(self):
+        path = lock.started_path(self.root, "A", SYMBOL)
+        self.assertEqual(path, self.root / "mode_A_BTC-USDT_test_started.json")
+
+        lock.claim_started(path, {"lock_sha256": SHA})
+        first = path.read_bytes()
+        with self.assertRaises(lock.LockError) as caught:
+            lock.claim_started(path, {"lock_sha256": "other"})
 
         self.assertEqual(read_json(path), {"lock_sha256": SHA})
         self.assertEqual(path.read_bytes(), first)
@@ -514,21 +532,47 @@ class TestStageTests(StageCase):
         marker = read_json(self.marker())
         self.assertEqual(marker["lock_sha256"], self.marker().stem.rsplit("_", 1)[1])
         self.assertEqual(doc["marker"], str(self.marker()))
+        self.assertIn(self.started_record().name, doc["files"])
 
     def test_marker_is_written_before_any_test_day_is_read(self):
         self.train()
-        marker = self.marker()
+        marker, started = self.marker(), self.started_record()
+        lock_sha = hashlib.sha256(self.lock_file().read_bytes()).hexdigest()
         test_days = {self.day_file(day) for day in TEST_DAYS}
 
-        with FileReads(probe=marker.exists) as reads:
+        with FileReads(probe=lambda: marker.exists() and started.exists()) as reads:
             self.run_test_stage()
 
-        test_reads = [marked for path, marked in reads.events if path in test_days]
+        test_reads = [claimed for path, claimed in reads.events if path in test_days]
         self.assertTrue(test_reads)
         self.assertTrue(all(test_reads))
-        training = [marked for path, marked in reads.events
+        training = [claimed for path, claimed in reads.events
                     if path == self.day_file(TRAIN_DAYS[0])]
-        self.assertIn(False, training)  # hashed against the lock before the marker
+        self.assertIn(False, training)  # hashed against the lock before the claims
+        record = read_json(started)
+        self.assertEqual(record["lock_sha256"], lock_sha)
+        self.assertEqual(record["data_dir"], str(self.data.resolve()))
+        self.assertEqual(record["created_at"], CLOCK.isoformat())
+
+    def test_a_test_that_failed_after_its_claim_refuses_a_rerun_on_a_fresh_data_copy(self):
+        self.train()
+        fresh = self.root / "fresh_copy"
+        shutil.copytree(self.data, fresh)
+        # A regular file passes every check before the claim and fails only when it is read.
+        self.day_file(TEST_DAYS[1]).write_bytes(b"not a gzip file")
+
+        code, _out, err = self.cli("test")
+        self.assertEqual(code, 1, err)
+        self.assertTrue(self.marker().exists())
+        before = self.snapshot()
+
+        self.data = fresh  # the natural recovery: copy the data again, run again
+        code, _out, err = self.cli("test")
+
+        self.assertEqual(code, 2, err)
+        self.assertIn("already ran", self.assert_one_error_line(err))
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((fresh / "holdout_runs").exists())
 
     def test_second_test_run_refuses(self):
         self.train()
@@ -544,15 +588,19 @@ class TestStageTests(StageCase):
 
     def test_a_new_lock_is_refused_once_the_test_ran(self):
         self.train()
+        fresh = self.root / "fresh_copy"
+        shutil.copytree(self.data, fresh)  # copied before the test, so it holds no marker
         self.run_test_stage()
         self.lock_file().unlink()
         before = self.snapshot()
 
-        code, _out, err = self.cli("train", now=CLOCK + timedelta(days=1))
-
-        self.assertEqual(code, 2, err)
-        self.assertIn("already ran", self.assert_one_error_line(err))
-        self.assertEqual(self.snapshot(), before)
+        for data_dir in (self.data, fresh):
+            with self.subTest(data_dir=data_dir.name):
+                self.data = data_dir
+                code, _out, err = self.cli("train", now=CLOCK + timedelta(days=1))
+                self.assertEqual(code, 2, err)
+                self.assertIn("already ran", self.assert_one_error_line(err))
+                self.assertEqual(self.snapshot(), before)
 
     def test_a_hand_edited_lock_is_refused_before_the_marker(self):
         self.train()
@@ -593,6 +641,22 @@ class TestStageTests(StageCase):
         self.assertEqual(code, 1, err)
         self.assertIn(f"{TEST_DAYS[1].isoformat()}.csv.gz", self.assert_one_error_line(err))
         self.assertFalse(self.marker().exists())
+        self.assertFalse(self.started_record().exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_folder_in_place_of_a_test_day_is_refused_before_the_marker(self):
+        self.train()
+        folder = self.day_file(TEST_DAYS[1])
+        folder.unlink()
+        folder.mkdir()  # the name exists, but it is no regular file
+        before = self.snapshot()
+
+        code, _out, err = self.cli("test")
+
+        self.assertEqual(code, 1, err)
+        self.assertIn("prod/BTC-USDT/1m/2026-07-10.csv.gz", self.assert_one_error_line(err))
+        self.assertFalse(self.marker().exists())
+        self.assertFalse(self.started_record().exists())
         self.assertEqual(self.snapshot(), before)
 
     def test_test_refuses_without_a_lock(self):

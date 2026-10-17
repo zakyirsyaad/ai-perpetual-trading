@@ -15,12 +15,17 @@ log per run and, last, the lock (see ``lock``).
 
 ``test_stage`` works in this order: read the configuration and the lock; hash the training files,
 reading nothing else; refuse unless the lock matches them, the configuration, the code and the
-Python version, and unless no run marker exists for the mode and pair; claim the run marker; and
-only then read the days from ``latihan_mulai`` to the day before ``ujian_selesai``, so every series
-is warm when the test starts. It runs Mode A on the locked timeframe and the comparator over the
-test stage and writes ``mode_A_BTC-USDT_test_<YYYYMMDD>.json``, a trade log per run and a Markdown
-report: the table of spec section 2.9 (the Latihan rows from the lock) and the status line, LOLOS,
-GAGAL or BELUM CUKUP SAMPEL.
+Python version, unless the test has not started yet (no run marker in this data folder and no
+start record next to the lock) and unless every day and warm-up file it will read is a regular
+file; claim the start record and then the run marker; and only then read the days from
+``latihan_mulai`` to the day before ``ujian_selesai``, so every series is warm when the test
+starts. Before the claims only names and file types are looked at (a ``stat`` each): what is
+inside the test days is ``verify-copy``'s check, run right before the test, and a day that fails
+to read after the claims ends the run with the test used up. It runs Mode A on the locked
+timeframe and the comparator over the test stage and writes
+``mode_A_BTC-USDT_test_<YYYYMMDD>.json``, a trade log per run and a Markdown report: the table of
+spec section 2.9 (the Latihan rows from the lock) and the status line, LOLOS, GAGAL or BELUM
+CUKUP SAMPEL.
 
 Every run of a stage trades only in NAIK and shares the stage's NAIK days (``naik_days`` with the
 weekly window and ``uji.hari_naik_minimal_jam_naik``). ``stage_metrics`` is called in one place,
@@ -28,8 +33,10 @@ with ``uji.lolos_buang_posisi_teratas``. The status lines print the exact number
 (``repr`` of each float), because the table rounds them.
 
 Refusals: ``StageError`` (exit code 1) for what Phase 1 cannot run as pre-registered, ``LockError``
-(exit code 2) for the lock and the marker, and ``FileExistsError`` (exit code 1) before any work
-when an output file exists: outputs are never overwritten, and the test runs once.
+(exit code 2) for the lock, the marker and the start record, ``FileExistsError`` (exit code 1)
+before any work when an output file exists, and ``FileNotFoundError`` (exit code 1) before the
+claims when a day file is missing or no regular file: outputs are never overwritten, and the test
+runs once, whatever data folder a rerun names.
 """
 
 from __future__ import annotations
@@ -203,13 +210,16 @@ def _refuse_existing(paths: Iterable[Path]) -> None:
         )
 
 
-def _refuse_after_the_test(data_dir: PathLike, mode: str, pair: str) -> None:
-    """Once a run marker exists for the mode and pair, the test has run: no new lock, no rerun."""
-    markers = lock.existing_markers(data_dir, mode, pair)
-    if markers:
+def _refuse_after_the_test(data_dir: PathLike, out_dir: PathLike, mode: str, pair: str) -> None:
+    """Once the test has started for the mode and pair, it has run: no new lock, no rerun. It has
+    started when a run marker of the mode and pair is in ``data_dir`` or the start record is next
+    to the lock in ``out_dir``, so a fresh copy of the data does not reopen it."""
+    started = lock.started_path(out_dir, mode, pair)
+    claims = lock.existing_markers(data_dir, mode, pair) + ([started] if started.exists() else [])
+    if claims:
         raise lock.LockError(
-            f"the test already ran for Mode {mode} on {pair} ({markers[0]}); it runs once, so "
-            "neither a new lock nor a second test is allowed"
+            f"the test already ran for Mode {mode} on {pair} ({', '.join(map(str, claims))}); it "
+            "runs once, so neither a new lock nor a second test is allowed"
         )
 
 
@@ -375,7 +385,7 @@ def train_stage(
     cfg, config_sha = load_modes_config_with_sha256(Path(config_path))
     code_sha, python = lock.code_sha256(), lock.python_version()
     _require_first_tf(cfg)
-    _refuse_after_the_test(data_dir, mode, pair)
+    _refuse_after_the_test(data_dir, out_dir, mode, pair)
     keys = (_run_key(MODE_A, FIRST_TF), _run_key(MODE_A, SWITCH_TF),
             _run_key(MODE_D, cfg.mode_d.tf_pemicu))
     outputs = _outputs(out_dir, lock.run_name(mode, pair), TRAIN, stamp, keys)
@@ -452,12 +462,29 @@ def _locked_rows(doc: Mapping[str, Any], path: Path, mode: str, pair: str,
                 ReportRow(COMPARATOR_LABEL, pair, LATIHAN, comparator))
 
 
+def _refuse_unusable_days(data_dir: PathLike, pair: str, uji: TestConfig) -> None:
+    """Every day and warm-up file the test reads must be a regular file. Only names and file
+    types are checked, one ``stat`` each, so nothing is read; a wrong file content is found by
+    ``verify-copy``, not here."""
+    root = Path(data_dir)
+    paths = stage_files(root, pair, _training(uji).first_day, _testing(uji).last_day)
+    problems = [
+        f"{path.relative_to(root).as_posix()} ({'no regular file' if path.exists() else 'missing'})"
+        for path in paths
+        if not path.is_file()
+    ]
+    if problems:
+        raise FileNotFoundError(
+            f"day or warm-up files missing or not regular files in {root}: {', '.join(problems)}"
+        )
+
+
 def _refuse_before_the_marker(data_dir: PathLike, mode: str, pair: str, outputs: _Outputs,
                               uji: TestConfig) -> None:
-    """Every refusal that can come before the marker does: a marker of the mode and pair, a test
-    result of any date, an output of today, a day file that does not exist. Only names are
-    looked at, so no day of the test stage is read before the marker."""
-    _refuse_after_the_test(data_dir, mode, pair)
+    """The refusals before the claims: the test started already (a marker of the mode and pair,
+    or the start record next to the lock), a test result of any date, an output of today, a day
+    or warm-up file that is missing or no regular file. Nothing of the test stage is read."""
+    _refuse_after_the_test(data_dir, outputs.folder, mode, pair)
     stem = outputs.result.name.rsplit("_", 1)[0]
     pattern = re.compile(re.escape(stem) + r"_[0-9]{8}\.json")
     earlier = sorted(str(p) for p in outputs.folder.glob(f"{stem}_*.json")
@@ -466,10 +493,7 @@ def _refuse_before_the_marker(data_dir: PathLike, mode: str, pair: str, outputs:
         raise FileExistsError(f"a test result already exists: {', '.join(earlier)}; "
                               "the test runs once")
     _refuse_existing([*outputs.paths(), outputs.result.with_suffix(".md")])
-    days = stage_files(data_dir, pair, _training(uji).first_day, _testing(uji).last_day)
-    missing = [path.name for path in days if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"missing day or warm-up files: {', '.join(missing)}")
+    _refuse_unusable_days(data_dir, pair, uji)
 
 
 def _test_status(mode: str, pair: str, cfg: ModesConfig, run: _Run, status: str) -> str:
@@ -523,7 +547,8 @@ def _test_doc(mode: str, pair: str, cfg: ModesConfig, tf: str, runs: Sequence[_R
         },
         "runs": _run_records(outputs, runs), "status": status,
         "status_line": _test_status(mode, pair, cfg, runs[0], status), "report": report.name,
-        "files": [*(outputs.logs[run.key] for run in runs), outputs.result.name, report.name],
+        "files": [lock_ref["started"], *(outputs.logs[run.key] for run in runs),
+                  outputs.result.name, report.name],
     }
 
 
@@ -550,10 +575,14 @@ def test_stage(
     keys = (_run_key(MODE_A, tf), _run_key(MODE_D, cfg.mode_d.tf_pemicu))
     outputs = _outputs(out_dir, lock.run_name(mode, pair), TEST, stamp, keys)
     _refuse_before_the_marker(data_dir, mode, pair, outputs, cfg.uji)
+    started = lock.started_path(out_dir, mode, pair)
     marker = lock.marker_path(data_dir, mode, pair, lock_sha)
-    lock_ref = {"lock": lock_file.name, "lock_sha256": lock_sha, "marker": str(marker)}
-    lock.claim_marker(marker, {"mode": mode, "pair": pair, "tf": tf, **lock_ref, **asdict(bound),
-                               "ujian": _testing(cfg.uji).record(), "created_at": now.isoformat()})
+    lock_ref = {"lock": lock_file.name, "lock_sha256": lock_sha, "marker": str(marker),
+                "started": started.name}
+    claim = {"mode": mode, "pair": pair, "tf": tf, **lock_ref, **asdict(bound),
+             "ujian": _testing(cfg.uji).record(), "created_at": now.isoformat()}
+    lock.claim_started(started, {**claim, "data_dir": str(Path(data_dir).resolve())})
+    lock.claim_marker(marker, claim)
 
     # Only now is any day of the test stage read.
     training, period = _training(cfg.uji), _testing(cfg.uji)

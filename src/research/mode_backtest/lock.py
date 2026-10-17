@@ -2,9 +2,13 @@
 
 Research code; the bot never imports it. ``train`` writes the lock ``mode_<mode>_<pair>_lock.json``
 next to its results. ``test`` refuses (``LockError``, exit code 2) unless the lock still describes
-the files it would run on, and then claims the run marker
-``<data_dir>/holdout_runs/mode_<mode>_<pair>_<lock sha256>.json`` before it reads any day of the
-test period. Both are written through ``research.pine_gate.fileio``, so neither is ever overwritten.
+the files it would run on, and then, before it reads any day of the test period, claims two
+records: the start record ``mode_<mode>_<pair>_test_started.json`` next to the lock and the run
+marker ``<data_dir>/holdout_runs/mode_<mode>_<pair>_<lock sha256>.json``. Either one, once it
+exists, refuses another test and another lock: the marker for that data folder, the start record
+for that lock folder whatever data folder a rerun names, so a fresh copy of the data cannot buy a
+second test. All three are written through ``research.pine_gate.fileio``, so none is ever
+overwritten.
 
 ``check_lock`` holds four bindings against the current run, and its ``LockError`` lists every one
 that differs:
@@ -47,6 +51,7 @@ __all__ = [
     "LockError",
     "check_lock",
     "claim_marker",
+    "claim_started",
     "code_files",
     "code_sha256",
     "existing_markers",
@@ -55,6 +60,7 @@ __all__ = [
     "python_version",
     "read_lock",
     "run_name",
+    "started_path",
 ]
 
 PathLike = Union[str, Path]
@@ -166,6 +172,11 @@ def marker_path(data_dir: PathLike, mode: str, pair: str, lock_sha: str) -> Path
     return Path(data_dir) / MARKER_DIR / f"{run_name(mode, pair)}_{lock_sha}.json"
 
 
+def started_path(out_dir: PathLike, mode: str, pair: str) -> Path:
+    """``<out_dir>/mode_<mode>_<pair>_test_started.json``: the start record, next to the lock."""
+    return Path(out_dir) / f"{run_name(mode, pair)}_test_started.json"
+
+
 def existing_markers(data_dir: PathLike, mode: str, pair: str) -> List[Path]:
     """The run markers of ``mode`` and ``pair`` under ``data_dir``, whatever lock made them."""
     folder = Path(data_dir) / MARKER_DIR
@@ -231,10 +242,21 @@ def check_lock(
         )
 
 
-def claim_marker(path: PathLike, doc: Mapping[str, Any]) -> None:
-    """Write the run marker ``doc`` at ``path`` exclusively; an existing one is a ``LockError``."""
+def _claim(path: PathLike, doc: Mapping[str, Any], label: str) -> None:
+    """Write ``doc`` at ``path`` exclusively; an existing file means the test already ran."""
     path = Path(path)
     try:
-        write_json_exclusive(path, doc, "run marker")
+        write_json_exclusive(path, doc, label)
     except FileExistsError:
-        raise LockError(f"{path}: the test already ran (run marker); it runs once") from None
+        raise LockError(f"{path}: the test already ran ({label}); it runs once") from None
+
+
+def claim_marker(path: PathLike, doc: Mapping[str, Any]) -> None:
+    """Write the run marker ``doc`` at ``path`` exclusively; an existing one is a ``LockError``."""
+    _claim(path, doc, "run marker")
+
+
+def claim_started(path: PathLike, doc: Mapping[str, Any]) -> None:
+    """Write the start record ``doc`` at ``path`` exclusively; an existing one is a
+    ``LockError``."""
+    _claim(path, doc, "start record")
