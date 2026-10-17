@@ -10,9 +10,13 @@ native 1h and 4h warm-ups end with the bar that contains the minute before the
 first day starts, on the UTC grid, so they join the aggregated bars of that
 first day without a gap.
 
-Every bar is flat (open = high = low = close) at ``price(i)`` and has a volume of
-1.0. ``price`` maps a bar number to a positive price; the default is a constant,
-so every series joins at 100.0.
+Every bar is flat (open = high = low = close) and has a volume of 1.0. A bar is
+priced by ``price(m)``, where ``m`` is the number of minutes from 00:00 WIB of the first
+day to the minute the bar opens (negative for a warm-up bar), so one function describes a
+series that runs on from the warm-ups into the days. The default is a constant, so every
+series joins at 100.0. A warm-up bar keeps one price for its whole interval: it agrees with
+the bars aggregated from the day files only where ``price`` stays the same over each bar of
+that interval.
 """
 
 from __future__ import annotations
@@ -88,9 +92,10 @@ def write_warmups(
     The last bar of each is the one that contains the minute before ``first_day``
     starts (00:00 WIB), aligned to the UTC epoch: for the 1h file it closes exactly
     when the first 1m bar opens, for the 4h file it is the 4h bar that opened one
-    hour earlier. ``hours_1h`` and ``bars_4h`` are the number of bars; ``price(i)``
-    takes the number of the bar, counted from the first bar of that file. Returns
-    the 1h path and the 4h path."""
+    hour earlier. ``hours_1h`` and ``bars_4h`` are the number of bars. ``price(m)``
+    takes the minutes from 00:00 WIB of ``first_day`` to the minute the bar opens,
+    negative for these bars: the axis ``write_days`` uses when ``first_day`` is the
+    earliest day it wrote. Returns the 1h path and the 4h path."""
     end_ms = wib_day_start_ms(first_day)
     paths = []
     for interval, interval_ms, count in (
@@ -99,7 +104,8 @@ def write_warmups(
     ):
         last_open_ms = (end_ms - 1) // interval_ms * interval_ms
         first_open_ms = last_open_ms - (count - 1) * interval_ms
-        rows = [flat_bar(first_open_ms + k * interval_ms, price(k)) for k in range(count)]
+        opens = [first_open_ms + k * interval_ms for k in range(count)]
+        rows = [flat_bar(open_ms, price((open_ms - end_ms) // MINUTE_MS)) for open_ms in opens]
         path = warmup_path(data_dir, symbol, interval)
         write_day(path, rows)
         paths.append(path)

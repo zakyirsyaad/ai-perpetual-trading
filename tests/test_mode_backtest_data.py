@@ -163,6 +163,20 @@ class HelperTests(DataDirTestCase):
                     times, [times[0] + k * interval_ms for k in range(count)]
                 )
 
+    def test_the_price_axis_is_shared_by_the_warmups_and_the_days(self):
+        def price(minute):  # minutes from 00:00 WIB of the first day; negative before it
+            return 1_000.0 + minute / 60
+
+        write_days(self.root, SYMBOL, [D1], price=price)
+        write_warmups(self.root, SYMBOL, D1, hours_1h=3, bars_4h=2, price=price)
+
+        pair = load_pair(self.root, SYMBOL, D1, D1)
+
+        self.assertEqual(pair.bars_1m.close[0], 1_000.0)
+        self.assertEqual(pair.bars_1m.close[60], 1_001.0)
+        self.assertEqual(list(pair.warmup_1h.close), [997.0, 998.0, 999.0])  # open 3, 2, 1 h before
+        self.assertEqual(list(pair.warmup_4h.close), [995.0, 999.0])  # open 5 h and 1 h before
+
     def test_warmups_join_the_aggregated_bars_without_a_gap(self):
         self.write_pair([D1, D2])
         pair = load_pair(self.root, SYMBOL, D1, D2)

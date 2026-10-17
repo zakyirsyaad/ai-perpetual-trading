@@ -339,3 +339,83 @@ Verification (these numbers supersede the Verification numbers above):
 - Realistic scale (scratch, 439 days x 2 symbols + 4,344 / 1,086 warm-ups): `load_pair` 1.5 s with the unused check (1.3 s before); `verify_copy` of 882 listed files 0.03 s with the stray scan.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1731 tests in 35.601s` / OK (1,719 + 12 new), exit 0.
 - `compileall -q src tests` OK; `git diff --check` clean; `tests.test_secret_hygiene` OK with this document tracked.
+
+## Task 5 — Hourly frame, condition at a time, NAIK days
+
+`src/research/mode_backtest/frames.py` starts here; the bot never imports it. `HourlyFrame.build(pair, sel)` joins the native 1h and 4h warm-ups to the candles aggregated from the 1m bars (`features.htf_bars`), computes the selector's series once (SMA fast and slow of the 1h closes, ATR14 (1h), the median of the last 720 ATR14 values, the 4h EMA) and keeps them as tuples. `context_at(t_ms)` only looks them up with `last_closed_index`, so at `t` the candles with `open + interval <= t` are visible and nothing else (D2). It returns a frozen `HourlyContext(sma20_1h, sma50_1h, atr14_1h, atr_median, close_4h, ema50_4h, kondisi)`, where `kondisi` is `pilih_mode` of the five selector inputs. `naik_days(start_ms, end_ms, window)` returns the WIB days that have a NAIK hour inside the weekly entry window.
+
+Choices the brief left open:
+
+- **The day of a candle is the WIB day of its close.** The range, the window and the condition are all read at the close, so the candle ending at 00:00 WIB belongs to the new day (a UTC day would put it on the old one). The range is half open on the close: a close at `start` counts, a close at `end` does not. Warm-up candles count when the range reaches them. An empty range gives no days, a reversed one raises `ValueError` (it can only be a caller bug, and the answer "no NAIK days" would shrink the sample without a word).
+- **The window is checked by `bot.core.entry_window.window_is_open`** on the WIB datetime of the close, built in one small function (`_wib_moment`, exact integer arithmetic, the fixed +07:00 `WIB` of `research.pine_gate.spec`, the same zone as Asia/Jakarta and the one `wib_day` uses). `window=None` is always open. A later task routes this one conversion through the shared helper.
+- **The context fields keep the names of the document's defaults** (`sma20_1h`, `sma50_1h`, `ema50_4h`) and hold the periods of `SelectorConfig`. The ATR period is the module constant `ATR_PERIOD_1H = 14` (the document's ATR14; it is not a YAML key). `ATR_MEDIAN_HOURS = 720`.
+- **A missing input never reaches the selector as anything but `None`.** An index of -1 (no candle closed yet) is guarded in one place, because `column[-1]` would silently return the last value of the series, which is the future. The median is not a selector input: `kondisi` is defined while `atr_median` is still `None`.
+- **No NaN can reach `pilih_mode`** (it guards `None` only): the bars are validated finite when they are read, and the series are plain averages and medians of them. `frames.py` adds no division of its own. A test sweeps 2,140 contexts, from before the first candle to the end of the data, and requires every number to be finite or `None`.
+- `HourlyFrame(bars_1h, bars_4h, sel)` takes the joined series and refuses any interval but 1h and 4h (a swapped pair would put every "closed" boundary in the wrong place without an error); `build` is the entry point. A hole at a warm-up seam raises `BarGapError` from `htf_bars` and stops the build.
+- `tests/test_pine_gate_structure.py`: `_bot_sources_imported_by_research` now walks `PACKAGE` (`research/pine_gate`) and its docstring says so. It guards the Pine lock's code fingerprint, which was never meant to cover the `bot/strategy/modes` imports of the mode backtest.
+- `tests/mode_backtest_helpers.py`: `write_warmups(..., price=...)` now prices a bar by the minutes from 00:00 WIB of `first_day` to the minute it opens (negative for a warm-up bar), the axis `write_days` already used, so one price function runs on across the seam. Before, it counted bars from the first bar of each file. A new helper test pins this; the old ones never passed a price to the warm-ups and stay green.
+
+Test design: every price is a function of time (flat inside each UTC hour, or each UTC 4h bucket where a test reads 4h candles), written through the helper to the day files and warm-ups, loaded with `load_pair`, and every expected number is computed in the test from that function (`HourlyReference`, plus `pine_indicators.atr`/`ema` over the generated closes), never from the frame. Beyond the six tests named in the brief:
+
+- the hour boundary is read at -1 ms, 0 and +1 ms around a close, and the six 4h closes are each read at 0 and 1 ms before (13 times a day) on both the seam day (Monday, whose 03:00 close is the candle that straddles the seam) and a normal day, with `close_4h` and `ema50_4h` decoded back to the candle they belong to;
+- a poisoning test rebuilds the frame with every 1m bar from `t` on priced 50 times higher: the context at `t` must not change, at an hour close, a 4h close and inside an hour; poisoning the candle that just closed must change it;
+- the ATR median is checked at 719 and 720 values, and against windows that are one short, one long, or without the latest value, on a volatility that rises every hour so that those windows give different numbers;
+- `naik_days` has the brief's window case (Monday 06:00 out, 07:00 in, Saturday out) with the condition stubbed per close, the WIB day roll at 00:00, the half-open range, each non-NAIK condition, `None` window, and real rising and falling weeks.
+
+RED, before `frames.py` existed, with `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames tests.test_pine_gate_structure -v` (paths shortened; the 13 Pine structure tests all pass at this point and are left out):
+
+```text
+test_mode_backtest_frames (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_frames (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_frames
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_frames.py", line 24, in <module>
+    from research.mode_backtest import frames
+ImportError: cannot import name 'frames' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.622s
+
+FAILED (errors=1)
+```
+
+This is the expected failure. The brief expects the Pine fingerprint test to fail on `bot/strategy/modes/regime.py` too, but nothing under `research/` imports that module until `frames.py` exists, so it fails only at the next step: with `frames.py` written and the scope change not yet made, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_pine_gate_structure`:
+
+```text
+FAIL: test_fingerprint_covers_every_bot_module_the_research_imports (tests.test_pine_gate_structure.CodeFingerprintCoverageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_pine_gate_structure.py", line 64, in test_fingerprint_covers_every_bot_module_the_research_imports
+    self.assertEqual(sorted(imported - covered), [])
+AssertionError: Lists differ: ['bot/core/entry_window.py', 'bot/strategy[45 chars].py'] != []
+
+First list contains 3 additional elements.
+First extra element 0:
+'bot/core/entry_window.py'
+
+- ['bot/core/entry_window.py',
+-  'bot/strategy/modes/config.py',
+-  'bot/strategy/modes/regime.py']
+
+Ran 13 tests in 0.568s
+
+FAILED (failures=1)
+```
+
+The helper's price axis had its own RED (a new test in `HelperTests`, run against the previous helper): `test_the_price_axis_is_shared_by_the_warmups_and_the_days` failed with `Lists differ: [1000.0, 1000.0166666666667, 1000.0333333333333] != [997.0, 998.0, 999.0]`, the warm-up having been priced by bar number. GREEN after the helper change: `tests.test_mode_backtest_data tests.test_mode_backtest_structure`, 76 tests / OK.
+
+GREEN, the brief's command after `frames.py` and the scope change: `Ran 42 tests in 1.105s` / OK (29 frames tests and the 13 Pine structure tests). All 27 frames tests of the first version passed at once, which is why the mutation check came next. Two tests were added after it: a hole at the warm-up seam stops the build (it passed at once, the behaviour being `htf_bars`'s), and series of the wrong interval are refused (RED first: `AssertionError: ValueError not raised` for all three cases, GREEN with the guard in the constructor).
+
+Verification:
+
+- Focused: `tests.test_mode_backtest_frames tests.test_pine_gate_structure tests.test_mode_backtest_structure tests.test_mode_backtest_data` `Ran 118 tests` / OK on Python 3.10.20 (`.venv`): 29 frames, 13 Pine structure, 12 mode-backtest structure, 64 data. Python 3.11 was not run: it needs a scratch venv, and the compiled `pydantic_core` of `.venv` does not load there.
+- Line coverage of `research/mode_backtest/frames.py`: 100 % (68 statements and 8 branches, 0 missed), measured with a scratch rcfile (coverage cannot read `pyproject.toml` on 3.10 without `tomli`).
+- Mutation check (scratch scripts, not committed): 46 bugs planted one at a time in a copy of the tree, all caught: 43 in `frames.py`, 3 in the helper. Examples: the forming candle visible by 1 ms (1h and 4h), the just-closed candle invisible, a candle one behind, no guard for index -1, SMA periods swapped or hard-coded, ATR period 20, the 4h EMA period or the sideways multiple hard-coded, a median window of 719 or 721 or without the latest value, a median of the closes, `close_4h` and `ema50_4h` swapped, a warm-up not joined, a gap at the seam swallowed, the NAIK day taken in UTC or from the candle's open, the window read in UTC, at UTC+8 or at the open, a window `None` treated as closed, the range end included or the start excluded, the condition read at the open, any condition but TURUN counted, a reversed range accepted, the interval guard dropped or half of it. The first pass had one survivor, an early exit that skipped the check for a day already found; it changed nothing in the result, so it was removed.
+- Realistic scale (scratch, 441 synthetic days, 4,344 1h and 1,086 4h warm-up candles, a random walk with all four conditions present): `HourlyFrame.build` 0.78 s; `naik_days` over the 441 days 22 ms; `context_at` 1.9 microseconds a call (211,680 calls in 0.40 s), so the simulation loop of Task 12 will not wait on it.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1761 tests in 36.967s` / OK (1,731 + 29 frames tests + 1 helper test), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the five changed Python files (ruff is not configured in the repo; used as a lint only).

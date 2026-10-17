@@ -39,9 +39,13 @@ _IO_ONLY_BOT_IMPORTS = frozenset({"bot/config.py", "bot/storage/supabase_trade_s
 
 
 def _bot_sources_imported_by_research():
-    """src-relative .py paths of every ``bot.*`` module any research module imports."""
+    """src-relative .py paths of every ``bot.*`` module any Pine gate module imports.
+
+    Only ``research/pine_gate`` is scanned: this guards the Pine lock's code fingerprint, and the
+    mode backtest imports bot modules (``bot/strategy/modes``) that the fingerprint was never
+    meant to cover."""
     found = set()
-    for path in sorted((SRC / "research").rglob("*.py")):
+    for path in sorted(PACKAGE.rglob("*.py")):
         for node in ast.walk(_tree(path)):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
