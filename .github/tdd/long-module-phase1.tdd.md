@@ -921,3 +921,92 @@ Notes for later tasks:
 - **Task 13**: `Money.slippage_usdt` and `Money.fee_usdt` are positive, `pnl_usdt` is after the fee, and `volume_usdt` is the entry plus the exit notional, which is what `Hasil per 1 juta` divides by. `ExitOutcome.reason` is already the log word (`TP`, `SL`, `WAKTU`).
 - **Task 14**: `simulate.py` imports `bot.strategy.modes.position_rules` (and through it `bot.core.entry_window`), `research.pine_gate.bars` and `research.pine_gate.features`, all of them already in the code fingerprint's path through `frames.py`.
 - `tests/test_mode_backtest_simulate.py` is 1,025 lines; the plan puts Task 12's tests in the same file. The random-walk helpers (`restated_exit`, `random_rows`, `bars_with_holes`, `RandomWalkTests`) and the `Money` oracle are the part that would move to a module of their own if it keeps growing.
+
+## Task 12 — The simulation loop for Mode A and Mode D
+
+`research.mode_backtest.simulate` (the loop part, beside Task 11's walk and money) turns closed candles into simulated positions:
+
+- `RunSpec(mode, pair, tf, kondisi_gate, start_ms, end_ms)` (frozen, validated in `__post_init__`), `MODE_A = "A"`, `MODE_D = "D"`.
+- `Trade` (frozen), the 22 fields of the brief in its order: every §2.9 log column except `trade_id` (Task 13's row number) can be read from it, the four indicator columns through `context`.
+- `RunResult(trades, blocked)`: `trades` a tuple in time order, `blocked` a read-only mapping with every key of `BLOCK_REASONS = ("window", "segment_edge", "kondisi", "position_open", "pause", "daily_cap", "volatility")` in that order, zeros included.
+- `simulate_run(frames, cfg, run)`. The clock is the close `t` of each trigger candle with `start_ms <= t < end_ms` (`frames.triggers[run.tf]` for A, `frames.stretch_bars` for D). Mode A sends every one of those candles to a fresh `PullbackTracker` with `ema[i]` and the SMA20/ATR14 of `frames.hourly.context_at(t)`; Mode D signals on `near_mean_short(stretch[i], maks_jarak_ke_ema_kali_atr)`. A signal meets the seven gates in that order and the first that fails is counted. A signal that passes enters on the 1m bar with `open_ms == t` (`entry_index_for` plus an exact check), then fill, bracket from the fill, `resolve_exit`, `settle`, record, and `consume()` for Mode A only.
+
+Controller rulings for this task (recorded as given):
+
+1. **Segment edge (D10):** blocked when `t + limit_min x 60,000 >= end_ms`; the time-exit bar opening exactly at the end belongs to the next segment. For A (limit 90) a signal at `end - 90 min` is blocked and the previous 15m candle (`end - 105 min`) enters. This also settles Task 11's note about the entry exactly `limit` before the end: it never reaches the walk.
+2. **A trade is never dropped:** `resolve_exit` returning `None` after every gate passed raises `RuntimeError` naming the signal time (WIB ISO time and ms); so does a signal with no 1m bar opening exactly at `t`.
+3. **Exit time:** `open_ms[exit_idx]` for a time exit and a gap, `open_ms[exit_idx] + 60,000` for a touched TP or SL. The position is open while `t < exit_ms`, and the pause runs from `exit_ms`.
+4. **Tests in a new module** `tests/test_mode_backtest_loop.py`; `tests/test_mode_backtest_simulate.py` is unchanged.
+5. **`faktor_k`:** TP and SL percents are multiplied by `cfg.pair[run.pair].faktor_k` (1.0 for BTC, recorded on the trade); `otomatis` (`None`, ETH) raises `ValueError`.
+
+Choices of mine, each pinned by a test:
+
+- **`RunSpec` takes only the runs of Phase 1:** Mode A on `15m`/`5m` in NAIK; Mode D on `3m` in TURUN, or in NAIK (the comparator). Anything else (`mode` "B", Mode A in TURUN, Mode D in SIDEWAYS, Mode D on 15m, float or bool times, an end before the start) raises `ValueError`. A start equal to the end is an empty run.
+- **One position per pair is structural**, so `umum.maks_posisi_per_pair != 1` raises `ValueError` instead of being ignored. The frames must be of the run's pair, the pair must be in the config, and the 1m bars, the trigger candles and their EMA or stretch column must have the run's interval and matching lengths (`ValueError` naming which).
+- **A missing trigger candle between two candles of the run raises `RuntimeError`**: the Mode A window counts the candles it is sent, so a hole would widen it silently. `load_pair` already refuses incomplete days, so this only protects against misuse.
+- **Each run starts clean**: the tracker sees only the candles of its own range (a touch closing before the start never reaches it), and no pause or daily count carries over from another segment. A test-stage signal at 00:00 WIB is therefore not paused by a training exit at 23:59, and a touch from the last training candle cannot confirm in the test; only the first minutes of a stage see a different state than a run that carried it over would (the pause lasts 15 minutes, a touch three candles), though a different first entry can shift the entries after it.
+- **The condition is read only through `context_at(t)`**, at every candle close for Mode A (the tracker's cap needs SMA20 and ATR14) and at signal closes for Mode D. The stub in the tests has `context_at` and nothing else and records each time asked.
+- **Daily caps:** a run trades one pair, so its count of entries on the WIB day of `t` is passed as both the pair count and the total; the smaller cap binds.
+
+Test design: 49 tests in 14 classes (`tests/test_mode_backtest_loop.py`), the brief's nine under their names (`test_segment_edge_blocks_a_signal_whose_time_limit_passes_the_end` with ruling 1's values). The trigger candles are written by hand against an EMA of 100 (quiet, touch, confirm, touch-and-confirm, too high, or a candle with its own EMA or none), Mode D's stretch is written per 3m candle, and the 1m bars are a separate flat series at 100.0 with the few bars a test edits. Expected trades are built with the committed `adverse_fill`, `bracket_prices` and `settle` from numbers the test picks, so the tests check what the loop passes to them. Every number comes from `config/modes.yaml` (pinned by a fixture test), and variants come from `dataclasses.replace`. The tests pin:
+
+- the entry: at the open of the 1m bar opening at the confirmation close (the bars a minute before and after carry other prices), the whole `Trade` equal field by field, each candle judged against its own EMA, candles without an EMA still counting toward the 3-candle window, the cap read from the context at that close, and `tf` choosing the 15m or 5m series;
+- D5: a touch blocked by an open position and then by the pause still enters inside its window, an entry uses the touch up, a surviving touch still lapses after three candles, and a kondisi block leaves the touch;
+- each gate on its own: weekend and Monday-before-07:00 signals blocked (Friday 23:45 enters and is held past the window), daily caps rolling at 00:00 WIB and not 00:00 UTC in both directions (Wednesday 00:00 WIB enters although its UTC day already holds six; Wednesday 07:15 WIB is capped although its UTC day holds none), an entry counting for the WIB day it opens on, the smaller cap binding, the volatility guard (above twice the median, exactly twice, no median yet, both modes), the segment edge for A on 15m and 5m and for D, exact to the minute (an end at 00:01), and no trade exiting at or after the end;
+- the exit time of each kind of exit (time, touched TP, touched SL, a touch in the entry minute, a gap through each level) and the pause measured from it (a touch blocks 15 minutes from the end of its minute, a gap from its open, a time exit's own minute counts as `pause` and not `position_open`);
+- the counting: one Mode D scenario with 23 signals over Friday evening, the weekend and Monday morning, each entered or blocked under the first of the gates it fails (signals also fail later gates: a weekend signal in TURUN with a hot ATR is `window`, an open position in a hot TURUN hour is `kondisi`, a paused signal with the cap reached is `pause`), with every count and every trade (entry, exit, reason) written out, plus a run where the window is checked before the segment edge;
+- the run range: a touch before the start is never seen, a candle closing at the end is outside, the condition is asked at every close inside the run and never outside it, an empty run, and two runs over the same frames giving the same result;
+- `faktor_k` scaling both levels for both modes (a bar that reaches the unscaled stop and not the scaled one does not exit) and `otomatis` refused;
+- every number read from the config (fee, slippage, notional, both brackets, both limits, the pause, the volatility multiple, the weekly window, the confirmation window, the cap multiple, the Mode D band);
+- the data defects (a missing minute inside the walk, data ending before the exit, a hole at the entry minute, data ending before or starting after it, bars off the minute grid, a missing trigger candle), each a `RuntimeError` naming the time;
+- the argument refusals: 19 bad `RunSpec`s, and 9 frame or config mismatches, each of these matched on its message so that the intended check is the one refusing.
+
+RED: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_loop -v` before the loop existed (paths shortened). The brief expected the import error on `simulate_run`; the import list is alphabetical, so the first missing name is `BLOCK_REASONS`:
+
+```text
+test_mode_backtest_loop (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_loop (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_loop
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_loop.py", line 31, in <module>
+    from research.mode_backtest.simulate import (
+ImportError: cannot import name 'BLOCK_REASONS' from 'research.mode_backtest.simulate' (<repo>/src/research/mode_backtest/simulate.py)
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+GREEN, first run with the loop written: `Ran 47 tests` / OK. A first pass that passes at once proves little, so the tests were then checked against planted bugs (below). While listing the bugs I added `test_an_entry_counts_for_the_wib_day_it_opens_on` (nothing pinned that an entry counts for its opening day rather than its exit day); it passed against the loop, `Ran 48 tests` / OK.
+
+RED, 2: the first mutation pass (104 bugs) left one non-equivalent survivor: a segment edge one minute longer (`(limit_min + 1) * 60,000`). With every end at a midnight and every close on the candle grid, `t + limit` never lands one minute before the end, so no test could tell. `test_the_edge_is_exact_to_the_minute` ends a run at 00:01, where the 22:30 signal's time exit opens at 00:00 inside the segment. Against the final tests the mutant fails:
+
+```text
+FAIL: test_the_edge_is_exact_to_the_minute (tests.test_mode_backtest_loop.SegmentEdgeTests)
+AssertionError: Lists differ: [] != [(1782833400000, 1782838800000)]
+Ran 49 tests in 0.057s
+FAILED (failures=1)
+```
+
+GREEN, 2: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_loop` `Ran 49 tests` / OK.
+
+Verification:
+
+- Focused: `tests.test_mode_backtest_loop`, `tests.test_mode_backtest_simulate`, `tests.test_mode_backtest_structure`, `tests.test_mode_backtest_frames` and `tests.test_pine_gate_structure` `Ran 209 tests` / OK on Python 3.10.20 (`.venv`); the first three `Ran 138 tests` / OK on 3.11.15 (a scratch venv with `requirements.txt`, because CI runs 3.11).
+- Line and branch coverage of `simulate.py` (scratch rcfile, because the 3.10 `coverage` cannot read `pyproject.toml`): 100 % (312 statements, 88 branches, 0 missed). Global line coverage with the `pyproject.toml` settings mirrored into a scratch rcfile: 90 % (gate 80 %).
+- Mutation check (scratch copy of `src`, not committed): 107 bugs planted one at a time in the loop and run against `tests.test_mode_backtest_loop`. 106 are caught, 98 of them by failing assertions and 8 by a crash that is the natural result of the bug (a skipped trade returning `None` into the book, levels swapped into `resolve_exit`'s own check, a `KeyError` once the config-pair check is gone). The one survivor is equivalent: `Candle(t_ms - 1, ...)` changes only the tracker's ordering check and its `PullbackSignal.close_ms`, which the loop does not read. By area: the order of the gates (each adjacent pair swapped, 6), each gate removed (7), gate details (21: the edge strict, one minute short or long, a fixed 90; the condition fixed to NAIK or TURUN; the position still open at its exit time; the pause fixed or one minute longer; the caps from one field only (2), one off, by UTC day, counted on the UTC day or on the exit day, counted on blocked signals; the volatility multiple fixed or its arguments swapped; the window fixed or open; the last exit not kept), the exit time (4), the tracker and its feed (17: no consume, consume on a block, skipping candles without an EMA or while a position is open, either neighbour's EMA, the context a candle late or a minute early (Mode A), a minute early (Mode D), SMA and ATR swapped, a fixed cap or window, the candle's close time, its high and low or open and close swapped, the next candle's stretch, the band from the wrong mode), the range of candles (7: the candle at the start skipped, one before it taken, the one at the end taken, the last one dropped, the open reported as the close, the hole check off or skipping the hole), the entry (17: the next or the previous 1m bar, no exact-open check, a skipped trade on each defect (3), a bracket from the open, the percents swapped, the levels swapped into the walk, fee and slippage swapped, fee, slippage or notional fixed, the notional of the record fixed, the entry or signal time wrong, `gapped` wrong), the terms of a mode (8: `faktor_k` ignored, on TP only, recorded as 1, `otomatis` let through; Mode D as LONG, Mode A as SHORT; each mode with the other's numbers), the input checks (15: the seven of `simulate_run`, the five of `RunSpec`, and Mode A in TURUN, Mode D in SIDEWAYS or on 15m let through) and the result (5: zero keys dropped, a writable mapping, a list of trades, the WIB time or the ms missing from a message).
+- Real data, training period only (read-only smoke run of the copy at `~/replay/mode_backtest/data`, 2025-08-01 to 2026-08-04 WIB, 369 days, 531,360 1m bars; no test day read, nothing written): Mode A on 15m and 5m and Mode D in NAIK and in TURUN over `[latihan_mulai, latihan_selesai)` all completed (frames 4.3 s, each run 0.1 to 0.3 s) with no `RuntimeError`, and structural invariants held on every run (no overlap and the pause kept, the daily cap kept, every exit before the segment end, every entry inside the window, the gate condition and the side, the volatility guard at each entry, the recorded context equal to `context_at` at the signal, the seven keys). No result is reported here.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 2083 tests` / OK (2,034 + 49 new).
+- `compileall -q src tests` OK; `git diff --check` clean; `uv pip check` reports all installed packages compatible (the venv has no `pip`); `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the two files; `tests.test_secret_hygiene` OK with this document tracked; `tests.test_mode_backtest_structure` OK (no private import, no network or venue word, no file write in the package).
+
+Notes for later tasks:
+
+- **Task 13**: `Trade.side` is the int `LONG`/`SHORT` (map it to the words), `exit_reason` is already the log word, `signal_ms == entry_ms`, and the indicator columns are `trade.context.sma20_1h`, `.sma50_1h`, `.ema50_4h` and `.atr14_1h`. "Rata-rata lama posisi" is `exit_ms - entry_ms` with ruling 3's exit time. `RunResult.blocked` is a `MappingProxyType`: use `dict(result.blocked)` before writing JSON.
+- **Task 14**: one `simulate_run` per stage and run, with `start_ms`/`end_ms` the stage's WIB midnights (`spec.ms` of the `uji` datetimes). The 1m data must reach the minute before the end (the loaded days do); the trigger series and the hourly frame need warm data at the start, so the test stage still loads from `latihan_mulai` (Task 9's note), while the loop itself never looks at a candle closing before `start_ms`. The code fingerprint must cover the modules `simulate.py` now imports: `bot.strategy.modes.pullback` and `bot.strategy.modes.near_mean` (both inside `bot/strategy/modes/*.py`), `bot.core.entry_window`, `research.pine_gate.spec`, `bars` and `features`, all of them also reached through `frames.py` except `pullback`. `mode_a.aktif`, `mode_d.aktif` and `pair.*.aktif` are not read by the loop; the stages decide what runs.
