@@ -52,9 +52,20 @@ PYTHONPATH=src python -m research.pine_gate.cli --help
 PYTHONPATH=src python -m unittest discover -s tests -p 'test_pine_*.py'   # its tests only
 ```
 
-**CI is the merge gate.** `.github/workflows/tests.yml` runs `compileall` → `coverage run` → `coverage report` on every push to `main` and every pull request. `fail_under = 80` in `pyproject.toml` makes the report step fail the build below 80% line coverage, so run those three locally before proposing a merge.
+Dashboard (`dashboard/`, Bun + Next.js; see "Live dashboard feed"):
 
-Note: `README.md` and `AGENTS.md` show PowerShell (`$env:PYTHONPATH="src"`); the dev machine here is macOS/zsh and the VPS is Linux, so use the POSIX forms above.
+```bash
+cd dashboard && bun install
+bun run dev                 # http://localhost:3001; reads the feed at NEXT_PUBLIC_API_URL (default :3000, the SSH tunnel)
+bunx tsc --noEmit           # type check — the only static check the dashboard has
+bun run build               # production build; NEXT_PUBLIC_API_URL / FEED_PROXY_TARGET are baked in at build time
+```
+
+`.claude/launch.json` defines a `dashboard` preview for the same dev server. The dashboard has no JS test suite; its only automated check is the Python `tests/test_dashboard_contract.py` (wire shape vs `bot-types.ts`).
+
+**CI is the merge gate.** `.github/workflows/tests.yml` runs `compileall` → `coverage run` → `coverage report` on every push to `main` and every pull request. `fail_under = 80` in `pyproject.toml` makes the report step fail the build below 80% line coverage, so run those three locally before proposing a merge. CI never builds or type-checks `dashboard/`, so run `bunx tsc --noEmit` yourself after dashboard changes.
+
+Note: `README.md` and `AGENTS.md` show PowerShell (`$env:PYTHONPATH="src"`); the dev machine here is macOS/zsh and the VPS is Linux, so use the POSIX forms above. `HANDOFF.md` (2026-06-13) is a stale note from the OKX/gpt-5.4 era — don't take its model, venue or `.env` values as current.
 
 ## Configuration
 
