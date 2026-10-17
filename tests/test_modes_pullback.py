@@ -48,6 +48,23 @@ def doji_above(n):
     return candle(n, 101.0, 101.0, 100.5)
 
 
+def wick_above(n):
+    """Reaches the EMA and closes green below it, with a high above it: open < close < EMA < high.
+    Only its wick clears the EMA."""
+    return Candle(close_ms=(n + 1) * STEP_MS, open=99.0, high=101.5, low=98.8, close=99.6)
+
+
+def red_wick_above(n):
+    """Stays above the EMA and closes red, with a high above its open: red despite the wick."""
+    return Candle(close_ms=(n + 1) * STEP_MS, open=101.0, high=101.8, low=100.5, close=100.8)
+
+
+def tall_at_cap(n):
+    """Stays above the EMA and closes green exactly on the ceiling, with a high far above it."""
+    return Candle(close_ms=(n + 1) * STEP_MS, open=100.5, high=CEILING + 10 * ATR, low=100.5,
+                  close=CEILING)
+
+
 def new_tracker(confirm_within=3, max_distance_atr=1.0):
     return PullbackTracker(confirm_within=confirm_within, max_distance_atr=max_distance_atr)
 
@@ -101,6 +118,26 @@ class RuleTests(unittest.TestCase):
         just_above = candle(0, 99.5, math.nextafter(CEILING, math.inf), 99.0)
         self.assertEqual(fired(feed(new_tracker(), [at_cap])), [0])
         self.assertEqual(fired(feed(new_tracker(), [just_above])), [])
+
+    def test_the_close_and_not_the_high_must_clear_the_ema(self):
+        # after an open touch: a green candle above the EMA by its wick alone confirms nothing,
+        # and the window stays open for a close above the EMA
+        tracker = new_tracker()
+        feed(tracker, [touch_red(0)])
+        self.assertIsNone(tracker.on_candle(wick_above(1), EMA, SMA, ATR))
+        self.assertIsNotNone(tracker.on_candle(green_above(2), EMA, SMA, ATR))
+        # as its own touch: no signal either, though it is a touch the next candle confirms
+        tracker = new_tracker()
+        self.assertIsNone(tracker.on_candle(wick_above(0), EMA, SMA, ATR))
+        self.assertIsNotNone(tracker.on_candle(green_above(1), EMA, SMA, ATR))
+        # and the colour is the close against the open: a high above the open is no green candle
+        self.assertEqual(fired(feed(new_tracker(), [touch_red(0), red_wick_above(1)])), [])
+
+    def test_the_distance_cap_holds_the_close_and_not_the_high(self):
+        # a close exactly on the cap still enters, however far above the cap the high went
+        tracker = new_tracker()
+        feed(tracker, [touch_red(0)])
+        self.assertIsNotNone(tracker.on_candle(tall_at_cap(1), EMA, SMA, ATR))
 
     def test_one_entry_per_touch(self):
         tracker = new_tracker()
@@ -168,6 +205,24 @@ class WindowTests(unittest.TestCase):
         falling.on_candle(touch_red(0), EMA, SMA, ATR)
         below_the_old_ema = candle(1, 99.0, 99.5, 98.5)
         self.assertIsNotNone(falling.on_candle(below_the_old_ema, 98.0, SMA, ATR))
+
+    def test_a_touch_is_judged_on_the_ema_passed_with_its_own_candle(self):
+        # D4 on the touch side, with no earlier touch open: candle 0 stays above an EMA of 100
+        rising = new_tracker()
+        self.assertIsNone(rising.on_candle(red_above(0), EMA, SMA, ATR))
+        # the EMA rose to 101: a low of 100.5, above the old EMA and below the new one, touches
+        # it, and the green close at 101.5 above the new EMA confirms in the same candle
+        dipped_to_the_new_ema = candle(1, 100.8, 101.5, 100.5)
+        self.assertIsNotNone(rising.on_candle(dipped_to_the_new_ema, 101.0, SMA, ATR))
+        # the EMA fell to 98: a low of 99, below the old EMA and above the new one, is no touch
+        above_the_new_ema = candle(1, 99.5, 100.5, 99.0)
+        falling = new_tracker()
+        self.assertIsNone(falling.on_candle(red_above(0), EMA, SMA, ATR))
+        self.assertIsNone(falling.on_candle(above_the_new_ema, 98.0, SMA, ATR))
+        # the same candle confirms a touch that is open: only the touch was missing
+        confirmed = new_tracker()
+        confirmed.on_candle(touch_red(0), EMA, SMA, ATR)
+        self.assertIsNotNone(confirmed.on_candle(above_the_new_ema, 98.0, SMA, ATR))
 
     def test_a_too_high_close_is_no_entry_and_leaves_the_touch_available(self):
         too_high = candle(0, 99.5, math.nextafter(CEILING, math.inf), 99.0)
