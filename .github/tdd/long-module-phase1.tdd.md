@@ -824,3 +824,100 @@ Notes for later tasks:
 - **Task 11** calls `adverse_fill(price, side, slippage_pct, closing)` with `side` as `LONG` / `SHORT` and `closing` a real bool, and `bracket_prices` takes the *fill*, so the entry is `adverse_fill(open, side, s, False)` first and the bracket after it (D6).
 - **Task 12** composes the gates in the order of section 9.1: `entry_window_open(window, t_ms)`, the segment edge, the condition, the open position, `pause_over(t_ms, last_exit_ms[pair], jeda_menit)`, `under_daily_caps(pair_entries, total_entries, maks_pair, maks_total)` with the counts of the WIB day of `t` (`wib_day`), then `volatility_ok(ctx.atr14_1h, ctx.atr_median, mult)`.
 - **Task 14**: the code fingerprint of the mode backtest must also follow `frames.py` into `bot/strategy/modes/position_rules.py` and from there into `bot/core/entry_window.py`.
+
+## Task 11 — Exit walk and trade money
+
+`research.mode_backtest.simulate` (the exit part; Task 12 adds the event loop to the same file) says how a simulated position ends and what it earns. It takes numbers and bars only and reads no clock, file or setting:
+
+- `ExitOutcome(reason, exit_idx, raw_price, gapped, both_touched)` (frozen), with the three reasons as `EXIT_TP`, `EXIT_SL` and `EXIT_WAKTU` (`"TP"`, `"SL"`, `"WAKTU"`, the words of the log), and `resolve_exit(bars_1m, entry_idx, side, tp, sl, limit_min)`. The walk starts on the entry bar itself, whose whole range counts because the entry fills at its open, and goes bar by bar. Order inside a bar: the time limit, an open at or beyond the SL, an open at or beyond the TP, an SL touch, a TP touch (LONG: `open <= sl`, `open >= tp`, `low <= sl`, `high >= tp`; SHORT mirrored). A gap exits at the bar's open (`gapped`), a touch at the level, and the time exit (D7) at the open of the bar `limit_min` minutes after the entry bar, before that bar's levels. A bar that touches both levels without opening beyond either is taken as the SL (`both_touched`). It returns `None` when the data ends first, and a bar that is not exactly one minute after the one before it (a hole, a repeated minute, a minute that goes back) is where the data ends.
+- `Money(entry_fill, exit_fill, qty, fee_usdt, slippage_usdt, pnl_usdt, volume_usdt)` (frozen) and `settle(entry_open, raw_exit, side, notional, fee_pct, slippage_pct)`: both fills come from `adverse_fill` (the entry with `closing=False`, the exit with `closing=True`), `qty = notional / entry_fill`, `volume = qty x entry_fill + qty x exit_fill`, `fee = fee_pct / 100 x volume`, `pnl = side x qty x (exit_fill - entry_fill) - fee`, and `slippage_usdt = qty x |entry_fill - entry_open| + qty x |raw_exit - exit_fill|`.
+
+Choices the brief left open, or changed:
+
+- **`both_touched` is the stop-first tie and nothing else.** It is True only for an SL taken at the SL price from a bar whose range also reached the TP. An exit at the open (a gap, or the time exit) is False even when the same bar's range goes on to reach the other level: the open comes first, so the order inside the minute is known and no tie was broken. This is the convention of the Pine outcome walker (`research.pine_gate.outcomes`). The flag is a diagnostic: it is not among the 23 log columns and no metric reads it.
+- **A level behind the entry open is a gap on the entry bar.** The walk applies the same rules to the entry bar as to any bar and is given levels, not percents, so it does not compare them with the entry open. The document's percents never put a level behind the open; a slippage larger than the stop distance would, and the answer is then the gap rule of D6 (exit at that bar's open). A test pins it.
+- **The arguments are checked, and a wrong one raises `ValueError`.** Bars that are not 1m; a `side` that is not the int `LONG` or `SHORT` (a bool or `1.0` included, which the `adverse_fill` check lets through for `1.0`); an `entry_idx` that is not an int inside the bars (a negative one would index the arrays from the end); a `limit_min` that is not an int of at least 1; a level that is not a finite number above 0; levels on the wrong sides of each other (a LONG needs `sl < tp`, a SHORT `tp < sl`, equal levels have no side); a `notional` that is not above 0; a `fee_pct` below 0. A bool is no number here. Prices and the slippage are left to `adverse_fill`. Each of these would otherwise give a plausible exit or profit without a word.
+- **A touch is only known to the minute.** `exit_idx` is the bar; the outcome carries no time. Task 12 decides what `exit_ms` is (see the notes).
+- **The brief's take-profit figures sit on a tie.** The exact pnl is 79.9558785 and the exact fee 17.5341215, which the brief rounds up to 79.955879 and 17.534122. A float lands on either side of such a rounding, so `places=6` would pass or fail with the order of the arithmetic. The brief's figures are compared with a tolerance of one unit of the 6th decimal (`delta=1e-6`) and the exact values are pinned beside them at nine decimals. The exact values come from decimal arithmetic at 50 digits, not from the code under test.
+- **The SHORT reference trades are not in the brief.** Mode D's SHORT (0.20 % each way from the fill 99.99) was worked out the same way: take-profit pnl 30.02162675, stop-loss pnl -70.02337675.
+- **`slippage_usdt` is written with absolute values**, so it is positive by construction and never `-0.0` (with a slippage of 0 a SHORT would otherwise write `-0.0` into the trade log).
+- **`INTERVAL_1M` is imported from `research.pine_gate.features`**, as `frames.py` does.
+
+Test design: 77 tests in 13 classes, the brief's seven under their names (the TP half of the gap test is a test of its own, `test_bar_opening_beyond_tp_exits_at_its_open`). The bars are flat at 100.0 except the few that decide the outcome, and every SHORT case is written out by hand and not derived from the LONG one, so a helper cannot repeat a mistake of the code. The tests pin:
+
+- the touches (TP, SL, both; the first bar to touch decides; `both_touched` belongs to the deciding bar), inclusive at the level to the last bit (`math.nextafter` one float inside and one outside, for all four comparisons), and the two levels not swapped between the sides;
+- the gaps: at the stop, at the target, exactly at a level (a gap) and one float inside it (a touch), a gap beating a touch in the same bar (a bar that opens beyond the SL and then reaches the TP is a gap and not a tie), and the exit price being the open;
+- the time exit: at the open of bar 90, before that bar's levels and before its gaps; bar 89 still counting; nothing after bar 90 looked at; the minutes counted from the entry bar (an entry at 10 exits at 100); a limit of 60 and of 1;
+- the entry bar's range counting (TP, SL, both) and the bars before it never looked at;
+- the end of the data: 90 bars is `None` and 91 is a time exit, an entry on the last bar, a level touched before the end still deciding, and a late touch past the limit not a reason for `None`;
+- holes: a missing minute, a level after the hole not taken and one before it taken, a hole where the time exit bar should be (and one bar earlier) not a time exit, a hole before the entry bar outside the walk, runs that join without a hole walking as one, and a repeated or backward minute ending the walk;
+- 4,000 seeded random walks on a tick grid (levels hit exactly, gaps, holes, eight limits and five level distances) compared with a plain per-side restatement of the rules written in the test, and a check that they reach every kind of outcome on both sides (33 to 782 times each; 1,060 walks hold a hole and 2,975 touch a level exactly), so the comparison cannot pass by looking at nothing;
+- the money: the brief's two reference trades, their SHORT mirrors, a round trip that closes where it opened (9 bps), no fee and no slippage, the fills equal to `adverse_fill`, the quantity over the fill and not the open, and 144 generated trades (both sides, six price pairs, three slippages, two fees, two notionals) against an oracle written in `Fraction`s;
+- the arguments (each refusal, with the levels of a LONG and of a SHORT for the side, so that the order of the levels cannot be what refuses it), and the composition the event loop will use: fill, bracket from the fill (D6), walk, settle, which gives the reference trades back.
+
+RED: the brief's step 2, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_simulate -v` before the module existed (paths shortened). The expected import failure:
+
+```text
+test_mode_backtest_simulate (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_simulate (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_simulate
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_simulate.py", line 21, in <module>
+    from research.mode_backtest.simulate import (
+ModuleNotFoundError: No module named 'research.mode_backtest.simulate'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+GREEN, first run with `simulate.py` written: 72 of 73 pass. The one failure was the tolerance of my own oracle test, not the code: it asked for `abs_tol=1e-12`, but a pnl is made of the difference of two float fills (each good to about 1e-14) times a quantity of a few hundred, so a float cannot be closer than a few 1e-12 USDT to the exact value:
+
+```text
+FAIL: test_money_matches_exact_arithmetic_on_a_grid_of_trades (tests.test_mode_backtest_simulate.MoneyOracleTests) (args=(100.0, 99.75, -1, 25000.0, 0.035, 0.1), field='pnl_usdt')
+AssertionError: False is not true : -4.92052364864373 != -4.920523648648653
+```
+
+The oracle now allows `abs_tol=1e-9` (a billionth of a USDT; a wrong formula is off by far more) with the reason written beside it, and `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_simulate -v` gave `Ran 73 tests` / OK.
+
+RED, 2: the mutation check below found two survivors, and each was a gap in the tests. (1) A hole check that only looks for a forward gap (`>` for `!=`) passed: the test for a repeated or backward minute changed a single timestamp, and the bar after it then looked like a forward gap, which the mutant also catches. The test now moves every bar from bar 5 on back by whole minutes, so the only wrong step is the one into bar 5. (2) A side check that also accepts 0 passed: `side=0` was tried with the levels of a LONG only, and the level-order check refuses a 0 with those anyway. The test now tries each bad side with the levels of a LONG and of a SHORT. Against the final tests the two mutants fail (paths shortened):
+
+```text
+mutant: if i > entry_idx and open_ms[i] > open_ms[i - 1] + INTERVAL_1M:
+FAIL: test_bars_that_repeat_or_go_back_in_time_end_the_walk (...HoleTests) (case='repeat')
+AssertionError: ExitOutcome(reason='WAKTU', exit_idx=90, raw_price=100.0, gapped=False, both_touched=False) is not None
+FAIL: test_bars_that_repeat_or_go_back_in_time_end_the_walk (...HoleTests) (case='back')
+AssertionError: ExitOutcome(reason='WAKTU', exit_idx=90, raw_price=100.0, gapped=False, both_touched=False) is not None
+Ran 77 tests / FAILED (failures=2)
+
+mutant: side not in (LONG, SHORT, 0)
+FAIL: test_a_side_that_is_not_long_or_short_is_refused (...WalkArgumentTests) (side=0, tp=99.6)
+AssertionError: ValueError not raised
+Ran 77 tests / FAILED (failures=1)
+```
+
+GREEN, 2: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_simulate` `Ran 77 tests` / OK (73 + 1 for the repeated and backward minutes + 3 for the random walks).
+
+Verification:
+
+- Focused: `tests.test_mode_backtest_simulate` `Ran 77 tests` / OK on Python 3.10.20 (`.venv`), and with `tests.test_mode_backtest_structure` `Ran 89 tests` / OK on 3.11.15, the Python of CI (the 3.11 from the local environment that has the dependencies, because the venv's compiled `pydantic_core` is a 3.10 build; the `features` import pulls `pydantic` in, as it does for `frames.py`).
+- Line and branch coverage of `simulate.py` (scratch rcfile, because the 3.10 `coverage` cannot read `pyproject.toml`): 100 % (94 statements, 30 branches, 0 missed).
+- Mutation check (scratch copy of `src` and `tests`, not committed): 122 bugs planted one at a time in `simulate.py`, run against the tests. The first pass caught 118 of the 120 that applied and 2 survived (RED, 2 above); two more patterns (the quantity over the open and over the exit fill) matched the docstring as well as the code and were rewritten to match the code only. After the two test fixes all 122 are caught, every one by failing assertions and none by a broken module. By area: the rules of a bar (12: each comparison made strict, the sides swapped or fixed to the LONG rule, the extremes swapped or fixed, the open read from the highs), holes and the end of the data (8: the check off, forward only, backward only, a wrong step, applied on the entry bar, from the start of the data, a hole or the end answered with a time exit), the loop and the limit (9: the limit bar one early or late, `limit_idx` one off or taken from the start of the data, the walk starting after the entry bar, the last bar skipped, the walk running past the data), what each exit returns (37: price, index, `gapped` and `both_touched` of the five kinds of exit, each gap check off, the touches swapped, a touch tested on the wrong extreme, the labels, and the time check, the two gap checks and the touches in six arrangements), the argument checks (22), and `settle` and the two records (34: the side, notional and fee checks off, the closing flags swapped, the quantity over the open or the exit fill, four wrong volumes, five wrong fees, six wrong pnls, six wrong slippages, the argument order and the field order of both records, neither record frozen).
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 2034 tests` / OK (1,957 + 77 new).
+- `compileall -q src tests` OK; `git diff --check` clean; `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the two new Python files; `tests.test_secret_hygiene` OK with this document tracked.
+
+Notes for later tasks:
+
+- **Task 12** composes the pieces in this order (D6): `entry_fill = adverse_fill(open, side, s, False)` first, then `bracket_prices(entry_fill, side, tp_pct, sl_pct)`, then `resolve_exit(pair.bars_1m, entry_idx, side, b.tp, b.sl, limit)` with `entry_idx` the 1m bar whose `open_ms == t`, then `settle(bars.open[entry_idx], outcome.raw_price, side, notional, fee_pct, s)` with the three numbers from `cfg.umum` (`notional_usdt`, `fee_taker_persen`, `slippage_persen`) and the limit from `cfg.mode_a.batas_waktu_menit` or `cfg.mode_d.batas_waktu_menit`. `None` means the data ended, or a minute is missing, before the position resolved. A `ValueError` from either function is a bug in the caller.
+- **The time exit needs the bar that opens `limit_min` minutes after the entry bar.** A stage ends at 00:00 WIB and its last day file stops at 23:59 WIB, so the bar at the end instant is not in the data. D10 still allows the entry exactly `limit` minutes before the end (a 15m close at 22:30 WIB for Mode A, 60 minutes for Mode D), and for that one entry `resolve_exit` returns `None`: the time-exit bar is missing. Task 12's loop must count such a signal (it is not a gate-blocked one) and Task 14 must either read one more minute past the stage end or accept the loss of that entry; it is not an error of the walk.
+- **`exit_ms` is Task 12's to decide and to pin with a test.** For a time exit and for a gap the exit is at the open of `exit_idx`, `open_ms[exit_idx]`. A touch happens somewhere inside the minute; the Pine simulation used the bar's close (`open_ms + 60,000`) for it, and that is the later, more cautious choice for the 15-minute pause. Do not copy the Pine rule `open_ms + (0 if gapped else 60,000)` as it stands: it would put a time exit, which is at the open, one minute late. It also decides the "average position length" column.
+- **Task 13**: `Money.slippage_usdt` and `Money.fee_usdt` are positive, `pnl_usdt` is after the fee, and `volume_usdt` is the entry plus the exit notional, which is what `Hasil per 1 juta` divides by. `ExitOutcome.reason` is already the log word (`TP`, `SL`, `WAKTU`).
+- **Task 14**: `simulate.py` imports `bot.strategy.modes.position_rules` (and through it `bot.core.entry_window`), `research.pine_gate.bars` and `research.pine_gate.features`, all of them already in the code fingerprint's path through `frames.py`.
+- `tests/test_mode_backtest_simulate.py` is 1,025 lines; the plan puts Task 12's tests in the same file. The random-walk helpers (`restated_exit`, `random_rows`, `bars_with_holes`, `RandomWalkTests`) and the `Money` oracle are the part that would move to a module of their own if it keeps growing.
