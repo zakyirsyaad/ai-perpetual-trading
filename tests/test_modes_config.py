@@ -406,6 +406,18 @@ class ValueRefusalTests(ConfigCase):
                 self.assertEqual(value, 2)
                 self.assertIsInstance(value, float)
 
+    def test_an_int_too_long_to_print_is_named_not_leaked(self):
+        # CPython refuses to print an int of more than 4300 digits (ValueError), and the message
+        # that names the bad value or key must not be the thing that raises.
+        huge = 10 ** 5000
+        for dotted in ("mode.A_pullback_long.aktif", "umum.zona_waktu", "umum.jendela_entry_mingguan"):
+            with self.subTest(key=dotted):
+                self.assertRefuses(edited(dotted, huge), dotted)
+        self.assertRefuses(edited("umum.jeda_menit", -huge), "umum.jeda_menit", "at least 0")
+        doc = valid_doc()
+        doc["umum"][huge] = 1
+        self.assertRefuses(doc, "umum.", "unknown key")
+
     def test_non_finite_and_huge_numbers_refuse(self):
         for dotted in POSITIVE_FLOATS + SIGNED_FLOATS + FAKTOR_K:
             for bad in (float("nan"), float("inf"), float("-inf")):
@@ -508,7 +520,9 @@ class ValueRefusalTests(ConfigCase):
                 with self.subTest(key=dotted, bad=bad):
                     self.assertRefuses(edited(dotted, bad), dotted, "quoted string")
             for bad in ("2025-13-01T00:00:00+07:00", "2025-08-32T00:00:00+07:00",
-                        "2025-08-01T24:00:00+07:00", "2025-08-01T00:00:00+25:00"):
+                        "2025-08-01T24:00:00+07:00", "2025-08-01T00:00:00+25:00",
+                        # valid on their own, but year 0 / year 10000 once seen in UTC
+                        "0001-01-01T00:00:00+07:00", "9999-12-31T23:59:59-23:59"):
                 with self.subTest(key=dotted, bad=bad):
                     self.assertRefuses(edited(dotted, bad), dotted, "not a valid date")
 
@@ -578,6 +592,77 @@ class YamlFileTests(ConfigCase):
         text = text.replace('"2025-08-01T00:00:00+07:00"', "2025-08-01T00:00:00+07:00")
         self.assertFileRefuses(text, "uji.latihan_mulai", "quoted string")
 
+    def test_an_unquoted_date_no_calendar_has_is_a_config_error_not_a_value_error(self):
+        # PyYAML builds a datetime from an unquoted date; its own ValueError used to escape.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        started = '"2025-08-01T00:00:00+07:00"'
+        cases = {
+            "month 13 in a date field": text.replace(started, "2025-13-01T00:00:00+07:00"),
+            "day 32 in a date field": text.replace(started, "2025-08-32"),
+            "30 February in a number field": text.replace("  jeda_menit: 15\n", "  jeda_menit: 2025-02-30\n"),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.assertFileRefuses(case, "cannot read as YAML")
+
+    def test_a_quoted_date_outside_the_supported_range_names_its_key(self):
+        # astimezone() overflows for year 1 and for the last day of year 9999 behind a -23:59 offset
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        for bad in ("0001-01-01T00:00:00+07:00", "9999-12-31T23:59:59-23:59"):
+            with self.subTest(bad=bad):
+                case = text.replace('"2025-08-01T00:00:00+07:00"', f'"{bad}"')
+                self.assertFileRefuses(case, "uji.latihan_mulai", "not a valid date")
+
+    def test_whatever_pyyaml_cannot_build_is_a_config_error(self):
+        # Each text is valid YAML, but PyYAML's constructor then raises something that is not a
+        # YAMLError: ValueError, KeyError or AttributeError.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        started, number, flag, fee = (
+            '"2025-08-01T00:00:00+07:00"', "  jeda_menit: 15\n",
+            "  ai_boleh_buka_tutup: false\n", "  fee_taker_persen: 0.035\n")
+        cases = {
+            "an hour no clock has": (started, "2025-08-01T25:00:00+07:00"),
+            "a UTC offset of more than a day": (started, "2025-08-01T00:00:00+25:00"),
+            "year zero": (started, "0000-01-01"),
+            "an explicit !!timestamp that is no timestamp": (started, "!!timestamp abc"),
+            "an explicit !!int that is no integer": (number, "  jeda_menit: !!int abc\n"),
+            "an explicit !!float that is no float": (fee, "  fee_taker_persen: !!float abc\n"),
+            "an explicit !!bool that is no boolean": (flag, "  ai_boleh_buka_tutup: !!bool maybe\n"),
+            # Python refuses to read an integer this long (CPython's digit limit) or, without
+            # that limit, the float conversion overflows: either way a config error.
+            "an integer of 5000 digits": (fee, "  fee_taker_persen: " + "9" * 5000 + "\n"),
+        }
+        for name, (old, new) in cases.items():
+            with self.subTest(name):
+                self.assertFileRefuses(text.replace(old, new))
+        for name in ("an hour no clock has", "year zero", "an explicit !!bool that is no boolean"):
+            old, new = cases[name]
+            with self.subTest(name, says="cannot read as YAML"):
+                self.assertFileRefuses(text.replace(old, new), "cannot read as YAML")
+
+    def test_a_hex_number_too_long_for_python_to_print_is_a_config_error(self):
+        # PyYAML reads a hex literal of any length (the digit limit covers decimal only), then
+        # CPython cannot print the value for the message.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        long_hex = "0x" + "f" * 4000
+        cases = {
+            "in a flag": ("    aktif: true\n    tf_pemicu: 15m", f"    aktif: {long_hex}\n    tf_pemicu: 15m",
+                          "mode.A_pullback_long.aktif"),
+            "in a whole-number field, negative": ("  jeda_menit: 15\n", f"  jeda_menit: -{long_hex}\n",
+                                                  "umum.jeda_menit"),
+            "in a text field": ("  zona_waktu: Asia/Jakarta\n", f"  zona_waktu: {long_hex}\n",
+                                "umum.zona_waktu"),
+            "as an explicit key": ("  jeda_menit: 15\n", f"  jeda_menit: 15\n  ? {long_hex}\n  : 1\n", "umum."),
+        }
+        for name, (old, new, named) in cases.items():
+            with self.subTest(name):
+                self.assertFileRefuses(text.replace(old, new), named)
+
+    def test_absurdly_deep_nesting_is_a_config_error(self):
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        deep = "[" * 3000 + "]" * 3000
+        self.assertFileRefuses(text.replace("  jeda_menit: 15\n", f"  jeda_menit: {deep}\n"))
+
     def test_a_key_written_twice_refuses_and_names_its_path(self):
         base = REPO_CONFIG.read_text(encoding="utf-8")
         slippage, mode_b = "  slippage_persen: 0.01\n", "  B_breakout_long:\n"
@@ -588,7 +673,8 @@ class YamlFileTests(ConfigCase):
         }
         for path, text in cases.items():
             with self.subTest(path=path):
-                self.assertFileRefuses(text, f"{path}: key written twice")
+                message = self.assertFileRefuses(text, f"{path}: key written twice")
+                self.assertNotIn("cannot read as YAML", message)
 
     def test_a_key_is_a_duplicate_even_when_one_spelling_is_quoted(self):
         text = REPO_CONFIG.read_text(encoding="utf-8").replace(

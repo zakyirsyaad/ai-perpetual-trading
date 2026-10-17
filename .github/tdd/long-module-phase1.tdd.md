@@ -116,3 +116,18 @@ Verification:
 - The existing guards cover the new package: planting `from bot.strategy import pine_indicators` and `import research.pine_gate` into a scratch copy of `config.py` made `test_no_live_module_imports_pine_indicators` and `test_no_bot_module_or_main_imports_research` fail.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1643 tests in 308.039s` / `OK` (1,588 existing + 55 new), exit 0, with the machine's load average at 40-107 and no stall.
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with the new files and this document tracked.
+
+### Fix round 1 (task review)
+
+The review found that "every content problem raises `ModesConfigError`" was not true. `yaml.safe_load` raised a bare `ValueError` for an unquoted date that no calendar has (`latihan_mulai: 2025-13-01T00:00:00+07:00`, `2025-08-32`, `jeda_menit: 2025-02-30`), and `astimezone` sat outside the `try`, so the quoted `"0001-01-01T00:00:00+07:00"` raised a bare `OverflowError`. Nothing wrong ever loaded, but a CLI that maps `ModesConfigError` to a one-line `error:` would have printed a traceback. Reproducing it showed the family is wider: `!!bool maybe` (`KeyError`), `!!timestamp abc` (`AttributeError`), `!!int abc`, `!!float abc`, an hour 25, an offset of +25:00 and year 0000 (`ValueError`), `9999-12-31T23:59:59-23:59` (`OverflowError`) and 1,500-deep nesting (`RecursionError`) all escaped too. A hex literal of more than 4,300 digits broke the message code itself, because CPython will not print so long an int.
+
+RED, the new tests against the unfixed loader: `Ran 59 tests` / `FAILED (errors=23)`, every error the bare library exception (`ValueError: month must be in 1..12`, `OverflowError: date value out of range`, `KeyError: 'maybe'`, `AttributeError: 'NoneType' object has no attribute 'groupdict'`, `RecursionError: maximum recursion depth exceeded`). The tests for the unprintable int came second: `Ran 61 tests` / `FAILED (errors=8)`, all `ValueError: Exceeds the limit (4300) for integer string conversion`.
+
+The fix, all in `config.py`:
+
+- `_wib_midnight`: `astimezone` moves inside the `try`, and `OverflowError` is caught with `ValueError`.
+- `_parse_yaml`: each PyYAML call (`compose`, `safe_load`) sits in its own `try` that turns any `Exception` into `ModesConfigError("cannot read as YAML: ...")`. `Exception` rather than `ValueError` because `KeyError`, `AttributeError` and `RecursionError` escaped as well. The repeated-key refusal stays outside both, so it is not wrapped a second time (`ModesConfigError` is itself a `ValueError`).
+- `load_modes_config` now only handles bad UTF-8 and prefixes the file name, since YAML failures are converted earlier.
+- `_show` replaces `repr` and `str` in `_describe`, `_join` and the "at least N" message, so naming a value or a key can never raise.
+
+GREEN: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_config` gives `Ran 61 tests` / `OK` (Python 3.10.20 and 3.11.15). Six tests are new and two existing ones gained cases. These numbers supersede the counts above: line coverage of `bot/strategy/modes/` 100 % (267 statements); 66 planted bugs, all caught; full suite `Ran 1649 tests` / `OK`; a fuzz of 25,034 hostile documents through `parse_modes_config` raised nothing but `ModesConfigError`. A message for an unquoted impossible date carries the file name and PyYAML's text (`month must be in 1..12`) but no key path, because PyYAML's constructor error carries no position.

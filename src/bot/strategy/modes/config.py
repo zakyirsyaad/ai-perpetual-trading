@@ -203,12 +203,22 @@ class ModesConfig:
 _Reader = Callable[[Any, str], Any]
 
 
+def _show(value: object) -> str:
+    """``repr(value)`` that cannot raise. CPython will not print an int of more than 4300 digits,
+    yet PyYAML reads a hex literal of any length, so a value named in a message must be safe."""
+    try:
+        return repr(value)
+    except ValueError:
+        return "<too many digits>"
+
+
 def _join(path: str, key: object) -> str:
-    return f"{path}.{key}" if path else str(key)
+    name = key if isinstance(key, str) else _show(key)
+    return f"{path}.{name}" if path else name
 
 
 def _describe(value: object) -> str:
-    return "null" if value is None else f"{value!r} ({type(value).__name__})"
+    return "null" if value is None else f"{_show(value)} ({type(value).__name__})"
 
 
 def _fail(path: str, reason: str) -> ModesConfigError:
@@ -252,7 +262,7 @@ def _integer(minimum: int) -> _Reader:
         if isinstance(value, bool) or not isinstance(value, int):
             raise _fail(path, f"expected a whole number, got {_describe(value)}")
         if value < minimum:
-            raise _fail(path, f"must be at least {minimum}, got {value}")
+            raise _fail(path, f"must be at least {minimum}, got {_show(value)}")
         return value
 
     return read
@@ -305,10 +315,9 @@ def _wib_midnight(value: Any, path: str) -> datetime:
             f"(date, time and UTC offset), got {_describe(value)}",
         )
     try:
-        moment = datetime.fromisoformat(value)
-    except ValueError:
-        raise _fail(path, f"not a valid date and time: {value!r}") from None
-    local = moment.astimezone(_WIB)
+        local = datetime.fromisoformat(value).astimezone(_WIB)
+    except (ValueError, OverflowError):  # month 13; or year 1, which has no UTC to convert via
+        raise _fail(path, f"not a valid date and time in the supported range: {value!r}") from None
     if local.time() != time(0):
         raise _fail(
             path, f"must be midnight in {_WIB_ZONE} (the data is per WIB day), got {value!r}"
@@ -516,23 +525,40 @@ def _refuse_repeated_keys(node: yaml.Node, path: str, visited: set[int]) -> None
             _refuse_repeated_keys(value_node, child, visited)
 
 
+def _unreadable(exc: Exception) -> ModesConfigError:
+    return ModesConfigError(f"cannot read as YAML: {exc}")
+
+
 def _parse_yaml(text: str) -> Any:
-    root = yaml.compose(text, Loader=yaml.SafeLoader)  # builds nodes only, no Python objects
+    """The Python values of ``text``.
+
+    Whatever PyYAML raises leaves as a ``ModesConfigError``: a ``YAMLError`` for bad syntax, but
+    also a bare ``ValueError`` for an unquoted date no calendar has (``2025-13-01``), a
+    ``KeyError`` for ``!!bool maybe`` or a ``RecursionError`` for absurd nesting. Only the library
+    calls sit inside a ``try``, so the repeated-key refusal below is not wrapped a second time."""
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)  # builds nodes only, no Python objects
+    except Exception as exc:
+        raise _unreadable(exc) from exc
     if root is not None:
         _refuse_repeated_keys(root, "", set())
-    return yaml.safe_load(text)
+    try:
+        return yaml.safe_load(text)
+    except Exception as exc:
+        raise _unreadable(exc) from exc
 
 
 def load_modes_config(path: Path) -> ModesConfig:
     """Read, parse and validate ``path``.
 
-    A file that cannot be read raises ``OSError``. A file that is not valid UTF-8 or YAML, or
-    whose content breaks a rule, raises ``ModesConfigError`` starting with the file name."""
+    A file that cannot be read raises ``OSError``. Anything else wrong with it raises
+    ``ModesConfigError`` starting with the file name: bytes that are not UTF-8, YAML that cannot
+    be parsed or built into values (a date no calendar has, say), or a rule that is broken."""
     path = Path(path)
     try:
         return parse_modes_config(_parse_yaml(path.read_text(encoding="utf-8")))
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ModesConfigError(f"{path}: cannot read as YAML: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ModesConfigError(f"{path}: not valid UTF-8 text: {exc}") from exc
     except ModesConfigError as exc:
         raise ModesConfigError(f"{path}: {exc}") from exc
 
