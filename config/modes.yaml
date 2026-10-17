@@ -1,0 +1,85 @@
+umum:
+  zona_waktu: Asia/Jakarta
+  fee_taker_persen: 0.035
+  slippage_persen: 0.01
+  maks_posisi_total: 2
+  maks_posisi_per_pair: 1
+  maks_entry_per_hari_total: 10
+  maks_entry_per_hari_per_pair: 6
+  jeda_menit: 15
+  penjaga_volatilitas_kali_median_atr: 2.0
+  ai_boleh_buka_tutup: false
+  notional_usdt: 25000                          # ditambahkan 2026-10-17 (D8)
+  jendela_entry_mingguan: "mon 07:00-sat 00:00" # ditambahkan 2026-10-17 (keputusan 3)
+
+pemilih_mode:
+  sma_cepat_1h: 20
+  sma_lambat_1h: 50
+  ema_4h: 50
+  sideways_jarak_kali_atr: 0.2
+
+pair:
+  BTC-USDT:
+    aktif: true
+    faktor_k: 1.0
+  ETH-USDT:
+    aktif: false
+    harus_sama_kondisi_dengan: BTC-USDT
+    faktor_k: otomatis   # median 30 hari, dibatasi 1.0 sampai 2.0
+
+mode:
+  A_pullback_long:
+    aktif: true
+    tf_pemicu: 15m
+    ema_pemicu: 20
+    konfirmasi_dalam_candle: 3
+    maks_jarak_di_atas_sma20_1h_kali_atr: 1.0
+    tp_persen: 0.40
+    sl_persen: 0.25
+    batas_waktu_menit: 90
+  B_breakout_long:
+    aktif: false
+    lookback_candle: 16
+    volume_kali_rata_rata: 1.5
+    periode_volume_rata_rata: 20
+    maks_jarak_di_atas_sma20_1h_kali_atr: 2.0
+    tp_persen: 0.40
+    sl_persen: 0.25
+    batas_waktu_menit: 90
+  C_sideways:
+    aktif: false
+    bollinger_periode: 20
+    bollinger_std: 2.0
+    min_jarak_tp_persen: 0.25
+    sl_persen: 0.25
+    batas_waktu_menit: 60
+  D_short_sekarang:
+    aktif: true          # aturan SHORT lama, hanya saat kondisi TURUN
+    tf_pemicu: 3m                        # ditambahkan 2026-10-17 (keputusan 2)
+    candle_jendela: 39                   # ditambahkan 2026-10-17 (keputusan 2)
+    ema_periode: 21                      # ditambahkan 2026-10-17 (keputusan 2)
+    atr_periode: 14                      # ditambahkan 2026-10-17 (keputusan 2)
+    maks_jarak_ke_ema_kali_atr: 0.75     # ditambahkan 2026-10-17 (keputusan 2)
+    tp_persen: 0.20                      # ditambahkan 2026-10-17 (keputusan 2)
+    sl_persen: 0.20                      # ditambahkan 2026-10-17 (keputusan 2)
+    batas_waktu_menit: 60                # ditambahkan 2026-10-17 (keputusan 2)
+  D2_pullback_short:
+    aktif: false
+    tf_pemicu: 15m
+    ema_pemicu: 20
+    konfirmasi_dalam_candle: 3
+    maks_jarak_di_bawah_sma20_1h_kali_atr: 1.0
+    tp_persen: 0.40
+    sl_persen: 0.25
+    batas_waktu_menit: 90
+
+uji:                                     # ditambahkan 2026-10-17 (angka §2.8 dokumen)
+  latihan_mulai: "2025-08-01T00:00:00+07:00"
+  latihan_selesai: "2026-08-05T00:00:00+07:00"
+  ujian_selesai: "2026-10-14T00:00:00+07:00"
+  lolos_hasil_per_1_juta_lebih_dari: -150
+  lolos_minimal_posisi: 40
+  lolos_buang_posisi_teratas: 3
+  lolos_hasil_tanpa_teratas_lebih_dari: -250
+  pindah_5m_jika_entry_per_hari_naik_kurang_dari: 3
+  hari_naik_minimal_jam_naik: 1
