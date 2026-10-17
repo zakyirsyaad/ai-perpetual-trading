@@ -520,3 +520,112 @@ Verification:
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the six new Python files.
 
 Not verified here: the real replay. It needs the copied VPS data and Pine files and runs in Task 7. A note for that run: the holdout file's `code_sha256` (`e915262…`, in the 16 October report) is the `lock.code_sha256` of commit `7d013bf` (2026-10-16 04:49 WIB), checked by hashing each commit's tree the way `lock.code_files` does. Since then the fingerprinted files changed only outside the replay path: `bars.py` (the day validation now shared with check-data; the same `Bars` for valid days), `features.py` (the check-data agreement helper; `FeatureFrame.build` untouched), `cli_data.py` (check-data) and `pine_indicators.py` (new `sma`, `stdev`, `rolling_median`). So the current code is expected to reproduce. The current `code_sha256` differs anyway, by design: it covers every file under `src/research`, `mode_backtest` included.
+
+## Task 8 — Mode A tracker
+
+`bot.strategy.modes.pullback` holds Mode A of the manager's module (spec §2.3) as a pure state machine over closed trigger candles: the frozen `Candle(close_ms, open, high, low, close)`, the frozen `PullbackSignal(close_ms)` and `PullbackTracker(confirm_within, max_distance_atr)`. `on_candle(candle, ema, sma20_1h, atr14_1h)` keeps the indices of the open touches in a small list. A touch is `low <= ema` (inclusive), covers candles `i … i + confirm_within − 1`, and leaves the list when the current index passes the end of its window. A candle that meets an open touch with `close > open`, `close > ema` (strict) and `close <= sma20_1h + max_distance_atr * atr14_1h` (inclusive) returns `PullbackSignal(close_ms)`. `consume()` empties the list: touches that ran out left when the signal candle arrived and none can be newer, so each touch still there holds the signal candle, which is D5's "every touch whose window contains the signal candle". The module imports `math`, `dataclasses` and `typing` only. No module imports it yet (checked with grep), and the guards that scan every source file under `src` (no bot module imports `research`, none imports `pine_indicators`) pass with it in place. Mode A is LONG-only; the mirrored D2 comes in a later phase.
+
+D4 and D5 as implemented: every candle is compared with the `ema` passed with it, as a touch and as a confirmation; touches are recorded whatever the condition, and the caller checks NAIK at the signal; a touch ends only in `consume()` or when its window runs out. A signal the caller does not consume, and a candle that is no signal (red, not above the EMA, too high), leave the touches alone.
+
+Choices the brief left open:
+
+- **Exceptions.** `ValueError` for a candle whose `close_ms` is not above the previous one (equal or older). A rejected candle changes nothing: it takes no window slot, it does not move the clock back, and a pending signal stays consumable. `RuntimeError` for `consume()` when the latest candle holds no unconsumed signal: before any candle, after a candle without a signal, for the signal of an earlier candle, and a second time after a consume. A refused `consume()` leaves the touches alone. `RuntimeError` is what Python itself raises for a call made in the wrong state (releasing an unlocked lock, starting a thread twice); `ValueError` is for an argument that cannot be accepted.
+- **Constructor checks beyond the brief.** `confirm_within` must be an `int` of at least 1 and `max_distance_atr` a finite number above 0; a `bool`, a string, NaN, infinity and a whole number beyond the float range are refused with `ValueError`. Without the checks a window of 0 or a NaN cap builds a tracker that never signals and says nothing. They are the config's rules (`_count`, `_positive`), so a tracker built from `config/modes.yaml` cannot trip them.
+- **A too-high close is no entry and leaves the touch.** D5 says a touch is used up only by an entry, so a green close above the EMA that is more than the cap above the SMA does not end the window: a later candle inside it, within the cap, may still signal. The manager's text does not say this in so many words; it is the literal reading of D5, and the one behaviour of this task worth confirming. A test pins it.
+- **A window counts candles received.** A candle with `ema=None` (warm-up) still advances it, so the caller must send every closed candle, which the module docstring says.
+- **Missing and NaN inputs.** As in the brief: no `ema`, neither a touch nor a confirmation; no `sma20_1h` or `atr14_1h`, no signal, but the touch is still recorded. A NaN fails closed the same way, since every comparison with it is false. A test pins this, because writing a comparison as its negation would turn a NaN into a touch. The producer should still keep NaN out, as for Task 3.
+- `Candle.high` is carried and unused by the rule. The spec's sketch names the return type `Signal`; the brief's `PullbackSignal` is used.
+
+Test design: every candle is a named shape against an EMA of 100, an SMA (1h) of 100 and an ATR (1h) of 2 (`touch_green`, `touch_red`, `red_above`, `green_above`, `doji_above`), so a test reads as a sequence and the cap is 102. Boundaries use exact floats: a low of exactly 100.0 against one `math.nextafter` above it, a close of exactly 100.0, a close at the cap against the next float above it. A candle that stays off the EMA closes above it (its low is at most its close), so a candle that neither touches nor confirms is a red one. The brief's eight tests are there under their names, and 23 more pin:
+
+- D4: a rising and a falling EMA between the touch and the confirmation, with both closes under the cap so that the EMA alone decides.
+- D5: a too-high close leaves the touch; an entry consumes every touch whose window holds the signal candle, including an older touch whose window runs past it; a blocked touch expires on its own and a later touch enters separately.
+- The window and the cap as parameters: 1, 2, 3 and 5 candles; four SMA, ATR and multiple combinations.
+- Missing and NaN inputs (also on a later candle of a window, and with a cap far above any close so that "missing means zero" would signal), and a candle without an EMA still counting in the window.
+- Each misuse error, a rejected candle changing nothing, the first candle at `close_ms` 0, the constructor refusals, and the frozen values.
+- A differential test against a reference written differently: a stateless scan back over the window for a touch after the last consumed signal. It runs 1,500 random candles in regimes below, around and well above the EMA, with about one candle in five missing an input, for windows of 1, 2, 3 and 5 and caps of 0.5 and 1.0, with the caller taking half of the signals at random. Each run holds 43 to 91 taken and 45 to 93 blocked signals, and 12 to 29 of them (windows of 2 and up) rest on the touch of an earlier candle; the test fails unless it sees more than 30 of each, so it cannot pass by looking at nothing.
+
+Two flaws in my own tests were found by reading them, before the first run: the rising-EMA candle's close was also above the cap, so the EMA did not decide, and a test of the candle count after `consume()` could not fail for any observable bug (indices are relative once the list is empty); it was removed.
+
+RED, before the module existed, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_pullback -v` (paths shortened). This is the expected failure of the brief's step 2, an import failure:
+
+```text
+test_modes_pullback (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_modes_pullback (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_modes_pullback
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_modes_pullback.py", line 12, in <module>
+    from bot.strategy.modes.pullback import Candle, PullbackSignal, PullbackTracker
+ModuleNotFoundError: No module named 'bot.strategy.modes.pullback'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+exit code: 1
+```
+
+GREEN, the same command after `pullback.py` was written, first run (the brief's eight tests shown, in the order unittest prints them; the other 23 also `ok`):
+
+```text
+test_blocked_signal_leaves_the_touch_available (tests.test_modes_pullback.RuleTests) ... ok
+test_confirmation_on_the_third_candle_but_not_the_fourth (tests.test_modes_pullback.RuleTests) ... ok
+test_distance_cap_is_inclusive (tests.test_modes_pullback.RuleTests) ... ok
+test_low_equal_to_ema_is_a_touch_and_close_equal_to_ema_is_not_a_confirmation (tests.test_modes_pullback.RuleTests) ... ok
+test_missing_inputs_never_signal (tests.test_modes_pullback.RuleTests) ... ok
+test_one_entry_per_touch (tests.test_modes_pullback.RuleTests) ... ok
+test_red_candle_never_confirms (tests.test_modes_pullback.RuleTests) ... ok
+test_touch_and_confirmation_in_one_candle (tests.test_modes_pullback.RuleTests) ... ok
+...
+Ran 31 tests in 0.035s
+
+OK
+exit code: 0
+```
+
+A first-try pass is a reason to doubt the tests, so three more things followed, each closing a gap:
+
+- **A missing input read as zero.** A scratch mutant reading a missing `sma20_1h` or `atr14_1h` as 0 survived all the explicit tests when the missing-inputs test used only the reference values: a zero there makes the cap 2 or 100, below every close, which looks like "too high". The randomized test catches the ATR one but cannot see the SMA one (its SMA is about 100). The lenient pass (SMA and ATR of 1,000) now catches both.
+- **A rejected older candle moving the clock back.** A mutant that stored `close_ms` before validating survived (`Ran 31 tests` / OK): a candle between the rejected one and the last accepted one would then be taken. The test now refuses candles 3 and 4 after 5 was accepted, and the mutant fails with `FAILED (failures=1)`.
+- **An overflow found by review, then RED.** `math.isfinite(10**400)` raised `OverflowError` out of the constructor instead of the documented `ValueError`. The test gained `10**400` and failed first (the label of the failing case, a 400-digit number, is shortened here):
+
+```text
+ERROR: test_the_cap_must_be_a_finite_number_above_zero (tests.test_modes_pullback.MisuseTests) (max_distance_atr=10000000...)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_modes_pullback.py", line 319, in test_the_cap_must_be_a_finite_number_above_zero
+    PullbackTracker(confirm_within=3, max_distance_atr=bad)
+  File "<repo>/src/bot/strategy/modes/pullback.py", line 77, in __init__
+    if not _is_number(max_distance_atr) or not math.isfinite(max_distance_atr):
+OverflowError: int too large to convert to float
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+  The check is now one helper that treats a whole number beyond the float range as invalid.
+
+Mutation check (scratch copies of `pullback.py` outside the repository, one planted bug each, every one run against the 31 tests): 64 bugs, all caught, and all 64 are also caught by the 30 explicit tests without the randomized one.
+
+- Candle order (7): `<` for `<=`, the check removed, a first candle at `close_ms` 0 refused, the pending signal cleared before validating, a rejected candle taking a window slot, a rejected candle moving the clock back, the wrong exception type.
+- Window (5): one short, one long, a hard-coded 3, never expiring, a candle without an EMA not counted.
+- Touch (8): `<` for `<=`, reversed, on the close, on the high, only with all inputs present, never recorded, not recorded while another is open, a NaN low counting.
+- Confirmation (8): no open touch needed, a doji counting, a close equal to the EMA counting, no green check, no above-EMA check, red candles confirming, the previous candle's EMA used, the open judged instead of the close.
+- Cap (10): `<`, the multiple ignored, the ATR ignored, the SMA ignored, measured from the EMA, a hard-coded 1.0, removed, reversed, a NaN passing, below the SMA. Missing inputs (3): SMA read as zero, ATR read as zero, a missing input passing the cap.
+- Signal (5): the wrong time, never flagged for `consume()`, consumed by itself, a too-high close consuming the touch, the flag surviving the next candle.
+- `consume()` (8): keeping the touches, keeping the signal candle's own touch, dropping only the newest, dropping only the oldest, callable twice, silent without a signal, clearing before it refuses, the wrong exception type.
+- Constructor (10): a window of 0, a bool window, the window check removed, a cap of 0, a negative cap, an infinite cap, a bool cap, a string cap, the overflow leaking, the cap check removed.
+
+Verification:
+
+- Focused: `Ran 31 tests` / OK on Python 3.10.20 (`.venv`), and also on 3.11.15 and 3.12.13 (the module and its tests use the standard library only). Line and branch coverage of `bot/strategy/modes/pullback.py`: 100 % (60 statements, 18 branches, 0 missed), measured with a scratch rcfile because coverage cannot read `pyproject.toml` on 3.10 without `tomli`.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1874 tests in 42.031s` / OK (1,843 + 31 new).
+- `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the two new Python files.
