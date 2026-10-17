@@ -26,6 +26,7 @@ from research.pine_gate.bars import (
     DayShapeError,
     MissingDayError,
     UnreadableDayError,
+    aggregate,
     day_path,
     load_days,
     warmup_path,
@@ -83,6 +84,13 @@ class DataDirTestCase(unittest.TestCase):
         for path in paths:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(GARBAGE)
+
+    @contextmanager
+    def fresh_data_dir(self):
+        """Point ``self.root`` at a new empty directory for the length of the block."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.root = Path(tmp)
+            yield
 
     @contextmanager
     def recorded_opens(self):
@@ -283,8 +291,7 @@ class LoadPairTests(DataDirTestCase):
 
     def test_missing_warmup_raises(self):
         for missing in (("1h",), ("4h",), ("1h", "4h")):
-            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
-                self.root = Path(tmp)
+            with self.subTest(missing=missing), self.fresh_data_dir():
                 self.write_pair([D1])
                 for interval in missing:
                     warmup_path(self.root, SYMBOL, interval).unlink()
@@ -296,6 +303,69 @@ class LoadPairTests(DataDirTestCase):
                 for interval in ("1h", "4h"):
                     named = f"prod/{SYMBOL}/{interval}/warmup.csv.gz" in str(ctx.exception)
                     self.assertEqual(named, interval in missing, interval)
+
+    def test_an_empty_warmup_is_refused(self):
+        for interval, other in (("1h", "4h"), ("4h", "1h")):
+            with self.subTest(interval=interval), self.fresh_data_dir():
+                self.write_pair([D1])
+                write_day(warmup_path(self.root, SYMBOL, interval), [])
+
+                with self.assertRaises(ValueError) as ctx:
+                    load_pair(self.root, SYMBOL, D1, D1)
+
+                self.assertNotIsInstance(
+                    ctx.exception, (UnreadableDayError, DayShapeError, BarGapError, MissingDayError)
+                )
+                self.assertIn(f"prod/{SYMBOL}/{interval}/warmup.csv.gz", str(ctx.exception))
+                self.assertNotIn(f"prod/{SYMBOL}/{other}/warmup.csv.gz", str(ctx.exception))
+
+    def test_a_warmup_that_starts_at_or_after_the_first_aggregated_bar_is_refused(self):
+        for interval, interval_ms in (("1h", HOUR_MS), ("4h", FOUR_HOUR_MS)):
+            for bars_late in (0, 5):
+                with self.subTest(interval=interval, bars_late=bars_late), self.fresh_data_dir():
+                    self.write_pair([D1, D2])
+                    bars_1m = load_days(self.root, SOURCE, SYMBOL, "1m", D1, D2)
+                    first = aggregate(bars_1m, interval_ms).open_ms[0] + bars_late * interval_ms
+                    rows = [flat_bar(first + k * interval_ms, 100.0) for k in range(3)]
+                    write_day(warmup_path(self.root, SYMBOL, interval), rows)
+
+                    with self.assertRaises(ValueError) as ctx:
+                        load_pair(self.root, SYMBOL, D1, D2)
+
+                    self.assertNotIsInstance(
+                        ctx.exception,
+                        (UnreadableDayError, DayShapeError, BarGapError, MissingDayError),
+                    )
+                    self.assertIn(f"prod/{SYMBOL}/{interval}/warmup.csv.gz", str(ctx.exception))
+
+    def test_every_unused_warmup_is_named(self):
+        self.write_pair([D1])
+        for interval in ("1h", "4h"):
+            write_day(warmup_path(self.root, SYMBOL, interval), [])
+
+        with self.assertRaises(ValueError) as ctx:
+            load_pair(self.root, SYMBOL, D1, D1)
+
+        for interval in ("1h", "4h"):
+            self.assertIn(f"prod/{SYMBOL}/{interval}/warmup.csv.gz", str(ctx.exception))
+
+    def test_one_bar_before_the_first_aggregated_bar_is_enough(self):
+        write_days(self.root, SYMBOL, [D1])
+        seam_bar = flat_bar(wib_day_start_ms(D1) - HOUR_MS, 100.0)  # opens 16:00 UTC, on both grids
+        for interval in ("1h", "4h"):
+            write_day(warmup_path(self.root, SYMBOL, interval), [seam_bar])
+
+        pair = load_pair(self.root, SYMBOL, D1, D1)
+
+        self.assertEqual((len(pair.warmup_1h), len(pair.warmup_4h)), (1, 1))
+
+    def test_an_unreadable_warmup_is_reported_before_an_unused_one(self):
+        self.write_pair([D1])
+        write_day(warmup_path(self.root, SYMBOL, "1h"), [])
+        self.corrupt(warmup_path(self.root, SYMBOL, "4h"))
+
+        with self.assertRaises(UnreadableDayError):
+            load_pair(self.root, SYMBOL, D1, D1)
 
     def test_a_corrupt_warmup_stops_the_load(self):
         self.write_pair([D1])
@@ -471,16 +541,23 @@ class VerifyCopyTests(DataDirTestCase):
         day2 = "prod/BTC-USDT/1m/2026-07-02.csv.gz"
         day3 = "prod/BTC-USDT/1m/2026-07-03.csv.gz"
         four_h = "prod/BTC-USDT/4h/warmup.csv.gz"
+        stray = "prod/BTC-USDT/1m/2026-07-06.csv.gz"
         flip_one_byte(self.day(D2))
         self.day(D3).unlink()
         flip_one_byte(warmup_path(self.root, SYMBOL, "4h"))
+        (self.root / stray).write_bytes(b"not on the VPS")
         listing += "deadbeef  prod/BTC-USDT/1m/2026-07-04.csv.gz\n"
         listing += "garbage\n"
 
         problems = verify_copy(self.root, listing)
 
-        self.assertEqual(len(problems), 5, problems)
-        for relative, reason in ((day2, "differs"), (four_h, "differs"), (day3, "missing")):
+        self.assertEqual(len(problems), 6, problems)
+        for relative, reason in (
+            (day2, "differs"),
+            (four_h, "differs"),
+            (day3, "missing"),
+            (stray, "not in the listing"),
+        ):
             with self.subTest(relative=relative):
                 found = self.mentioning(problems, relative)
                 self.assertEqual(len(found), 1, found)
@@ -492,6 +569,93 @@ class VerifyCopyTests(DataDirTestCase):
             "prod/BTC-USDT/funding.json",
         ):
             self.assertEqual(self.mentioning(problems, untouched), [], untouched)
+
+    def listed_paths(self, listing):
+        return [line.split("  ", 1)[1] for line in listing.splitlines()]
+
+    def test_a_truncated_listing_is_not_an_exact_copy(self):
+        listing = self.local_copy()
+        paths = self.listed_paths(listing)
+        cut_after_first_line = listing.splitlines()[0] + "\n"
+
+        problems = verify_copy(self.root, cut_after_first_line)
+
+        self.assertEqual(len(problems), len(paths) - 1, problems)
+        for relative in paths[1:]:
+            with self.subTest(relative=relative):
+                found = self.mentioning(problems, relative)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("not in the listing", found[0])
+        self.assertEqual(self.mentioning(problems, paths[0]), [])
+
+    def test_a_listing_cut_in_the_middle_of_a_line_is_not_an_exact_copy(self):
+        listing = self.local_copy()
+        lines = listing.splitlines()
+        cut_in_a_line = lines[0] + "\n" + lines[1][:40]
+
+        problems = verify_copy(self.root, cut_in_a_line)
+
+        # the half line is one problem, and each of the files from line 2 on is another
+        self.assertEqual(len(problems), 1 + len(lines) - 1, problems)
+        self.assertTrue(problems[0].startswith("line 2: "), problems[0])
+
+    def test_a_stray_local_file_is_a_problem(self):
+        listing = self.local_copy()
+        (stray,) = write_days(self.root, SYMBOL, [D4])  # a valid day file the VPS listing lacks
+        self.assertIn(stray, stage_files(self.root, SYMBOL, D1, D4))  # a load of D1..D4 reads it
+
+        (problem,) = verify_copy(self.root, listing)
+
+        self.assertIn("prod/BTC-USDT/1m/2026-07-04.csv.gz", problem)
+        self.assertIn("not in the listing", problem)
+
+    def test_every_stray_file_is_one_problem_in_path_order(self):
+        listing = self.local_copy()
+        strays = [
+            "prod/BTC-USDT/native/extra.json",
+            "prod/ETH-USDT/funding.json",
+            "prod/BTC-USDT/1m/2026-07-04.csv.gz.1a2b3c.tmp",
+        ]
+        for relative in strays:
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"left over")
+
+        problems = verify_copy(self.root, listing)
+
+        self.assertEqual(len(problems), 3, problems)
+        for problem, relative in zip(problems, sorted(strays), strict=True):
+            self.assertTrue(problem.startswith(f"{relative}: "), problem)
+
+    def test_names_starting_with_a_dot_are_not_stray_files(self):
+        listing = self.local_copy()
+        for relative in (
+            ".DS_Store",
+            "BTC-USDT/.DS_Store",
+            "BTC-USDT/1m/.DS_Store",
+            "BTC-USDT/1m/._2026-07-01.csv.gz",
+        ):
+            (self.root / SOURCE / relative).write_bytes(b"finder leftovers")
+
+        self.assertEqual(verify_copy(self.root, listing), [])
+
+    def test_only_regular_files_under_prod_are_examined(self):
+        listing = self.local_copy()
+        (self.root / SOURCE / "ETH-USDT" / "1m").mkdir(parents=True)  # a directory, no file
+        marker = self.root / "holdout_runs" / "mode_A_BTC-USDT_0123.json"  # beside prod, not in it
+        marker.parent.mkdir()
+        marker.write_text("{}", encoding="utf-8")
+        (self.root / "notes.txt").write_text("not data", encoding="utf-8")
+
+        self.assertEqual(verify_copy(self.root, listing), [])
+
+    def test_a_listed_file_that_is_missing_is_not_also_a_stray_file(self):
+        listing = self.local_copy()
+        self.day(D2).unlink()
+
+        (problem,) = verify_copy(self.root, listing)
+
+        self.assertIn("missing locally", problem)
 
     def test_a_mismatch_names_both_hashes(self):
         listing = self.local_copy()
@@ -532,6 +696,7 @@ class VerifyCopyTests(DataDirTestCase):
             sha,  # no separator
             "# comment",
         ]
+        self.local_copy()  # nothing is listed, so the local files are not listed as strays
         for text in malformed:
             with self.subTest(text=text):
                 (problem,) = verify_copy(self.root, text + "\n")
@@ -592,6 +757,8 @@ class VerifyCopyTests(DataDirTestCase):
         self.assertIn("...", problem)
 
     def test_one_malformed_line_is_one_problem_not_two(self):
+        self.local_copy()  # a full local copy is no reason for more problems when nothing is listed
+
         self.assertEqual(len(verify_copy(self.root, "garbage\n")), 1)
 
     def test_a_path_listed_twice_is_a_problem(self):

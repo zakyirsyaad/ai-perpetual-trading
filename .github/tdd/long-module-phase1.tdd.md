@@ -203,15 +203,16 @@ Verification:
 
 Choices the brief left open:
 
-- `load_pair` checks the days first. `load_days` names every missing day before it reads any file, so a missing day wins over a missing warm-up and nothing is read. Then both warm-ups are checked together, and one `FileNotFoundError` names each missing one. A corrupt file or an invalid bar raises what `bars` raises (`UnreadableDayError`, `DayShapeError`, `BarGapError`); nothing is caught or replaced by an empty series.
+- `load_pair` checks the days first. `load_days` names every missing day before it reads any file, so a missing day wins over a missing warm-up and nothing is read. Then both warm-ups are checked together, and one `FileNotFoundError` names each missing one. A corrupt file or an invalid bar raises what `bars` raises (`UnreadableDayError`, `DayShapeError`, `BarGapError`); nothing is caught or replaced by an empty series. Once both warm-ups are read, one that adds nothing is refused (Fix round 1).
 - `stage_files` only builds names, so nothing has to exist yet. It refuses a reversed range, because an empty range would give a manifest of the two warm-ups alone. A test records every `gzip.open` of a `load_pair` call and requires the sorted list to equal `stage_files`, so the manifest cannot drift from what the load reads.
 - `manifest` lines are `relpath:sha256`, relative to `data_dir` with `/` separators, so a copy of the data has the manifest of the original. A path outside `data_dir` or given twice raises `ValueError`. `manifest_sha256` sorts the lines itself, so the hash does not depend on the order in which a caller joined two symbols, and it refuses a bare string, which would be sorted letter by letter.
-- `verify_copy` takes the listing as the authority and reports one problem for each of these:
+- `verify_copy` compares both ways (Fix round 1) and reports one problem for each of these:
   - the hash differs (both hashes are printed), the file is missing, or it cannot be read (a directory in its place is a problem, not a crash);
   - the line is not `<64 hex>  <path>` (two spaces, as `sha256sum` prints in text mode; the binary-mode `*` is malformed), or the path is not a file inside `prod/`: absolute, with `..`, outside `prod/` or holding a NUL. Such a path is never read, so a bad listing cannot make the check hash another file;
-  - the same path appears twice, because two entries for one file could otherwise cancel out.
+  - the same path appears twice, because two entries for one file could otherwise cancel out;
+  - a regular file under `prod/` that the listing does not name (a stray file, or a listing cut short).
 
-  Blank lines, CRLF line ends and upper-case hex are tolerated. A listing with no file entry at all is one problem, so an empty or cut-off file cannot pass, and a lone malformed line is one problem, not two. Files that exist only locally are not examined. `prod/<symbol>/funding.json` (three path components, not four) is a normal entry although `stage_files` does not list it, since this harness does not read funding.
+  Blank lines, CRLF line ends and upper-case hex are tolerated. A listing with no file entry at all is one problem, so an empty file cannot pass, and a lone malformed line is one problem, not two. `prod/<symbol>/funding.json` (three path components, not four) is a normal entry although `stage_files` does not list it, since this harness does not read funding.
 
 `tests/mode_backtest_helpers.py` (not `test_*`; tests import it as `from tests.mode_backtest_helpers import ...`, as `tests/test_telemetry_book_ticker.py` does) writes synthetic data that looks like the real data:
 
@@ -292,3 +293,49 @@ Verification:
 - Existing guards stay green with the new package: `tests.test_pine_gate_structure` scans every research source for the venue words and every research import of a `bot` module.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1719 tests in 35.538s` / OK (1,656 existing + 63 new), exit 0.
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with the new files and this document tracked.
+
+### Fix round 1 (task review)
+
+The review found two ways to a wrong result with no error. The controller ruled that spec §7 (a copy is accepted only when every file matches the VPS) outranks the plan's "the listing is the authority".
+
+- `verify_copy` could return `[]` without comparing every file the harness reads. A listing cut after its first line returned `[]`, and so did a day file that exists locally but is absent from the listing: `load_pair` then loads it and `manifest(stage_files(...))` binds its hash into the training manifest of a one-shot lock. After the loop, every regular file under `<data_dir>/prod` that the listing does not name is now a problem (`<path>: local file is not in the listing`), in path order. Skipped: names starting with a dot (`.DS_Store`, `._name`), directories, and everything outside `prod/` (the run markers live in `holdout_runs/`). An empty listing stays exactly one problem; the stray check runs only when at least one file is listed, so a listing with no valid line gets only its own line problems. `[]` now means every local file under `prod/` was compared with the VPS and matched.
+- `load_pair` accepted an empty warm-up, or one that starts at or after the first aggregated bar, and `htf_bars` joins it silently. The 4h EMA50 and the 720-hour ATR median then stay `None` for weeks, the selector answers TIDAK_ENTRY and trades drop with no error. The Pine loader treats exactly this as a missing warm-up (`dataset.py`) and its pipeline refuses the run. Once both warm-ups are read, `load_pair` raises `ValueError` naming every file for which `features.warmup_unused` holds. A corrupt warm-up still raises its own error first, and one bar before the first aggregated bar is enough.
+
+RED, the final tests against the previous `data.py` (a scratch tree; excerpt, paths shortened), `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_data tests.test_mode_backtest_structure`:
+
+```text
+ERROR: test_a_stray_local_file_is_a_problem (VerifyCopyTests)
+ValueError: not enough values to unpack (expected 1, got 0)
+FAIL: test_a_truncated_listing_is_not_an_exact_copy (VerifyCopyTests)
+AssertionError: 0 != 5 : []
+FAIL: test_a_listing_cut_in_the_middle_of_a_line_is_not_an_exact_copy (VerifyCopyTests)
+AssertionError: 1 != 6 : ["line 2: not '<64 hex digits>  <path>': '4123e3921242ce94f58b73a66c2901359f8c9a4a'"]
+FAIL: test_every_stray_file_is_one_problem_in_path_order (VerifyCopyTests)
+AssertionError: 0 != 3 : []
+FAIL: test_verify_copy_reports_every_mismatch_and_missing_file (VerifyCopyTests)
+AssertionError: 5 != 6 : ['prod/BTC-USDT/1m/2026-07-02.csv.gz: sha256 differs (local c2c8d4d2..., VPS f81fb903...
+FAIL: test_an_empty_warmup_is_refused (LoadPairTests) (interval='1h')
+AssertionError: ValueError not raised
+FAIL: test_an_empty_warmup_is_refused (LoadPairTests) (interval='4h')
+AssertionError: ValueError not raised
+FAIL: test_a_warmup_that_starts_at_or_after_the_first_aggregated_bar_is_refused (LoadPairTests) (interval='1h', bars_late=0)
+AssertionError: ValueError not raised
+  (the same for ('1h', 5), ('4h', 0) and ('4h', 5))
+FAIL: test_every_unused_warmup_is_named (LoadPairTests)
+AssertionError: ValueError not raised
+
+Ran 75 tests in 0.525s
+FAILED (failures=11, errors=1)
+```
+
+The other new tests (dot names, directories and files outside `prod/` are not strays, a listed-but-missing file is not also a stray, one seam bar is enough, an unreadable warm-up is reported before an unused one) guard what must not change, and pass on the old code too. The mutation check below shows they bite. GREEN, the same command after the change: `Ran 75 tests` / OK.
+
+Verification (these numbers supersede the Verification numbers above):
+
+- Focused: `Ran 75 tests` / OK (63 in `test_mode_backtest_data`, 12 in `test_mode_backtest_structure`; 12 new) on Python 3.10.20 (`.venv`) and 3.11.15 (scratch venv). `test_malformed_lines_are_each_one_problem` and `test_one_malformed_line_is_one_problem_not_two` now run with a full local copy present, and the brief's named `test_verify_copy_reports_every_mismatch_and_missing_file` also carries a stray file.
+- Line coverage of `research/mode_backtest/`: 100 % (`data.py` 107 statements and 30 branches on 3.10 with the scratch rcfile; 106 statements, 0 missed, on 3.11 with the repo's `pyproject.toml`).
+- Mutation check (scratch, not committed): 56 bugs planted in `data.py` (the 38 of the first pass with moved patterns updated, plus 18 for this round: strays never reported, dot names or directories counted as strays, the scan covering the whole data dir or not recursing, the scan also running when nothing valid is listed, unsorted strays, only one of the two warm-ups checked, only an empty warm-up refused, another exception type, no file named, the second warm-up not read before the unused check) and 10 violating modules for the structure rules: all 66 caught; the 8 helper mutants are still caught.
+- The two reproductions from the review, replayed on the fixed code: a 4-file copy with a listing cut after its first line gives 3 problems; a valid extra day file gives 1 and `[]` once removed; an empty listing with a full local copy gives exactly 1; an empty 4h warm-up and a 4h warm-up whose first bar opens at the first aggregated bar both raise `ValueError` naming `prod/BTC-USDT/4h/warmup.csv.gz`, and the real warm-ups still load.
+- Realistic scale (scratch, 439 days x 2 symbols + 4,344 / 1,086 warm-ups): `load_pair` 1.5 s with the unused check (1.3 s before); `verify_copy` of 882 listed files 0.03 s with the stray scan.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1731 tests in 35.601s` / OK (1,719 + 12 new), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean; `tests.test_secret_hygiene` OK with this document tracked.

@@ -2,8 +2,9 @@
 
 Research code; the bot never imports it. A missing, unreadable or altered file stops
 the run with an error and never shrinks the sample: day files load as whole days or
-not at all, an absent warm-up raises, and a copy of the data is accepted only when
-every file's sha256 equals the one the VPS printed.
+not at all, an absent or useless warm-up raises, and a copy of the data is accepted only
+when it matches the VPS file for file, in both directions: every file the VPS printed has
+the same sha256 here, and no file under ``prod/`` here is missing from the listing.
 
 The source is production (VST volume is not real). Files are laid out as the Pine gate
 stores them: ``<data_dir>/prod/<SYMBOL>/1m/<YYYY-MM-DD>.csv.gz`` (one WIB day each) and
@@ -30,6 +31,7 @@ from research.pine_gate.bars import (
     warmup_path,
 )
 from research.pine_gate.cli_common import file_sha256
+from research.pine_gate.features import warmup_unused
 
 SOURCE = "prod"
 
@@ -78,24 +80,38 @@ def _read_warmup(path: Path, interval: str) -> Bars:
     return bars_from_rows(read_day(path), interval_to_ms(interval))
 
 
+def _relative(path: Path, root: PathLike) -> str:
+    return path.relative_to(root).as_posix()
+
+
 def load_pair(data_dir: PathLike, symbol: str, first_day: date, last_day: date) -> PairData:
     """Load the 1m bars of the inclusive WIB day range and the two warm-ups.
 
     Only the days of the range are read. A missing day raises ``MissingDayError``
     (every missing day named) before any file is read, a missing warm-up raises
     ``FileNotFoundError``, and a corrupt file or an invalid bar raises what
-    ``research.pine_gate.bars`` raises for it."""
+    ``research.pine_gate.bars`` raises for it. Once both warm-ups are read, a warm-up
+    that adds nothing (``features.warmup_unused``: empty, or without a bar before the
+    first aggregated bar) raises ``ValueError`` naming the file: the 4h EMA50 and the
+    720-hour ATR median would stay ``None`` for weeks, the selector would answer
+    TIDAK_ENTRY and trades would drop with no error."""
     bars_1m = load_days(data_dir, SOURCE, symbol, _DAY_INTERVAL, first_day, last_day)
     paths = {iv: warmup_path(data_dir, symbol, iv) for iv in _WARMUP_INTERVALS}
-    missing = [p.relative_to(data_dir).as_posix() for p in paths.values() if not p.exists()]
+    missing = [_relative(path, data_dir) for path in paths.values() if not path.exists()]
     if missing:
         raise FileNotFoundError(f"missing warm-up files: {', '.join(missing)}")
-    return PairData(
-        symbol,
-        bars_1m,
-        _read_warmup(paths["1h"], "1h"),
-        _read_warmup(paths["4h"], "4h"),
-    )
+    warmups = {iv: _read_warmup(paths[iv], iv) for iv in _WARMUP_INTERVALS}
+    unused = [
+        _relative(paths[iv], data_dir)
+        for iv in _WARMUP_INTERVALS
+        if warmup_unused(bars_1m, warmups[iv], interval_to_ms(iv))
+    ]
+    if unused:
+        raise ValueError(
+            "warm-up files add nothing (empty, or no bar before the first aggregated bar): "
+            + ", ".join(unused)
+        )
+    return PairData(symbol, bars_1m, warmups["1h"], warmups["4h"])
 
 
 def manifest(data_dir: PathLike, paths: Iterable[PathLike]) -> List[str]:
@@ -153,16 +169,31 @@ def _file_problem(root: Path, relative: str, vps_sha: str) -> Optional[str]:
     return None
 
 
+def _local_files(root: Path) -> List[str]:
+    """The regular files under ``root/prod``, as paths relative to ``root``, sorted.
+
+    Files whose names start with a dot (``.DS_Store``, ``._name``) are left out."""
+    return sorted(
+        _relative(path, root)
+        for path in (root / SOURCE).rglob("*")
+        if not path.name.startswith(".") and path.is_file()
+    )
+
+
 def verify_copy(data_dir: PathLike, sha256sum_text: str) -> List[str]:
     """Compare a local data copy with the VPS's ``sha256sum`` output; ``[]`` means exact.
 
     The text comes from ``cd ~/replay/pine_gate/data && find prod -type f | sort |
     xargs sha256sum``: ``<64 hex>  prod/<symbol>/<interval>/<file>`` per line, paths
-    relative to ``data_dir``. One problem is reported for each file that differs, each
-    file that is missing or cannot be read, and each malformed or repeated line. A listing
-    without a single file is a problem too, so an empty file cannot pass.
+    relative to ``data_dir``. The comparison runs both ways. One problem is reported for
+    each file that differs, is missing or cannot be read, for each malformed or repeated
+    line, and for each regular file under ``<data_dir>/prod`` that the listing does not
+    name: a stray file, or a listing cut short (an interrupted ``ssh`` leaves one). Names
+    starting with a dot are skipped, and so is everything outside ``prod/``. So ``[]``
+    means every local file under ``prod/`` was compared with the VPS and matched.
 
-    The listing is the authority: files that exist only locally are not examined."""
+    A listing without a single file is one problem, so an empty file cannot pass, and the
+    local files are then not listed one by one; neither are they when no line is valid."""
     root = Path(data_dir)
     problems: List[str] = []
     listed = set()
@@ -181,6 +212,12 @@ def verify_copy(data_dir: PathLike, sha256sum_text: str) -> List[str]:
         problem = _file_problem(root, relative, vps_sha)
         if problem is not None:
             problems.append(problem)
-    if not listed and not problems:
+    if listed:
+        problems += [
+            f"{relative}: local file is not in the listing"
+            for relative in _local_files(root)
+            if relative not in listed
+        ]
+    elif not problems:
         problems.append("the listing holds no files; nothing was verified")
     return problems
