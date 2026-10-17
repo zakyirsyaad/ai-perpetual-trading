@@ -10,8 +10,12 @@ codes, as ``research.pine_gate.cli`` does:
   listing printed on the VPS (``data.verify_copy``) and prints every problem.
 * ``train`` and ``test``, each with ``--mode --pair --config --data-dir --out-dir``, run
   ``stages.train_stage`` and ``stages.test_stage``: the training stage and its lock, then the
-  one-shot test against it. Each prints the files it wrote (and the run marker of the test), then
-  its status line. Phase 1 runs Mode A on BTC-USDT only; anything else is an expected failure.
+  one-shot test against it. Each prints the files it wrote (and the start record and run marker of
+  the test), then its status line. The lock and the start record go in ``--out-dir``, the run
+  marker in ``--data-dir``/holdout_runs. Once either record exists, ``test`` and ``train`` both
+  refuse (exit 2): the marker for its data folder, the start record for its out folder whatever
+  data folder a rerun names. So run both stages with one pair of folders. Phase 1 runs Mode A on
+  BTC-USDT only; anything else is an expected failure.
 
 Exit codes: 0 success, 1 an expected failure (one ``error:`` line on stderr and no traceback,
 unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error or a lock refusal (``lock.LockError``: a
@@ -106,7 +110,9 @@ def _add_stage_parser(sub: Any, name: str, handler: Callable[[argparse.Namespace
                    help="the copied production data (the folder holding prod/); the run markers "
                         "go in its holdout_runs/")
     p.add_argument("--out-dir", required=True, type=_path,
-                   help="where the results, the trade logs and the lock go")
+                   help="where the results, the trade logs, the lock and the test's start record "
+                        "go; once that record exists neither stage runs again, so use one folder "
+                        "for train and test")
     p.set_defaults(handler=handler)
 
 

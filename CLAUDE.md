@@ -27,6 +27,7 @@ PYTHONPATH=src python -m unittest tests.test_ai_orchestration.ClassName.test_met
 # coverage (gate is 80% line coverage, enforced by fail_under in pyproject.toml)
 PYTHONPATH=src python -m coverage run -m unittest discover -s tests
 PYTHONPATH=src python -m coverage report
+# on Python 3.10 coverage cannot read pyproject.toml without tomli (pip install 'coverage[toml]'), even if you pass the settings as flags; CI's 3.11 reads it natively
 
 # cheap syntax/import check (closest thing to a lint — there is no configured linter)
 PYTHONPATH=src python -m compileall src tests
@@ -50,6 +51,14 @@ PYTHONPATH=src python src/supervisor.py --dry-run
 # offline Pine-gate research (see "Offline research"); `--help` lists every stage
 PYTHONPATH=src python -m research.pine_gate.cli --help
 PYTHONPATH=src python -m unittest discover -s tests -p 'test_pine_*.py'   # its tests only
+
+# offline LONG-module backtest, phase 1 (see "Offline research"); `--help` lists every stage
+M=~/replay/mode_backtest   # the data copy lives outside the repo
+PYTHONPATH=src python -m research.mode_backtest verify-copy --data-dir $M/data --sha256sum $M/vps_sha256sum.txt
+PYTHONPATH=src python -m research.mode_backtest step0 --data-dir $M/data --pine-dir $M/pine_phase1 --config config/modes.yaml --out-dir $M/out
+PYTHONPATH=src python -m research.mode_backtest train --mode A --pair BTC-USDT --config config/modes.yaml --data-dir $M/data --out-dir $M/out
+PYTHONPATH=src python -m research.mode_backtest test --mode A --pair BTC-USDT --config config/modes.yaml --data-dir $M/data --out-dir $M/out   # ONE SHOT: verify-copy first, only on the user's go-ahead
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_mode*.py'   # its tests only
 ```
 
 Dashboard (`dashboard/`, Bun + Next.js; see "Live dashboard feed"):
@@ -201,6 +210,15 @@ A missing/invalid persisted envelope is unknown exposure. A mismatch, an unreada
 - On the VPS it runs under `nice -n 19` with CWD `~/ai-perpetual-trading` (for `.env`) but `PYTHONPATH=$HOME/replay/pine_gate_repo/src`, with data in `~/replay/pine_gate/data/` and outputs in `~/replay/out/`. It must never restart pm2, edit `.env`, or touch `~/replay/kline_keeper.py` or its cron line.
 - **Phase 1 outcome (2026-10-16): nothing passed the gate.** One holdout run, `chosen None`; best net per 1M was -247 (contender 3, ETH), against the live bot's -190. The bot is unchanged and the K2 configuration continues; contender 1 (`H4|P40|ADX|OFF|OFF`) is frozen only as reference defaults in `docs/tradingview/pine_adapted_gate_v2.pine`. Evidence: `.github/tdd/pine-gate-phase1.tdd.md`; report (Indonesian) `docs/research/2026-10-16-pine-gate-phase1-report.md`; on the VPS `~/replay/out/pine_gate_{calibration,selection,holdout,edge}_20261016.*` (the holdout file and run marker must not be deleted or regenerated).
 - **VPS gotchas.** BingX in-body code `100410` means retry later (the fetcher backs off 5/15/45 s). Warm-up windows are capped at 1000 bars and funding windows at 30 days; longer funding windows silently truncate their start. Run `native-check-fetch` before `check-data`. Its native-vs-aggregated check gates OHLC at 99.9% agreement and volume only on the worst bar (relative difference <= 1e-3; BingX's native volume is off by up to 1.28e-4 in a few bars), over the native window only (2025-08 by default). `days_check` reads every stored day through `bars.read_valid_day`, the reader `load_days` uses, and also fails a run of >= 60 zero-volume minutes, counted across midnight (the stored data has none). Run heavy stages (`check-data`, `train`, `test`) under `nohup`, `nice` and `ulimit -v`; peak RSS was 360–410 MB.
+
+`research.mode_backtest` is Phase 1 of the manager's "Modul LONG" spec (17 Oct 2026): step 0 (the Pine holdout split by side and market condition) and Mode A (pullback LONG in an up-trend) on BTC, offline. Spec `docs/superpowers/specs/2026-10-17-long-module-phase1-design.md`, plan `docs/superpowers/plans/2026-10-17-long-module-phase1.md`, evidence `.github/tdd/long-module-phase1.tdd.md`. Nothing in the live bot reads it.
+
+- **Core/harness split.** `bot/strategy/modes/` (mode selector, Mode A tracker, near-mean SHORT trigger, position rules, YAML loader) takes numbers (the trigger one short window of highs, lows and closes), never bar series, and no live module imports it (checked by grep, no test pins it). `research.mode_backtest` computes the series with `pine_indicators` and calls the core. No look-ahead: a series value is read only at or after the close of its candle.
+- **`config/modes.yaml` holds every number** (bar the ATR14 period and the 720-hour median window, fixed in `frames.py`): the manager's block verbatim plus the keys marked `# ditambahkan 2026-10-17` (notional, entry window, Mode D's terms, the `uji` dates and pass thresholds). The loader (PyYAML, safe loading only) raises `ModesConfigError` on any unknown, missing, mistyped or repeated key. The lock binds the file's sha256 (hashed and parsed from one read), so editing it after `train` makes `test` exit 2.
+- **Stages:** `verify-copy` (the local data against the VPS `sha256sum` listing, both ways), `step0` (replays the Pine holdout without touching its marker; writes the split only if all 15 metrics match the holdout file), `train` (Mode A on 15m, the pre-registered 5m switch, the Mode D comparator in NAIK, then the lock) and `test`. Phase 1 refuses any mode but A and any pair but BTC-USDT (exit 1), lock refusals exit 2, outputs are never overwritten, `MODE_BACKTEST_DEBUG=1` prints tracebacks.
+- **`test` runs once, and two records enforce it.** After every refusal check and before it reads any test-period day, it claims the start record `mode_A_BTC-USDT_test_started.json` next to the lock in `--out-dir`, then the marker `<data_dir>/holdout_runs/mode_A_BTC-USDT_<lock sha>.json`. Either one makes `train` and `test` refuse, and only the start record stops a rerun on a fresh data copy. A run that dies after the claims has used the shot. The start record stays behind even when the marker claim itself fails (fails closed); delete it by hand only if no test-period day was read. The lock binds config, code (`lock.code_sha256`: all 61 files Python loads when the package is imported, the arena modules `bot/arena/__init__` pulls in included), the training-file manifest and the Python minor version. Before the claims `test` only checks that each day and warm-up file is a regular file; content integrity is `verify-copy`'s job, so run it right before `test`. Use one `--out-dir`/`--data-dir` pair for both stages and never reuse a rehearsal's out-dir.
+- **Data** is copied read-only from the VPS (`~/replay/pine_gate/data/prod`, 892 files) to `~/replay/mode_backtest/data` on the Mac, outside the repo: production klines, not VST, as in the Pine gate.
+- **Step 0 (2026-10-17):** the replay reproduced the Pine holdout file with 0 differences (15 metrics x 3 contenders x 2 symbols) on data identical to the Pine run; LONG in NAIK showed no edge under the Pine exits (BTC -359 to -479 per 1M). Report (Indonesian): `docs/research/2026-10-17-modul-long-langkah0.md`. As of 2026-10-18 Mode A's `train` and `test` have not run.
 
 ### Live dashboard feed (optional, off by default)
 

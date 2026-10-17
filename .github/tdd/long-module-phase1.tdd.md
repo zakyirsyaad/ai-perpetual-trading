@@ -1,6 +1,6 @@
 # LONG Module Phase 1 — TDD Evidence
 
-Offline backtest of the manager's LONG module for the BingX VST bot. The rule core will live in `src/bot/strategy/modes/` and the harness in `src/research/mode_backtest/`; neither is wired into the live bot. Spec: `docs/superpowers/specs/2026-10-17-long-module-phase1-design.md`. Plan: `docs/superpowers/plans/2026-10-17-long-module-phase1.md`.
+Offline backtest of the manager's LONG module for the BingX VST bot. The rule core lives in `src/bot/strategy/modes/` and the harness in `src/research/mode_backtest/`; neither is wired into the live bot. Spec: `docs/superpowers/specs/2026-10-17-long-module-phase1-design.md`. Plan: `docs/superpowers/plans/2026-10-17-long-module-phase1.md`.
 
 ## User journey
 
@@ -57,7 +57,7 @@ git diff --check: passed
 secret hygiene test (tests.test_secret_hygiene): passed, with this document tracked
 ```
 
-Two earlier full runs were made while unrelated jobs held the machine's load average between 50 and 160. Both stalled at `test_telemetry_poller.RunLoopTests.test_run_keeps_polling_until_cancelled`, the known Python 3.10 hang (a bare `asyncio.wait_for` in the poller can swallow a cancellation, so the poller loop never stops; telemetry code this task does not touch). Each was stopped after more than 2 minutes with 0 failures among the 1,349 tests that ran before it; the 235 tests after it also passed on their own (`Ran 235 tests`, OK), and the stalled test passes alone in about 0.03 s (three runs out of three). No `bot` module imports `pine_indicators` (`test_pine_gate_structure` enforces it), so the poller cannot see this change. The third run, on a quiet machine, was clean.
+Two earlier full runs were made while unrelated jobs held the machine's load average between 50 and 160. Both stalled at `test_telemetry_poller.RunLoopTests.test_run_keeps_polling_until_cancelled`, the Python 3.10 hang of that time (a bare `asyncio.wait_for` in the poller could swallow a cancellation, so the poller loop never stopped; telemetry code this task does not touch). Main's PR #37 fixed it afterwards (`MarketDataPoller._guarded` and both server waits now go through `ws.with_timeout`, commit `d3da0c5`), and the branch has the fix since the merge `3eb7065`. Each was stopped after more than 2 minutes with 0 failures among the 1,349 tests that ran before it; the 235 tests after it also passed on their own (`Ran 235 tests`, OK), and the stalled test passes alone in about 0.03 s (three runs out of three). No `bot` module imports `pine_indicators` (`test_pine_gate_structure` enforces it), so the poller cannot see this change. The third run, on a quiet machine, was clean.
 
 Note: `pine_indicators.py` is inside the Pine gate's code fingerprint (`research.pine_gate.lock`), so the Pine selection file's `code_sha256` no longer matches current code. That was already so after PR #36; the Pine holdout ran once and its run marker refuses a second test regardless.
 
@@ -276,8 +276,8 @@ This is the expected failure. The data tests cannot import `research.mode_backte
 GREEN after `__init__.py` and `data.py`:
 
 ```text
-PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_data tests.test_mode_backtest_structure
-Ran 63 tests in 0.5s
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_data tests.test_mode_backtest_structure -v
+Ran 63 tests in 0.337s
 
 OK
 ```
@@ -519,7 +519,16 @@ Verification:
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1843 tests in 42.389s` / OK (1,769 + 74 new).
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the six new Python files.
 
-Not verified here: the real replay. It needs the copied VPS data and Pine files and runs in Task 7. A note for that run: the holdout file's `code_sha256` (`e915262…`, in the 16 October report) is the `lock.code_sha256` of commit `7d013bf` (2026-10-16 04:49 WIB), checked by hashing each commit's tree the way `lock.code_files` does. Since then the fingerprinted files changed only outside the replay path: `bars.py` (the day validation now shared with check-data; the same `Bars` for valid days), `features.py` (the check-data agreement helper; `FeatureFrame.build` untouched), `cli_data.py` (check-data) and `pine_indicators.py` (new `sma`, `stdev`, `rolling_median`). So the current code is expected to reproduce. The current `code_sha256` differs anyway, by design: it covers every file under `src/research`, `mode_backtest` included.
+Not verified in this task: the real replay. It needs the copied VPS data and Pine files and ran in Task 7 (next section). A note for that run: the holdout file's `code_sha256` (`e915262…`, in the 16 October report) is the `lock.code_sha256` of commit `7d013bf` (2026-10-16 04:49 WIB), checked by hashing each commit's tree the way `lock.code_files` does. Since then the fingerprinted files changed only outside the replay path: `bars.py` (the day validation now shared with check-data; the same `Bars` for valid days), `features.py` (the check-data agreement helper; `FeatureFrame.build` untouched), `cli_data.py` (check-data) and `pine_indicators.py` (new `sma`, `stdev`, `rolling_median`). So the current code is expected to reproduce. The current `code_sha256` differs anyway, by design: it covers every file under `src/research`, `mode_backtest` included.
+
+## Task 7 — Step 0 on the real data
+
+The controller ran this step. It is a run of the Task 6 code on the real data, so it has no RED of its own. The numbers come from the run's log and output file, from `verify-copy` and from the committed report `docs/research/2026-10-17-modul-long-langkah0.md` (Indonesian, commit `5084b1b`).
+
+- **Data.** `~/replay/pine_gate/data/prod` on the VPS was copied read-only to `~/replay/mode_backtest/data` on the Mac. The VPS listing and the copy hold 892 files each, and `verify-copy` printed `0 problems: every file matches the VPS listing`; run again on 2026-10-18 it prints the same. The three Pine files (selection, calibration, holdout) have the sha256 the VPS holds.
+- **Run.** 2026-10-17, 20:18 WIB, `step0` with the code of commit `57e33ed` on Python 3.10: exit 0 in 16.8 s, peak memory about 410 MB. The replay equalled the Pine holdout file in all 15 compared metrics for 3 contenders and 2 symbols (`reproduction.differences` is 0), on the same `data_sha256` as the Pine run (`d426d975…`). Only then were the trades labelled with the selector's condition and split. The frozen-code fallback of spec section 8, point 3 (the Phase 1 code of 16 October) was not needed: the current code reproduced the run.
+- **Result.** 44 groups of contender, symbol, side and condition. LONG in NAIK, Mode A's condition, has no edge under the Pine exits (BTC -359 to -479 per 1M on 133 to 276 positions). The only group with 40 or more positions above -150 is c3 ETH LONG in TURUN (47 positions, -143), which is inside its uncertainty of about 150; the positive groups hold 1 to 15 positions. These positions use the Pine exits (TP and SL 0.20 %, 60 minutes), not Mode A's, so step 0 does not decide Mode A.
+- **Output.** `~/replay/mode_backtest/out/step0_20261017.json` and `.md`, outside the repository. The committed report above has the same table (its 44 rows equal those of the `.md`), with a summary, a reading guide and the limits added.
 
 ## Task 8 — Mode A tracker
 
@@ -764,7 +773,7 @@ Choices the brief left open, or changed:
 - **Plain functions, not an `EntryGate` class.** The design's module table sketches `bracket(...)` and `EntryGate.allows(...)`; the plan's Task 10 fixes the plain functions above, and Task 12's event loop composes the gates in the order of section 9.1.
 - `bot/strategy/modes/__init__.py`: one sentence about `position_rules` in the package docstring.
 
-Test design: 50 tests in ten classes, the brief's six under their names. Every expected number is written in the test from the rules of the document and never computed with the code under test; a time is built from a WIB wall-clock reading by integer arithmetic on the epoch. The others pin:
+Test design: 50 tests in nine classes, the brief's six under their names. Every expected number is written in the test from the rules of the document and never computed with the code under test; a time is built from a WIB wall-clock reading by integer arithmetic on the epoch. The others pin:
 
 - the bracket against numbers worked out by hand (LONG from 100 at 0.40 / 0.25 gives 100.4 and 99.75; SHORT at 0.20 / 0.20 gives 99.8 and 100.2), the two percents not swapped (SHORT at 0.40 / 0.25 gives 99.6 and 100.25), the levels as a ratio of the fill at three prices, and the SHORT as the mirror of the LONG around the entry;
 - the fills against a real price (63,250.5, whose basis point is 6.32505), the direction (no fill ever moves in favour of the position, for either side and either order), zero slippage as the identity, the slippage as a percent, and `closing` given by position;
@@ -1128,7 +1137,7 @@ Notes for later tasks:
 
 - `research.mode_backtest.lock`: `LockError(message, problems=())` (a `RuntimeError`; `problems` holds one line per mismatch), `CODE_DIRS`, `CODE_EXTRA`, `code_files()`, `code_sha256()`, `python_version()` (`"3.10"`), `run_name(mode, pair)`, `lock_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_lock.json`), `marker_path(data_dir, mode, pair, lock_sha)` (`holdout_runs/mode_A_BTC-USDT_<sha>.json`), `existing_markers(data_dir, mode, pair)`, `read_lock(path)` (the document and the sha256 of its bytes), `check_lock(doc, *, config_sha, code_sha, train_manifest_sha, python)` and `claim_marker(path, doc)`. Fix round 1 added `started_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_test_started.json`) and `claim_started(path, doc)`.
 - `research.mode_backtest.stages`: `StageError` (a `ValueError`, exit 1), `check_phase1`, `train_stage(config_path, data_dir, out_dir, mode, pair, now) -> Path` and `test_stage(...) -> Path`, each returning its result JSON.
-- `research.mode_backtest.cli`: `train` and `test`, each with `--mode --pair --config --data-dir --out-dir`. They print every file written (the test also its run marker), then the status line. A `LockError` prints its problems on stdout, then one `error:` line, and exits 2.
+- `research.mode_backtest.cli`: `train` and `test`, each with `--mode --pair --config --data-dir --out-dir`. They print every file written (the test lists its start record among them, and also its run marker), then the status line. A `LockError` prints its problems on stdout, then one `error:` line, and exits 2.
 - `bot.strategy.modes.config.load_modes_config_with_sha256(path)`: reads the file once and returns the config and the sha256 of those same bytes. `load_modes_config` now delegates to it.
 - Test helpers: `tests/mode_backtest_helpers.write_minute_warmups` builds each warm-up bar from the minute prices it covers, so a moving price has no ATR jump at the seam. `tests/mode_backtest_stages.py` holds a synthetic rising week (Mon 6 to Fri 10 July 2026: training Mon to Wed, the test Thu and Fri, every day NAIK, both Mode A and the comparator trade) and `stage_config_text(**uji)`, which moves the `uji` dates of the repo YAML onto it (quoted WIB midnights) and refuses a key not written exactly once.
 
@@ -1143,7 +1152,7 @@ Controller rulings for this task (recorded as given):
 7. `stage_metrics` gets `cfg.uji.lolos_buang_posisi_teratas` at exactly one call site, and a test shows the YAML value changes the verdict.
 8. The JSON and the status lines carry the exact (unrounded) Hasil per 1 juta and without-top values, plus, for `train`, the 15m entries per NAIK day next to the 5m decision.
 9. Each stage runs Mode A in NAIK at the chosen timeframe and the comparator, Mode D (3m) in NAIK. `train` runs A at `tf_pemicu`, and once more at 5m when `wants_5m`; both training results are kept.
-10. The lock binds the config, code and training manifest sha256s, Python major.minor, the chosen timeframe, the training summary, the stage bounds, the mode and the pair. It is written exclusively. The marker is claimed exclusively before any test day is read, and an existing marker refuses with exit 2 ("already ran").
+10. The lock binds the config, code and training manifest sha256s, Python major.minor, the chosen timeframe, the training summary, the stage bounds, the mode and the pair. It is written exclusively. The marker is claimed exclusively before any test day is read, and an existing marker refuses with exit 2 ("already ran"). (Fix round 1 below adds a second record to this guard, the start record next to the lock.)
 11. Phase 1 refuses any mode but A and any pair but BTC-USDT with exit 1. Lock refusals and mismatches exit 2. Outputs: `mode_A_BTC-USDT_train_<YYYYMMDD>.json` (WIB date of `now`), one CSV per run and the lock; then `mode_A_BTC-USDT_test_<YYYYMMDD>.json`, the CSVs and a `.md` with the section 2.9 table (Latihan rows from the lock) and the status line.
 
 Choices of mine, each pinned by a test:
@@ -1168,7 +1177,7 @@ Test design: 50 new tests.
   - The training stage: results, logs and an exclusive lock, and no training exit after `latihan_selesai`. `test_train_never_opens_a_test_day_file` uses a corrupt Thursday file, a folder in place of Friday, and a recorder of every `gzip.open` and `Path.read_bytes`. Also the 5m switch run once and locked, no switch, the NAIK-day minimum from the config (18 hours drops Monday, which has 17 window hours), both short warm-ups, a flat market without a NAIK day (exit 1, "5m switch cannot be evaluated"), `tf_pemicu: 5m` and a naive clock.
   - The test stage:
     - the verdict and the report table, rebuilt with `mode_table` from the lock and the result;
-    - `test_marker_is_written_before_any_test_day_is_read`: every read of a test-day file happens after the marker exists, and a training file is hashed before it;
+    - `test_marker_is_written_before_any_test_day_is_read`: every read of a test-day file happens after the marker exists (and, since fix round 1, after the start record), and a training file is hashed before them;
     - a second run (same day and three days later);
     - a new lock after the test;
     - no lock;
@@ -1280,11 +1289,12 @@ Verification:
 
 Notes for later tasks:
 
-- **Task 15**: document `train`/`test` in CLAUDE.md, with the lock and the start record in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them).
+- **Task 15**: document `train`/`test` in CLAUDE.md, with the lock and the start record in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them). Done in Task 15.
 - **Task 16**:
   - Run `verify-copy` right before `test`. Before its claims, `test` checks only names and file types: every day and warm-up file must be a regular file, one `stat` each, nothing read. Content integrity comes from `verify-copy` alone. A test day that is a regular file but fails to read after the claims (the start record and the marker) ends the run with the one shot used up, whatever data folder a rerun names.
-  - Keep the checkout unchanged between `train` and `test`: any change to the 61 fingerprinted files (12 package modules, 6 rule-core modules, 43 in `CODE_EXTRA`), the YAML, the training files or the Python minor version makes `test` exit 2. While no marker exists, the lock may be deleted and `train` re-run.
-  - Run both stages with the same `--data-dir`, because the marker lives there.
+  - Keep the checkout unchanged between `train` and `test`: any change to the 61 fingerprinted files (12 package modules, 6 rule-core modules, 43 in `CODE_EXTRA`), the YAML, the training files or the Python minor version makes `test` exit 2. While neither the start record nor a marker exists, the lock may be deleted and `train` re-run.
+  - Use one `--out-dir` and one `--data-dir` for `train` and `test`, and never reuse the out-dir of a rehearsal. The start record `mode_A_BTC-USDT_test_started.json` sits next to the lock in `--out-dir` and refuses both `test` and `train` whatever `--data-dir` a rerun names. The marker sits in `<data_dir>/holdout_runs/` and refuses them for that data folder only. So a rehearsal run into the out-dir of the real run would leave a lock and a start record that refuse the real one. A lock copied to another out-dir together with a fresh data copy would still bypass both records; that is deliberate circumvention, which the guard does not try to stop (it covers the natural ways to run `test` twice).
+  - The start record is claimed first and the marker second. If the marker claim fails (an I/O error on the data folder, for instance), the start record stays behind and still refuses `test` and `train`. This fails closed. Delete it by hand only if no test-period day was read; none is read before both claims have succeeded.
 
 ### Fix round 1 (task review)
 
@@ -1364,3 +1374,83 @@ GREEN:
   | A corrupt regular file | the claims are made, then exit 1 |
   | A fresh copy with the same out-dir | exit 2, "already ran (…/mode_A_BTC-USDT_test_started.json)" |
   | `train` on the fresh copy after deleting the lock | exit 2 |
+
+## Verification (Task 15, the whole branch)
+
+Run on 2026-10-18 on `e5d220d` plus the edits of this task: the documentation, and the help text and docstring of `cli.py` (no behaviour change). Python 3.10.20 (`.venv`), `PYTHONPATH=src`. This task adds and changes no test, so the suite is the 2,261 tests of Task 14. `<scratch>` is a folder outside the repository (see the coverage note below).
+
+```text
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests
+(no output; exit 0)
+
+PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<scratch>/coveragerc --source=src --omit=src/tradingview_relay.py -m unittest discover -s tests
+Ran 2261 tests in 117.632s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<scratch>/coveragerc --fail-under=80
+TOTAL                                         14893   1387    91%
+(exit 0; the gate is 80 %)
+
+git diff --check
+(no output; exit 0)
+
+git diff --check 772cd16..HEAD
+(no output; exit 0)
+
+uv pip check --python .venv/bin/python
+Checked 17 packages in 8ms
+All installed packages are compatible
+
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_secret_hygiene -v
+test_tracked_files_do_not_contain_real_api_key_patterns (tests.test_secret_hygiene.SecretHygieneTests) ... ok
+
+OK
+```
+
+- **Coverage on Python 3.10.** `coverage` 7.16.2 reads `pyproject.toml` by default and stops with `Can't read 'pyproject.toml' without TOML support` when `tomli` is missing, even if the settings are given as flags. So both commands also pass `--rcfile`, a scratch file that holds the project's own `[tool.coverage]` settings: `source`, `branch`, `omit`, `fail_under`, `show_missing`, `skip_covered` and the four `exclude_lines`. These are the settings that CI's Python 3.11 reads from the real file. No package was installed.
+- **New code.** `bot/strategy/modes/` and `research/mode_backtest/`: 18 files, 1,807 statements, 1 missed (the import line of `__main__.py`, which only the subprocess test runs), so 99.94 %. `pine_indicators.py`: 100 %.
+- **`uv pip check` stands in for `pip check`**, because `.venv` was built by `uv` and has no `pip`.
+- **Not run here.** The full suite on Python 3.11, the version of CI (the compiled `pydantic_core` in `.venv` is a 3.10 build); earlier tasks ran their focused tests on 3.11.15 in a scratch environment. The dashboard is untouched, so there was no `bunx tsc --noEmit`.
+- **The commands added to CLAUDE.md** that cannot spend the one shot were run as written. `verify-copy` on the Mac's data copy printed `0 problems: every file matches the VPS listing` (exit 0). `unittest discover -s tests -p 'test_mode*.py'` ran 673 tests, OK. `test --help` shows the new `--out-dir` text. `step0` is done (Task 7), and `train` and `test` wait for Task 16.
+
+## Commit trail
+
+`git log --oneline --reverse 772cd16..HEAD`: 26 commits, and this one. Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
+
+- `40569bd` — `test: pin telemetry cancellation against swallowed wait_for` (main, PR #37)
+- `d3da0c5` — `fix: telemetry waits never swallow a cancellation` (main, PR #37)
+- `f1f4086` — `docs: TDD evidence for telemetry cancellation fix` (main, PR #37)
+- `f631379` — `docs: list the dashboard commands and flag HANDOFF.md as stale in CLAUDE.md`
+- `2520a3b` — `docs: design the LONG module phase 1 backtest (step 0 and Mode A on BTC)`
+- `15106a5` — `docs: implementation plan for the LONG module phase 1`
+- `5ad899b` — `Merge pull request #37 from zakyirsyaad/claude/dazzling-elion-e5f0d0` (main)
+- `c29f2d7` — `feat: add SMA, population stdev and rolling median to pine_indicators` (Task 1)
+- `3eb7065` — `Merge remote-tracking branch 'origin/main' into feat/long-module-backtest`
+- `8200139` — `feat: load and validate the LONG module YAML configuration` (Task 2)
+- `f2d86a2` — `fix: report every PyYAML failure and date overflow as ModesConfigError` (Task 2, fix round 1)
+- `7994e9c` — `feat: the manager's mode selector as a pure function` (Task 3)
+- `4c2d5f3` — `feat: data loading and copy verification for the mode backtest` (Task 4)
+- `7e41983` — `fix: compare the data copy both ways and refuse an unused warm-up` (Task 4, fix round 1)
+- `b23196b` — `feat: hourly frame and mode selector context for the mode backtest` (Task 5)
+- `0ea6d8b` — `fix: make naik_days honour the minimum NAIK hours of the config` (Task 5, fix round 1)
+- `57e33ed` — `feat: step 0 replays the Pine holdout and splits it by side and condition` (Task 6)
+- `5084b1b` — `docs: step 0 split of the Pine holdout by side and condition` (Task 7)
+- `d030280` — `feat: Mode A pullback tracker with one entry per touch` (Task 8)
+- `00b0c6d` — `feat: trigger series and the near-mean SHORT trigger` (Task 9)
+- `aac2dc3` — `feat: position rules for the LONG module` (Task 10)
+- `1bcb230` — `feat: 1m exit walk and trade money for the mode backtest` (Task 11)
+- `0cf881d` — `feat: event loop for Mode A and the Mode D comparator` (Task 12)
+- `44d910c` — `feat: metrics, pass rule, trade log and the mode table` (Task 13)
+- `488ab42` — `feat: lock and one-shot train/test stages for the mode backtest` (Task 14)
+- `e5d220d` — `fix: claim a start record next to the lock and refuse non-file test days` (Task 14, fix round 1)
+- this commit — `docs: LONG module phase 1 in CLAUDE.md and TDD evidence` (Task 15)
+
+## Deployment gate
+
+Nothing is deployed. The live bot, `.env`, pm2 (`ai-perp-volume`) and the VPS are untouched, and Phase 1 is an offline experiment.
+
+- Against main the branch adds `config/modes.yaml`, `src/bot/strategy/modes/` and `src/research/mode_backtest/`, three functions in `src/bot/strategy/pine_indicators.py` and PyYAML in `requirements.txt` and `pyproject.toml`; the rest is tests and documentation. Only `research.mode_backtest` imports the rule core (checked by grep; no test pins it). No live module imports `pine_indicators` (`test_pine_gate_structure` enforces that). PyYAML is imported only by `bot/strategy/modes/config.py`, so the live environment needs nothing new.
+- The package makes no network call and writes files only through `research.pine_gate.fileio`; `tests/test_mode_backtest_structure.py` bans the network and venue words and every other way of writing a file.
+- Still to do, in Task 16 and only after the merge and the user's go-ahead: `train`, then `verify-copy` right before the one-shot `test`. The operator notes are in Task 14 ("Notes for later tasks"): one `--out-dir` and one `--data-dir` for both stages, no rehearsal in the out-dir of the real run, no change to the checkout between the stages, and what to do with a start record left behind.
+- Anything beyond Phase 1 (the other modes, ETH, wiring a mode into the bot) needs its own spec and a fresh decision from the user.
