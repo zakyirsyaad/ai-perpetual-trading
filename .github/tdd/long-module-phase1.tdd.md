@@ -1010,3 +1010,114 @@ Notes for later tasks:
 
 - **Task 13**: `Trade.side` is the int `LONG`/`SHORT` (map it to the words), `exit_reason` is already the log word, `signal_ms == entry_ms`, and the indicator columns are `trade.context.sma20_1h`, `.sma50_1h`, `.ema50_4h` and `.atr14_1h`. "Rata-rata lama posisi" is `exit_ms - entry_ms` with ruling 3's exit time. `RunResult.blocked` is a `MappingProxyType`: use `dict(result.blocked)` before writing JSON.
 - **Task 14**: one `simulate_run` per stage and run, with `start_ms`/`end_ms` the stage's WIB midnights (`spec.ms` of the `uji` datetimes). The 1m data must reach the minute before the end (the loaded days do); the trigger series and the hourly frame need warm data at the start, so the test stage still loads from `latihan_mulai` (Task 9's note), while the loop itself never looks at a candle closing before `start_ms`. The code fingerprint must cover the modules `simulate.py` now imports: `bot.strategy.modes.pullback` and `bot.strategy.modes.near_mean` (both inside `bot/strategy/modes/*.py`), `bot.core.entry_window`, `research.pine_gate.spec`, `bars` and `features`, all of them also reached through `frames.py` except `pullback`. `mode_a.aktif`, `mode_d.aktif` and `pair.*.aktif` are not read by the loop; the stages decide what runs.
+
+
+## Task 13 — Metrics, trade log and the Mode A table
+
+`research.mode_backtest.metrics`, `research.mode_backtest.tradelog` and the Mode A table in `research.mode_backtest.report` turn the trades of a run into the numbers that decide the one-shot holdout verdict and into what the manager reads:
+
+- `StageMetrics(posisi, entry_per_hari_aktif, menang_pct, hasil_per_1_juta, tp, sl, waktu, rata_lama_menit, hasil_tanpa_teratas, hari_naik)` (frozen, the ten fields of the brief in its order) and `stage_metrics(trades, hari_naik, drop_top)`.
+- `pass_status(m, uji)` returning `"LOLOS"`, `"GAGAL"` or `"BELUM CUKUP SAMPEL"` (module constants `LOLOS`, `GAGAL`, `BELUM_CUKUP_SAMPEL`), and `wants_5m(m15, uji)`.
+- `tradelog.COLUMNS` (the 23 names of spec 2.9, in order), `wib_iso(t_ms)`, `trade_log_text(trades)` and `write_trade_log(path, trades)` (through `write_exclusive(..., "trade log")`).
+- `report.ReportRow(mode, pair, tahap, metrics)`, `report.MODE_HEADER`, `report.NO_TRADING` and `report.mode_table(rows)`.
+
+Controller rulings for this task (recorded as given):
+
+1. **Entry per hari aktif** is `positions / NAIK days`; with 0 NAIK days it is `None`, never a `ZeroDivisionError`.
+2. **The 5m switch fails loudly:** `wants_5m` is True iff the 15m run's entries per NAIK day is below `uji.pindah_5m_jika_entry_per_hari_naik_kurang_dari` (3); if that figure is `None` (no NAIK day) it raises `ValueError`, because the pre-registered rule cannot be evaluated.
+3. **Trade log:** the 23 columns exactly as spec 2.9, in order; `trade_id` is the 1-based row number inside each CSV; `sisi` is LONG/SHORT from `side`; `kondisi` is the trade's `kondisi`; `ema50_4h`, `sma20_1h`, `sma50_1h` and `atr14_1h` come from `trade.context`; times are ISO 8601 in WIB with `+07:00`; `alasan_exit` is TP/SL/WAKTU; numbers are written so they round-trip (`repr` of floats).
+4. **Every Indonesian table uses the decimal comma:** the new table reuses `format_number` and `format_percent` of `report.py`.
+5. **Pass rule:** fewer than `uji.lolos_minimal_posisi` (40) positions is `BELUM CUKUP SAMPEL` (not a failure); otherwise `LOLOS` iff Hasil per 1 juta `>` -150 and the result without the top `drop_top` (3) `>` -250, both strictly; else `GAGAL`.
+
+Choices of mine, each pinned by a test:
+
+- **Sums are `math.fsum`**, so the same set of trades gives the same bits whatever order it is listed in. The pass rule is strict and the stage code lists trades in time order, the trimmed set in rank order; a plain float sum could differ in the last bit between the two.
+- **The trim ranks by `(-pnl_usdt, entry_ms)`**: the highest profit in USDT first (not per volume), ties by the earliest entry, whatever the input order. Dropping more positions than exist, or all of them, gives `None`; dropping none equals the whole result.
+- **`stage_metrics` refuses what would give a quiet wrong verdict** (`ValueError` naming the field): an `exit_reason` that is not TP, SL or WAKTU (it would be left out of `tp + sl + waktu`), a `pnl_usdt` that is not finite (NaN fails every `>` and would read as GAGAL), a `volume_usdt` that is not a finite number above 0, and a `hari_naik` or `drop_top` that is not a whole number of at least 0 (a bool is not one). `StageMetrics` itself is a plain record with no checks, so a test or a later task can build one by hand.
+- **`pass_status` raises `ValueError`** when there are enough positions but `hasil_per_1_juta` or `hasil_tanpa_teratas` is `None` or not finite, instead of failing the mode. With too few positions it never looks at the results (a stage with no trades is `BELUM CUKUP SAMPEL`, not an error). `StageMetrics` has no `drop_top` field (the brief's field list is exact), so `pass_status` trusts that `hasil_tanpa_teratas` was made with `uji.lolos_buang_posisi_teratas`; the module docstring says so and Task 14 must pass that number.
+- **The log is machine text:** a decimal point, no thousands separator, `repr` of the float, `\n` line ends, rows in the trades' order. A missing indicator (`None` in the context) is an empty cell and not a lost trade. `wib_iso` accepts only an `int` (not a bool or a float) that is a whole second, and raises `ValueError` instead of cutting the time. A `side` that is not `LONG` or `SHORT` (a bool is neither) raises. The text is built before the file is touched, so a trade that cannot be written leaves no file.
+- **The table groups by tahap and pair without reordering:** the "Tidak trading" row follows the last row of each (tahap, pair) and shows Posisi 0, Entry per hari aktif 0,00 (or "–" when the stage has no NAIK day, as every row would), Menang "–", Hasil per 1 juta 0, "0 / 0 / 0" and "–" for the hold. Its NAIK days are those of the row it follows. Columns: Posisi and Hasil per 1 juta are whole numbers, Entry per hari aktif has two decimals, Menang one, the exit counts use the thousands dot and the hold is "45,5 menit". The Pair column shows `BTC-USDT` as the config names it (the step-0 table's "Koin" shows `BTC`). `mode_table` reads its rows once, so a generator works.
+- **Test helpers:** `tests/mode_backtest_trades.py` (a `Trade` and context builder and the readers of the two layouts in spec 2.9) is a new module, because `tests/mode_backtest_helpers.py` is imported by the data tests and would otherwise pull `simulate` into them. The table has its own test module, `tests/test_mode_backtest_report.py`, next to the brief's two.
+
+Test design: 125 tests in three modules, every expected number worked out by hand.
+
+- `tests/test_mode_backtest_metrics.py` (65): the config numbers; `test_hasil_per_1_juta` (10 and -40 on 50,000 each is -300), pooled rather than a mean of ratios, an exact `Fraction` oracle, order independence over 60 random trades and 20 shuffles; Menang without time exits (3 TP, 1 SL, 6 time exits is 75), `None` without TP or SL, 0 for stop-losses only; exit counts; entry per day including 0 NAIK days; the hold from the entry and not the signal; the trim (ties by time with three tied at 20 and different volumes, ranking by profit and not by ratio, `drop_top` 0 to 4, nothing left, a brute-force oracle that finds the one dropped set by the rule itself); empty input, any iterable, no mutation, JSON round trip; the argument refusals; `test_statuses` as 12 tests (39 positions with good and bad numbers, 40 at -149 / -249, exactly -150 and exactly -250, a step either side of each, the limits read from the config); `wants_5m` at 2.99, 3.0 and 3.01, no NAIK day, NaN, inf and bool; and an end-to-end class with 40 trades whose sums sit exactly on both limits (-150.0 and -250.0 in binary floating point), half a USDT better and worse, three big winners, and 39 positions.
+- `tests/test_mode_backtest_tradelog.py` (35): the header equal to the document twice (a copy typed in the test and the code block read out of the spec file), 23 distinct columns, WIB times (the brief's `2026-08-05T07:15:00+07:00`, midnight, the epoch, never `Z`), the refusals of `wib_iso`, one full row written out by hand and a field-by-field map with a number of its own in every field (signal 15 minutes before the entry, exit 45 after), a SHORT row, `kondisi` from the trade and not the context, the fills as the prices, missing indicators as empty cells, `trade_id` from 1 in every log, order kept, float round trips with awkward values, times parsed back to the same instant, the file written exactly, a text path, a missing folder, an existing file never overwritten (original bytes kept, label in the message) and a trade that cannot be written leaving no file.
+- `tests/test_mode_backtest_report.py` (25): the header equal to the document (a copy and the line read out of the spec), a row written out in full in Indonesian notation (`1.234`, `2,50`, `48,1%`, `-1.234`, `600 / 500 / 134`, `45,5 menit`), dashes for missing values, "-0" never shown, nine cells in every line, a trailing newline; the "Tidak trading" row after each tahap, after the last row of a tahap when rows interleave, with a dash when there is no NAIK day, one per pair, with 0 positions and a result of 0; and a table made from real trades through `stage_metrics`.
+
+RED: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_metrics tests.test_mode_backtest_tradelog -v` before any of the three modules existed (paths shortened). The brief expected an import failure; neither `metrics` nor `tradelog` existed, and the table tests failed the same way on `metrics`:
+
+```text
+test_mode_backtest_metrics (unittest.loader._FailedTest) ... ERROR
+test_mode_backtest_tradelog (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_metrics (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_metrics
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_metrics.py", line 21, in <module>
+    from research.mode_backtest.metrics import (
+ModuleNotFoundError: No module named 'research.mode_backtest.metrics'
+
+
+======================================================================
+ERROR: test_mode_backtest_tradelog (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_tradelog
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_tradelog.py", line 19, in <module>
+    from research.mode_backtest.tradelog import COLUMNS, trade_log_text, wib_iso, write_trade_log
+ModuleNotFoundError: No module named 'research.mode_backtest.tradelog'
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+FAILED (errors=2)
+```
+
+```text
+test_mode_backtest_report (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_report (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_report
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_report.py", line 13, in <module>
+    from research.mode_backtest.metrics import StageMetrics, stage_metrics
+ModuleNotFoundError: No module named 'research.mode_backtest.metrics'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+GREEN, first run with the modules written: `Ran 123 tests` / OK. A first pass that passes at once proves little, so the tests were then checked against planted bugs and against coverage (below), and two gaps were closed.
+
+RED, 2: the first mutation pass (111 bugs) left one survivor, the volume summed with `sum` instead of `fsum`: the order test used 40 identical volumes, which add up exactly in any order. `test_hasil_does_not_depend_on_the_order_of_the_trades` now uses 60 random profits and volumes and 20 shuffles; against the final tests the mutant fails. Coverage showed `metrics.py` line 95 (the bool guard of `_is_finite`) never run, so a bool, an int beyond the float range and text were added to the profit, volume, result and ratio refusals. Two further tests came from the self-review: `mode_table` read its rows twice, so a generator gave a header-only table (`test_any_iterable_of_rows_gives_the_same_table`; `mode_table` now takes `tuple(rows)`), and `test_the_metrics_survive_a_round_trip_through_json` pins that the metrics are JSON-ready for the stages.
+
+GREEN, 2: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_metrics tests.test_mode_backtest_tradelog tests.test_mode_backtest_report` `Ran 125 tests` / OK.
+
+Verification:
+
+- Focused: the three new modules, `tests.test_mode_backtest_structure`, `tests.test_mode_backtest_step0` and `tests.test_pine_gate_structure` `Ran 209 tests` / OK on Python 3.10.20 (`.venv`) and on 3.11.15 (a scratch venv with `requirements.txt`, because CI runs 3.11). The brief's command (`tests.test_mode_backtest_metrics tests.test_mode_backtest_tradelog`) `Ran 100 tests` / OK.
+- Line and branch coverage of `metrics.py`, `tradelog.py` and `report.py` (scratch rcfile, because the 3.10 `coverage` cannot read `pyproject.toml`): 100 % (176 statements, 38 branches, 0 missed).
+- Mutation check (scratch copy of `src`, not committed): 112 bugs planted one at a time and run against the three new modules; all 112 are caught. By area: the pass rule (13: each comparison `>=` or `<=`, `and` to `or`, the minimum fixed or off by one, the limits and the status text, the verdict inverted, the 5m comparison and its None check, the result checks off), the numbers (24: the scale, `fsum`, the trim's rank key, its tie-break, its cut and its count, Menang's denominator and its empty and falsy cases, tp and sl swapped, entry per day with a floor of 1 or a zero for none, the hold in seconds, not averaged, or from the signal, waktu not an exit reason), the argument checks (11), the log (38: columns swapped or dropped, every column fed from a neighbouring field, `trade_id` from 0 or shifted, a rounded or fixed-precision number, `None` as a number, CRLF, UTC instead of WIB, the whole-second and type checks of `wib_iso`, the label of the write, a bool side, the header missing, the rows sorted) and the table (26: each header cell, each column's decimals and unit, the order of the exit counts, the baseline row's cells, its group key, its position after every row, after none or after the first, its label, its pair and tahap, the separator, the trailing newline, `tuple(rows)`).
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 2208 tests` / OK (2,083 + 125 new).
+- `compileall -q src tests` OK; `git diff --check` clean; `ruff check --select F,E,W,B --line-length 100` clean on the six new files and `report.py`, `ruff format --check --line-length 100` clean on the six new files (`report.py` as a whole was not ruff-format clean before this task, so its step-0 part is left as it was and the additions follow its existing style); `tests.test_secret_hygiene` OK with this document tracked; `tests.test_mode_backtest_structure` OK (no private import, no network or venue word, no file write in the package, with the two new modules covered).
+
+Notes for later tasks:
+
+- **Task 14**: call `stage_metrics(trades, hari_naik=len(naik_days), drop_top=cfg.uji.lolos_buang_posisi_teratas)`; the trimmed result is only right with that number. `wants_5m(m15, cfg.uji)` raises `ValueError` when the training stage has no NAIK day: let it end the `train` command with a one-line error and exit 1, do not catch it into False. `dataclasses.asdict(metrics)` is JSON-ready (floats, ints and `None`). Write one CSV per run with `write_trade_log` (its `trade_id` starts at 1 in each) and build the `.md` with `mode_table`: give every row of a tahap the same `hari_naik`, list Mode A first and the comparators last, and label the comparator rows yourself (`ReportRow.mode`); "Tidak trading" is added by the table.
+- **The code fingerprint** must cover the new imports: `metrics.py` imports `bot.strategy.modes.config` (already in `modes/*.py`) and `.simulate`; `tradelog.py` imports `bot.strategy.modes.position_rules`, `research.pine_gate.fileio` and `research.pine_gate.spec`; `report.py` now imports `.metrics`. `fileio` and `spec` are `research.pine_gate` modules, so `CODE_EXTRA` needs them (`step0.py` and `simulate.py` already import them).
+- **The status line** the `test` stage prints (Task 16 asks for the three numbers) can read `m.posisi`, `m.hasil_per_1_juta` and `m.hasil_tanpa_teratas` from the same `StageMetrics` that `pass_status` judged. The table rounds Hasil per 1 juta to a whole number, so -149.6 shows as -150 and still passes; the status line should print the exact values.
