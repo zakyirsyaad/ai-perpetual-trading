@@ -196,3 +196,99 @@ Verification:
 - Line coverage of `bot/strategy/modes/regime.py`: 100 % (16 statements, 0 missed), measured with a scratch rcfile because coverage cannot read `pyproject.toml` on 3.10 without `tomli`, as in Task 2.
 - Full suite, `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1656 tests in 35.176s` / OK (1,649 existing plus 7 new), exit 0.
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add).
+
+## Task 4 — Backtest package, data loading and copy check
+
+`src/research/mode_backtest/` starts here, and the bot never imports it. `data.py` is the one place the harness reads bar files. `load_pair` returns a `PairData` (the 1m bars of an inclusive WIB day range and the native 1h and 4h warm-ups), `stage_files` names exactly the files such a load opens, `manifest` and `manifest_sha256` hash them (a later task's lock binds that hash), and `verify_copy` checks a local copy of the data against the VPS's `sha256sum` output. It uses only public names of `research.pine_gate` (`bars`, and `cli_common.file_sha256`) and imports nothing but research modules and the standard library. The rule behind every choice below: a missing, unreadable or altered file stops a run with an error and never shrinks the sample.
+
+Choices the brief left open:
+
+- `load_pair` checks the days first. `load_days` names every missing day before it reads any file, so a missing day wins over a missing warm-up and nothing is read. Then both warm-ups are checked together, and one `FileNotFoundError` names each missing one. A corrupt file or an invalid bar raises what `bars` raises (`UnreadableDayError`, `DayShapeError`, `BarGapError`); nothing is caught or replaced by an empty series.
+- `stage_files` only builds names, so nothing has to exist yet. It refuses a reversed range, because an empty range would give a manifest of the two warm-ups alone. A test records every `gzip.open` of a `load_pair` call and requires the sorted list to equal `stage_files`, so the manifest cannot drift from what the load reads.
+- `manifest` lines are `relpath:sha256`, relative to `data_dir` with `/` separators, so a copy of the data has the manifest of the original. A path outside `data_dir` or given twice raises `ValueError`. `manifest_sha256` sorts the lines itself, so the hash does not depend on the order in which a caller joined two symbols, and it refuses a bare string, which would be sorted letter by letter.
+- `verify_copy` takes the listing as the authority and reports one problem for each of these:
+  - the hash differs (both hashes are printed), the file is missing, or it cannot be read (a directory in its place is a problem, not a crash);
+  - the line is not `<64 hex>  <path>` (two spaces, as `sha256sum` prints in text mode; the binary-mode `*` is malformed), or the path is not a file inside `prod/`: absolute, with `..`, outside `prod/` or holding a NUL. Such a path is never read, so a bad listing cannot make the check hash another file;
+  - the same path appears twice, because two entries for one file could otherwise cancel out.
+
+  Blank lines, CRLF line ends and upper-case hex are tolerated. A listing with no file entry at all is one problem, so an empty or cut-off file cannot pass, and a lone malformed line is one problem, not two. Files that exist only locally are not examined. `prod/<symbol>/funding.json` (three path components, not four) is a normal entry although `stage_files` does not list it, since this harness does not read funding.
+
+`tests/mode_backtest_helpers.py` (not `test_*`; tests import it as `from tests.mode_backtest_helpers import ...`, as `tests/test_telemetry_book_ticker.py` does) writes synthetic data that looks like the real data:
+
+- `minute_rows` and `write_days` write valid 1,440-bar WIB day files of flat bars; `price(i)` counts minutes from 00:00 WIB of the earliest day written, so one function gives a continuous series, also across a day that is left out.
+- `write_warmups` writes the 1h and 4h warm-ups so that the last bar is the one that contains the minute before the first day starts, on the UTC grid. Both open at 16:00 UTC when the day starts at 00:00 WIB, as on the real files, and a test joins them to the aggregated bars with `features.htf_bars`, which raises on a hole at the seam.
+- `sha256sum_text` prints what `find prod -type f | sort | xargs sha256sum` prints on the VPS.
+
+`tests/test_mode_backtest_structure.py` runs its rules over every `*.py` of the package, so a module added by a later task is covered without editing it:
+
+- no import of a private name of another module (relative, `research.*` and `bot.*` imports; also a private module, and a private name reached through an imported module such as `bars._empty`);
+- none of `httpx`, `socket`, `urllib`, `requests`, `bingx_client`, `_signed_request`, `X-BX-APIKEY` and `listenKey` anywhere in the text, docstrings and comments included;
+- no `write_text`, `write_bytes` or `open`-style call (`open`, `fdopen`, `GzipFile`) with a mode that can write; a non-constant `mode=` counts too.
+
+Each detector also runs on small synthetic sources that must and must not trip it, so a rule cannot pass just because it looks at nothing.
+
+RED, before the package existed, with `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_data tests.test_mode_backtest_structure -v` (paths shortened). The first run, in the repo, used the first version of the tests and failed the same way; the output below is the same command on the final tests in a scratch copy of the tree without `src/research/mode_backtest`, so it matches what is committed:
+
+```text
+test_mode_backtest_data (unittest.loader._FailedTest) ... ERROR
+test_files_are_written_only_through_fileio (structure.FileWriteTests) ... ok
+test_the_write_guard_lets_reading_through (structure.FileWriteTests) ... ok
+test_the_write_guard_sees_every_way_to_write_a_file (structure.FileWriteTests) ... ok
+test_no_network_or_venue_code (structure.NetworkAndVenueTests) ... ok
+test_the_word_guard_sees_every_word_in_code_comments_and_docstrings (structure.NetworkAndVenueTests) ... ok
+test_the_rules_below_look_at_real_modules (structure.PackageLayoutTests) ... FAIL
+test_no_module_imports_a_private_name_of_another (structure.PrivateImportTests) ... ok
+test_no_module_reaches_a_private_name_through_an_imported_module (structure.PrivateImportTests) ... ok
+test_the_attribute_guard_lets_public_names_and_own_privates_through (structure.PrivateImportTests) ... ok
+test_the_attribute_guard_sees_a_private_name_behind_an_import (structure.PrivateImportTests) ... ok
+test_the_import_guard_lets_public_names_and_other_packages_through (structure.PrivateImportTests) ... ok
+test_the_import_guard_sees_every_form_of_a_private_import (structure.PrivateImportTests) ... ok
+
+======================================================================
+ERROR: test_mode_backtest_data (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_data
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_data.py", line 14, in <module>
+    from research.mode_backtest import data as backtest_data
+ModuleNotFoundError: No module named 'research.mode_backtest'
+
+
+======================================================================
+FAIL: test_the_rules_below_look_at_real_modules (structure.PackageLayoutTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_structure.py", line 144, in test_the_rules_below_look_at_real_modules
+    self.assertIn("__init__.py", names)
+AssertionError: '__init__.py' not found in []
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.001s
+
+FAILED (failures=1, errors=1)
+```
+
+This is the expected failure. The data tests cannot import `research.mode_backtest`. Three structure rules (private imports, forbidden words, file writes) pass on an empty package because there is nothing to violate; `test_the_rules_below_look_at_real_modules` is the one that fails, and it is there so that these rules cannot pass vacuously once the package is gone or moved. The mutation check below shows that they trip on a violating module.
+
+GREEN after `__init__.py` and `data.py`:
+
+```text
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_data tests.test_mode_backtest_structure
+Ran 63 tests in 0.5s
+
+OK
+```
+
+The first run passed all 60 tests then in the two files, which is why the mutation check came next (below). Two tests were added afterwards (a very long listing line is cut in its message; a string `data_dir` works like a path) and one was split in two.
+
+Verification:
+
+- Focused: `Ran 63 tests` / OK (51 in `test_mode_backtest_data`, 12 in `test_mode_backtest_structure`) on Python 3.10.20 (`.venv`) and on 3.11.15 (a scratch venv with `requirements.txt`, because CI runs 3.11).
+- Line coverage of `research/mode_backtest/`: 100 % (`data.py` 96 statements and 26 branches on 3.10 with a scratch rcfile, since coverage cannot read `pyproject.toml` on 3.10 without `tomli`; 95 statements, 0 missed, on 3.11 with the repo's own `pyproject.toml`).
+- Mutation check (scratch scripts, not committed): 38 plausible bugs planted one at a time in `data.py`, 10 violating modules dropped into the package for the structure rules, and 8 bugs in the test helpers; all 56 are caught. Examples: a reversed range allowed, the last day dropped, `..` or a NUL allowed in a listing path, one space accepted as separator, a short hash accepted, a duplicate allowed, an empty listing passing, an unreadable file crashing, a manifest with absolute paths, an unsorted manifest hash, a warm-up that ends on the first minute instead of before it. The first pass had two survivors (one space accepted, a short hash accepted): the malformed lines all named `funding.json`, which the base listing already holds, so a mis-parsed line still produced a "listed twice" problem. Each shape is now its own listing with a path that is not in the local copy.
+- Realistic scale (scratch, 439 synthetic days for two symbols plus 4,344 1h and 1,086 4h warm-ups each): `load_pair` 1.3 s and both warm-up seams join; the manifest of 441 staged files 0.02 s; `verify_copy` of 882 listed files 0.03 s.
+- Existing guards stay green with the new package: `tests.test_pine_gate_structure` scans every research source for the venue words and every research import of a `bot` module.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1719 tests in 35.538s` / OK (1,656 existing + 63 new), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with the new files and this document tracked.
