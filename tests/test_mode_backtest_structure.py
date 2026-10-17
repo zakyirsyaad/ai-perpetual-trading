@@ -8,6 +8,9 @@ The code fingerprint of the lock is held to the modules the package imports, fou
 ways: an AST walk of every import statement, followed from module to module through
 ``bot`` and ``research``, and the modules a fresh Python process has loaded once it has
 imported every module of the package.
+
+One rule looks the other way: no live module (every source under ``src`` outside
+``research/`` and the rule core ``bot/strategy/modes/``) imports the rule core.
 """
 
 import ast
@@ -240,6 +243,53 @@ def import_closure(paths: Iterable[Path]) -> Dict[str, Path]:
 
 def relative(path: Path) -> str:
     return path.relative_to(SRC).as_posix()
+
+
+RULE_CORE = "bot.strategy.modes"
+RULE_CORE_DIR = SRC / "bot" / "strategy" / "modes"
+DYNAMIC = "<dynamic>"  # a dynamic import whose module name is not a constant
+
+
+def live_sources() -> List[Path]:
+    """Every source under ``src`` outside ``research/`` and the rule core: the bot, ``main.py``
+    and the scripts."""
+    return [
+        path
+        for path in sorted(SRC.rglob("*.py"))
+        if "research" not in path.relative_to(SRC).parts and RULE_CORE_DIR not in path.parents
+    ]
+
+
+def is_dynamic_import(func: ast.expr) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id in ("__import__", "import_module")
+    return isinstance(func, ast.Attribute) and func.attr == "import_module"
+
+
+def dynamic_imports(tree: ast.AST) -> Set[str]:
+    """The modules that ``importlib.import_module("x")``, ``import_module("x")`` and
+    ``__import__("x")`` name, and ``DYNAMIC`` for a name that is not a constant."""
+    return {
+        node.args[0].value if is_text_constant(node.args[0]) else DYNAMIC
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and is_dynamic_import(node.func) and node.args
+    }
+
+
+def rule_core_imports(tree: ast.AST, module: str, is_package: bool) -> List[str]:
+    """The names under ``bot.strategy.modes`` that ``module`` may load, relative imports resolved
+    (``imported_names``) and dynamic ones included, plus ``DYNAMIC`` when a dynamic import's name
+    cannot be read."""
+    names = imported_names(tree, module, is_package) | dynamic_imports(tree)
+    return sorted(
+        name for name in names
+        if name in (RULE_CORE, DYNAMIC) or name.startswith(f"{RULE_CORE}.")
+    )
+
+
+def rule_core_imports_of(path: Path) -> List[str]:
+    tree = parse(path.read_text(encoding="utf-8"))
+    return rule_core_imports(tree, module_name(path), path.name == "__init__.py")
 
 
 class PackageLayoutTests(unittest.TestCase):
@@ -479,6 +529,62 @@ class CodeFingerprintTests(unittest.TestCase):
                  "research.pine_gate.bars.Bars", "bot.no_such_module"}
 
         self.assertEqual(project_modules(names), set())
+
+
+class RuleCoreIsolationTests(unittest.TestCase):
+    """Only ``research/`` and the rule core itself import ``bot.strategy.modes``; wiring a mode
+    into the live bot is a later phase with its own spec."""
+
+    def test_no_live_module_imports_the_rule_core(self):
+        paths = live_sources()
+        self.assertIn(SRC / "main.py", paths)
+        self.assertGreater(len([p for p in paths if SRC / "bot" in p.parents]), 20)
+        self.assertIn(SRC / "bot" / "strategy" / "__init__.py", paths)
+        # the guard sees the core in a real import (research's), and the scan leaves out
+        # research and the core's own modules
+        stages = PACKAGE / "stages.py"
+        self.assertIn("bot.strategy.modes.config", rule_core_imports_of(stages))
+        core = sorted(RULE_CORE_DIR.glob("*.py"))
+        self.assertIn(RULE_CORE_DIR / "pullback.py", core)
+        self.assertEqual([relative(p) for p in [stages, *core] if p in paths], [])
+
+        offenders = [f"{relative(path)}: {name}"
+                     for path in paths for name in rule_core_imports_of(path)]
+
+        self.assertEqual(offenders, [])
+
+    def test_the_rule_core_guard_sees_every_form_of_import(self):
+        sources = (
+            "import bot.strategy.modes\n",
+            "import bot.strategy.modes.config as modes_config\n",
+            "from bot.strategy import modes\n",
+            "from bot.strategy.modes.pullback import PullbackTracker\n",
+            "from . import modes\n",
+            "from .modes import regime\n",
+            "from ..strategy.modes.near_mean import near_mean_short\n",
+            "def later():\n    from bot.strategy.modes import position_rules\n",
+            "import importlib\nimportlib.import_module('bot.strategy.modes.config')\n",
+            "__import__('bot.strategy.modes')\n",
+            "from importlib import import_module\nimport_module(name)\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                found = rule_core_imports(parse(source), "bot.strategy.engine", is_package=False)
+                self.assertNotEqual(found, [])
+
+    def test_the_rule_core_guard_lets_other_modules_through(self):
+        source = (
+            "import modes\n"
+            "import bot.strategy.indicators\n"
+            "from bot import strategy\n"
+            "from bot.strategy import pine_indicators\n"
+            "from .modes_extra import helper\n"
+            "from . import indicators\n"
+            "import importlib\n"
+            "importlib.import_module('bot.strategy.indicators')\n"
+        )
+
+        self.assertEqual(rule_core_imports(parse(source), "bot.strategy.engine", False), [])
 
 
 if __name__ == "__main__":
