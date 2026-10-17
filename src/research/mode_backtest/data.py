@@ -64,16 +64,24 @@ def _days(first_day: date, last_day: date) -> List[date]:
     return [first_day + timedelta(days=k) for k in range((last_day - first_day).days + 1)]
 
 
+def day_files(data_dir: PathLike, symbol: str, first_day: date, last_day: date) -> List[Path]:
+    """The 1m day files of the inclusive WIB day range, oldest first: ``stage_files`` without
+    the warm-ups.
+
+    Only names are built; nothing is read and nothing has to exist yet."""
+    return [
+        day_path(data_dir, SOURCE, symbol, _DAY_INTERVAL, day)
+        for day in _days(first_day, last_day)
+    ]
+
+
 def stage_files(data_dir: PathLike, symbol: str, first_day: date, last_day: date) -> List[Path]:
     """The files ``load_pair`` reads: the day files of the range and both warm-ups, sorted.
 
     Only names are built; nothing is read and nothing has to exist yet."""
-    paths = [
-        day_path(data_dir, SOURCE, symbol, _DAY_INTERVAL, day)
-        for day in _days(first_day, last_day)
-    ]
-    paths += [warmup_path(data_dir, symbol, interval) for interval in _WARMUP_INTERVALS]
-    return sorted(paths)
+    days = day_files(data_dir, symbol, first_day, last_day)
+    warmups = [warmup_path(data_dir, symbol, interval) for interval in _WARMUP_INTERVALS]
+    return sorted(days + warmups)
 
 
 def _read_warmup(path: Path, interval: str) -> Bars:

@@ -13,19 +13,21 @@ without a word. It runs Mode A on 15m candles and the comparator, the current SH
 5m. It writes ``mode_A_BTC-USDT_train_<YYYYMMDD>.json``, dated by the WIB day of ``now``, one trade
 log per run and, last, the lock (see ``lock``).
 
-``test_stage`` works in this order: read the configuration and the lock; hash the training files,
-reading nothing else; refuse unless the lock matches them, the configuration, the code and the
-Python version, unless the test has not started yet (no run marker in this data folder and no
-start record next to the lock) and unless every day and warm-up file it will read is a regular
-file; claim the start record and then the run marker; and only then read the days from
-``latihan_mulai`` to the day before ``ujian_selesai``, so every series is warm when the test
-starts. Before the claims only names and file types are looked at (a ``stat`` each): what is
-inside the test days is ``verify-copy``'s check, run right before the test, and a day that fails
-to read after the claims ends the run with the test used up. It runs Mode A on the locked
-timeframe and the comparator over the test stage and writes
-``mode_A_BTC-USDT_test_<YYYYMMDD>.json``, a trade log per run and a Markdown report: the table of
-spec section 2.9 (the Latihan rows from the lock) and the status line, LOLOS, GAGAL or BELUM
-CUKUP SAMPEL.
+``test_stage`` works in this order: read the configuration and the lock; hash the training files
+(both warm-ups among them), reading nothing else; refuse unless the lock matches them, the
+configuration, the code and the Python version, unless the test has not started yet (no run
+marker in this data folder and no start record next to the lock) and unless every day and warm-up
+file it will read is a regular file; claim the start record and then the run marker; and only
+then read the days from ``latihan_mulai`` to the day before ``ujian_selesai``, so every series is
+warm when the test starts. Of the test days only names and file types are looked at before the
+claims (a ``stat`` each): what is inside them is ``verify-copy``'s check, run right before the
+test, and a day that fails to read after the claims ends the run with the test used up. After the
+claims the test hashes what it is about to load, and its result and report record two manifest
+sha256s, one of every file it loads and one of the test days alone, so a later run can show that
+it read the same bytes. It runs Mode A on the locked timeframe and the comparator over the test
+stage and writes ``mode_A_BTC-USDT_test_<YYYYMMDD>.json``, a trade log per run and a Markdown
+report: the table of spec section 2.9 (the Latihan rows from the lock), the status line, LOLOS,
+GAGAL or BELUM CUKUP SAMPEL, and the lock, the marker and the two manifests.
 
 Every run of a stage trades only in NAIK and shares the stage's NAIK days (``naik_days`` with the
 weekly window and ``uji.hari_naik_minimal_jam_naik``). ``stage_metrics`` is called in one place,
@@ -54,7 +56,7 @@ from research.pine_gate.fileio import write_exclusive, write_json_exclusive
 from research.pine_gate.spec import WIB, ms
 
 from . import lock
-from .data import load_pair, manifest, manifest_sha256, stage_files
+from .data import day_files, load_pair, manifest, manifest_sha256, stage_files
 from .frames import PairFrames, build_pair_frames
 from .metrics import StageMetrics, pass_status, stage_metrics, wants_5m
 from .report import ReportRow, mode_table
@@ -462,6 +464,35 @@ def _locked_rows(doc: Mapping[str, Any], path: Path, mode: str, pair: str,
                 ReportRow(COMPARATOR_LABEL, pair, LATIHAN, comparator))
 
 
+@dataclass(frozen=True)
+class _ReadData:
+    """What the test stage reads, as the result file records it: the manifest sha256 of every
+    file it loads (the days from ``latihan_mulai`` to the day before ``ujian_selesai`` and both
+    warm-ups) and of the test-period days alone, each with its number of files."""
+
+    loaded_files: int
+    loaded_manifest_sha256: str
+    test_day_files: int
+    test_days_manifest_sha256: str
+
+    def note(self) -> str:
+        """The sentence of the report that names both manifests."""
+        return (
+            f"Data yang dibaca ujian: {self.loaded_files} berkas (hari latihan, hari ujian dan "
+            f"kedua warm-up), manifest sha256 `{self.loaded_manifest_sha256}`; hari ujian saja: "
+            f"{self.test_day_files} berkas, manifest sha256 `{self.test_days_manifest_sha256}`."
+        )
+
+
+def _read_data(data_dir: PathLike, pair: str, uji: TestConfig) -> _ReadData:
+    """Hash the files the test loads. It reads every test day, so it runs after the claims."""
+    training, period = _training(uji), _testing(uji)
+    loaded = manifest(data_dir, stage_files(data_dir, pair, training.first_day, period.last_day))
+    test_days = manifest(data_dir, day_files(data_dir, pair, period.first_day, period.last_day))
+    return _ReadData(len(loaded), manifest_sha256(loaded), len(test_days),
+                     manifest_sha256(test_days))
+
+
 def _refuse_unusable_days(data_dir: PathLike, pair: str, uji: TestConfig) -> None:
     """Every day and warm-up file the test reads must be a regular file. Only names and file
     types are checked, one ``stat`` each, so nothing is read; a wrong file content is found by
@@ -530,13 +561,13 @@ def _test_report(mode: str, cfg: ModesConfig, tf: str, rows: Sequence[ReportRow]
 
 
 def _test_doc(mode: str, pair: str, cfg: ModesConfig, tf: str, runs: Sequence[_Run],
-              naik: Sequence[date], bound: _Bindings, outputs: _Outputs,
+              naik: Sequence[date], bound: _Bindings, read: _ReadData, outputs: _Outputs,
               lock_ref: Mapping[str, str], now: datetime) -> Dict[str, Any]:
     uji, report = cfg.uji, outputs.result.with_suffix(".md")
     status = pass_status(runs[0].metrics, uji)
     return {
         "stage": TEST, "mode": mode, "pair": pair, "tf": tf, "created_at": now.isoformat(),
-        **lock_ref, **asdict(bound), "bounds": _testing(uji).record(),
+        **lock_ref, **asdict(bound), **asdict(read), "bounds": _testing(uji).record(),
         "naik_days": [day.isoformat() for day in naik], "hari_naik": len(naik),
         "drop_top": uji.lolos_buang_posisi_teratas,
         "pass_rule": {
@@ -584,19 +615,20 @@ def test_stage(
     lock.claim_started(started, {**claim, "data_dir": str(Path(data_dir).resolve())})
     lock.claim_marker(marker, claim)
 
-    # Only now is any day of the test stage read.
+    # Only now is any day of the test stage read: hashed for the record, then loaded.
     training, period = _training(cfg.uji), _testing(cfg.uji)
+    read = _read_data(data_dir, pair, cfg.uji)
     frames = build_pair_frames(load_pair(data_dir, pair, training.first_day, period.last_day), cfg)
     naik = _naik_days(frames, cfg, period)
     runs = (_run(frames, cfg, MODE_A, tf, period, len(naik)),
             _comparator(frames, cfg, period, len(naik)))
-    doc = _test_doc(mode, pair, cfg, tf, runs, naik, bound, outputs, lock_ref, now)
+    doc = _test_doc(mode, pair, cfg, tf, runs, naik, bound, read, outputs, lock_ref, now)
     rows = (*latihan_rows, ReportRow(mode, pair, UJIAN, runs[0].metrics),
             ReportRow(COMPARATOR_LABEL, pair, UJIAN, runs[1].metrics))
     _write_logs(outputs, runs)
     write_json_exclusive(outputs.result, doc, "test result")
     lock_note = (f"Lock `{lock_file.name}` (sha256 `{lock_sha}`), marker "
-                 f"`{lock.MARKER_DIR}/{marker.name}`.")
+                 f"`{lock.MARKER_DIR}/{marker.name}`. {read.note()}")
     write_exclusive(outputs.result.with_suffix(".md"),
                     _test_report(mode, cfg, tf, rows, doc["status_line"], lock_note), "test report")
     return outputs.result

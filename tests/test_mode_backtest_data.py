@@ -14,6 +14,7 @@ from unittest import mock
 from research.mode_backtest import data as backtest_data
 from research.mode_backtest.data import (
     PairData,
+    day_files,
     load_pair,
     manifest,
     manifest_sha256,
@@ -448,6 +449,19 @@ class StageFilesTests(DataDirTestCase):
     def test_the_symbol_must_be_a_venue_pair(self):
         with self.assertRaises(ValueError):
             stage_files(self.root, "../etc", D1, D2)
+
+    def test_day_files_are_the_stage_files_without_the_warmups(self):
+        paths = day_files(self.root, SYMBOL, D1, D3)
+
+        self.assertEqual(paths, [self.day(D1), self.day(D2), self.day(D3)])
+        warmups = [warmup_path(self.root, SYMBOL, interval) for interval in ("1h", "4h")]
+        self.assertEqual(stage_files(self.root, SYMBOL, D1, D3), sorted(paths + warmups))
+        self.assertEqual(day_files(str(self.root), SYMBOL, D2, D2), [self.day(D2)])
+        self.assertFalse(self.root.exists())  # only names: nothing is read or made
+        for first, last, symbol in ((D2, D1, SYMBOL), (D1, D2, "../etc")):
+            with self.subTest(first=first, last=last, symbol=symbol):
+                with self.assertRaises(ValueError):
+                    day_files(self.root, symbol, first, last)
 
 
 class ManifestTests(DataDirTestCase):

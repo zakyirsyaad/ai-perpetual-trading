@@ -69,6 +69,14 @@ def read_log(path):
         return list(csv.reader(handle))
 
 
+def flip_gzip_mtime(path):
+    """Change one byte of a gzip file in place: the modification time in its header, which no
+    reader checks. The bytes differ and the bars inside do not."""
+    raw = bytearray(path.read_bytes())
+    raw[4] ^= 0x01
+    path.write_bytes(bytes(raw))
+
+
 class FileReads:
     """Every path opened through ``gzip.open`` or read through ``Path.read_bytes`` while active.
 
@@ -553,6 +561,42 @@ class TestStageTests(StageCase):
         self.assertEqual(record["lock_sha256"], lock_sha)
         self.assertEqual(record["data_dir"], str(self.data.resolve()))
         self.assertEqual(record["created_at"], CLOCK.isoformat())
+
+    def test_the_verdict_records_the_manifests_of_the_data_it_read(self):
+        recorded = {}
+        for changed in (False, True):
+            with self.subTest(one_byte_of_a_test_day_changed=changed):
+                self.setUp()  # a fresh root each time: the test runs once per out-dir
+                self.train()
+                day = self.day_file(TEST_DAYS[1])
+                written = day.read_bytes()
+                if changed:  # after train, so the lock still matches; the bars stay the same
+                    flip_gzip_mtime(day)
+                    self.assertNotEqual(day.read_bytes(), written)
+                warmups = [self.data / "prod" / SYMBOL / interval / "warmup.csv.gz"
+                           for interval in ("1h", "4h")]
+                test_days = [self.day_file(d) for d in TEST_DAYS]
+                loaded = [self.day_file(d) for d in TRAIN_DAYS] + test_days + warmups
+
+                path = self.run_test_stage()
+
+                doc = read_json(path)
+                expected = {
+                    "loaded_files": 7,
+                    "loaded_manifest_sha256": manifest_sha256(manifest(self.data, loaded)),
+                    "test_day_files": 2,
+                    "test_days_manifest_sha256": manifest_sha256(manifest(self.data, test_days)),
+                }
+                self.assertEqual({key: doc.get(key) for key in expected}, expected)
+                report = path.with_suffix(".md").read_text(encoding="utf-8")
+                for key in ("loaded_manifest_sha256", "test_days_manifest_sha256"):
+                    self.assertIn(f"`{doc[key]}`", report)
+                recorded[changed] = doc
+        for key in ("loaded_manifest_sha256", "test_days_manifest_sha256"):
+            self.assertNotEqual(recorded[False][key], recorded[True][key], key)
+        self.assertEqual(recorded[False]["train_manifest_sha256"],
+                         recorded[True]["train_manifest_sha256"])
+        self.assertEqual(recorded[False]["runs"], recorded[True]["runs"])  # same bars, same runs
 
     def test_a_test_that_failed_after_its_claim_refuses_a_rerun_on_a_fresh_data_copy(self):
         self.train()
