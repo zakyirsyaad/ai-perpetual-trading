@@ -452,3 +452,71 @@ Verification (these numbers supersede the Verification numbers above):
 - Mutation check (scratch, not committed): 56 bugs, the 46 of the first round plus 10 for the minimum, all caught: the minimum ignored (the reported bug), `>` for `>=`, needing one more hour, comparing it with the number of days or with the hours of the whole range, counting hours outside the window toward it (while requiring one inside), the check removed, 1 refused, 0 accepted, a default of 1.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1769 tests in 153.990s` / OK (1,761 + 8 new), exit 0. The time is the machine's, which had a load average of 18 from other applications; the earlier quiet run took 37 s.
 - `compileall -q src tests` OK; `git diff --check` clean; `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the two changed Python files.
+
+## Task 6 — Step 0
+
+`src/research/mode_backtest/step0.py`, `report.py` (the step-0 table), `cli.py` and `__main__.py` start here; the bot never imports them. Step 0 is the manager's first request: the Pine Phase 1 holdout of 16 October, split by side and by the new selector's condition, with no new test. The Pine test stage must never run again (its run marker forbids it), so step 0 never calls it and never touches a marker. `replay_main_runs(data_dir, pine_dir)` rebuilds the stage's inputs with public names of `research.pine_gate`, assembled as the stage's `_context` assembled them (`holdout_context`): `load_dataset(data_dir, None)`, `holdout_markets`, `HoldoutPeriod.spec()`, `load_calibration_file`, seed 0, `days`, `last20_days`, `purge_tick_minutes(calib, exec_cfg)` and the spec `ExecConfig()`, `GuardConfig()`, `GateConfig()` (`SPEC_CONFIGS`, the same objects `check_inputs` compares). It then runs `h.run(c.signal)` for every contender of `build_contenders`. `run_step0` compares `symbol_metrics` of the replay with the holdout file, and only when every value matches does it label each trade (`pilih_mode` at its signal time, on `HourlyFrame`s from `load_pair` over 2025-08-01 to 2026-10-13), split the trades (`split_rows`) and write `step0_<YYYYMMDD>.json` and `.md`.
+
+Choices the brief left open:
+
+- **`check_inputs` checks more than the brief's three inputs.** Besides the selection file's sha256, `configs.exec/guard/gate` against `asdict` of the defaults and `data_sha256`, it checks the seed (0), the period (`HoldoutPeriod.spec().to_dict()`) and the calibration file: s*, stop count and latency count against the holdout file's `calibration` record, and the latency sample against the selection's `latencies_sha256`, the chain the test stage's `check_calibration` used. All are inputs of the `Holdout`; without these checks a wrong calibration file would surface only after the replay (minutes on the real data), as a list of metric differences. Every problem is listed in one `ReproductionError`. The check runs inside `replay_main_runs`, after `load_dataset` (it needs `data_sha256`) and before any run.
+- **Values are compared as JSON text** (`json.dumps(sort_keys=True)`): floats are compared bit for bit (JSON keeps every bit, through `repr`), an int never equals a float (`2 != 2.0`), `null` never equals `0`, and NaN never equals a stored number. Every key `symbol_metrics` returns is compared; the stored file's other keys (robustness, source, verdict, ...) are not. A key, symbol or contender on one side only is a difference, and so is comparing nothing at all (`[]` from two empty sides never passes). Lines read `c1 BTC-USDT wr: 48.1 != 48.2` (replay first).
+- **`ReproductionError(message, problems)`** keeps every difference; the CLI prints each on stdout and then the one `error:` line on stderr, so the operator sees all of them while stderr keeps exactly one line.
+- **The label days are derived, not typed:** `LABEL_FIRST_DAY = wib_day(ms(TRAIN_START))`, `LABEL_LAST_DAY = wib_day(ms(HOLDOUT_END) - 1)`, the day files the Pine load read; a test pins them to 2025-08-01 and 2026-10-13. `condition_lookup(pairs, selector)` refuses a time outside a pair's 1m bars (`[first open, last open + 1 min)`), because past the data the last closed candle is stale and the label would be wrong without a word; it also refuses an unknown symbol, a pair without bars and a pair given twice. `label_lookup(data_dir, selector)` loads both pairs over the label days and calls it.
+- **`split_rows` keeps only groups with trades**, ordered by contender (the mapping's order), symbol (BTC first), side (LONG first) and condition (NAIK, TURUN, SIDEWAYS, TIDAK_ENTRY). Menang is Pine's `stats.win_rate` (100 × TP / (TP + SL), `None` when TP + SL = 0), gross is `stats.mean_gross_bps`, so step 0 reads the trades as the 16 October report did. The notional is keyword-only, defaults to the spec `ExecConfig().notional_usdt` (no literal 25,000), and `run_step0` passes the replay's `h.exec_cfg.notional_usdt`. An unknown symbol, side or condition and a notional that is not positive and finite raise `ValueError` naming the value.
+- **`run_step0` refuses before the replay whenever it can:** a naive clock, an existing output (either file), a missing Pine file (`FileNotFoundError` naming every missing one), a config that does not load, a holdout file that is not a JSON object. A failed second write removes the first file, as Pine's `write_report` does, so a run leaves both files or neither; the JSON is rendered (`fileio.json_text`, NaN refused) before anything is written. After the reproduction check the `Holdout` is dropped before the labels load, so the Pine frames and the label pairs are not in memory together.
+- **Provenance in the JSON:** sha256 of the three Pine files, `data_sha256` (the one `check_inputs` accepted), the config's sha256, the current `lock.code_sha256()` beside the holdout file's `code_sha256`, the Python version, the period, the label days, `asdict(exec_cfg)`, the reproduction summary (contenders, symbols, the 15 compared fields, 0 differences) and the rows.
+- **The Markdown** is Indonesian with the decimal comma and a dot between thousands (ruling 4: `48,1%`, `-3,25`, `-1.450`; a value that rounds to zero has no sign; missing is `–`). It names the holdout file, the period and the seed, and carries the spec §8 caveat with the numbers taken from `exec_cfg` (TP 0,20% dan SL 0,20%, 60 menit, tick clock with AI latency, the Pine guards, not the new modes' exits). `format_number` and `format_percent` are public in `report.py` for Task 13.
+- **CLI:** every option is required (no default directories), `~` is expanded, exit codes 0 / 1 (one `error:` line, `cli_common.one_line`) / 2 (argparse), `MODE_BACKTEST_DEBUG=1` prints the traceback first, an unexpected exception is not turned into an error line. `verify-copy` prints every problem and fails with `error: N problems: ...`, or prints `0 problems: every file matches the VPS listing`.
+
+Test design: the real data is outside the repository, so the replay and step 0 run on a synthetic Pine data directory (23 random-walk days at the end of the holdout, both symbols, 1,000 1h and 500 4h warm-up bars, funding every 8 h), loaded once with `start_day`. The tests patch `step0.load_dataset` to return it and `step0.load_pair` to read its days, and both patches record what they were asked for, so the tests also check `load_dataset(data_dir, None)` and the label range 2025-08-01 to 2026-10-13. The reference trades are simulated directly with `simulate_holdout` and explicit spec settings and seed 0, not through the code under test: 742 trades (c1 258, c2 330, c3 154), on both sides and in all four conditions, and some days reach the 1M volume guard, so the guard config matters. The replay must equal them trade for trade, and `run_step0` must pass the reproduction check against a holdout document built from them. The brief's six tests are there (`test_identical_metrics_have_no_mismatch`, `test_one_changed_field_is_reported_and_stops_step0` with `replay_main_runs` patched and no file in `out_dir`, `test_split_rows_groups_by_side_and_condition`, `test_check_inputs_refuses_a_different_selection_file`, `test_cli_unknown_command_exits_2`, `test_cli_missing_pine_file_exits_1_with_one_error_line`), plus a perturbation of each of the 15 `symbol_metrics` fields one at a time, the type and NaN cases, the one-sided contender and symbol cases, each input check, the replay's `Holdout` fields, the refusals before the replay, WIB file dating (18:30 UTC is the next WIB day, 16:59 UTC is not), the rollback, the label guard, the table formatting and the CLI paths, including one `python -m research.mode_backtest` subprocess.
+
+RED, before the four modules existed, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_step0 tests.test_mode_backtest_cli -v` (interpreter path shortened):
+
+```text
+test_mode_backtest_step0 (unittest.loader._FailedTest) ... ERROR
+test_mode_backtest_cli (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_step0 (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_step0
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_step0.py", line 28, in <module>
+    from research.mode_backtest import report, step0
+ImportError: cannot import name 'report' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+
+======================================================================
+ERROR: test_mode_backtest_cli (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_cli
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_cli.py", line 14, in <module>
+    from research.mode_backtest import cli, step0
+ImportError: cannot import name 'cli' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+FAILED (errors=2)
+```
+
+This is the expected failure (the brief's step 2: an import failure). The first GREEN run had 3 errors, all in the test: `ConditionLookupTests` kept the lookup function as a class attribute, which Python bound as a method (`kondisi_at() takes 2 positional arguments but 3 were given`); wrapped in `staticmethod`.
+
+GREEN, the same command after the mutation-check additions: `Ran 74 tests in 5.737s` / OK (59 step-0 tests, 15 CLI tests).
+
+Verification:
+
+- Focused: `tests.test_mode_backtest_step0 tests.test_mode_backtest_cli tests.test_mode_backtest_structure` `Ran 86 tests` / OK on Python 3.10.20 (`.venv`); the structure tests (no private import, no network or venue word, writes only through `fileio`) cover the four new modules. Python 3.11 was not run (the compiled `pydantic_core` of `.venv` does not load there).
+- Line and branch coverage (scratch rcfile): `step0.py` 100 % (243 statements, 76 branches), `report.py` 100 % (31, 6), `cli.py` 100 % (65, 8). `__main__.py` runs only in the subprocess test, which coverage does not follow.
+- Mutation check (scratch copy of the tree, not committed): 51 bugs planted one at a time, all caught. Examples: seed 1, purge one minute short, `last20_days` as `days`, ETH before BTC, guards off, `load_dataset` cut at the holdout end, the input check after the runs, c3 replayed on its primary rule, each input check removed, `==` instead of the JSON form, the last metrics key skipped, a contender only in the file ignored, "nothing compared" passing, the reproduction stop removed, labels at the entry time, one leg per trade, time exits counted as losses, LONG and SHORT or the conditions reordered, the label days moved by one, the label guard removed or made inclusive, files dated in UTC, no rollback, no early output refusal, a naive clock accepted, a hard-coded notional, the Pine files checked after the config, each `split_rows` guard removed, the selector's slow SMA at 40, differences not printed by the CLI, `ReproductionError` not mapped to exit 1, `verify-copy` passing with problems, usage errors as 1, no decimal comma, a signed zero, Menang with two decimals, a hard-coded bracket. The first pass had two survivors, both test gaps: the conditions' order was never checked within one side (SIDEWAYS moved first went unnoticed), and an unknown condition still raised `ValueError` from `tuple.index` without the explicit guard (the same held for the symbol guard). A test now orders all four conditions in one group, and the guard tests match the message naming the value.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1843 tests in 42.389s` / OK (1,769 + 74 new).
+- `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the six new Python files.
+
+Not verified here: the real replay. It needs the copied VPS data and Pine files and runs in Task 7. A note for that run: the holdout file's `code_sha256` (`e915262…`, in the 16 October report) is the `lock.code_sha256` of commit `7d013bf` (2026-10-16 04:49 WIB), checked by hashing each commit's tree the way `lock.code_files` does. Since then the fingerprinted files changed only outside the replay path: `bars.py` (the day validation now shared with check-data; the same `Bars` for valid days), `features.py` (the check-data agreement helper; `FeatureFrame.build` untouched), `cli_data.py` (check-data) and `pine_indicators.py` (new `sma`, `stdev`, `rolling_median`). So the current code is expected to reproduce. The current `code_sha256` differs anyway, by design: it covers every file under `src/research`, `mode_backtest` included.
