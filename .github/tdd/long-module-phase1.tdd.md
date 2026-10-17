@@ -739,3 +739,88 @@ Notes for later tasks:
 - **Task 12** reads `triggers[tf]` (Mode A) and `stretch_bars` with `stretch` (Mode D) for the candles whose close, `open_ms[i] + interval_ms`, falls in the stage, takes `ema[i]` and `stretch[i]` at that close, and feeds every candle to the tracker, those whose EMA is still `None` included.
 - **Task 14**: the code fingerprint of the mode backtest must follow `frames.py` into `bot/strategy/modes/near_mean.py` and from there into `bot/strategy/indicators.py` and `bot/arena/setup_profile.py` (the Pine fingerprint already holds the last two). `tests/test_pine_gate_structure.py` does not scan `near_mean.py`: it walks `research/pine_gate` only.
 - `tests/test_mode_backtest_frames.py` is now 1,026 lines (680 before); the brief puts the new tests there. If it keeps growing, the three Task 9 classes (`TriggerSeriesTests`, `StretchSeriesTests`, `PairFramesTests`, with `WavyCase` and `wavy`) move to a module of their own.
+
+## Task 10 — Position rules
+
+`bot.strategy.modes.position_rules` holds the price arithmetic and the entry gates that every mode shares, as small functions of numbers:
+
+- `LONG = 1`, `SHORT = -1`, `Bracket(tp, sl)` and `bracket_prices(entry_fill, side, tp_pct, sl_pct)`: `tp = entry x (1 + side x tp/100)` and `sl = entry x (1 - side x sl/100)`, set from the entry fill (D6).
+- `adverse_fill(price, side, slippage_pct, closing)`: `price x (1 + against x s/100)`, with `against = side` for an opening fill and `-side` for a closing one. A LONG pays up on the way in and gives up on the way out; a SHORT the other way round.
+- `entry_window_open(window, t_ms)`: `bot.core.entry_window.window_is_open` on the WIB datetime of `t_ms`; `None` is always open.
+- `pause_over(t_ms, last_exit_ms, pause_min)`: `last_exit_ms is None or t_ms >= last_exit_ms + pause_min x 60,000`.
+- `under_daily_caps(pair_today, total_today, max_pair, max_total)`: `pair_today < max_pair and total_today < max_total`, the counts being the entries already opened that WIB day.
+- `volatility_ok(atr14_1h, atr_median, mult)`: False when either is `None`, else `atr14_1h <= mult x atr_median`.
+
+`research.mode_backtest.frames` no longer converts to WIB by itself (the controller's ruling carried from Task 5): `HourlyFrame.naik_days` asks `entry_window_open(window, close_ms)`, and `_wib_moment`, `_EPOCH` and the imports only they needed (`window_is_open`, `datetime`, `timedelta`, `timezone`, `WIB`) are gone, so one WIB conversion remains. `tests/test_mode_backtest_frames.py` is unchanged (58 tests, green before and after). This is a behaviour-preserving refactor, so those tests are its safety net and it has no RED of its own; the mutation check below shows they would notice a broken delegation.
+
+Choices the brief left open, or changed:
+
+- **A fixed UTC+7, not `ZoneInfo`.** The brief says to convert with `datetime.fromtimestamp(t_ms / 1000, ZoneInfo("Asia/Jakarta"))`. The controller ruled for a fixed `timezone(timedelta(hours=7))`: Asia/Jakarta has been UTC+7 since 1964, the config pins `zona_waktu` to it, the research side (`wib_day`, and `_wib_moment` here) already read WIB as a fixed offset, and it needs no tzdata. The conversion is exact integer arithmetic (`epoch + timedelta(milliseconds=t_ms)`, as `_wib_moment` did) and not the float of `t_ms / 1000`. The module keeps its own `_WIB` because the rule core never imports `research` (`config.py` keeps a private one too).
+- **`side` is the integer `LONG` (+1) or `SHORT` (-1)**, which is what the brief's formulas multiply by (and Task 11's `side x qty x (exit - entry)`). Anything else raises `ValueError`, a bool included.
+- **What raises and what answers False.** The two price functions cannot say "no", so a `side` that is not 1 or -1, a `closing` that is not a bool, and a price or percent that is not a finite number above 0 (a slippage of 0 is allowed; `None`, text and an int too large for a float count as not finite) raise `ValueError`: each would otherwise put a level on the wrong side of the entry, or a fill in the position's favour, without a word. The gates refuse instead. `volatility_ok` is False for `None` and for NaN, because it is written as `atr <= mult x median` and a comparison with NaN is False (the negative form `not atr > limit` lets NaN through; a test holds that). `HourlyContext.atr_median` is `None` until 720 hourly values exist, so the design's "also skip while fewer than 720 values exist" needs no code of its own.
+- **The caps count entries already opened.** `under_daily_caps(5, 9, 6, 10)` is True (the 6th entry on the pair and the 10th in total are allowed); `(6, 9, 6, 10)` and `(5, 10, 6, 10)` are False.
+- **The pause is closed on the left.** An entry exactly 15 minutes after the exit is allowed, one millisecond earlier is not, and a signal at the exit itself or before it is inside the pause (with a pause of 0 minutes the exit instant is over). A pair that has not exited yet is never paused.
+- **The window is read to the minute**, as the live `window_is_open` does, with its end excluded: Monday 06:59:59.999 is closed, 07:00:00.000 is open, Friday 23:59:59.999 is open and Saturday 00:00:00.000 is closed.
+- **Plain functions, not an `EntryGate` class.** The design's module table sketches `bracket(...)` and `EntryGate.allows(...)`; the plan's Task 10 fixes the plain functions above, and Task 12's event loop composes the gates in the order of section 9.1.
+- `bot/strategy/modes/__init__.py`: one sentence about `position_rules` in the package docstring.
+
+Test design: 50 tests in ten classes, the brief's six under their names. Every expected number is written in the test from the rules of the document and never computed with the code under test; a time is built from a WIB wall-clock reading by integer arithmetic on the epoch. The others pin:
+
+- the bracket against numbers worked out by hand (LONG from 100 at 0.40 / 0.25 gives 100.4 and 99.75; SHORT at 0.20 / 0.20 gives 99.8 and 100.2), the two percents not swapped (SHORT at 0.40 / 0.25 gives 99.6 and 100.25), the levels as a ratio of the fill at three prices, and the SHORT as the mirror of the LONG around the entry;
+- the fills against a real price (63,250.5, whose basis point is 6.32505), the direction (no fill ever moves in favour of the position, for either side and either order), zero slippage as the identity, the slippage as a percent, and `closing` given by position;
+- the weekly window against an oracle that uses no `datetime`: the minute of the week taken from the epoch alone (1970-01-01 was a Thursday). Every minute of two weeks is compared, the second week running across New Year, at the first and the last millisecond of each minute (40,320 checks, 6,780 open minutes a week). The four edges are held to the millisecond. WIB and not UTC is shown through UTC instants (Monday 00:00 UTC is open, Sunday 23:59 UTC is closed, Friday 17:00 UTC is Saturday 00:00 WIB and closed), and a second window shows the argument is the one applied;
+- the pause at the exact boundary, a millisecond before it, at and before the exit, with no exit, in minutes (a 30-minute pause), and with a pause of 0;
+- the caps as a table, each cap against its own count (7 of 6 on the pair with 3 in total is refused, 3 and 7 is allowed), other caps, and the arguments by name;
+- the volatility guard at the limit (2.0 against a median of 1.0 passes), at the next float above it (`math.nextafter`, which fails) and below it, with `None`, NaN and infinity, and with another multiplier;
+- the refusals above, and the module boundary: an AST scan of `position_rules.py` finds no import that reaches `research` or `pine_indicators` and finds `bot.core.entry_window.window_is_open`; the same detector is run on a synthetic source with every form of import, so the scan cannot pass by looking at nothing.
+
+RED: the brief's step 2, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_position_rules -v` (paths shortened). The expected import failure:
+
+```text
+test_modes_position_rules (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_modes_position_rules (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_modes_position_rules
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_modes_position_rules.py", line 19, in <module>
+    from bot.strategy.modes import position_rules
+ImportError: cannot import name 'position_rules' from 'bot.strategy.modes' (<repo>/src/bot/strategy/modes/__init__.py)
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+GREEN, first run with `position_rules.py` written: 49 of 50 pass. The one failure was in my own test helper, not in the module: the import detector built `..pine_indicators` for `from . import pine_indicators`, and its synthetic-source test, written for exactly that, caught it (`AssertionError: Lists differ: ['..pine_indicators', ...] != ['.pine_indicators', ...]`). The helper joins the prefix correctly now, and the second run is the result: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_position_rules -v` `Ran 50 tests in 0.039s` / OK.
+
+Then the refactor of `frames.py`: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames` `Ran 58 tests` / OK, with the file unchanged.
+
+RED, 2: the self-review of the module found a gap between its docstring and its code. A price, percent or slippage that is `None`, text or an int too large for a float reached `math.isfinite` and raised `TypeError` or `OverflowError`, where the module promises `ValueError` (and the neighbouring `PullbackTracker` makes a non-number a `ValueError` too). The four refusal tests were extended with `None`, a string and `10**400` (their subtest headers use a short label, since `10**400` has 401 digits), and `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_position_rules` gave `Ran 50 tests` / `FAILED (errors=12)`, three kinds of error four times each:
+
+```text
+TypeError: must be real number, not NoneType
+TypeError: must be real number, not str
+OverflowError: int too large to convert to float
+```
+
+GREEN, 2: `_is_finite` catches both errors and the two validators use it. `Ran 50 tests` / OK.
+
+Verification:
+
+- Focused: `tests.test_modes_position_rules tests.test_mode_backtest_frames` `Ran 108 tests` / OK, and with `tests.test_mode_backtest_structure`, `tests.test_pine_gate_structure` and `tests.test_entry_window` `Ran 145 tests` / OK, on Python 3.10.20 (`.venv`) and on 3.11.15, the Python of CI (3.11 from a local environment that has the dependencies, because the venv's compiled `pydantic_core` is a 3.10 build).
+- Line and branch coverage (scratch rcfile): `position_rules.py` 100 % (55 statements, 10 branches, 0 missed) and `frames.py` 100 % (117 statements, 24 branches, 0 missed). The whole repository on the project's settings (line coverage, `omit` and `fail_under = 80` copied into a scratch rcfile, because the 3.10 `coverage` cannot read `pyproject.toml`): 90 %, 0 below the gate.
+- Mutation check (scratch copy of `src`, `tests` and `config`, not committed): 77 bugs planted one at a time, 71 in `position_rules.py` against the new tests and 6 in the `naik_days` delegation of `frames.py` against the unchanged frames tests. All 77 are caught on the first pass, each by failing assertions and none by a broken import (7 to 26 failing tests for the frames ones). By area: `bracket_prices` and `Bracket` (15: either sign flipped, the two percents swapped, a percent not divided or divided by 1,000, an additive level, the side missing from a level, each check removed, the fields swapped, not frozen), `adverse_fill` (11: the closing flag inverted, or ignored in either direction, the percent not divided or divided by 10,000, the sign flipped, an additive fill, each check removed), `_is_finite` (4: a non-number or an oversized int not caught, an error counted as finite, infinity counted as finite), the validators and `LONG` / `SHORT` (10: zero accepted as a price or percent, zero refused as a slippage, infinity or a negative slippage accepted, a bool or a zero accepted as a side, SHORT refused, the constants changed), the zone and the window (9: UTC, +8, +6, -7, the window ignored or negated, the end of the minute, a millisecond early, the epoch a day late), `pause_over` (7), `under_daily_caps` (6), `volatility_ok` (9: the limit exclusive, the multiplier fixed or added, reversed or swapped operands, NaN passing, a missing value passing, only one of the two checked, both needed) and the `naik_days` call (6: the result inverted, the close minus a millisecond, the opening time instead of the close, the window ignored, the gate skipped, always closed).
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1957 tests in 57.197s` / OK (1,907 + 50 new), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean; `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the four changed Python files; `tests.test_secret_hygiene` OK with this document tracked.
+
+Notes for later tasks:
+
+- **Task 11** calls `adverse_fill(price, side, slippage_pct, closing)` with `side` as `LONG` / `SHORT` and `closing` a real bool, and `bracket_prices` takes the *fill*, so the entry is `adverse_fill(open, side, s, False)` first and the bracket after it (D6).
+- **Task 12** composes the gates in the order of section 9.1: `entry_window_open(window, t_ms)`, the segment edge, the condition, the open position, `pause_over(t_ms, last_exit_ms[pair], jeda_menit)`, `under_daily_caps(pair_entries, total_entries, maks_pair, maks_total)` with the counts of the WIB day of `t` (`wib_day`), then `volatility_ok(ctx.atr14_1h, ctx.atr_median, mult)`.
+- **Task 14**: the code fingerprint of the mode backtest must also follow `frames.py` into `bot/strategy/modes/position_rules.py` and from there into `bot/core/entry_window.py`.

@@ -24,26 +24,24 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from types import MappingProxyType
 from typing import FrozenSet, List, Mapping, Optional, Tuple
 
-from bot.core.entry_window import WeeklyWindow, window_is_open
+from bot.core.entry_window import WeeklyWindow
 from bot.strategy.modes.config import ModesConfig, SelectorConfig
 from bot.strategy.modes.near_mean import stretch_from_window
+from bot.strategy.modes.position_rules import entry_window_open
 from bot.strategy.modes.regime import NAIK, pilih_mode
 from bot.strategy.pine_indicators import atr, ema, rolling_median, sma
 from research.pine_gate.bars import Bars, aggregate, interval_to_ms, last_closed_index, wib_day
 from research.pine_gate.features import INTERVAL_1H, INTERVAL_1M, INTERVAL_3M, INTERVAL_4H, htf_bars
-from research.pine_gate.spec import WIB
 
 from .data import PairData
 
 ATR_PERIOD_1H = 14  # the document's ATR14 (1h)
 ATR_MEDIAN_HOURS = 720  # 30 days of closed hours, from the manager's document
 TRIGGER_TIMEFRAMES = ("15m", "5m")  # Mode A's trigger candles; 5m is the pre-registered switch
-
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 Column = Tuple[Optional[float], ...]
 
@@ -70,14 +68,6 @@ class HourlyContext:
 def _at(column: Column, index: int) -> Optional[float]:
     """``column[index]``, or ``None`` when no candle has closed yet (index -1 is not the last)."""
     return column[index] if index >= 0 else None
-
-
-def _wib_moment(t_ms: int) -> datetime:
-    """The WIB wall-clock datetime of a UTC millisecond timestamp, as the weekly window reads it.
-
-    Exact integer arithmetic. WIB is the fixed +07:00 of ``research.pine_gate.spec``:
-    Asia/Jakarta has no daylight saving time, so it is the same zone."""
-    return (_EPOCH + timedelta(milliseconds=t_ms)).astimezone(WIB)
 
 
 class HourlyFrame:
@@ -182,7 +172,7 @@ class HourlyFrame:
         naik_hours = Counter()
         for i in range(first, last):
             close_ms = opens[i] + INTERVAL_1H
-            if not window_is_open(window, _wib_moment(close_ms)):
+            if not entry_window_open(window, close_ms):
                 continue
             if self.context_at(close_ms).kondisi == NAIK:
                 naik_hours[wib_day(close_ms)] += 1
