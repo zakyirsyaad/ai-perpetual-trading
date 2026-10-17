@@ -32,9 +32,12 @@ class FakeClient:
         self.fail_books: set[str] = set()
         self.fail_klines = False
         self.hang = False
+        self.book_gate: asyncio.Event | None = None
 
     async def get_order_book(self, symbol: str, depth: int = 20) -> SimpleNamespace:
         self.book_calls.append(symbol)
+        if self.book_gate is not None:
+            await self.book_gate.wait()
         if self.hang:
             await asyncio.sleep(10)
         if symbol in self.fail_books:
@@ -250,6 +253,27 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
             await task
 
         self.assertGreaterEqual(len(client.book_calls), 2 * len(SYMBOLS))
+
+    async def test_cancelling_run_is_never_swallowed_even_if_the_call_finishes_in_the_same_tick(self) -> None:
+        # asyncio.wait_for (3.11 and earlier) returns the finished call and drops the
+        # cancellation here, so a stopped poller kept polling forever and hung the suite.
+        client = FakeClient()
+        client.book_gate = asyncio.Event()
+        # A long interval parks a poller that swallowed the cancel in sleep(), so the
+        # cleanup cancel below always lands and the test fails instead of hanging.
+        poller, _, _, _ = make(client, interval_seconds=60)
+
+        task = asyncio.create_task(poller.run())
+        try:
+            await asyncio.sleep(0.01)  # run() is now parked inside the first book call
+            client.book_gate.set()
+            task.cancel()
+            await asyncio.wait({task}, timeout=1.0)
+
+            self.assertTrue(task.cancelled(), "run() swallowed the cancellation and kept polling")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":
