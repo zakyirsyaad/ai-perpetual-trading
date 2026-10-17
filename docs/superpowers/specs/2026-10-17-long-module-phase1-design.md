@@ -1,6 +1,6 @@
 # LONG module, Phase 1 — offline backtest of step 0 and Mode A on BTC — design
 
-Date: 2026-10-17 · Status: approved design, awaiting spec review · Source: the manager's document
+Date: 2026-10-17 · Status: approved (2026-10-17) · Source: the manager's document
 "Modul LONG — Spesifikasi & Rencana Uji" (2026-10-17, 11 pages, PDF held by the user) · Related:
 `docs/research/2026-10-16-laporan-perkembangan-bot.pdf` (the report the document answers),
 `docs/superpowers/specs/2026-10-14-pine-adapted-gate-design.md` (Pine Phase 1, whose data, split and
@@ -391,6 +391,12 @@ every `bot` and `research` module the package imports; files are written only th
    with an error; nothing is adjusted. If the current code cannot reproduce the run, the frozen
    Phase 1 code (`~/replay/pine_gate_repo/src.phase1-20261016-212600`) is used instead, and the
    report says so.
+   *Note (2026-10-18):* that fallback cannot work as worded. `src/research` is a regular package
+   (it has an `__init__.py`), so with the frozen `src` and the current one both on `PYTHONPATH`
+   the first one supplies the whole `research` package: the frozen copy either shadows the current
+   code (and has no `research.mode_backtest`, so step 0 cannot start) or is shadowed by it and
+   never runs. It was not needed: step 0 reproduced the holdout file exactly (0 differences) with
+   the current code (Task 7 in `.github/tdd/long-module-phase1.tdd.md`).
 4. Label every trade with its side and with `pilih_mode` evaluated on the same production bars at
    its signal time (D1–D3).
 5. Report per contender × symbol × side × condition: positions, Menang, mean gross bps and Hasil per

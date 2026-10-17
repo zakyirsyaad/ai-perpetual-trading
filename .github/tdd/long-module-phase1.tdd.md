@@ -1291,9 +1291,9 @@ Notes for later tasks:
 
 - **Task 15**: document `train`/`test` in CLAUDE.md, with the lock and the start record in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them). Done in Task 15.
 - **Task 16**:
-  - Run `verify-copy` right before `test`. Before its claims, `test` checks only names and file types: every day and warm-up file must be a regular file, one `stat` each, nothing read. Content integrity comes from `verify-copy` alone. A test day that is a regular file but fails to read after the claims (the start record and the marker) ends the run with the one shot used up, whatever data folder a rerun names.
+  - Run `verify-copy` right before `test`. Before its claims, `test` re-hashes every training day and both warm-ups against the lock's training manifest, but of the test-period days it checks only names and file types: each must be a regular file, one `stat` each, nothing read. Their content integrity comes from `verify-copy` alone. A test day that is a regular file but fails to read after the claims (the start record and the marker) ends the run with the one shot used up, whatever data folder a rerun names. (Wording made exact in the final review fix wave; since then the result also records what the run read, see that section.)
   - Keep the checkout unchanged between `train` and `test`: any change to the 61 fingerprinted files (12 package modules, 6 rule-core modules, 43 in `CODE_EXTRA`), the YAML, the training files or the Python minor version makes `test` exit 2. While neither the start record nor a marker exists, the lock may be deleted and `train` re-run.
-  - Use one `--out-dir` and one `--data-dir` for `train` and `test`, and never reuse the out-dir of a rehearsal. The start record `mode_A_BTC-USDT_test_started.json` sits next to the lock in `--out-dir` and refuses both `test` and `train` whatever `--data-dir` a rerun names. The marker sits in `<data_dir>/holdout_runs/` and refuses them for that data folder only. So a rehearsal run into the out-dir of the real run would leave a lock and a start record that refuse the real one. A lock copied to another out-dir together with a fresh data copy would still bypass both records; that is deliberate circumvention, which the guard does not try to stop (it covers the natural ways to run `test` twice).
+  - Use one `--out-dir` and one `--data-dir` for `train` and `test`, and never reuse the out-dir of a rehearsal. The start record `mode_A_BTC-USDT_test_started.json` sits next to the lock in `--out-dir` and refuses both `test` and `train` whatever `--data-dir` a rerun names. The marker sits in `<data_dir>/holdout_runs/` and refuses them for that data folder only. So a rehearsal run into the out-dir of the real run would leave a lock and a start record that refuse the real one. A rehearsal must never point at the real data dir either: a rehearsal `train` or `test` against `~/replay/mode_backtest/data` reads the real data, its `test` reads the real holdout days, and it leaves a marker in `data/holdout_runs/` that refuses the real run. Rehearse only on synthetic data, such as the week `tests/mode_backtest_stages.py` builds. A lock copied to another out-dir together with a fresh data copy would still bypass both records; that is deliberate circumvention, which the guard does not try to stop (it covers the natural ways to run `test` twice).
   - The start record is claimed first and the marker second. If the marker claim fails (an I/O error on the data folder, for instance), the start record stays behind and still refuses `test` and `train`. This fails closed. Delete it by hand only if no test-period day was read; none is read before both claims have succeeded.
 
 ### Fix round 1 (task review)
@@ -1413,10 +1413,175 @@ OK
 - **`uv pip check` stands in for `pip check`**, because `.venv` was built by `uv` and has no `pip`.
 - **Not run here.** The full suite on Python 3.11, the version of CI (the compiled `pydantic_core` in `.venv` is a 3.10 build); earlier tasks ran their focused tests on 3.11.15 in a scratch environment. The dashboard is untouched, so there was no `bunx tsc --noEmit`.
 - **The commands added to CLAUDE.md** that cannot spend the one shot were run as written. `verify-copy` on the Mac's data copy printed `0 problems: every file matches the VPS listing` (exit 0). `unittest discover -s tests -p 'test_mode*.py'` ran 673 tests, OK. `test --help` shows the new `--out-dir` text. `step0` is done (Task 7), and `train` and `test` wait for Task 16.
+- The numbers after the final review fix wave are in that section, below.
+
+## Final review fix wave
+
+The final whole-branch review found one Important issue, three test gaps and five documentation gaps. One wave fixes all nine. `stages.py` and `data.py` are fingerprinted into the lock, and changing them is fine now because no lock exists yet: `train` and `test` run after the merge (Task 16). The tests and the documents are not fingerprinted. Nothing here ran `train`, `test` or `step0` on the real data in `~/replay/mode_backtest`; every stage run below used synthetic data in a temporary folder.
+
+### Important 1: the verdict records the test-period data it read
+
+- **Problem.** `test` bound the training manifest and recorded it, but recorded nothing about the ~70 test days it reads after the claims. Their integrity rested on a `verify-copy` whose output exists only in the terminal. The Pine holdout records `data_sha256` (`research/pine_gate/holdout.py`), and that is what made its later reproduction checkable.
+- **Fix.** After both claims, `test_stage` first hashes what it is about to load (`stages._read_data`), then loads it. The result JSON gets four new fields, and the `.md` names both sha256s after the lock and the marker:
+  - `loaded_files` and `loaded_manifest_sha256`: `manifest_sha256(manifest(data_dir, stage_files(data_dir, pair, latihan_mulai, ujian_selesai - 1 day)))`, so every file the run loads (training days, test days and both warm-ups);
+  - `test_day_files` and `test_days_manifest_sha256`: the same over the test-period day files alone, `latihan_selesai` to `ujian_selesai - 1 day`. These come from the new `data.day_files` (the day files of a range without the warm-ups), which `stage_files` now builds on.
+- **The ordering guarantee is unchanged.** The hashing reads a test day only after both claims. `test_marker_is_written_before_any_test_day_is_read` stays green: every read of a test day, through `gzip.open` or `Path.read_bytes` (the hashing uses the latter), happens with both records in place.
+- **Tests.**
+  - `test_the_verdict_records_the_manifests_of_the_data_it_read` runs `train` and `test` twice, on fresh roots. Each time, the four fields equal manifests the test computes from the synthetic files it names itself (7 loaded files, 2 test days), and both sha256s appear in the report.
+  - The second time, one byte of a test day is changed after `train`: the mtime in the gzip header, which no reader checks, so the bars stay the same and the test still runs. Both recorded sha256s change, while the training manifest and every run record stay the same.
+  - `test_day_files_are_the_stage_files_without_the_warmups` covers `day_files`.
+
+RED, against the code of `72e12e9` (paths shortened):
+
+```text
+ERROR: test_the_verdict_records_the_manifests_of_the_data_it_read (tests.test_mode_backtest_lock.TestStageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_lock.py", line 595, in test_the_verdict_records_the_manifests_of_the_data_it_read
+    self.assertNotEqual(recorded[False][key], recorded[True][key], key)
+KeyError: False
+
+======================================================================
+FAIL: test_the_verdict_records_the_manifests_of_the_data_it_read (tests.test_mode_backtest_lock.TestStageTests) (one_byte_of_a_test_day_changed=False)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_lock.py", line 589, in test_the_verdict_records_the_manifests_of_the_data_it_read
+    self.assertEqual({key: doc.get(key) for key in expected}, expected)
+AssertionError: {'loaded_files': None, 'loaded_manifest_sha256': None, 'te[50 chars]None} != {'loaded_files': 7, 'loaded_manifest_sha256': '1399bf48174[168 chars]179'}
+[... the same failure for one_byte_of_a_test_day_changed=True ...]
+----------------------------------------------------------------------
+Ran 1 test in 0.590s
+
+FAILED (failures=2, errors=1)
+```
+
+```text
+ERROR: test_mode_backtest_data (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_data
+[...]
+ImportError: cannot import name 'day_files' from 'research.mode_backtest.data' (<repo>/src/research/mode_backtest/data.py)
+```
+
+GREEN: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock tests.test_mode_backtest_data tests.test_mode_backtest_cli tests.test_mode_backtest_structure`: `Ran 145 tests` / OK (142 before item 4 added three structure tests). On the synthetic week the report ends with `Data yang dibaca ujian: 7 berkas (hari latihan, hari ujian dan kedua warm-up), manifest sha256 `1399bf48…`; hari ujian saja: 2 berkas, manifest sha256 `9906f331…`.`
+
+### Items 2 and 3: Mode A's close and its touch, pinned
+
+Item 2 (`pullback.py:129-130`). The rule reads the close for the colour, for the EMA and for the cap; `high` only completes the candle. Every candle in the tests had `high = max(open, close)`, so a green candle's high was its close, and replacing `candle.close` with `candle.high` anywhere on those two lines passed every test. The new tests use candles that carry their own high:
+
+- `test_the_close_and_not_the_high_must_clear_the_ema`:
+  - (a) after an open touch, a green candle with `open < close < EMA < high` gives no signal, and the touch is still open for the next close above the EMA;
+  - (c) the same candle as its own touch gives no signal, and the next candle confirms it;
+  - a red candle whose high is above its open gives no signal after a touch. I added this case because a colour test reading `high > open` also passed every old test.
+- `test_the_distance_cap_holds_the_close_and_not_the_high`: (b) a green close exactly on the cap, with a high 10 ATR above it, still signals.
+
+Item 3 (D4 on the touch side, `pullback.py:123`). `test_a_touch_is_judged_on_the_ema_passed_with_its_own_candle` has no earlier touch open: candle 0 stays above an EMA of 100.
+
+- Rising EMA (101): a candle whose low (100.5) lies between the previous and the current EMA, green and closing at 101.5 above the current EMA, signals.
+- Falling EMA (98): a low of 99, above the current EMA but below the previous one, is no touch and gives no signal. The same candle does confirm a touch that is open, so only the touch was missing.
+
+RED: each bug below was planted in a copy of `src` in a scratch folder. The HEAD version of `tests/test_modes_pullback.py` and the new one were then run against each copy:
+
+| Planted bug | HEAD tests | New tests |
+|---|---|---|
+| M1: confirmation on `candle.high > ema` | OK (survives) | FAIL `test_the_close_and_not_the_high_must_clear_the_ema` |
+| M2: the cap on `candle.high` | OK (survives) | FAIL `test_the_distance_cap_holds_the_close_and_not_the_high` |
+| M3: green as `candle.high > candle.open` | OK (survives) | FAIL `test_the_close_and_not_the_high_must_clear_the_ema` |
+| M4: touch on the previous candle's EMA | 8 FAIL, all `DifferentialTests` | those 8 and `test_a_touch_is_judged_on_the_ema_passed_with_its_own_candle` (rising half) |
+| M5: touch on the larger of the two EMAs | 8 FAIL, all `DifferentialTests` | those 8 and the new test (falling half) |
+| M6: touch on the smaller of the two EMAs | 8 FAIL, all `DifferentialTests` | those 8 and the new test (rising half) |
+
+So at HEAD the touch side was guarded only by the random walk of the differential test. The new example test catches all three touch bugs on its own, and it needs both halves: M5 fails only the falling one. The M1 failure:
+
+```text
+FAIL: test_the_close_and_not_the_high_must_clear_the_ema (__main__.RuleTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<scratch>/test_pullback_new.py", line 127, in test_the_close_and_not_the_high_must_clear_the_ema
+    self.assertIsNone(tracker.on_candle(wick_above(1), EMA, SMA, ATR))
+AssertionError: PullbackSignal(close_ms=1800000) is not None
+```
+
+GREEN: `tests.test_modes_pullback`: `Ran 34 tests` / OK.
+
+### Item 4: no live module imports the rule core
+
+`RuleCoreIsolationTests` in `tests/test_mode_backtest_structure.py` is modelled on `test_pine_gate_structure.py::test_no_live_module_imports_pine_indicators`, aimed at `bot.strategy.modes`:
+
+- `test_no_live_module_imports_the_rule_core` scans every source under `src` outside `research/` and `bot/strategy/modes/`, `main.py` and more than 20 bot modules among them.
+  - Imports are resolved with the file's own module name (the walk's `imported_names`), so relative imports count, and so do dynamic imports with a constant name. A dynamic import whose name is not a constant counts as an offender.
+  - It also checks the guard on a real file: `research/mode_backtest/stages.py` imports `bot.strategy.modes.config`, and neither it nor any module of the core is in the scan.
+- Self-tests on synthetic sources, so the guard cannot pass by looking at nothing:
+  - `test_the_rule_core_guard_sees_every_form_of_import` covers 11 forms: `import`, `import … as`, `from bot.strategy import modes`, `from bot.strategy.modes.x import name`, `from . import modes`, `from .modes import`, `from ..strategy.modes…`, an import inside a function, `importlib.import_module`, `__import__` and `import_module(name)`;
+  - `test_the_rule_core_guard_lets_other_modules_through` passes a top-level `modes`, `bot.strategy.indicators`, `pine_indicators`, `.modes_extra`, `from bot import strategy` and a dynamic import of `bot.strategy.indicators`.
+
+RED: each import below was planted in its own full copy of `src`, `tests` and `config` in a scratch folder. The HEAD structure tests (`tests/test_mode_backtest_structure.py` at HEAD and `tests/test_pine_gate_structure.py`) and the new guard were then run against each copy:
+
+| Planted import | HEAD structure tests | New guard |
+|---|---|---|
+| S1: `from bot.strategy.modes.config import load_modes_config` in `main.py` | OK | FAIL |
+| S2: `from . import modes` in `bot/strategy/__init__.py` | OK | FAIL |
+| S3: `from ..strategy.modes.pullback import PullbackTracker` in `bot/risk/risk_manager.py` | OK | FAIL |
+| S4: `importlib.import_module('bot.strategy.modes.regime')` in `bot/risk/risk_manager.py` | OK | FAIL |
+
+```text
+FAIL: test_no_live_module_imports_the_rule_core (tests.test_mode_backtest_structure.RuleCoreIsolationTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<scratch>/iso/S1_main_absolute/tests/test_mode_backtest_structure.py", line 554, in test_no_live_module_imports_the_rule_core
+    self.assertEqual(offenders, [])
+AssertionError: Lists differ: ['main.py: bot.strategy.modes.config', 'ma[47 chars]fig'] != []
+```
+
+GREEN: `tests.test_mode_backtest_structure`: `Ran 21 tests` / OK.
+
+### Items 5 to 9: documentation
+
+- **5, rehearsals.** CLAUDE.md (the "`test` runs once" bullet) and the Task 16 notes in Task 14 now say a rehearsal must never point at the real data dir. A rehearsal against `~/replay/mode_backtest/data` reads the real data, and its `test` reads the real holdout days and leaves a marker that refuses the real run. Rehearse only on synthetic data, such as the week `tests/mode_backtest_stages.py` builds.
+- **6, what `test` reads before the claims.** CLAUDE.md now says that `test` re-hashes every training day and both warm-ups against the lock's manifest, and only `stat`s the test-period days (`is_file()`). The Task 16 note in Task 14 and the `stages.py` docstring say the same. CLAUDE.md also names the two manifests the result now records.
+- **7, `.claude/launch.json`.** CLAUDE.md no longer claims a tracked file: a local, untracked `.claude/launch.json` can define the `dashboard` preview for the Claude desktop app.
+- **8, the spec.** Its status is now "approved (2026-10-17)". Section 8, step 3 has a note: the frozen-code `PYTHONPATH` fallback cannot work as worded, because `src/research` is a regular package and a frozen `src` either shadows or is shadowed. It was not needed, since step 0 reproduced exactly with the current code (Task 7).
+- **9, Task 16 operator notes** in the deployment gate: `verify-copy` immediately before `test`; the Python 3.10 `.venv` for both stages; no pull or merge of `main` between them; no rehearsal against the real data dir; and the CLAUDE.md status sentence to replace with the outcome after the run.
+- CLAUDE.md and the deployment gate no longer say the rule core's isolation is "checked by grep, no test pins it".
+
+### Verification (final review fix wave)
+
+Run on 2026-10-18 on `40de062` (the code and tests of this wave) with the documents of this commit. Python 3.10.20 (`.venv`), `PYTHONPATH=src`. `<scratch>` is a folder outside the repository.
+
+```text
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests
+(no output; exit 0)
+
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2269 tests in 52.647s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<scratch>/coveragerc -m unittest discover -s tests
+Ran 2269 tests in 134.575s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<scratch>/coveragerc
+TOTAL                                         14909   1387    91%
+(exit 0; the gate is 80 %)
+
+git diff --check
+(no output; exit 0)
+```
+
+- **Full suite.** 2,269 tests, the 2,261 of Task 14 plus 8 new ones: 1 in `test_mode_backtest_lock`, 1 in `test_mode_backtest_data`, 3 in `test_modes_pullback` and 3 in `test_mode_backtest_structure`. `unittest discover -s tests -p 'test_mode*.py'`: 681 tests, OK.
+- **Coverage.** The rcfile is a scratch file with the project's own `[tool.coverage]` settings, as in Task 15, because the 3.10 `coverage` cannot read `pyproject.toml`. The total went from 14,893 statements and 1,387 missed to 14,909 and 1,387: the 16 new statements are all covered.
+  - New code (`bot/strategy/modes/` and `research/mode_backtest/`): 1,823 statements, 1 missed (the import line of `__main__.py`, which only the subprocess test runs), so 99.95 %.
+  - `stages.py`, `data.py`, `lock.py` and `pullback.py`: 100 % line and branch coverage under the focused modules.
+- **Python 3.11.15** (the scratch environment of the earlier tasks, CI's version): the six focused modules (`test_mode_backtest_lock`, `_data`, `_cli`, `_structure`, `test_modes_pullback`, `test_pine_gate_structure`), `Ran 192 tests` / OK.
+- `ruff check --select F,E,W,B --line-length 100` is clean on the six changed Python files. `uv pip check`: 17 packages, all compatible. `tests.test_secret_hygiene` OK with this document tracked.
+- **End to end** through `python -m research.mode_backtest` on the synthetic week in a temporary folder, never the real data: `train` exit 0; `test` exit 0, with `loaded_files` 7, `test_day_files` 2 and both sha256s in the result and in the `.md`; a second `test` exit 2 ("already ran").
+- The fingerprint still covers 61 files: this wave changed two of them (`stages.py`, `data.py`) and added none.
 
 ## Commit trail
 
-`git log --oneline --reverse 772cd16..HEAD`: 26 commits, and this one. Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
+`git log --oneline --reverse 772cd16..HEAD`: 30 commits, and this one (Task 15's `72e12e9` and the final review fix wave are the last five). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
 
 - `40569bd` — `test: pin telemetry cancellation against swallowed wait_for` (main, PR #37)
 - `d3da0c5` — `fix: telemetry waits never swallow a cancellation` (main, PR #37)
@@ -1444,13 +1609,23 @@ OK
 - `44d910c` — `feat: metrics, pass rule, trade log and the mode table` (Task 13)
 - `488ab42` — `feat: lock and one-shot train/test stages for the mode backtest` (Task 14)
 - `e5d220d` — `fix: claim a start record next to the lock and refuse non-file test days` (Task 14, fix round 1)
-- this commit — `docs: LONG module phase 1 in CLAUDE.md and TDD evidence` (Task 15)
+- `72e12e9` — `docs: LONG module phase 1 in CLAUDE.md and TDD evidence` (Task 15)
+- `1ba29da` — `fix: record the test-period data manifests in the one-shot result` (final review fix wave, Important 1)
+- `a9e2967` — `test: pin the close-above-EMA clause and the touch side of Mode A` (final review fix wave, items 2 and 3)
+- `40de062` — `test: pin that no live module imports the rule core` (final review fix wave, item 4)
+- this commit — `docs: final review fixes for the LONG module phase 1 docs` (final review fix wave, items 5 to 9 and this evidence)
 
 ## Deployment gate
 
 Nothing is deployed. The live bot, `.env`, pm2 (`ai-perp-volume`) and the VPS are untouched, and Phase 1 is an offline experiment.
 
-- Against main the branch adds `config/modes.yaml`, `src/bot/strategy/modes/` and `src/research/mode_backtest/`, three functions in `src/bot/strategy/pine_indicators.py` and PyYAML in `requirements.txt` and `pyproject.toml`; the rest is tests and documentation. Only `research.mode_backtest` imports the rule core (checked by grep; no test pins it). No live module imports `pine_indicators` (`test_pine_gate_structure` enforces that). PyYAML is imported only by `bot/strategy/modes/config.py`, so the live environment needs nothing new.
+- Against main the branch adds `config/modes.yaml`, `src/bot/strategy/modes/` and `src/research/mode_backtest/`, three functions in `src/bot/strategy/pine_indicators.py` and PyYAML in `requirements.txt` and `pyproject.toml`; the rest is tests and documentation. Only `research.mode_backtest` imports the rule core (`tests/test_mode_backtest_structure.py` enforces that since the final review fix wave). No live module imports `pine_indicators` (`test_pine_gate_structure` enforces that). PyYAML is imported only by `bot/strategy/modes/config.py`, so the live environment needs nothing new.
 - The package makes no network call and writes files only through `research.pine_gate.fileio`; `tests/test_mode_backtest_structure.py` bans the network and venue words and every other way of writing a file.
-- Still to do, in Task 16 and only after the merge and the user's go-ahead: `train`, then `verify-copy` right before the one-shot `test`. The operator notes are in Task 14 ("Notes for later tasks"): one `--out-dir` and one `--data-dir` for both stages, no rehearsal in the out-dir of the real run, no change to the checkout between the stages, and what to do with a start record left behind.
+- Still to do, in Task 16 and only after the merge and the user's go-ahead: `train`, then `verify-copy`, then the one-shot `test`. Task 16 operator notes (the reasons are in Task 14, "Notes for later tasks"):
+  - Run `verify-copy` immediately before `test`, with nothing in between. Before its claims `test` re-hashes the training days and both warm-ups against the lock, but of the test-period days it checks only that each is a regular file.
+  - Stay on the Python 3.10 `.venv` for both `train` and `test`. The lock binds major.minor, so a `test` on 3.11 (CI's version, or a scratch 3.11 environment) exits 2 against a lock that 3.10 wrote.
+  - Do not pull or merge `main` between `train` and `test`. The 61 fingerprinted files include `bot/arena/*`, `bot/models.py`, `bot/core/entry_window.py` and `bot/strategy/indicators.py`, live-bot modules that main can change at any time, so any change there makes `test` exit 2. The YAML, the training files and the Python minor version are bound as well.
+  - Use one `--out-dir` and one `--data-dir` for both stages. Never rehearse in the out-dir of the real run, and never point a rehearsal at the real data dir (`~/replay/mode_backtest/data`): its `test` would read the real test-period days and leave a marker that refuses the real run. Rehearse on synthetic data only, such as the week `tests/mode_backtest_stages.py` builds.
+  - A start record left behind by a failed marker claim: see Task 14.
+  - After the run, replace the sentence "As of 2026-10-18 Mode A's `train` and `test` have not run." in CLAUDE.md's `research.mode_backtest` entry with the outcome: the status line, the result file, and the lock, marker and data-manifest sha256s the result records.
 - Anything beyond Phase 1 (the other modes, ETH, wiring a mode into the bot) needs its own spec and a fresh decision from the user.
