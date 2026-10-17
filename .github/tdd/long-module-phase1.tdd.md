@@ -131,3 +131,68 @@ The fix, all in `config.py`:
 - `_show` replaces `repr` and `str` in `_describe`, `_join` and the "at least N" message, so naming a value or a key can never raise.
 
 GREEN: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_config` gives `Ran 61 tests` / `OK` (Python 3.10.20 and 3.11.15). Six tests are new and two existing ones gained cases. These numbers supersede the counts above: line coverage of `bot/strategy/modes/` 100 % (267 statements); 66 planted bugs, all caught; full suite `Ran 1649 tests` / `OK`; a fuzz of 25,034 hostile documents through `parse_modes_config` raised nothing but `ModesConfigError`. A message for an unquoted impossible date carries the file name and PyYAML's text (`month must be in 1..12`) but no key path, because PyYAML's constructor error carries no position.
+
+## Task 3 — Mode selector
+
+`bot.strategy.modes.regime` holds the manager's `pilih_mode` (spec §2.2) as a pure function of the five numbers and the band multiple. It keeps the document's order and operators: SIDEWAYS first and strict (`gap < sideways_jarak_kali_atr * atr14_1h`), then NAIK (`sma20_1h > sma50_1h and close_4h > ema50_4h`), then TURUN (`sma20_1h < sma50_1h`, with no 4h filter, on purpose), else TIDAK_ENTRY. The one addition is the guard the brief asks for: a `None` in any of the five numeric inputs returns TIDAK_ENTRY before anything is computed. The spec's literal `0.2` is the `sideways_jarak_kali_atr` parameter, which is `pemilih_mode.sideways_jarak_kali_atr: 0.2` in `config/modes.yaml`. The module imports only `typing`, and no live module imports it.
+
+Choices the brief left open: the guard is an explicit `or` chain of `is None` tests, so a `0.0` is a value and not a missing input; only the five inputs are guarded, and `sideways_jarak_kali_atr` is a configured float that is not checked. A NaN (not `None`) is not guarded. A NaN ATR makes `gap < ...` False and lets NAIK or TURUN decide, while a NaN SMA falls through to TIDAK_ENTRY (probed: `pilih_mode(101.0, 100.0, nan, 3.0, 2.0, 0.2)` returns NAIK). The brief limits the guard to `None` and the module to `typing`, so the producer (Task 5) must keep NaN out of these inputs.
+
+RED, before any implementation, with `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_regime -v` (paths shortened). The test file already held the brief's five tests and the precedence test described below:
+
+```text
+test_modes_regime (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_modes_regime (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_modes_regime
+Traceback (most recent call last):
+  File ".../unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File ".../tests/test_modes_regime.py", line 5, in <module>
+    from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN, pilih_mode
+ModuleNotFoundError: No module named 'bot.strategy.modes.regime'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+exit code: 1
+```
+
+GREEN: after `regime.py` was written, the same file ran six tests and passed. A band test was added afterwards, and the final focused run is:
+
+```text
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_regime -v
+test_any_missing_input_is_tidak_entry ... ok
+test_gap_equal_to_the_band_is_not_sideways ... ok
+test_naik_needs_the_4h_close_above_its_ema ... ok
+test_sideways_is_checked_before_both_trends ... ok
+test_sideways_when_gap_is_below_the_band ... ok
+test_the_band_is_the_given_multiple_of_atr ... ok
+test_turun_ignores_the_4h_filter ... ok
+
+Ran 7 tests in 0.000s
+
+OK
+```
+
+The five brief tests keep their exact numbers. The `None` test runs the five inputs through `subTest`, and first checks that its base case is a NAIK case, so the `None` is the only cause of the result. Two tests go beyond the brief's list. The precedence test was written from the brief's own comment ("checked before the trend"). The band test was added after GREEN, because every brief test passes `0.2`. The mutation check below then showed that the brief's five alone let three plausible bugs through, and that these two catch them:
+
+- `test_sideways_is_checked_before_both_trends`: the brief's `test_sideways_when_gap_is_below_the_band` has `close_4h` under its EMA, so NAIK does not hold there and the test cannot tell the order apart. This one has NAIK and TURUN each holding on one of its inputs.
+- `test_the_band_is_the_given_multiple_of_atr`: every brief test passes `0.2`, and an ATR of 1.0 or 5.0 cannot show the scaling.
+
+Mutation check (scratch copies of `regime.py`, not committed): 14 planted bugs, each run against the seven-test file and against the brief's five tests alone.
+
+- Caught by both sets (10): no `None` guard (the five `subTest`s error), guard returns SIDEWAYS, guard misses ATR, band with `<=`, NAIK without the 4h filter, NAIK with `>=` on the 4h close, NAIK with the SMA direction reversed, TURUN with the 4h filter, TURUN with `>`, gap without `abs`.
+- Caught only by the two added tests (3): SIDEWAYS checked after NAIK, band hard-coded at `0.2`, band ignoring ATR.
+- Caught by neither (1): a truthiness guard (`not x`) in place of `is None`. It reads a `0.0` input as missing and returns TIDAK_ENTRY, which fails closed. No test pins it.
+
+Verification:
+
+- Focused: `Ran 7 tests` / OK on Python 3.10.20 (`.venv`).
+- Line coverage of `bot/strategy/modes/regime.py`: 100 % (16 statements, 0 missed), measured with a scratch rcfile because coverage cannot read `pyproject.toml` on 3.10 without `tomli`, as in Task 2.
+- Full suite, `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1656 tests in 35.176s` / OK (1,649 existing plus 7 new), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add).
