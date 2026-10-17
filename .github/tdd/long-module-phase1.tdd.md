@@ -629,3 +629,113 @@ Verification:
 - Focused: `Ran 31 tests` / OK on Python 3.10.20 (`.venv`), and also on 3.11.15 and 3.12.13 (the module and its tests use the standard library only). Line and branch coverage of `bot/strategy/modes/pullback.py`: 100 % (60 statements, 18 branches, 0 missed), measured with a scratch rcfile because coverage cannot read `pyproject.toml` on 3.10 without `tomli`.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1874 tests in 42.031s` / OK (1,843 + 31 new).
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the two new Python files.
+
+## Task 9 — Trigger series and the Mode D trigger
+
+Two pieces. `bot.strategy.modes.near_mean` is the pure rule: `stretch_from_window(highs, lows, closes, ema_period, atr_period)` returns `build_setup_profile({"last_price": closes[-1], "ema_21": ema(closes, ema_period), "atr_14": atr(highs, lows, closes, atr_period)}, "LONG")["stretch_atr"]` with the live `bot.strategy.indicators`, which is the number the live stretch gate decides on (rounded to four decimals, as the profile rounds it), and `near_mean_short(stretch_atr, max_abs)` is `stretch_atr is not None and abs(stretch_atr) <= max_abs`. `research.mode_backtest.frames` gains the series the event loop of Task 12 walks:
+
+- `TriggerSeries(bars, ema)` and `trigger_series(bars_1m, tf, ema_period)`: the 15m or 5m candles (`aggregate`, UTC-epoch buckets, a bucket with a missing minute dropped) and `pine_indicators.ema` of their closes (mean-seeded, `None` before 8 x period candles, so the first 159 candles at a period of 20: 40 hours at 15m, 13 h 20 min at 5m).
+- `stretch_series(bars_1m, window, ema_period, atr_period) -> (Bars, Column)`: the 3m candles and, for each, `stretch_from_window` over the `window` candles ending with it; `None` for the first `window - 1`. The loop has the shape of the Pine research's stretch column, and a test holds the two equal on every candle of the series. Its first value needs 39 3m bars (1 h 57 min).
+- `PairFrames(symbol, bars_1m, hourly, triggers, stretch_bars, stretch)` and `build_pair_frames(pair, cfg)`: the hourly frame from `cfg.pemilih_mode`, both triggers with `cfg.mode_a.ema_pemicu`, the stretch with `cfg.mode_d.candle_jendela`, `ema_periode` and `atr_periode`.
+
+D2 for these series: the value at index `i` is computed through the close of candle `i`, so it is known at `bars.open_ms[i] + bars.interval_ms` and not before (D4 for the trigger EMA: a candle is compared with the EMA that includes its own close). The docstrings say so, because Task 12 reads them at exactly that time.
+
+Choices the brief left open:
+
+- **`Column`, not `Series`.** The brief types the numbers as `Series`. The module already has `Column = Tuple[Optional[float], ...]`, which `HourlyFrame` stores, so the new fields use it: tuples, not lists. `PairFrames.triggers` is a `MappingProxyType`, as `ModesConfig.pair` is; both classes are frozen.
+- **What is refused.** `trigger_series` takes `"15m"` and `"5m"` only (the config's two values) and 1m bars only; `stretch_series` takes 1m bars. Without the 1m check, 3m bars aggregate to 15m without a word (the same check as `FeatureFrame.build`). `stretch_series` also refuses a window the live maths cannot measure: the live `ema` returns the last close when it has fewer closes than its period (a stretch of 0.0, which is "near the mean" on every candle, so Mode D would short everywhere), and the live `atr` returns 0 with fewer than `period + 1` closes (no stretch at all). So a window under `max(ema_period, atr_period + 1)`, or a period under 1, raises `ValueError`. `stretch_from_window` itself keeps the live behaviour (a test pins both quirks) and refuses only bars that do not match (none, or different lengths: a high list one longer than the closes would be measured on misaligned bars without a word). The standard configuration, 39 / 21 / 14, passes with room.
+- **The side `"LONG"` is a constant that cannot be tested away.** `build_setup_profile` reads the side only for its `setup_key`; the stretch is the same for `LONG`, `SHORT`, an empty side and `None` (checked), so a mutant that passes `"SHORT"` is equivalent. The constant is named and commented, as the Pine research does.
+- **An unmeasured stretch is no signal.** `near_mean_short(None, ...)` is False, as is NaN or infinity (a comparison with NaN is False). The live gate lets an entry with an unreadable setup through; a trigger needs a measured value (D3: a missing input blocks the signal), and the Pine research's `contender2_signal` does the same.
+- **No warm-up for the trigger candles.** They are aggregated from the 1m bars only (the brief), so the first 160 candles of the data have no EMA and Mode A cannot signal on them; Task 12 must still feed those candles to the tracker (Task 8's note).
+- **Both timeframes are always built** (the 5m series costs 0.4 s per pair), so a run can pick 15m or the pre-registered 5m switch without rebuilding.
+- `bot/strategy/modes/__init__.py`: its docstring says the rules "take numbers, never bar arrays"; one sentence now says `near_mean` takes one short window of highs, lows and closes and measures it with the live indicators.
+
+Test design: the price is `wavy`, a sum of sines that moves every minute (written through the Task 4 helpers to day files and loaded with `load_pair`, three WIB days), so the high, low and close of a 3m, 5m or 15m candle all differ and the stretch crosses zero and the +-0.75 band (on the fixture: 1,402 measured values, 488 inside the band and 914 outside, 675 positive and 727 negative). Expected candle closes are computed in the test from the price function (`candle_closes`), never from the frame. The brief's four tests are there under their names, and 29 more pin:
+
+- the stretch against an oracle written in the test from the definitions (the EMA as a weighted sum of the closes, the ATR as the mean of the last 14 true ranges), within the four decimals of the profile, besides the literal equality with the live call sequence;
+- the Pine cross-check at the brief's five times (38 bars closed: none; the 39th just closed; inside the 40th bar; a bar in the middle; the end of the data), and then on every one of the 1,440 candles at the time it closes;
+- look-ahead, in the way the hourly tests do it: the 1m bars from `t` on are scaled by 50, and no value up to the candle that closed at `t` may change, while the next one must; the candle's own last minute scaled must change its value (for the trigger EMA at candle 200 of the 15m series and for the stretch at candle 300 of the 3m series);
+- the EMA at candle `i` against the EMA of the closes `0..i` and not `0..i-1` or `0..i+1` (the price moves every candle, so a shifted series differs), at the first valid candle (159), the next, a middle one and the last;
+- partial candles dropped at either end (1m bars from 00:07 to 02:40 WIB give nine 15m candles), the UTC grid of the open times, 15m and 5m, the EMA period, the window and both periods as arguments, a flat market (all `None`), every refusal above, and the frozen and read-only types and their field order;
+- `build_pair_frames` against the direct calls with the values of `config/modes.yaml`, then with every period changed (selector SMA, trigger EMA, window, both stretch periods) so that none can be a constant, and with a symbol that is not the fixture's.
+
+RED, 1: the brief's step 2, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_near_mean tests.test_mode_backtest_frames -v` (paths shortened). The expected import failure, in both modules:
+
+```text
+test_modes_near_mean (unittest.loader._FailedTest) ... ERROR
+test_mode_backtest_frames (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_modes_near_mean (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_modes_near_mean
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_modes_near_mean.py", line 15, in <module>
+    from bot.strategy.modes.near_mean import near_mean_short, stretch_from_window
+ModuleNotFoundError: No module named 'bot.strategy.modes.near_mean'
+
+
+======================================================================
+ERROR: test_mode_backtest_frames (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_frames
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_frames.py", line 22, in <module>
+    from bot.strategy.modes.near_mean import stretch_from_window
+ModuleNotFoundError: No module named 'bot.strategy.modes.near_mean'
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+FAILED (errors=2)
+```
+
+GREEN for the first module, `near_mean.py` written: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_near_mean -v` `Ran 12 tests in 0.001s` / OK.
+
+RED, 2: with `near_mean.py` in place and `frames.py` unchanged, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames` (excerpt). The 37 existing tests pass; the new ones fail on the missing names, which is the failure that shows they test the new code:
+
+```text
+.....................................EEEEEEEEEEEEEEE
+======================================================================
+ERROR: setUpClass (tests.test_mode_backtest_frames.PairFramesTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_frames.py", line 940, in setUpClass
+    cls.built = frames.build_pair_frames(cls.pair, cls.cfg)
+AttributeError: module 'research.mode_backtest.frames' has no attribute 'build_pair_frames'
+
+======================================================================
+ERROR: test_trigger_ema_is_aligned_to_closed_candles (tests.test_mode_backtest_frames.TriggerSeriesTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repo>/tests/test_mode_backtest_frames.py", line 733, in test_trigger_ema_is_aligned_to_closed_candles
+    ts = frames.trigger_series(self.pair.bars_1m, "15m", TRIGGER_EMA)
+AttributeError: module 'research.mode_backtest.frames' has no attribute 'trigger_series'
+...
+----------------------------------------------------------------------
+Ran 52 tests in 0.661s
+
+FAILED (errors=29)
+```
+
+GREEN, the brief's command after the `frames.py` additions: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_near_mean tests.test_mode_backtest_frames -v` `Ran 69 tests in 1.011s` / OK (12 near-mean tests and 57 frames tests, the brief's four among them). Everything passed at once, so the mutation check came next and found a gap (below); the test added for it makes it 70 tests.
+
+Verification:
+
+- Focused: `tests.test_modes_near_mean tests.test_mode_backtest_frames` `Ran 70 tests` / OK on Python 3.10.20 (`.venv`), and with the structure tests (`tests.test_mode_backtest_structure`, `tests.test_pine_gate_structure`) `Ran 95 tests` / OK on 3.11.15, the Python of CI. The neighbouring modules (`test_mode_backtest_structure`, `test_pine_gate_structure`, `test_mode_backtest_data`, `test_modes_pullback`, `test_modes_regime`, `test_modes_config`) pass: 188 tests.
+- Line and branch coverage (scratch rcfile): `near_mean.py` 100 % (13 statements, 2 branches), `frames.py` 100 % (120 statements, 24 branches), 0 missed.
+- Mutation check (scratch copy of the tree, not committed): 66 bugs planted one at a time, run against the two test modules and the structure tests. First pass 65 caught, 1 survivor: `build_pair_frames` returning a hard-coded `'BTC-USDT'` as the symbol, because the fixture's symbol is `BTC-USDT`; `test_the_symbol_is_the_pairs_own` now builds the frames of an `ETH-USDT` pair, and the mutant fails (66 of 66). By area: `near_mean_short` (7: `<` for `<=`, no `abs` on either side, the `None` check gone or replaced by truthiness, the band hard-coded, NaN passing), `stretch_from_window` (10: the previous close as the price, each period hard-coded, the ATR fed lows and highs swapped, the EMA of the highs, the EMA key fed the last close, each length check and the empty check removed), `trigger_series` (14: 5m dropped from the timeframes, 3m accepted, either check removed, always 15m, the EMA period hard-coded, the EMA one candle late or early, of the highs or the opens, from the first candle, after 4 x period, the dataclass fields swapped, not frozen), `stretch_series` (15: the 1m or the measurable check removed, 5m candles, the first value one bar late or early, a 38- or 40-bar window, the window one bar early or one bar ahead, only the close looking ahead, the periods swapped or hard-coded, the window hard-coded, a list for a tuple), `_require_measurable` (6, each bound off by one), `build_pair_frames` and `PairFrames` (14: each config value hard-coded, Mode D2's EMA period, the selector default, a writable mapping, only 15m, the 1m bars copied, the bars and the stretch swapped, not frozen, the fields reordered).
+- Realistic scale (scratch, 441 synthetic days, 635,040 1m bars, a random walk): `trigger_series` 0.13 s at 15m (42,336 candles) and 0.39 s at 5m (127,008), `stretch_series` 4 to 6 s (211,680 candles), `build_pair_frames` 4.4 s in all, peak RSS 200 MB. The stretch loop is the cost, one `stretch_from_window` per candle; the Pine research pays the same. Two pairs are about 10 s, once per run.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1907 tests in 43.157s` / OK (1,874 + 33 new), exit 0.
+- `compileall -q src tests` OK; `git diff --check` clean; `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` and `ruff format --check --line-length 100` clean on the five changed Python files.
+
+Notes for later tasks:
+
+- **Task 12** reads `triggers[tf]` (Mode A) and `stretch_bars` with `stretch` (Mode D) for the candles whose close, `open_ms[i] + interval_ms`, falls in the stage, takes `ema[i]` and `stretch[i]` at that close, and feeds every candle to the tracker, those whose EMA is still `None` included.
+- **Task 14**: the code fingerprint of the mode backtest must follow `frames.py` into `bot/strategy/modes/near_mean.py` and from there into `bot/strategy/indicators.py` and `bot/arena/setup_profile.py` (the Pine fingerprint already holds the last two). `tests/test_pine_gate_structure.py` does not scan `near_mean.py`: it walks `research/pine_gate` only.
+- `tests/test_mode_backtest_frames.py` is now 1,026 lines (680 before); the brief puts the new tests there. If it keeps growing, the three Task 9 classes (`TriggerSeriesTests`, `StretchSeriesTests`, `PairFramesTests`, with `WavyCase` and `wavy`) move to a module of their own.

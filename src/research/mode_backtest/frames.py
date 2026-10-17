@@ -1,13 +1,17 @@
-"""The hourly frame of the mode selector: the market condition at any time, and NAIK days.
+"""The frames of a pair for the mode backtest: the hourly condition, trigger candles, stretch.
 
 Research code; the bot never imports it. ``HourlyFrame`` joins the native 1h and 4h warm-ups to
 the candles aggregated from the 1m bars, computes the selector's series once at build time and
-answers ``context_at(t)`` by looking them up.
+answers ``context_at(t)`` by looking them up. ``trigger_series`` and ``stretch_series`` give the
+candles the event loop walks, each with its numbers, and ``build_pair_frames`` gathers the three
+for one pair in a ``PairFrames``.
 
 * D1: candles are UTC-epoch buckets, as BingX and TradingView build them, so 4h candles close at
-  03, 07, 11, 15, 19 and 23 WIB.
+  03, 07, 11, 15, 19 and 23 WIB. A bucket missing a minute is dropped.
 * D2: at ``t`` only candles with ``open + interval <= t`` are visible. A 15m candle closing at
   10:00 WIB sees the 1h candle 09:00-10:00 and never the one from 10:00 that is still forming.
+  A value of a trigger series or of the stretch at bar ``i`` is computed through the close of
+  bar ``i``, so it exists from ``open_ms[i] + interval_ms`` and not before.
 * D3: a value that is not computed yet is ``None`` and makes the condition TIDAK_ENTRY.
 
 The bars are validated finite when they are read and the series are plain averages and medians of
@@ -21,20 +25,23 @@ from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import FrozenSet, Optional, Tuple
+from types import MappingProxyType
+from typing import FrozenSet, List, Mapping, Optional, Tuple
 
 from bot.core.entry_window import WeeklyWindow, window_is_open
-from bot.strategy.modes.config import SelectorConfig
+from bot.strategy.modes.config import ModesConfig, SelectorConfig
+from bot.strategy.modes.near_mean import stretch_from_window
 from bot.strategy.modes.regime import NAIK, pilih_mode
 from bot.strategy.pine_indicators import atr, ema, rolling_median, sma
-from research.pine_gate.bars import Bars, last_closed_index, wib_day
-from research.pine_gate.features import INTERVAL_1H, INTERVAL_4H, htf_bars
+from research.pine_gate.bars import Bars, aggregate, interval_to_ms, last_closed_index, wib_day
+from research.pine_gate.features import INTERVAL_1H, INTERVAL_1M, INTERVAL_3M, INTERVAL_4H, htf_bars
 from research.pine_gate.spec import WIB
 
 from .data import PairData
 
 ATR_PERIOD_1H = 14  # the document's ATR14 (1h)
 ATR_MEDIAN_HOURS = 720  # 30 days of closed hours, from the manager's document
+TRIGGER_TIMEFRAMES = ("15m", "5m")  # Mode A's trigger candles; 5m is the pre-registered switch
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -180,3 +187,120 @@ class HourlyFrame:
             if self.context_at(close_ms).kondisi == NAIK:
                 naik_hours[wib_day(close_ms)] += 1
         return frozenset(day for day, hours in naik_hours.items() if hours >= min_naik_hours)
+
+
+def _require_1m(bars: Bars) -> None:
+    """The series below are built from 1m bars; 3m bars would aggregate to 15m without a word."""
+    if bars.interval_ms != INTERVAL_1M:
+        raise ValueError(f"expected 1m bars, got {bars.interval_ms} ms")
+
+
+@dataclass(frozen=True)
+class TriggerSeries:
+    """The closed trigger candles of one timeframe and the EMA through each candle's close.
+
+    ``ema[i]`` belongs to candle ``i`` of ``bars`` and is the EMA of the closes ``0..i``: a candle
+    is compared with the EMA that includes its own close (D4) and nothing later. It is known when
+    the candle closes, ``bars.open_ms[i] + bars.interval_ms``, and is ``None`` until 8 x period
+    candles exist (D3)."""
+
+    bars: Bars
+    ema: Column
+
+
+def trigger_series(bars_1m: Bars, tf: str, ema_period: int) -> TriggerSeries:
+    """The ``tf`` candles (``"15m"`` or ``"5m"``) of the 1m bars and their EMA of ``ema_period``.
+
+    The candles are UTC-epoch buckets and a bucket that misses a minute is dropped (``aggregate``).
+    The EMA is the mean-seeded one of ``pine_indicators``. Any other ``tf``, and bars that are not
+    1m, raise ``ValueError``."""
+    if tf not in TRIGGER_TIMEFRAMES:
+        raise ValueError(
+            f"trigger timeframe must be one of {', '.join(TRIGGER_TIMEFRAMES)}, got {tf!r}"
+        )
+    _require_1m(bars_1m)
+    bars = aggregate(bars_1m, interval_to_ms(tf))
+    return TriggerSeries(bars, tuple(ema(list(bars.close), ema_period)))
+
+
+def _require_measurable(window: int, ema_period: int, atr_period: int) -> None:
+    """The live EMA needs ``ema_period`` closes and the live ATR ``atr_period + 1`` of them.
+
+    With fewer, the EMA is the last close (a stretch of 0.0, near the mean on every candle) or the
+    ATR is 0 (no stretch at all), and the series would look like data."""
+    if ema_period < 1 or atr_period < 1:
+        raise ValueError(f"periods must be at least 1, got EMA {ema_period} and ATR {atr_period}")
+    needed = max(ema_period, atr_period + 1)
+    if window < needed:
+        raise ValueError(
+            f"a window of {window} candles is too short for an EMA of {ema_period} and an ATR of "
+            f"{atr_period}: it needs {needed}"
+        )
+
+
+def stretch_series(
+    bars_1m: Bars, window: int, ema_period: int, atr_period: int
+) -> Tuple[Bars, Column]:
+    """The 3m candles of the 1m bars and the stretch of each, as the live gate measures it.
+
+    The stretch of candle ``i`` is ``near_mean.stretch_from_window`` over the ``window`` candles
+    ending with candle ``i``, so it uses closes up to and including ``i`` and is known when the
+    candle closes. It is ``None`` for the first ``window - 1`` candles and wherever the window has
+    no ATR (a flat market). The loop is the one that builds ``stretch_3m`` in
+    ``research.pine_gate.features``, and a test holds the two equal on every candle. A window the
+    live maths cannot measure (see ``_require_measurable``) raises ``ValueError``."""
+    _require_1m(bars_1m)
+    _require_measurable(window, ema_period, atr_period)
+    bars = aggregate(bars_1m, INTERVAL_3M)
+    highs, lows, closes = list(bars.high), list(bars.low), list(bars.close)
+    out: List[Optional[float]] = []
+    for end in range(1, len(closes) + 1):
+        if end < window:
+            out.append(None)
+            continue
+        start = end - window
+        out.append(
+            stretch_from_window(
+                highs[start:end], lows[start:end], closes[start:end], ema_period, atr_period
+            )
+        )
+    return bars, tuple(out)
+
+
+@dataclass(frozen=True)
+class PairFrames:
+    """Everything the event loop reads for one pair.
+
+    ``hourly`` answers the market condition at any time. ``triggers`` maps ``"15m"`` and ``"5m"``
+    to Mode A's candles with their EMA. ``stretch_bars`` are Mode D's 3m candles and ``stretch``
+    holds the stretch of each, index for index. ``triggers`` is read-only."""
+
+    symbol: str
+    bars_1m: Bars
+    hourly: HourlyFrame
+    triggers: Mapping[str, TriggerSeries]
+    stretch_bars: Bars
+    stretch: Column
+
+
+def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
+    """The frames of one pair under ``cfg``.
+
+    The hourly frame takes the selector's periods (``pemilih_mode``). Both trigger timeframes are
+    built with Mode A's EMA period (``mode_a.ema_pemicu``), so a run can pick 15m or the 5m
+    switch. The stretch takes Mode D's window and periods (``candle_jendela``, ``ema_periode``,
+    ``atr_periode``)."""
+    stretch_bars, stretch = stretch_series(
+        pair.bars_1m, cfg.mode_d.candle_jendela, cfg.mode_d.ema_periode, cfg.mode_d.atr_periode
+    )
+    triggers = {
+        tf: trigger_series(pair.bars_1m, tf, cfg.mode_a.ema_pemicu) for tf in TRIGGER_TIMEFRAMES
+    }
+    return PairFrames(
+        pair.symbol,
+        pair.bars_1m,
+        HourlyFrame.build(pair, cfg.pemilih_mode),
+        MappingProxyType(triggers),
+        stretch_bars,
+        stretch,
+    )
