@@ -342,7 +342,7 @@ Verification (these numbers supersede the Verification numbers above):
 
 ## Task 5 — Hourly frame, condition at a time, NAIK days
 
-`src/research/mode_backtest/frames.py` starts here; the bot never imports it. `HourlyFrame.build(pair, sel)` joins the native 1h and 4h warm-ups to the candles aggregated from the 1m bars (`features.htf_bars`), computes the selector's series once (SMA fast and slow of the 1h closes, ATR14 (1h), the median of the last 720 ATR14 values, the 4h EMA) and keeps them as tuples. `context_at(t_ms)` only looks them up with `last_closed_index`, so at `t` the candles with `open + interval <= t` are visible and nothing else (D2). It returns a frozen `HourlyContext(sma20_1h, sma50_1h, atr14_1h, atr_median, close_4h, ema50_4h, kondisi)`, where `kondisi` is `pilih_mode` of the five selector inputs. `naik_days(start_ms, end_ms, window)` returns the WIB days that have a NAIK hour inside the weekly entry window.
+`src/research/mode_backtest/frames.py` starts here; the bot never imports it. `HourlyFrame.build(pair, sel)` joins the native 1h and 4h warm-ups to the candles aggregated from the 1m bars (`features.htf_bars`), computes the selector's series once (SMA fast and slow of the 1h closes, ATR14 (1h), the median of the last 720 ATR14 values, the 4h EMA) and keeps them as tuples. `context_at(t_ms)` only looks them up with `last_closed_index`, so at `t` the candles with `open + interval <= t` are visible and nothing else (D2). It returns a frozen `HourlyContext(sma20_1h, sma50_1h, atr14_1h, atr_median, close_4h, ema50_4h, kondisi)`, where `kondisi` is `pilih_mode` of the five selector inputs. `naik_days(start_ms, end_ms, window, min_naik_hours)` returns the WIB days that have at least `min_naik_hours` NAIK hours inside the weekly entry window (the first version took no minimum; see Fix round 1).
 
 Choices the brief left open:
 
@@ -419,3 +419,36 @@ Verification:
 - Realistic scale (scratch, 441 synthetic days, 4,344 1h and 1,086 4h warm-up candles, a random walk with all four conditions present): `HourlyFrame.build` 0.78 s; `naik_days` over the 441 days 22 ms; `context_at` 1.9 microseconds a call (211,680 calls in 0.40 s), so the simulation loop of Task 12 will not wait on it.
 - Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1761 tests in 36.967s` / OK (1,731 + 29 frames tests + 1 helper test), exit 0.
 - `compileall -q src tests` OK; `git diff --check` clean (new files marked intent-to-add); `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the five changed Python files (ruff is not configured in the repo; used as a lint only).
+
+### Fix round 1 (task review)
+
+The review found that `uji.hari_naik_minimal_jam_naik` was accepted by the config loader (any whole number of at least 1) and then ignored: `naik_days` fixed "one NAIK hour makes a NAIK day", so a value of 2 would have loaded without an error while "Entry per hari aktif" and the 5m switch kept counting a day with one NAIK hour. The plan gave `naik_days` no place for the number and no task read it. The controller ruled that the function takes it.
+
+- `HourlyFrame.naik_days(start_ms, end_ms, window, min_naik_hours)`. The new parameter has no default, so a caller cannot leave the config value out (callers pass `cfg.uji.hari_naik_minimal_jam_naik`). Which closes count is unchanged (close in `[start, end)`, window open at the close, condition NAIK); they are now counted per WIB day of the close, and a day is kept when it has at least `min_naik_hours` of them. A value below 1 raises `ValueError`. The docstring says all of this.
+- At 1, the value in `config/modes.yaml`, the results are unchanged. Checked against the committed version of the function (scratch script): 180 random ranges over 441 synthetic days, with no window, with `mon 07:00-sat 00:00` and with `tue 00:00-thu 12:00`, give identical sets, and the number of days only falls as the minimum rises (206 days at 1, 199 at 2, 178 at 6 and 0 at 25 for the weekly window), so an ignored key would have moved the count.
+- Tests: the existing `naik_days` tests pass 1. New (`NaikDaysTests`): a day with exactly one NAIK window hour is kept at 1 and dropped at 2; a day with two (not next to each other) is kept at 2 and dropped at 3; an hour before the window opens (Monday 06:00) does not count; hours are counted per WIB day (23:00 and 00:00 are two days although one UTC day; one hour on each of two days is not two); closes outside `[start, end)` do not count; 0 and -1 raise; the parameter has no default; and a real rising week with the weekly window (Monday has 17 window closes, Tuesday to Friday 24) kept or dropped at 17, 18, 24 and 25, and without a window at 24 and 25.
+
+RED, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames tests.test_pine_gate_structure -v` against the three-argument function (excerpt, paths shortened):
+
+```text
+ERROR: test_naik_days_count_only_window_hours (tests.test_mode_backtest_frames.NaikDaysTests) [Monday 07:00 is its first hour]
+  File "<repo>/tests/test_mode_backtest_frames.py", line 496, in week_days
+    return self.week.frame.naik_days(*self.WEEK_RANGE, window, min_naik_hours)
+TypeError: HourlyFrame.naik_days() takes 4 positional arguments but 5 were given
+FAIL: test_the_minimum_has_no_default_so_no_caller_can_leave_it_out (tests.test_mode_backtest_frames.NaikDaysTests)
+AssertionError: TypeError not raised
+
+Ran 50 tests in 1.358s
+FAILED (failures=1, errors=41)
+```
+
+That RED is about the signature. To show that the new tests also catch the reported bug itself, I accepted the parameter and ignored it in a scratch copy (what the review described): 12 failures with the numbers wrong, for example `AssertionError: frozenset({datetime.date(2026, 7, 1)}) != set()` for a day with one NAIK hour at a minimum of 2, and `ValueError not raised` for 0 and -1.
+
+GREEN, the same command after the change: `Ran 50 tests in 1.257s` / OK (37 frames tests, 13 Pine structure tests).
+
+Verification (these numbers supersede the Verification numbers above):
+
+- Focused: 50 tests / OK on Python 3.10.20 (`.venv`). Line and branch coverage of `frames.py`: 100 % (73 statements, 12 branches, 0 missed).
+- Mutation check (scratch, not committed): 56 bugs, the 46 of the first round plus 10 for the minimum, all caught: the minimum ignored (the reported bug), `>` for `>=`, needing one more hour, comparing it with the number of days or with the hours of the whole range, counting hours outside the window toward it (while requiring one inside), the check removed, 1 refused, 0 accepted, a default of 1.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 1769 tests in 153.990s` / OK (1,761 + 8 new), exit 0. The time is the machine's, which had a load average of 18 from other applications; the earlier quiet run took 37 s.
+- `compileall -q src tests` OK; `git diff --check` clean; `tests.test_secret_hygiene` OK with this document tracked; `ruff check --select F,E,W,B --line-length 100` clean on the two changed Python files.

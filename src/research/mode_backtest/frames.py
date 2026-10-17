@@ -18,6 +18,7 @@ guards ``None`` only: a NaN would not stop it.
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import FrozenSet, Optional, Tuple
@@ -145,26 +146,37 @@ class HourlyFrame:
         )
 
     def naik_days(
-        self, start_ms: int, end_ms: int, window: Optional[WeeklyWindow]
+        self,
+        start_ms: int,
+        end_ms: int,
+        window: Optional[WeeklyWindow],
+        min_naik_hours: int,
     ) -> FrozenSet[date]:
-        """The WIB days with an hour in which Mode A could enter: NAIK, inside the entry window.
+        """The WIB days with at least ``min_naik_hours`` hours in which Mode A could enter.
 
-        A closed 1h candle counts when its close lies in ``[start_ms, end_ms)`` (the start is
-        included, the end is not), ``window`` is open at that close (read as a WIB time; ``None``
-        means always open) and ``context_at(close).kondisi`` is NAIK. The day of a candle is the
-        WIB day of its close, so the candle ending at 00:00 WIB belongs to the new day. Warm-up
-        candles count when the range reaches them. An empty range gives no days and a reversed
-        one raises ``ValueError``."""
+        An hour counts when its closed 1h candle's close lies in ``[start_ms, end_ms)`` (the
+        start is included, the end is not), ``window`` is open at that close (read as a WIB time;
+        ``None`` means always open) and ``context_at(close).kondisi`` is NAIK. The hours are
+        counted for the WIB day of the close, so the candle ending at 00:00 WIB counts for the new
+        day, and a day is kept when it has at least ``min_naik_hours`` of them. Warm-up candles
+        count when the range reaches them.
+
+        ``min_naik_hours`` is the config's ``uji.hari_naik_minimal_jam_naik`` (1 in
+        ``config/modes.yaml``: one NAIK hour makes a NAIK day). It has no default, so no caller
+        can leave the config value out, and a value below 1 raises ``ValueError``. An empty range
+        gives no days and a reversed one raises ``ValueError``."""
         if end_ms < start_ms:
             raise ValueError(f"end_ms {end_ms} is before start_ms {start_ms}")
+        if min_naik_hours < 1:
+            raise ValueError(f"min_naik_hours must be at least 1, got {min_naik_hours}")
         opens = self._bars_1h.open_ms
         first = bisect_left(opens, start_ms - INTERVAL_1H)
         last = bisect_left(opens, end_ms - INTERVAL_1H)
-        days = set()
+        naik_hours = Counter()
         for i in range(first, last):
             close_ms = opens[i] + INTERVAL_1H
             if not window_is_open(window, _wib_moment(close_ms)):
                 continue
             if self.context_at(close_ms).kondisi == NAIK:
-                days.add(wib_day(close_ms))
-        return frozenset(days)
+                naik_hours[wib_day(close_ms)] += 1
+        return frozenset(day for day, hours in naik_hours.items() if hours >= min_naik_hours)

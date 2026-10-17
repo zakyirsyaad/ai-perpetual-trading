@@ -492,8 +492,8 @@ class NaikDaysTests(WeekCase):
         naik = set(closes_ms)
         return self.kondisi_is(lambda t_ms: NAIK if t_ms in naik else TURUN)
 
-    def week_days(self, window=WINDOW):
-        return self.week.frame.naik_days(*self.WEEK_RANGE, window)
+    def week_days(self, window=WINDOW, min_naik_hours=1):
+        return self.week.frame.naik_days(*self.WEEK_RANGE, window, min_naik_hours)
 
     def test_naik_days_count_only_window_hours(self):
         cases = (
@@ -547,7 +547,50 @@ class NaikDaysTests(WeekCase):
         )
         for label, naik_close, start_ms, end_ms, expected in cases:
             with self.subTest(label), self.only_these_are_naik(naik_close):
-                self.assertEqual(self.week.frame.naik_days(start_ms, end_ms, None), expected)
+                self.assertEqual(self.week.frame.naik_days(start_ms, end_ms, None, 1), expected)
+
+    def test_a_day_with_one_window_hour_is_kept_at_1_and_dropped_at_2(self):
+        with self.only_these_are_naik(at(WED, 10)):
+            self.assertEqual(self.week_days(min_naik_hours=1), {WED})
+            self.assertEqual(self.week_days(min_naik_hours=2), set())
+
+    def test_a_day_with_two_window_hours_is_kept_at_2(self):
+        with self.only_these_are_naik(at(WED, 10), at(WED, 15)):  # any two hours, not a run
+            self.assertEqual(self.week_days(min_naik_hours=2), {WED})
+            self.assertEqual(self.week_days(min_naik_hours=3), set())
+
+    def test_hours_outside_the_window_do_not_count_toward_the_minimum(self):
+        with self.only_these_are_naik(at(MON, 6), at(MON, 7)):  # 06:00 is before the window opens
+            self.assertEqual(self.week_days(min_naik_hours=1), {MON})
+            self.assertEqual(self.week_days(min_naik_hours=2), set())
+            self.assertEqual(self.week_days(window=None, min_naik_hours=2), {MON})
+
+    def test_the_hours_are_counted_per_wib_day(self):
+        cases = (
+            ("23:00 and 00:00 are two days (one UTC day)", [at(MON, 23), at(TUE, 0)], set()),
+            ("00:00 and 01:00 are one day", [at(TUE, 0), at(TUE, 1)], {TUE}),
+            ("one hour on each of two days is not two", [at(TUE, 10), at(WED, 10)], set()),
+        )
+        for label, naik_closes, expected in cases:
+            with self.subTest(label), self.only_these_are_naik(*naik_closes):
+                self.assertEqual(self.week_days(min_naik_hours=2), expected)
+
+    def test_hours_outside_the_range_do_not_count_toward_the_minimum(self):
+        noon, one, two = at(WED, 12), at(WED, 13), at(WED, 14)
+        naik_days = self.week.frame.naik_days
+        with self.only_these_are_naik(noon, one):
+            self.assertEqual(naik_days(noon, two, None, 2), {WED})
+            self.assertEqual(naik_days(noon, one, None, 2), set())  # 13:00 is the end
+            self.assertEqual(naik_days(noon + 1, two, None, 2), set())  # 12:00 is before the start
+
+    def test_a_minimum_below_1_is_refused(self):
+        for minimum in (0, -1):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                self.week_days(min_naik_hours=minimum)
+
+    def test_the_minimum_has_no_default_so_no_caller_can_leave_it_out(self):
+        with self.assertRaises(TypeError):
+            self.week.frame.naik_days(*self.WEEK_RANGE, WINDOW)
 
     def test_the_condition_is_read_at_the_close_of_each_candle(self):
         seen = []
@@ -557,7 +600,7 @@ class NaikDaysTests(WeekCase):
             return TURUN
 
         with self.kondisi_is(recording):
-            self.week.frame.naik_days(at(WED, 12), at(WED, 15), None)
+            self.week.frame.naik_days(at(WED, 12), at(WED, 15), None, 1)
 
         self.assertEqual(seen, [at(WED, 12), at(WED, 13), at(WED, 14)])
 
@@ -567,17 +610,32 @@ class NaikDaysTests(WeekCase):
 
         self.assertEqual(self.week_days(), {MON, TUE, WED, THU, FRI})
         self.assertEqual(self.week_days(window=None), {MON, TUE, WED, THU, FRI, SAT, SUN})
-        self.assertEqual(frame.naik_days(at(MON, 6), at(MON, 7), WINDOW), set())
-        self.assertEqual(frame.naik_days(at(MON, 6), at(MON, 7) + 1, WINDOW), {MON})
-        self.assertEqual(frame.naik_days(at(FRI, 23), at(SAT, 1), WINDOW), {FRI})
-        self.assertEqual(frame.naik_days(at(SAT, 0), at(NEXT_MON, 0), WINDOW), set())
+        self.assertEqual(frame.naik_days(at(MON, 6), at(MON, 7), WINDOW, 1), set())
+        self.assertEqual(frame.naik_days(at(MON, 6), at(MON, 7) + 1, WINDOW, 1), {MON})
+        self.assertEqual(frame.naik_days(at(FRI, 23), at(SAT, 1), WINDOW, 1), {FRI})
+        self.assertEqual(frame.naik_days(at(SAT, 0), at(NEXT_MON, 0), WINDOW, 1), set())
+
+    def test_naik_days_of_a_rising_week_with_a_minimum(self):
+        # Monday's closes from 07:00 to 23:00 are in the window: 17 hours. Tuesday to Friday have
+        # 24, and without the window every day of the week has its 24 closes.
+        cases = (
+            (WINDOW, 17, {MON, TUE, WED, THU, FRI}),
+            (WINDOW, 18, {TUE, WED, THU, FRI}),
+            (WINDOW, 24, {TUE, WED, THU, FRI}),
+            (WINDOW, 25, set()),
+            (None, 24, {MON, TUE, WED, THU, FRI, SAT, SUN}),
+            (None, 25, set()),
+        )
+        for window, minimum, expected in cases:
+            with self.subTest(window=window, minimum=minimum):
+                self.assertEqual(self.week_days(window, minimum), expected)
 
     def test_naik_days_of_a_falling_week_is_empty(self):
         down = Fixture(self.addCleanup, MON, 7, 200, WARM_4H, hourly_price(MON, falling))
 
         self.assertEqual(down.frame.context_at(at(WED, 10)).kondisi, TURUN)
-        self.assertEqual(down.frame.naik_days(*self.WEEK_RANGE, WINDOW), set())
-        self.assertEqual(down.frame.naik_days(*self.WEEK_RANGE, None), set())
+        self.assertEqual(down.frame.naik_days(*self.WEEK_RANGE, WINDOW, 1), set())
+        self.assertEqual(down.frame.naik_days(*self.WEEK_RANGE, None, 1), set())
 
     def test_naik_days_is_a_frozenset_of_dates(self):
         days = self.week_days()
@@ -586,9 +644,9 @@ class NaikDaysTests(WeekCase):
         self.assertTrue(all(type(day) is date for day in days))
 
     def test_an_empty_range_is_empty_and_a_reversed_one_is_refused(self):
-        self.assertEqual(self.week.frame.naik_days(at(WED, 12), at(WED, 12), None), frozenset())
+        self.assertEqual(self.week.frame.naik_days(at(WED, 12), at(WED, 12), None, 1), frozenset())
         with self.assertRaises(ValueError):
-            self.week.frame.naik_days(at(WED, 13), at(WED, 12), None)
+            self.week.frame.naik_days(at(WED, 13), at(WED, 12), None, 1)
 
 
 class ContextTypeTests(unittest.TestCase):
