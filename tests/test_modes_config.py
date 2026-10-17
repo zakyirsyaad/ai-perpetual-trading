@@ -14,6 +14,7 @@ import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -30,6 +31,7 @@ from bot.strategy.modes.config import (
     TestConfig,
     config_sha256,
     load_modes_config,
+    load_modes_config_with_sha256,
     parse_modes_config,
 )
 
@@ -739,6 +741,59 @@ class Sha256Tests(unittest.TestCase):
                     self.assertNotEqual(changed, original)
                     path.write_bytes(changed)
                     self.assertNotEqual(config_sha256(path), config_sha256(REPO_CONFIG))
+
+
+class ReadOnceTests(unittest.TestCase):
+    """``load_modes_config_with_sha256``: the numbers and the sha256 a lock binds, from one read."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "modes.yaml"
+        self.path.write_bytes(REPO_CONFIG.read_bytes())
+
+    def test_it_gives_the_config_and_the_sha256_of_the_file(self):
+        cfg, sha = load_modes_config_with_sha256(self.path)
+
+        self.assertEqual(cfg, load_modes_config(self.path))
+        self.assertEqual(sha, config_sha256(self.path))
+        self.assertEqual(load_modes_config_with_sha256(str(self.path)), (cfg, sha))
+
+    def test_a_file_edited_between_two_reads_still_binds_the_bytes_it_parsed(self):
+        original = self.path.read_bytes()
+        edited = original.replace(b"jeda_menit: 15", b"jeda_menit: 20", 1)
+        self.assertNotEqual(edited, original)
+        reads = iter([original, edited])
+
+        with mock.patch.object(Path, "read_bytes", lambda _path: next(reads)):
+            cfg, sha = load_modes_config_with_sha256(self.path)
+
+        self.assertEqual(cfg.umum.jeda_menit, 15)
+        self.assertEqual(sha, hashlib.sha256(original).hexdigest())
+
+    def test_windows_line_ends_read_as_they_always_did(self):
+        self.path.write_bytes(REPO_CONFIG.read_bytes().replace(b"\n", b"\r\n"))
+
+        cfg, sha = load_modes_config_with_sha256(self.path)
+
+        self.assertEqual(cfg, load_modes_config(REPO_CONFIG))
+        self.assertEqual(sha, hashlib.sha256(self.path.read_bytes()).hexdigest())
+
+    def test_its_errors_are_those_of_load_modes_config(self):
+        self.path.write_bytes(b"umum: \xff\xfe\n")
+        with self.assertRaises(ModesConfigError) as caught:
+            load_modes_config_with_sha256(self.path)
+        self.assertIn(str(self.path), str(caught.exception))
+
+        self.path.write_text(REPO_CONFIG.read_text(encoding="utf-8").replace(
+            "  jeda_menit: 15\n", "  jeda_menit: 15\n  extra: 1\n"), encoding="utf-8")
+        with self.assertRaises(ModesConfigError) as caught:
+            load_modes_config_with_sha256(self.path)
+        self.assertIn("umum.extra", str(caught.exception))
+        self.assertIn(str(self.path), str(caught.exception))
+
+        with self.assertRaises(FileNotFoundError):
+            load_modes_config_with_sha256(self.path.with_name("absent.yaml"))
 
 
 class ImmutabilityTests(unittest.TestCase):

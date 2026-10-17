@@ -47,6 +47,7 @@ __all__ = [
     "TestConfig",
     "config_sha256",
     "load_modes_config",
+    "load_modes_config_with_sha256",
     "parse_modes_config",
 ]
 
@@ -554,9 +555,21 @@ def load_modes_config(path: Path) -> ModesConfig:
     A file that cannot be read raises ``OSError``. Anything else wrong with it raises
     ``ModesConfigError`` starting with the file name: bytes that are not UTF-8, YAML that cannot
     be parsed or built into values (a date no calendar has, say), or a rule that is broken."""
+    return load_modes_config_with_sha256(path)[0]
+
+
+def load_modes_config_with_sha256(path: Path) -> tuple[ModesConfig, str]:
+    """The configuration of ``path`` and the SHA-256 of the bytes it was parsed from.
+
+    The file is read once: those bytes are hashed and those bytes are parsed, so the sha256 a
+    lock binds always belongs to the numbers the run used, even if the file is edited meanwhile
+    (``config_sha256`` and ``load_modes_config`` each read the file). The text is read as text
+    mode reads it, line ends turned into ``\\n``. Raises what ``load_modes_config`` raises."""
     path = Path(path)
+    data = path.read_bytes()
     try:
-        return parse_modes_config(_parse_yaml(path.read_text(encoding="utf-8")))
+        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        return parse_modes_config(_parse_yaml(text)), hashlib.sha256(data).hexdigest()
     except UnicodeDecodeError as exc:
         raise ModesConfigError(f"{path}: not valid UTF-8 text: {exc}") from exc
     except ModesConfigError as exc:

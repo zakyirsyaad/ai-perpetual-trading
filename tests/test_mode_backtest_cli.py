@@ -1,7 +1,12 @@
-"""Tests for the mode backtest command line: exit codes, one error line, step0 and verify-copy."""
+"""Tests for the mode backtest command line: exit codes, one error line, and its commands.
+
+The ``train`` and ``test`` stages themselves are tested in ``tests/test_mode_backtest_lock.py``;
+here they are replaced, except where the command must refuse before any stage work.
+"""
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -11,7 +16,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from research.mode_backtest import cli, step0
+from research.mode_backtest import cli, stages, step0
+from research.mode_backtest.lock import LockError
 from research.mode_backtest.step0 import PINE_FILES, ReproductionError
 from tests.mode_backtest_helpers import sha256sum_text, write_days, write_warmups
 
@@ -209,6 +215,97 @@ class VerifyCopyCommandTests(CliTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("vps_sha256sum.txt", self.assert_one_error_line(err))
+
+
+
+class StageCommandTests(CliTestCase):
+    def stage_args(self, command, mode="A", pair=SYMBOL):
+        return [command, "--mode", mode, "--pair", pair, "--config", str(CONFIG),
+                "--data-dir", str(self.data), "--out-dir", str(self.out)]
+
+    def test_a_missing_stage_option_exits_2(self):
+        for command in ("train", "test"):
+            args = self.stage_args(command)
+            for option in ("--mode", "--pair", "--config", "--data-dir", "--out-dir"):
+                with self.subTest(command=command, option=option):
+                    index = args.index(option)
+                    code, _out, err = run_cli(args[:index] + args[index + 2:])
+                    self.assertEqual(code, 2)
+                    self.assertIn(option, err)
+
+    def test_help_lists_the_stages(self):
+        code, out, _err = run_cli(["--help"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("train", out)
+        self.assertIn("test", out)
+
+    def test_phase_1_refuses_another_mode_or_pair_with_exit_1(self):
+        for command in ("train", "test"):
+            for mode, pair in (("D", SYMBOL), ("B", SYMBOL), ("A", "ETH-USDT")):
+                with self.subTest(command=command, mode=mode, pair=pair):
+                    code, out, err = run_cli(self.stage_args(command, mode, pair))
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    line = self.assert_one_error_line(err)
+                    self.assertIn("Phase 1", line)
+                    self.assertFalse(self.out.exists())
+                    self.assertFalse(self.data.exists())
+
+    def written_result(self, stage, marker=None):
+        """A result file as a stage writes it, with the outputs and the status line it lists."""
+        self.out.mkdir(exist_ok=True)
+        path = self.out / f"mode_A_BTC-USDT_{stage}_20261017.json"
+        doc = {"files": [f"mode_A_BTC-USDT_{stage}_20261017_A_15m_NAIK.csv", path.name],
+               "status_line": f"Status {stage}: -149.63184210526315"}
+        if marker is not None:
+            doc["marker"] = marker
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path, doc
+
+    def test_each_stage_gets_the_paths_and_the_clock_and_its_outputs_are_printed(self):
+        marker = str(self.data / "holdout_runs" / ("mode_A_BTC-USDT_" + "a" * 64 + ".json"))
+        for command, name, marker_line in (("train", "train_stage", None),
+                                           ("test", "test_stage", marker)):
+            with self.subTest(command=command):
+                path, doc = self.written_result(command, marker_line)
+                with mock.patch.object(stages, name, return_value=path) as stage, \
+                        mock.patch.object(cli, "now", return_value=CLOCK):
+                    code, out, err = run_cli(self.stage_args(command))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err, "")
+                stage.assert_called_once_with(CONFIG, self.data, self.out, "A", SYMBOL, CLOCK)
+                expected = [str(self.out / name) for name in doc["files"]]
+                expected += [marker_line] if marker_line else []
+                self.assertEqual(out.splitlines(), expected + [doc["status_line"]])
+
+    def test_a_lock_refusal_prints_every_problem_then_one_error_line_and_exits_2(self):
+        error = LockError("the lock does not match the current files: 2 mismatches",
+                          ("config_sha256: the lock has 1, the current files give 2",
+                           "python: the lock has 3.10, this run is 3.11"))
+        with mock.patch.object(stages, "test_stage", side_effect=error):
+            code, out, err = run_cli(self.stage_args("test"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out.splitlines(), list(error.problems))
+        self.assertIn("2 mismatches", self.assert_one_error_line(err))
+
+    def test_a_refusal_without_problems_is_one_error_line(self):
+        with mock.patch.object(stages, "train_stage", side_effect=LockError("already ran")):
+            code, out, err = run_cli(self.stage_args("train"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(self.assert_one_error_line(err), "error: already ran")
+
+    def test_a_stage_that_cannot_run_exits_1(self):
+        error = stages.StageError("the warm-up is too short")
+        with mock.patch.object(stages, "train_stage", side_effect=error):
+            code, out, err = run_cli(self.stage_args("train"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(self.assert_one_error_line(err), "error: the warm-up is too short")
 
 
 if __name__ == "__main__":

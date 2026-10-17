@@ -8,25 +8,33 @@ codes, as ``research.pine_gate.cli`` does:
   When the check fails, every difference is printed on stdout before the error line.
 * ``verify-copy --data-dir --sha256sum`` compares a local data copy with the ``sha256sum``
   listing printed on the VPS (``data.verify_copy``) and prints every problem.
+* ``train`` and ``test``, each with ``--mode --pair --config --data-dir --out-dir``, run
+  ``stages.train_stage`` and ``stages.test_stage``: the training stage and its lock, then the
+  one-shot test against it. Each prints the files it wrote (and the run marker of the test), then
+  its status line. Phase 1 runs Mode A on BTC-USDT only; anything else is an expected failure.
 
 Exit codes: 0 success, 1 an expected failure (one ``error:`` line on stderr and no traceback,
-unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error. Output files are never overwritten.
+unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error or a lock refusal (``lock.LockError``: a
+missing or changed lock, or a test that already ran; every mismatch is printed on stdout before
+the error line). Output files are never overwritten.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from research.pine_gate.cli_common import CliError, one_line
 
-from . import step0
+from . import stages, step0
 from .data import verify_copy
+from .lock import LockError
 
 DEBUG_ENV = "MODE_BACKTEST_DEBUG"
 _EXPECTED_ERRORS = (CliError, step0.ReproductionError, OSError, ValueError)
@@ -65,6 +73,43 @@ def cmd_verify_copy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_outputs(result: Path) -> None:
+    """The files a stage wrote, its run marker if it claimed one, then its status line."""
+    doc = json.loads(result.read_text(encoding="utf-8"))
+    for name in doc["files"]:
+        print(result.parent / name)
+    if "marker" in doc:
+        print(doc["marker"])
+    print(doc["status_line"])
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    _print_outputs(stages.train_stage(args.config, args.data_dir, args.out_dir, args.mode,
+                                      args.pair, now()))
+    return 0
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    _print_outputs(stages.test_stage(args.config, args.data_dir, args.out_dir, args.mode,
+                                     args.pair, now()))
+    return 0
+
+
+def _add_stage_parser(sub: Any, name: str, handler: Callable[[argparse.Namespace], int],
+                      help_text: str) -> None:
+    """``name`` with the five options both stages take; ``sub`` is the subparsers action."""
+    p = sub.add_parser(name, help=help_text)
+    p.add_argument("--mode", required=True, help="the mode to run (Phase 1: A)")
+    p.add_argument("--pair", required=True, help="the pair to run (Phase 1: BTC-USDT)")
+    p.add_argument("--config", required=True, type=_path, help="config/modes.yaml")
+    p.add_argument("--data-dir", required=True, type=_path,
+                   help="the copied production data (the folder holding prod/); the run markers "
+                        "go in its holdout_runs/")
+    p.add_argument("--out-dir", required=True, type=_path,
+                   help="where the results, the trade logs and the lock go")
+    p.set_defaults(handler=handler)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m research.mode_backtest",
                                      description="Offline backtest of the LONG module (phase 1).")
@@ -85,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sha256sum", required=True, type=_path,
                    help="the listing printed by sha256sum on the VPS")
     p.set_defaults(handler=cmd_verify_copy)
+
+    _add_stage_parser(sub, "train", cmd_train,
+                      "run the training stage and write its results and the lock")
+    _add_stage_parser(sub, "test", cmd_test,
+                      "run the one-shot test against the lock and write the verdict")
     return parser
 
 
@@ -103,6 +153,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return exc.code if isinstance(exc.code, int) else 2
     try:
         return args.handler(args)
+    except LockError as exc:
+        for problem in exc.problems:
+            print(problem)
+        _fail(exc)
+        return 2
     except _EXPECTED_ERRORS as exc:
         _fail(exc)
         return 1

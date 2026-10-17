@@ -1121,3 +1121,162 @@ Notes for later tasks:
 - **Task 14**: call `stage_metrics(trades, hari_naik=len(naik_days), drop_top=cfg.uji.lolos_buang_posisi_teratas)`; the trimmed result is only right with that number. `wants_5m(m15, cfg.uji)` raises `ValueError` when the training stage has no NAIK day: let it end the `train` command with a one-line error and exit 1, do not catch it into False. `dataclasses.asdict(metrics)` is JSON-ready (floats, ints and `None`). Write one CSV per run with `write_trade_log` (its `trade_id` starts at 1 in each) and build the `.md` with `mode_table`: give every row of a tahap the same `hari_naik`, list Mode A first and the comparators last, and label the comparator rows yourself (`ReportRow.mode`); "Tidak trading" is added by the table.
 - **The code fingerprint** must cover the new imports: `metrics.py` imports `bot.strategy.modes.config` (already in `modes/*.py`) and `.simulate`; `tradelog.py` imports `bot.strategy.modes.position_rules`, `research.pine_gate.fileio` and `research.pine_gate.spec`; `report.py` now imports `.metrics`. `fileio` and `spec` are `research.pine_gate` modules, so `CODE_EXTRA` needs them (`step0.py` and `simulate.py` already import them).
 - **The status line** the `test` stage prints (Task 16 asks for the three numbers) can read `m.posisi`, `m.hasil_per_1_juta` and `m.hasil_tanpa_teratas` from the same `StageMetrics` that `pass_status` judged. The table rounds Hasil per 1 juta to a whole number, so -149.6 shows as -150 and still passes; the status line should print the exact values.
+
+## Task 14 — Lock and the train/test stages
+
+`train` and `test` make the Mode A backtest a pre-registered, one-shot experiment:
+
+- `research.mode_backtest.lock`: `LockError(message, problems=())` (a `RuntimeError`; `problems` holds one line per mismatch), `CODE_DIRS`, `CODE_EXTRA`, `code_files()`, `code_sha256()`, `python_version()` (`"3.10"`), `run_name(mode, pair)`, `lock_path(out_dir, mode, pair)` (`mode_A_BTC-USDT_lock.json`), `marker_path(data_dir, mode, pair, lock_sha)` (`holdout_runs/mode_A_BTC-USDT_<sha>.json`), `existing_markers(data_dir, mode, pair)`, `read_lock(path)` (the document and the sha256 of its bytes), `check_lock(doc, *, config_sha, code_sha, train_manifest_sha, python)` and `claim_marker(path, doc)`.
+- `research.mode_backtest.stages`: `StageError` (a `ValueError`, exit 1), `check_phase1`, `train_stage(config_path, data_dir, out_dir, mode, pair, now) -> Path` and `test_stage(...) -> Path`, each returning its result JSON.
+- `research.mode_backtest.cli`: `train` and `test`, each with `--mode --pair --config --data-dir --out-dir`. They print every file written (the test also its run marker), then the status line. A `LockError` prints its problems on stdout, then one `error:` line, and exits 2.
+- `bot.strategy.modes.config.load_modes_config_with_sha256(path)`: reads the file once and returns the config and the sha256 of those same bytes. `load_modes_config` now delegates to it.
+- Test helpers: `tests/mode_backtest_helpers.write_minute_warmups` builds each warm-up bar from the minute prices it covers, so a moving price has no ATR jump at the seam. `tests/mode_backtest_stages.py` holds a synthetic rising week (Mon 6 to Fri 10 July 2026: training Mon to Wed, the test Thu and Fri, every day NAIK, both Mode A and the comparator trade) and `stage_config_text(**uji)`, which moves the `uji` dates of the repo YAML onto it (quoted WIB midnights) and refuses a key not written exactly once.
+
+Controller rulings for this task (recorded as given):
+
+1. The config is hashed and parsed from the same bytes (one read), in `train` and in `test`.
+2. `code_files()` covers every `research/mode_backtest/*.py`, every `bot/strategy/modes/*.py`, and every other `bot.*` and `research.pine_gate.*` module the package imports, followed transitively within `bot` and `research`. The structure test fails when such a module is missing. Replacing `data.py`'s `cli_common.file_sha256` import was allowed, not required.
+3. The training manifest is `stage_files(data_dir, "BTC-USDT", latihan_mulai, latihan_selesai - 1 day)`. `test` recomputes it by hashing only and compares it with the lock before the marker.
+4. `train` reads only `latihan_mulai` to `latihan_selesai - 1 day`. `test` loads `latihan_mulai` to `ujian_selesai - 1 day`, and only after the marker is written.
+5. `train` fails (exit 1) when the 4h EMA50 or the 720-hour ATR median is `None` at the first training day's 00:00 WIB.
+6. NAIK days come from `frames.hourly.naik_days(start, end, window, uji.hari_naik_minimal_jam_naik)` and feed both Mode A and the comparator.
+7. `stage_metrics` gets `cfg.uji.lolos_buang_posisi_teratas` at exactly one call site, and a test shows the YAML value changes the verdict.
+8. The JSON and the status lines carry the exact (unrounded) Hasil per 1 juta and without-top values, plus, for `train`, the 15m entries per NAIK day next to the 5m decision.
+9. Each stage runs Mode A in NAIK at the chosen timeframe and the comparator, Mode D (3m) in NAIK. `train` runs A at `tf_pemicu`, and once more at 5m when `wants_5m`; both training results are kept.
+10. The lock binds the config, code and training manifest sha256s, Python major.minor, the chosen timeframe, the training summary, the stage bounds, the mode and the pair. It is written exclusively. The marker is claimed exclusively before any test day is read, and an existing marker refuses with exit 2 ("already ran").
+11. Phase 1 refuses any mode but A and any pair but BTC-USDT with exit 1. Lock refusals and mismatches exit 2. Outputs: `mode_A_BTC-USDT_train_<YYYYMMDD>.json` (WIB date of `now`), one CSV per run and the lock; then `mode_A_BTC-USDT_test_<YYYYMMDD>.json`, the CSVs and a `.md` with the section 2.9 table (Latihan rows from the lock) and the status line.
+
+Choices of mine, each pinned by a test:
+
+- **The fingerprint is everything Python loads when the package is imported**: 43 `CODE_EXTRA` files beside the two globs (49 outside the package in all). That includes the packages around each imported module, because their `__init__` runs first, so `bot/arena/__init__.py` and the arena modules it imports (`agents`, `attribution`, `expression_engine`, `factors`, `flow_signals`, `program_trader`, `signals`, then `bot/models.py`, `bot/data/market_signals.py`, `bot/volume/profile.py`) are fingerprinted too. Two imports sit inside functions the package never calls and only read the live settings and Supabase: `bot.config` in `pine_gate.cli_common.make_settings` and `bot.storage.supabase_trade_store` in `pine_gate.calibrate`. They are left out, as `tests/test_pine_gate_structure.py` leaves them out. The structure test checks the list twice: with a static AST walk of every import statement (relative imports, `from package import submodule`, imports inside functions and `TYPE_CHECKING`, parent packages), followed transitively, and with a fresh interpreter that imports every module of the package and lists the files Python loaded. `CODE_EXTRA` must also hold no module the package does not import, no duplicate and no globbed file. I did not replace `data.py`'s `cli_common` import: `cli.py` (`CliError`, `one_line`) and `step0.py` (`load_calibration_file`) import `cli_common` too, so the change would not shrink the fingerprint.
+- **The config is read once in `bot/strategy/modes/config.py`**: the only public way to parse bytes with the repeated-key refusal is a new function there, because `_parse_yaml` is private. The text is decoded as text mode reads it (line ends turned into `\n`), so `load_modes_config` behaves as before.
+- **`test` checks the lock's own record before the marker**: mode, pair, both stage bounds against the config, the three training metrics records (`mode_a_15m`, `mode_a`, `pembanding`), and the locked timeframe re-derived by `wants_5m` on the locked 15m run. The last check came from mutation testing: with only a "15m or 5m" check, a lock edited from 15m to 5m by hand ran the one-shot test on 5m (RED 2 below).
+- **Every refusal that can come before the marker does**: any marker of the mode and pair, whatever its lock (so `train` also refuses to make a new lock once the test ran: "a lock may be deleted and recreated only while no marker exists for it"), a test result of any date, any output of today, and a missing day or warm-up file (existence only, nothing read). A training file that has gone is a training-data mismatch (`LockError`, exit 2), not exit 1.
+- **The warm-up guard checks all six hourly inputs** of the selector at 00:00 WIB of the first training day, a superset of the ruling's two. One bar short of either warm-up (830 1h bars, or 400 4h bars, because the last 4h warm-up bar is still forming at 00:00 WIB) is refused with the series named.
+- **`train` refuses `mode.A_pullback_long.tf_pemicu: 5m`** (`StageError`): the procedure starts on 15m and reaches 5m only through the switch, and a 5m start would make the switch run 5m twice.
+- **Outputs**: run keys `A_15m_NAIK`, `A_5m_NAIK` and `D_3m_NAIK` name the CSVs (`mode_A_BTC-USDT_train_<date>_A_15m_NAIK.csv`) and the `runs` entries. The comparator rows are "D di NAIK". Every possible output is checked before any work, and the lock is written last. The JSON keys come out sorted (`fileio.json_text`), so `blocked` lists the gates alphabetically, not in gate order. The status lines are Indonesian, like the report, with every float as `repr`, so -149.63184210526315 shows in full while the table shows -150.
+
+Test design: 50 new tests.
+
+- `tests/test_mode_backtest_lock.py` (33).
+  - The lock helpers: spec names and refusals of bad names and shas, `check_lock` listing all four mismatches and every missing binding, `read_lock` (sha of the bytes, missing, broken, a folder), `claim_marker` never overwriting, markers of one mode and pair, and `code_files`/`code_sha256`.
+  - The training stage: results, logs and an exclusive lock, and no training exit after `latihan_selesai`. `test_train_never_opens_a_test_day_file` uses a corrupt Thursday file, a folder in place of Friday, and a recorder of every `gzip.open` and `Path.read_bytes`. Also the 5m switch run once and locked, no switch, the NAIK-day minimum from the config (18 hours drops Monday, which has 17 window hours), both short warm-ups, a flat market without a NAIK day (exit 1, "5m switch cannot be evaluated"), `tf_pemicu: 5m` and a naive clock.
+  - The test stage:
+    - the verdict and the report table, rebuilt with `mode_table` from the lock and the result;
+    - `test_marker_is_written_before_any_test_day_is_read`: every read of a test-day file happens after the marker exists, and a training file is hashed before it;
+    - a second run (same day and three days later);
+    - a new lock after the test;
+    - no lock;
+    - a hand-edited lock (tf, bounds, pair, summary, a 15m run without a NAIK day);
+    - a missing test day;
+    - `test_test_refuses_on_a_changed_config_code_or_training_byte`: config, a training day, a warm-up, a missing training day, code and Python, each exit 2 with nothing written, then the unchanged lock runs;
+    - `test_outputs_are_never_overwritten`.
+  - The verdict: `drop_top` 3 against 0 on 40 fabricated trades gives GAGAL against LOLOS, and every `stage_metrics` call got the YAML value. The exact numbers: 7 entries on 3 NAIK days is `2.3333333333333335` and switches to 5m; a test at -149.63 per 1M is LOLOS while the table shows -150. A test with no positions is BELUM CUKUP SAMPEL and shows dashes. An AST check finds a single `stage_metrics` call site, passing `cfg.uji.lolos_buang_posisi_teratas`.
+- `tests/test_mode_backtest_cli.py` (+7): missing options (exit 2), help, Phase 1 refusals for both commands (exit 1, nothing written), the stage called with the paths and the clock and its outputs printed, a `LockError` printing its problems then one line (exit 2), and a `StageError` (exit 1).
+- `tests/test_mode_backtest_structure.py` (+6): `test_fingerprint_covers_every_bot_and_pine_gate_module_the_package_imports`, which also asserts that the walk reaches transitive modules such as `bot/strategy/indicators.py` and `bot/arena/factors.py`. Also no stale `CODE_EXTRA` entries, the interpreter cross-check, and the walker on synthetic sources (every import form, a package's relative imports, the I/O-only and non-module names dropped).
+- `tests/test_modes_config.py` (+4): the config and sha of one read, a file edited between two reads still binding the parsed bytes, CRLF files, and the errors of `load_modes_config`.
+
+RED: `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock tests.test_mode_backtest_cli tests.test_mode_backtest_structure -v` before `lock.py` and `stages.py` existed (paths shortened). The brief expected an import failure:
+
+```text
+test_mode_backtest_lock (unittest.loader._FailedTest) ... ERROR
+test_mode_backtest_cli (unittest.loader._FailedTest) ... ERROR
+test_mode_backtest_structure (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_mode_backtest_lock (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_lock
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_lock.py", line 27, in <module>
+    from research.mode_backtest import cli, lock, stages
+ImportError: cannot import name 'lock' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+
+======================================================================
+ERROR: test_mode_backtest_cli (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_cli
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_cli.py", line 19, in <module>
+    from research.mode_backtest import cli, stages, step0
+ImportError: cannot import name 'stages' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+
+======================================================================
+ERROR: test_mode_backtest_structure (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mode_backtest_structure
+Traceback (most recent call last):
+  File "<py>/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "<repo>/tests/test_mode_backtest_structure.py", line 23, in <module>
+    from research.mode_backtest import lock
+ImportError: cannot import name 'lock' from 'research.mode_backtest' (<repo>/src/research/mode_backtest/__init__.py)
+
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+FAILED (errors=3)
+```
+
+The config tests failed the same way, on the function that did not exist yet (`PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_config`):
+
+```text
+ImportError: cannot import name 'load_modes_config_with_sha256' from 'bot.strategy.modes.config' (<repo>/src/bot/strategy/modes/config.py)
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+```
+
+GREEN, first run with the modules written: `Ran 69 tests` with 2 failures, both one assertion: `blocked` was expected in gate order, but `fileio.json_text` sorts JSON keys. The test now compares the key set. After that, the three modules and the config tests ran `Ran 134 tests` / OK.
+
+RED, 2: mutation testing. First pass: 28 bugs were planted one at a time in a scratch copy of the repository (`src`, `tests`, `config`) and run against the lock, CLI and config tests. A first attempt had copied only `src`, so `test_code_sha256_is_the_sha256_of_the_code_file_lines`, which hashes the files next to the tests, failed for every mutant whatever it changed. The run was redone on a full copy. Three bugs survived:
+
+- my marker mutant was wrong: it claimed a second marker while the real one was still claimed first. It was rebuilt to claim the real marker after the test days are read;
+- the lock's bounds were not checked by any test;
+- the lock's `tf` was not checked by any test, and a hand edit from 15m to 5m was accepted.
+
+The fix re-derives the timeframe with `wants_5m` on a 15m record the lock now keeps (`summary.mode_a_15m`), with `test_a_hand_edited_lock_is_refused_before_the_marker` as its test. A test for a missing test day refused before the marker was added in the same pass. Here is that test against a copy that has the earlier check (the 5m edit runs the one-shot test, exit 0, and so uses it up):
+
+```text
+======================================================================
+FAIL: test_a_hand_edited_lock_is_refused_before_the_marker (tests.test_mode_backtest_lock.TestStageTests) (edit='tf')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<copy>/tests/test_mode_backtest_lock.py", line 577, in test_a_hand_edited_lock_is_refused_before_the_marker
+    self.assertEqual(code, 2, err)
+AssertionError: 0 != 2 :
+```
+
+GREEN, 2: all 28 runtime bugs are caught. They include train reading into the test stage, the marker claimed after the test days are read, the test loaded from its own start (cold series), `drop_top` fixed at 3, a rounded status line, `check_lock` ignoring Python or stopping at the first mismatch, no warm-up guard, train ignoring markers, the NAIK-day minimum fixed at 1, the switch always or never locking 5m, the comparator in TURUN, a config hashed from a second read, the warm-ups left out of the manifest, the CLI exiting 1 for a lock refusal, and the verdict taken from the comparator. All 9 structural bugs are caught too: an arena module, `indicators.py` (reached only through `features` and `near_mean`), `cli_common`, or a package `__init__` dropped from `CODE_EXTRA`; a module that is not imported, a duplicate or a globbed file added to it; a second `stage_metrics` call; and a new project import missing from the fingerprint. Each missing module fails both the AST walk and the interpreter check.
+
+Coverage then showed four lines of mine never run: an unreadable lock (a folder), a naive clock, the dash for a missing result in a status line, and a locked 15m record without a NAIK day. Each now has a test. Line and branch coverage of `lock.py`, `stages.py` and `cli.py` is 100 % (scratch rcfile, because the 3.10 `coverage` cannot read `pyproject.toml`). `config.py` is at 99 %: one partial branch (a YAML key that is not a scalar) predates this task.
+
+Verification:
+
+- The brief's command, `PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock tests.test_mode_backtest_cli tests.test_mode_backtest_structure -v`: `Ran 73 tests` / OK. `tests.test_modes_config`: `Ran 65 tests` / OK.
+- Python 3.11.15 (the scratch venv with `requirements.txt`, because CI runs 3.11): those four modules plus `tests.test_mode_backtest_data` and `tests.test_pine_gate_structure`, `Ran 215 tests` / OK.
+- Full suite, exact command `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`: `Ran 2258 tests` / OK (2,208 + 50 new).
+- `compileall -q src tests` OK. `git diff --check` is clean. `ruff check --select F,E,W,B --line-length 100` is clean on every new and changed file; the long lines in `tests/test_modes_config.py` were there before (27 at HEAD, 27 now). `tests.test_secret_hygiene` OK with this document tracked. `tests.test_mode_backtest_structure` OK, with `lock.py` and `stages.py` covered by the private-import, network-word and write rules.
+- End to end on the synthetic week through `python -m research.mode_backtest`, against a temporary data copy and never the real one:
+  - `train`: exit 0, four files and the line `entry per hari NAIK pada 15m = 4.0 ... tetap 15m, dikunci 15m`;
+  - `test`: exit 0, four files, the marker and BELUM CUKUP SAMPEL (12 positions);
+  - a second `test`: exit 2, "already ran";
+  - `--pair ETH-USDT`: exit 1.
+- Scale: `train` on 20 synthetic days took 0.28 s at 49 MB peak RSS, about 5 s for the 370 real training days if it scales linearly.
+
+Notes for later tasks:
+
+- **Task 15**: document `train`/`test` in CLAUDE.md, with the lock in `--out-dir`, the marker in `--data-dir/holdout_runs/`, exit 2 for lock refusals, and the fingerprint scope (the arena modules are covered because `bot/arena/__init__.py` imports them).
+- **Task 16**:
+  - Run `verify-copy` first. A data failure after the marker (a corrupt test day) leaves the marker in place and so uses up the one shot; only missing files are refused before it.
+  - Keep the checkout unchanged between `train` and `test`: any change to the 61 fingerprinted files (12 package modules, 6 rule-core modules, 43 in `CODE_EXTRA`), the YAML, the training files or the Python minor version makes `test` exit 2. While no marker exists, the lock may be deleted and `train` re-run.
+  - Run both stages with the same `--data-dir`, because the marker lives there.

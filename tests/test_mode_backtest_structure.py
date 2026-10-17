@@ -3,13 +3,24 @@
 Every rule runs over each ``*.py`` file of ``src/research/mode_backtest``, so a module
 added by a later task is covered without touching this file. Each detector is also
 run on small synthetic sources, so a rule cannot pass just because it looks at nothing.
+
+The code fingerprint of the lock is held to the modules the package imports, found two
+ways: an AST walk of every import statement, followed from module to module through
+``bot`` and ``research``, and the modules a fresh Python process has loaded once it has
+imported every module of the package.
 """
 
 import ast
+import json
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
-from typing import List, Set
+from typing import Dict, Iterable, List, Optional, Set
+
+from research.mode_backtest import lock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 PACKAGE = SRC / "research" / "mode_backtest"
@@ -135,6 +146,100 @@ def file_writes(tree: ast.AST) -> List[str]:
                 ):
                     found.append(f"line {node.lineno}: {callee_name(node.func)}(mode=...)")
     return found
+
+
+# Imported inside functions the package never calls, to read the live settings and Supabase
+# (``research.pine_gate.cli_common.make_settings`` and ``research.pine_gate.calibrate``'s
+# ``make_get_rows``): neither shapes a computed result, so the walk neither keeps nor follows
+# them, as ``tests/test_pine_gate_structure.py`` leaves them out of the Pine fingerprint.
+IO_ONLY_IMPORTS = frozenset({"bot.config", "bot.storage.supabase_trade_store"})
+
+# Run by a fresh interpreter: import every module of the package, then print the source files
+# under ``src`` (the first argument) of every module Python has loaded.
+LOADED_BY_THE_PACKAGE = """
+import importlib, json, pkgutil, sys
+from pathlib import Path
+import research.mode_backtest as package
+for info in pkgutil.iter_modules(package.__path__):
+    importlib.import_module(f"research.mode_backtest.{info.name}")
+src = Path(sys.argv[1]).resolve()
+files = {
+    Path(module.__file__).resolve().relative_to(src).as_posix()
+    for module in list(sys.modules.values())
+    if getattr(module, "__file__", None) and Path(module.__file__).resolve().is_relative_to(src)
+}
+print(json.dumps(sorted(files)))
+"""
+
+
+def module_name(path: Path) -> str:
+    """The dotted name of a source file under ``src``; a package is named by its folder."""
+    parts = list(path.relative_to(SRC).with_suffix("").parts)
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def module_source(name: str) -> Optional[Path]:
+    """The source file of module ``name`` under ``src``, or None when it is no project module."""
+    if name.split(".")[0] not in PROJECT_ROOTS:
+        return None
+    base = SRC.joinpath(*name.split("."))
+    for path in (base.with_suffix(".py"), base / "__init__.py"):
+        if path.is_file():
+            return path
+    return None
+
+
+def imported_names(tree: ast.AST, module: str, is_package: bool) -> Set[str]:
+    """Every dotted name an import statement anywhere in ``module`` may load, relative ones
+    resolved: ``import a.b`` names ``a.b``, and ``from a import b`` names both ``a`` and
+    ``a.b``, because ``b`` may be a submodule. Imports inside functions count too."""
+    package = module if is_package else module.rpartition(".")[0]
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".")
+                base = ".".join(parts[: len(parts) - node.level + 1])
+                source = f"{base}.{node.module}" if node.module else base
+            else:
+                source = node.module
+            names.add(source)
+            names.update(f"{source}.{alias.name}" for alias in node.names)
+    return names
+
+
+def project_modules(names: Iterable[str]) -> Set[str]:
+    """The names that are project modules, each with the packages around it, whose
+    ``__init__`` Python runs first; ``IO_ONLY_IMPORTS`` are left out."""
+    found = set()
+    for name in names:
+        if name in IO_ONLY_IMPORTS or module_source(name) is None:
+            continue
+        parts = name.split(".")
+        found.update(".".join(parts[:k]) for k in range(1, len(parts) + 1))
+    return found
+
+
+def import_closure(paths: Iterable[Path]) -> Dict[str, Path]:
+    """Every project module that the modules at ``paths`` import, followed transitively, by
+    name; the modules at ``paths`` are included."""
+    todo = [module_name(path) for path in paths]
+    seen: Dict[str, Path] = {}
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        path = module_source(name)
+        seen[name] = path
+        tree = parse(path.read_text(encoding="utf-8"))
+        todo += project_modules(imported_names(tree, name, path.name == "__init__.py"))
+    return seen
+
+
+def relative(path: Path) -> str:
+    return path.relative_to(SRC).as_posix()
 
 
 class PackageLayoutTests(unittest.TestCase):
@@ -285,6 +390,95 @@ class FileWriteTests(unittest.TestCase):
         for source in reads:
             with self.subTest(source=source):
                 self.assertEqual(file_writes(parse(source)), [])
+
+
+class CodeFingerprintTests(unittest.TestCase):
+    def imported_from_outside(self) -> Set[str]:
+        """The files of the modules the package imports that are not its own."""
+        return {
+            relative(path)
+            for name, path in import_closure(modules()).items()
+            if not name.startswith("research.mode_backtest")
+        }
+
+    def covered(self) -> Set[str]:
+        return {rel for rel, _sha in lock.code_files()}
+
+    def test_fingerprint_covers_every_bot_and_pine_gate_module_the_package_imports(self):
+        imported = self.imported_from_outside()
+
+        for followed in (
+            "bot/strategy/modes/near_mean.py",  # simulate -> near_mean
+            "bot/core/entry_window.py",  # frames, simulate, position_rules -> entry_window
+            "research/pine_gate/features.py",  # data -> features
+            "bot/arena/setup_profile.py",  # features -> setup_profile
+            "bot/strategy/indicators.py",  # features, near_mean -> indicators
+            "bot/strategy/pine_indicators.py",  # frames, features -> pine_indicators
+            "research/pine_gate/cli_common.py",  # cli, data, step0 -> cli_common
+            "bot/arena/__init__.py",  # runs before setup_profile ...
+            "bot/arena/factors.py",  # ... and imports the arena modules
+        ):
+            self.assertIn(followed, imported)
+        self.assertEqual(sorted(imported - self.covered()), [])
+
+    def test_code_extra_names_only_modules_the_package_imports(self):
+        extra = list(lock.CODE_EXTRA)
+        globbed = {relative(path) for path in modules()}
+        globbed |= {relative(path) for path in (SRC / "bot" / "strategy" / "modes").glob("*.py")}
+
+        self.assertEqual(len(extra), len(set(extra)))
+        self.assertEqual(sorted(set(extra) & globbed), [])
+        self.assertEqual(sorted(set(extra) - self.imported_from_outside()), [])
+
+    def test_python_loads_no_project_module_the_fingerprint_misses(self):
+        env = {**os.environ, "PYTHONPATH": str(SRC)}
+        done = subprocess.run(
+            [sys.executable, "-c", LOADED_BY_THE_PACKAGE, str(SRC)],
+            cwd=SRC.parent, env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        loaded = set(json.loads(done.stdout))
+        self.assertIn("research/mode_backtest/stages.py", loaded)
+        self.assertIn("bot/strategy/pine_indicators.py", loaded)
+        self.assertEqual(sorted(loaded - self.covered()), [])
+
+    def test_the_walk_resolves_every_form_of_import(self):
+        source = (
+            "import os\n"
+            "import bot.strategy.indicators as live\n"
+            "from bot.strategy import pine_indicators\n"
+            "from . import data\n"
+            "from .frames import build_pair_frames\n"
+            "from ..pine_gate import bars\n"
+            "def later():\n"
+            "    from bot.core.entry_window import parse_weekly_window\n"
+            "if TYPE_CHECKING:\n"
+            "    from .step0 import Step0Row\n"
+        )
+
+        names = imported_names(parse(source), "research.mode_backtest.stages", is_package=False)
+
+        self.assertEqual(project_modules(names), {
+            "bot", "bot.strategy", "bot.strategy.indicators", "bot.strategy.pine_indicators",
+            "bot.core", "bot.core.entry_window",
+            "research", "research.mode_backtest", "research.mode_backtest.data",
+            "research.mode_backtest.frames", "research.mode_backtest.step0",
+            "research.pine_gate", "research.pine_gate.bars",
+        })
+
+    def test_relative_imports_of_a_package_start_from_the_package_itself(self):
+        names = imported_names(parse("from . import data\nfrom .. import pine_gate\n"),
+                               "research.mode_backtest", is_package=True)
+
+        self.assertEqual(names, {"research.mode_backtest", "research.mode_backtest.data",
+                                 "research", "research.pine_gate"})
+
+    def test_the_walk_drops_io_only_imports_and_names_that_are_no_project_module(self):
+        names = {"bot.config", "bot.storage.supabase_trade_store", "os", "yaml",
+                 "research.pine_gate.bars.Bars", "bot.no_such_module"}
+
+        self.assertEqual(project_modules(names), set())
 
 
 if __name__ == "__main__":
