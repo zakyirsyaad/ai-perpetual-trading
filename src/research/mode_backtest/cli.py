@@ -21,6 +21,10 @@ codes, as ``research.pine_gate.cli`` does:
   (``config/modes_live_exit.yaml``); the lock binds that file's sha256, so editing it after
   ``train`` makes ``test`` exit 2. ``--live-config`` with ``--mode A`` or ``--mode L`` without it
   is a usage error (exit 2); any other mode exits 1.
+* ``rescore --trade-log PATH ... --config --live-config --out-dir`` runs ``rescore.rescore_stage``:
+  Mode A's Phase 1 trade logs repriced with the costs of ``config/modes_live_exit.yaml``, as a
+  cost sensitivity and never a pass or fail. It reads only the logs given, no bar file, and prints
+  the JSON and the Indonesian report it wrote.
 
 Exit codes: 0 success, 1 an expected failure (one ``error:`` line on stderr and no traceback,
 unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error (argparse's, or a ``--live-config`` that does
@@ -42,7 +46,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from research.pine_gate.cli_common import CliError, one_line
 
-from . import stages, stages_live, step0
+from . import rescore, stages, stages_live, step0
 from .data import verify_copy
 from .lock import LockError
 
@@ -130,6 +134,14 @@ def cmd_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rescore(args: argparse.Namespace) -> int:
+    json_path = rescore.rescore_stage(args.trade_log, args.live_config, args.config, args.out_dir,
+                                      now())
+    print(json_path)
+    print(json_path.with_suffix(".md"))
+    return 0
+
+
 def _add_stage_parser(sub: Any, name: str, handler: Callable[[argparse.Namespace], int],
                       help_text: str) -> None:
     """``name`` with the five options both stages take; ``sub`` is the subparsers action."""
@@ -175,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
                       "run the training stage and write its results and the lock")
     _add_stage_parser(sub, "test", cmd_test,
                       "run the one-shot test against the lock and write the verdict")
+
+    p = sub.add_parser("rescore", help="reprice Phase 1 trade logs with the live-exit costs "
+                                       "(a cost sensitivity, not a test)")
+    p.add_argument("--trade-log", required=True, action="append", type=_path,
+                   help="a Phase 1 trade log CSV; repeat for several")
+    p.add_argument("--config", required=True, type=_path, help="config/modes.yaml")
+    p.add_argument("--live-config", required=True, type=_path,
+                   help="config/modes_live_exit.yaml (its biaya block gives the new costs)")
+    p.add_argument("--out-dir", required=True, type=_path)
+    p.set_defaults(handler=cmd_rescore)
     return parser
 
 

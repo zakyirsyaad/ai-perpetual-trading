@@ -350,3 +350,44 @@ a temporary folder (never `~/replay/mode_backtest`), `train --mode L` exits 0, a
 the live config, then `test --mode L` exits 2 with a `live_config_sha256` line on stdout, one
 `error:` line, and no test result, start record or `holdout_runs` marker. `compileall`,
 `git diff --check` and the secret-hygiene test are clean. The Phase 1 tests are unchanged and pass.
+
+## Task 9: Rescore stage
+
+`research.mode_backtest.rescore` reprices Mode A's (and the Phase 1 comparator's) trade logs with the
+spec section 5 costs, keeping each trade's exit event, as a cost sensitivity ("sensitivitas biaya,
+bukan uji"; never a pass or fail). The raw entry open is `harga_entry / (1 + side x old/100)` and the
+raw exit `harga_exit / (1 - side x old/100)`, recovered from the fills for every kind of exit, so a
+gapped stop is repriced from the bar's open and not from `harga_sl` (Review Focus 5). The new money
+is `settle_live` on those numbers with the row's own reason and notional. The old and new results per
+1M and per 1M without the top 3 use `metrics.stage_metrics`. Only the 23 Phase 1 columns are
+accepted (a mode L log already carries the new costs). Reads only the CSVs given; writes
+`rescore_<stamp>.json` and `.md` through `fileio` (both existence-checked before the first write).
+CLI: `rescore --trade-log PATH ... --config --live-config --out-dir`.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_rescore
+ImportError: cannot import name 'rescore' from 'research.mode_backtest'
+Ran 1 test in 0.000s
+FAILED (errors=1)
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_rescore
+Ran 19 tests in 0.109s
+OK
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2462 tests in 56.728s
+OK
+```
+
+Three hand mutants of `rescore.py` each fail the new tests: taking the exit from `harga_sl` for an SL
+(3 failures), not undoing the old entry slippage (7), pricing every exit as an SL (3).
+
+One existing test changed: `test_stage_metrics_has_one_call_site_and_it_passes_the_config_drop_top`
+(`tests/test_mode_backtest_lock.py`) now skips `rescore.py`, which calls the same helper but gives
+no verdict; the guard on the verdict path (`stages.py`, config `drop_top`) is unchanged.
+`compileall` and `git diff --check` are clean; the structure test passes.
