@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from bot.config import Settings
 from bot.core.entry_window import parse_weekly_window, window_is_open
+from bot.core.forward_guard import forward_guard_reason
 from bot.core.regime_gate import RegimeGate
 from bot.exchange.contracts import (
     ExchangeAPIError,
@@ -193,11 +194,37 @@ class TradeEngine:
         except Exception:  # noqa: BLE001 - a dashboard figure must never stop the trading loop
             self._logger.warning("Could not publish token usage to the dashboard.", exc_info=True)
 
+    async def _forward_guard_blocks_entries(self) -> bool:
+        """The LONG forward bot's kill and review stop, recomputed from the store on every tick.
+
+        Off (both limits 0) it makes no store call. It is stateless, so a restart holds it, and it logs at
+        ERROR on every tick it blocks (like the entries latch). It does not touch `_entries_blocked_reason`,
+        which belongs to reconciliation and the supervisor. An unreadable store fails closed: an unknown
+        result must not let an entry through. Open positions are unaffected: they are managed outside `_tick`.
+        """
+        kill_after = int(getattr(self._settings, "forward_kill_after_positions", 0) or 0)
+        review_at = int(getattr(self._settings, "forward_review_at_positions", 0) or 0)
+        if kill_after <= 0 and review_at <= 0:
+            return False
+        kill_below = float(getattr(self._settings, "forward_kill_below_per_1m", -500.0))
+        try:
+            totals = await self._trade_store.cycle_trade_totals()
+        except Exception:  # noqa: BLE001 - an unknown result must block entries, never crash the loop
+            self._logger.error("Forward guard could not read the cycle totals; entries paused.", exc_info=True)
+            return True
+        reason = forward_guard_reason(totals, kill_after, kill_below, review_at)
+        if reason is None:
+            return False
+        self._logger.error("Forward guard stops new entries: %s", reason)
+        return True
+
     async def _tick(self) -> None:
         await self._publish_volume()
         await self._publish_usage()
         if self._entries_blocked_reason is not None:
             self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
+            return
+        if await self._forward_guard_blocks_entries():
             return
         if not self._entry_window_is_open():
             return

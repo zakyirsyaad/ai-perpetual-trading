@@ -11,6 +11,7 @@ import httpx
 
 from bot.ai.usage import AICallMetrics, DailyAiUsage
 from bot.config import Settings
+from bot.core.forward_guard import CycleTotals
 from bot.models import ClosedTrade, OpenPosition, PositionDirection
 
 
@@ -388,6 +389,15 @@ class SupabaseTradeStore:
         """Net PnL of every closed trade since the volume cycle started (dashboard header only)."""
         rows = await self._all_closed_trade_rows("pnl_usdt")
         return sum(float(row.get("pnl_usdt") or 0.0) for row in rows)
+
+    async def cycle_trade_totals(self) -> CycleTotals:
+        """Count, net PnL and traded volume of every closed trade since the cycle start (forward guard)."""
+        rows = await self._all_closed_trade_rows("pnl_usdt,entry_price,exit_price,quantity")
+        return CycleTotals(
+            count=len(rows),
+            pnl_usdt=sum(float(row.get("pnl_usdt") or 0.0) for row in rows),
+            volume_usdt=self._sum_trade_volume(rows),
+        )
 
     async def recent_closed_trades(self, limit: int = 100) -> list[ClosedTrade]:
         """The newest `limit` closed trades, oldest first, for seeding the dashboard history."""

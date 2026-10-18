@@ -191,6 +191,12 @@ class Settings(BaseSettings):
     cooldown_minutes_after_stop: int = Field(default=20, alias="COOLDOWN_MINUTES_AFTER_STOP")
     # Pause after a close of any reason (stop, neutral exit, AI exit, time stop). 0 = off.
     cooldown_minutes_after_exit: int = Field(default=0, ge=0, alias="COOLDOWN_MINUTES_AFTER_EXIT")
+    # LONG forward bot self-stop (0 = off). From FORWARD_KILL_AFTER_POSITIONS closed positions, entries latch
+    # off while the pooled result is below FORWARD_KILL_BELOW_PER_1M per 1M; FORWARD_REVIEW_AT_POSITIONS
+    # latches them whatever the result, so the manager decides.
+    forward_kill_after_positions: int = Field(default=0, ge=0, alias="FORWARD_KILL_AFTER_POSITIONS")
+    forward_kill_below_per_1m: float = Field(default=-500.0, alias="FORWARD_KILL_BELOW_PER_1M")
+    forward_review_at_positions: int = Field(default=0, ge=0, alias="FORWARD_REVIEW_AT_POSITIONS")
     max_daily_drawdown_usdt: float = Field(default=100.0, alias="MAX_DAILY_DRAWDOWN_USDT")
     max_consecutive_losses: int = Field(default=3, alias="MAX_CONSECUTIVE_LOSSES")
     prevent_new_entries_if_exchange_position_open: bool = Field(
