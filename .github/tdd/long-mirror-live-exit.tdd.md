@@ -509,3 +509,20 @@ Items 2 to 5 change wording and layout only. Two docstrings in bound modules cha
 
 Verification: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` ran 2463 tests, OK;
 `compileall -q src tests` exit 0; `git diff --check` clean.
+
+## CI fix: platform-independent Mode A golden
+
+**Failure (CI, Python 3.11 on Linux, run 39131046859):** `test_mode_a_trade_log_unchanged_on_the_synthetic_week` failed with `AssertionError: '0b2a3282…' != '39aa210b…'`. The run still had 30 trades. Locally the text hash was `39aa210b…` on both Python 3.10 and 3.11 (macOS), so the cause is the platform, not the Python version.
+- The synthetic prices (`naik_price`) come from `math.exp` and `math.sin`. The last digit of those can differ between the macOS libm and glibc.
+- The trade log writes floats with `repr`, so a one-ulp difference changes the log text and its sha256.
+
+**Fix:**
+- The golden hashes `rounded_log(trade_log_text(...))`, which rounds every decimal cell to 6 decimals and leaves the other cells as they are. The new constant is `33938329…675bec59`. It is the same on 3.10 and 3.11, from code whose full text hash still equals the a4dffcc value `39aa210b…`.
+- Checked on the same week:
+
+  | Check | Text hash | Rounded hash | Golden |
+  |---|---|---|---|
+  | Every price moved up by one ulp (`math.nextafter`) | changes (`06236d05…`) | unchanged | passes |
+  | `settle` mutated to add 1e-4 USDT to each pnl | — | — | fails |
+
+  So the golden still catches a change in Mode A's walk or money, and no longer depends on the platform's libm.

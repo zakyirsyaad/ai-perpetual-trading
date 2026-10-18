@@ -12,8 +12,10 @@ and each SHORT case is written out by hand and not derived from the LONG one: a 
 mirrors the bars could repeat the mistake of the code it checks.
 """
 
+import csv
 import dataclasses
 import hashlib
+import io
 import itertools
 import math
 import random
@@ -1096,9 +1098,31 @@ class ComposeTests(unittest.TestCase):
 
 
 # The sha256 of the trade log of Mode A (5m, NAIK, the whole week as one segment) on the synthetic
-# week of tests.mode_backtest_stages, taken on the code before mode L's event loop was added (30
-# trades). Mode A's walk, money and log must stay as they were.
-MODE_A_SYNTHETIC_LOG_SHA = "39aa210b16d9a6ccdf6bf3c78718cdb0cd9411b36dd07cef8913879ca8112431"
+# week of tests.mode_backtest_stages, with every number rounded to 6 decimals (30 trades). The full
+# log text was identical to the one of the code before mode L's event loop was added (a4dffcc). The
+# synthetic prices come from math.exp and math.sin, whose last digit differs between the macOS and
+# the glibc libm, and the log writes floats with repr, so the unrounded text is not the same on CI.
+# Mode A's walk, money and log must stay as they were.
+MODE_A_SYNTHETIC_LOG_SHA = "33938329605fccdaa9528b901320529b5e81c1ad1d6e6dc704fcd284675bec59"
+
+
+def rounded_log(text: str) -> str:
+    """The trade log with each decimal number rounded to 6 decimals; other cells as they are."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    for row in csv.reader(io.StringIO(text)):
+        writer.writerow([format(float(cell), ".6f") if _is_decimal(cell) else cell for cell in row])
+    return out.getvalue()
+
+
+def _is_decimal(cell: str) -> bool:
+    if "." not in cell and "e" not in cell:
+        return False
+    try:
+        float(cell)
+    except ValueError:
+        return False
+    return True
 
 
 class ModeAGoldenTests(unittest.TestCase):
@@ -1113,7 +1137,7 @@ class ModeAGoldenTests(unittest.TestCase):
         result = simulate_run(frames, cfg, RunSpec(MODE_A, SYMBOL, "5m", NAIK, start, end))
 
         self.assertEqual(len(result.trades), 30)
-        text = trade_log_text(result.trades)
+        text = rounded_log(trade_log_text(result.trades))
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(), MODE_A_SYNTHETIC_LOG_SHA)
 
 
