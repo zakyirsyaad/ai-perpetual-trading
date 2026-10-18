@@ -986,11 +986,16 @@ class PairFramesTests(WavyCase):
         self.assertEqual(built.stretch, stretch)
         self.assertEqual(built.stretch_bars.interval_ms, M3)
 
-    def test_the_frames_record_the_config_they_were_built_under(self):
+    def test_the_frames_record_the_numbers_they_were_built_with(self):
         other = self.other_config()
+        live_only = dataclasses.replace(  # numbers the event loop reads from its own config
+            self.cfg, mode_a=dataclasses.replace(self.cfg.mode_a, tp_persen=0.30))
 
-        self.assertIs(self.built.cfg, self.cfg)
-        self.assertIs(frames.build_pair_frames(self.pair, other).cfg, other)
+        self.assertEqual(self.built.params, frames.FrameParams.of(self.cfg))
+        self.assertEqual(frames.build_pair_frames(self.pair, other).params,
+                         frames.FrameParams.of(other))
+        self.assertNotEqual(frames.FrameParams.of(other), frames.FrameParams.of(self.cfg))
+        self.assertEqual(frames.FrameParams.of(live_only), frames.FrameParams.of(self.cfg))
 
     def test_the_symbol_is_the_pairs_own(self):
         eth = dataclasses.replace(self.pair, symbol="ETH-USDT")
@@ -1035,7 +1040,7 @@ class PairFramesTests(WavyCase):
         names = [field.name for field in dataclasses.fields(frames.PairFrames)]
 
         self.assertEqual(
-            names, ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch", "cfg"]
+            names, ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch", "params"]
         )
 
 

@@ -266,14 +266,34 @@ def stretch_series(
 
 
 @dataclass(frozen=True)
+class FrameParams:
+    """The numbers of a config that ``build_pair_frames`` bakes into the series.
+
+    They are the selector's periods and band, Mode A's EMA period and Mode D's window and periods.
+    The event loop reads every other number from the config it runs under, so only these have to
+    be the ones the frames were built with."""
+
+    selector: SelectorConfig
+    ema_pemicu: int
+    candle_jendela: int
+    ema_periode: int
+    atr_periode: int
+
+    @classmethod
+    def of(cls, cfg: ModesConfig) -> "FrameParams":
+        mode_d = cfg.mode_d
+        return cls(cfg.pemilih_mode, cfg.mode_a.ema_pemicu, mode_d.candle_jendela,
+                   mode_d.ema_periode, mode_d.atr_periode)
+
+
+@dataclass(frozen=True)
 class PairFrames:
     """Everything the event loop reads for one pair.
 
     ``hourly`` answers the market condition at any time. ``triggers`` maps ``"15m"`` and ``"5m"``
     to Mode A's candles with their EMA. ``stretch_bars`` are Mode D's 3m candles and ``stretch``
-    holds the stretch of each, index for index. ``triggers`` is read-only. ``cfg`` is the config
-    the frames were built under: its periods are in the series, so ``simulate_run`` refuses to
-    run them under another one."""
+    holds the stretch of each, index for index. ``triggers`` is read-only. ``params`` are the
+    numbers the series were built with, so ``simulate_run`` refuses a config with others."""
 
     symbol: str
     bars_1m: Bars
@@ -281,28 +301,29 @@ class PairFrames:
     triggers: Mapping[str, TriggerSeries]
     stretch_bars: Bars
     stretch: Column
-    cfg: ModesConfig
+    params: FrameParams
 
 
 def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
-    """The frames of one pair under ``cfg``.
+    """The frames of one pair under ``cfg``, built from ``FrameParams.of(cfg)`` alone.
 
     The hourly frame takes the selector's periods (``pemilih_mode``). Both trigger timeframes are
     built with Mode A's EMA period (``mode_a.ema_pemicu``), so a run can pick 15m or the 5m
     switch. The stretch takes Mode D's window and periods (``candle_jendela``, ``ema_periode``,
     ``atr_periode``)."""
+    params = FrameParams.of(cfg)
     stretch_bars, stretch = stretch_series(
-        pair.bars_1m, cfg.mode_d.candle_jendela, cfg.mode_d.ema_periode, cfg.mode_d.atr_periode
+        pair.bars_1m, params.candle_jendela, params.ema_periode, params.atr_periode
     )
     triggers = {
-        tf: trigger_series(pair.bars_1m, tf, cfg.mode_a.ema_pemicu) for tf in TRIGGER_TIMEFRAMES
+        tf: trigger_series(pair.bars_1m, tf, params.ema_pemicu) for tf in TRIGGER_TIMEFRAMES
     }
     return PairFrames(
         pair.symbol,
         pair.bars_1m,
-        HourlyFrame.build(pair, cfg.pemilih_mode),
+        HourlyFrame.build(pair, params.selector),
         MappingProxyType(triggers),
         stretch_bars,
         stretch,
-        cfg,
+        params,
     )

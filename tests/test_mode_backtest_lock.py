@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -357,18 +358,35 @@ class LockFileTests(unittest.TestCase):
         self.assertIn("bot/logger.py", covered)
         self.assertNotIn("bot/logger.py", {rel for rel, _sha in lock.code_files()})
 
-    def test_dotfiles_beside_the_modules_are_not_fingerprinted(self):
+    def test_files_no_import_can_name_are_not_fingerprinted(self):
+        # Dotfiles, and names that are no module name, which no import statement can load.
         src = self.copy_of_src()
         folder = src / "research" / "mode_backtest"
         (folder / ".#stages.py").symlink_to("someone@host.1234:1700000000")  # an editor lock
         (folder / "._stages.py").write_bytes(b"\x00\x05\x16\x07")  # a macOS AppleDouble file
+        (folder / "stages.v2.py").write_text("x = 1\n", encoding="utf-8")  # a hand backup
+        (folder / "stages copy.py").write_text("x = 1\n", encoding="utf-8")  # a Finder copy
 
         with mock.patch.object(lock, "SRC_ROOT", src):
             names = [rel for rel, _sha in lock.code_files()]
             sha = lock.code_sha256()
 
-        self.assertEqual([name for name in names if Path(name).name.startswith(".")], [])
+        self.assertEqual([name for name in names if not Path(name).stem.isidentifier()], [])
         self.assertEqual(sha, lock.code_sha256())  # the same bytes as the real tree
+
+    def test_each_file_is_read_once_so_the_hashed_bytes_are_the_parsed_bytes(self):
+        real = Path.read_bytes
+        reads = Counter()
+
+        def counted(path):
+            reads[path] += 1
+            return real(path)
+
+        with mock.patch.object(Path, "read_bytes", autospec=True, side_effect=counted):
+            files = lock.code_files()
+
+        self.assertEqual(len(reads), len(files))
+        self.assertEqual(max(reads.values()), 1)
 
     def test_python_version_is_major_dot_minor(self):
         self.assertEqual(lock.python_version(), f"{sys.version_info[0]}.{sys.version_info[1]}")

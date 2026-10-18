@@ -27,7 +27,7 @@ from types import MappingProxyType
 from bot.strategy.modes.config import load_modes_config
 from bot.strategy.modes.position_rules import LONG, SHORT, adverse_fill, bracket_prices
 from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN, pilih_mode
-from research.mode_backtest.frames import HourlyContext, PairFrames, TriggerSeries
+from research.mode_backtest.frames import FrameParams, HourlyContext, PairFrames, TriggerSeries
 from research.mode_backtest.simulate import (
     BLOCK_REASONS,
     EXIT_SL,
@@ -171,14 +171,15 @@ def minutes(first_open, end, edits=None):
 
 
 def make_frames(bars_1m, hourly, m15=None, m5=None, stretch_of=None, symbol=PAIR, cfg=CFG):
-    """Frames written by hand; they record ``cfg`` as the config they were built under."""
+    """Frames written by hand; they record the numbers of ``cfg`` as those they were built with."""
     triggers = {
         "15m": m15 or TriggerSeries(bars_from_rows([], M15), ()),
         "5m": m5 or TriggerSeries(bars_from_rows([], M5), ()),
     }
     stretch_bars, values = stretch_of or (bars_from_rows([], M3), ())
     return PairFrames(
-        symbol, bars_1m, hourly, MappingProxyType(triggers), stretch_bars, values, cfg
+        symbol, bars_1m, hourly, MappingProxyType(triggers), stretch_bars, values,
+        FrameParams.of(cfg),
     )
 
 
@@ -1175,7 +1176,7 @@ class ArgumentTests(unittest.TestCase):
             MappingProxyType({"15m": series}),
             three_minute[0],
             three_minute[1],
-            CFG,
+            FrameParams.of(CFG),
         )
         cases = {
             "frames of another pair": (
@@ -1240,16 +1241,25 @@ class ArgumentTests(unittest.TestCase):
                 spec_a,
                 "built under another config",
             ),
-            "a config differing in a number the loop reads itself": (
-                make_frames(bars, StubHourly(), m15=series),
-                variant(umum={"jeda_menit": 5}),
-                spec_a,
-                "built under another config",
-            ),
         }
         for name, (frames, cfg, spec, message) in cases.items():
             with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
                 simulate_run(frames, cfg, spec)
+
+    def test_frames_run_under_a_config_that_differs_only_in_numbers_the_loop_reads(self):
+        # The pause, the take-profit and the confirmation window are read from the run's own
+        # config, so the frames need not be built again for them.
+        start, end = at(TUE, 9), at(TUE, 13)
+        frames = make_frames(minutes(start - M15, end), StubHourly(),
+                             m15=candles(start, end - M15, {at(TUE, 10, 15): SIGNAL}))
+        cfg = variant(umum={"jeda_menit": 5},
+                      mode_a={"tp_persen": 0.30, "konfirmasi_dalam_candle": 2})
+
+        result = simulate_run(frames, cfg, RunSpec(MODE_A, PAIR, "15m", NAIK, start, end))
+
+        (trade,) = result.trades
+        fill = adverse_fill(100.0, LONG, 0.01, False)
+        self.assertEqual(trade.tp, bracket_prices(fill, LONG, 0.30, 0.25).tp)
 
 
 if __name__ == "__main__":

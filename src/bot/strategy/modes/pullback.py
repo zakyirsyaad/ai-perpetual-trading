@@ -36,7 +36,8 @@ Misuse raises instead of passing silently:
 * ``ValueError`` for a constructor argument the rule cannot work with (a window under one candle,
   a cap that is not a finite number above 0, an interval that is not whole milliseconds above 0)
   and for a candle whose ``close_ms`` is not one interval after the previous one's: an older or
-  repeated candle, or one after a missing candle. A rejected candle changes nothing.
+  repeated candle, one after a missing candle, or one off the interval grid (a wrong feed). A
+  rejected candle changes nothing.
 * ``RuntimeError`` for ``consume()`` when the latest candle holds no unconsumed signal.
 
 The module takes numbers only: no I/O, no bars and no indicator code, and no live module imports
@@ -110,13 +111,13 @@ class PullbackTracker:
                 f"candles must come in increasing close_ms, got {candle.close_ms} "
                 f"after {self._last_close_ms}"
             )
-        if self._last_close_ms is not None and (
-            candle.close_ms != self._last_close_ms + self._interval_ms
-        ):
+        gap = None if self._last_close_ms is None else candle.close_ms - self._last_close_ms
+        if gap is not None and gap != self._interval_ms:
+            what = ("a candle is missing" if gap % self._interval_ms == 0
+                    else "the candle is off the interval grid")
             raise ValueError(
-                f"a candle is missing: close_ms {candle.close_ms} is not one interval "
-                f"({self._interval_ms} ms) after {self._last_close_ms}, and the window counts "
-                "candles"
+                f"{what}: close_ms {candle.close_ms} is {gap} ms after {self._last_close_ms}, "
+                f"the interval is {self._interval_ms} ms, and the window counts candles"
             )
         index = self._candles_seen
         self._candles_seen = index + 1

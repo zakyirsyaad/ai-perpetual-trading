@@ -1796,9 +1796,112 @@ git diff --check
   - The lock's `code_sha256` equals the current one over 62 files.
 - **The fingerprint now covers 62 files**: the 61 of before plus `bot/strategy/modes/checks.py`, found by the walk with no list to edit. Every lock written before this wave is void, as intended: no real `train` has run.
 
+## High-level review fix wave (2026-10-18)
+
+After CI went green on `2ee5389`, a `/code-review` at high effort reported 8 findings: 8 inline angles, deduplicated, no verify pass. The user asked for all 8 to be fixed with minimal edits. As before, every source change lands before the first real `train`. The RED runs are the failures with the new or updated tests in place.
+
+### H1. The loader reads no other YAML 1.1 form (`config.py`)
+
+**Finding.** The plain-number loader still read `yes`, `no`, `on` and `off` as flags. An explicit `!!int`, `!!float` or `!!bool` tag also went through PyYAML's 1.1 constructor, so `!!int 015` loaded 13, `!!float 1:30` 90.0 and `!!int 0x15` 21.
+
+**RED.** `FAILED (failures=8)`. `off`, `no`, `Off`, `NO`, `!!int 015`, `!!int 0x15` and `!!bool off` raised `ModesConfigError not raised`. `!!float 1:30` was refused only as a float in a whole-number field.
+
+**GREEN.**
+- `_PlainScalarLoader` (renamed from `_PlainNumberLoader`) also replaces the bool resolver with `true|True|TRUE|false|False|FALSE`, the YAML 1.2 core set.
+- The node walk, `_check_nodes` (renamed from `_refuse_repeated_keys`), refuses a scalar tagged int, float or bool whose value is not plain, and names its path.
+- `test_whatever_pyyaml_cannot_build_is_a_config_error` now expects `!!bool maybe` and `!!int abc` to be refused with their key path, not as "cannot read as YAML".
+
+**Tests.** `test_an_explicit_tag_cannot_bring_the_yaml_1_1_forms_back` and `test_a_flag_is_true_or_false_and_no_other_yaml_1_1_word`. `!!int 15` is still accepted.
+
+### H2. A file no import can name is not fingerprinted (`lock.py`)
+
+**Finding.** A start file whose stem is no module name, such as a `stages.v2.py` backup, crashed `code_files()` with `AttributeError: 'NoneType' object has no attribute 'read_bytes'`.
+
+**GREEN.** The start files are the `*.py` whose stem `isidentifier()`. That also covers the dotfiles of the previous wave.
+
+**Tests.** `test_files_no_import_can_name_are_not_fingerprinted`: an editor lock, an AppleDouble file, `stages.v2.py` and `stages copy.py`, with the sha equal to the real tree's.
+
+### H3. An independent walk holds the fingerprint (`tests/test_mode_backtest_structure.py`)
+
+**Finding.** The fingerprint tests used `lock.import_closure` as their own reference.
+
+**GREEN.** `found_by_modulefinder` runs the standard library's `modulefinder` over the package and the rule core. It reads the compiled imports, those inside functions included, and takes 0.18 s.
+- The fingerprint must equal what it reaches, minus `bot/storage/__init__.py`. That package is opened only on the way to the excluded I/O-only Supabase import, which Python never runs.
+- `test_fingerprint_covers_every_...` uses it as well.
+
+**Mutation check (scratch).** With `project_modules` patched to lose `research.pine_gate.cli_common` (60 files), both oracle tests fail, and so does the subprocess check.
+
+### H4. The frames check covers only the numbers the frames bake in (`frames.py`, `simulate.py`)
+
+**Finding.** `frames.cfg != cfg` refused a run whose config differed only in numbers the loop reads itself.
+
+**GREEN.**
+- `FrameParams` holds the selector, `ema_pemicu`, `candle_jendela`, `ema_periode` and `atr_periode`.
+- `build_pair_frames` builds from `FrameParams.of(cfg)` alone, so the list cannot drift from what is baked in.
+- `PairFrames.params` records it, and `_check_inputs` compares `FrameParams.of(cfg)`.
+
+**Tests.**
+- `test_the_frames_record_the_numbers_they_were_built_with` (a TP change leaves the params equal).
+- `test_frames_run_under_a_config_that_differs_only_in_numbers_the_loop_reads`: a pause, TP and confirmation variant runs on the same frames, and the trade carries the variant's TP.
+- The refusal case for a different `ema_pemicu` stays.
+
+### H5. Each fingerprinted file is read once (`lock.py`)
+
+**GREEN.** `import_closure` returns each module's path with the bytes it parsed, and `code_files` hashes those bytes.
+
+**RED.** `test_each_file_is_read_once_so_the_hashed_bytes_are_the_parsed_bytes` gave `AssertionError: 2 != 1`.
+
+### H6. Pine's fingerprint skips dot-folders (`pine_gate/lock.py`)
+
+**RED.** `['research/pine_gate/.ipynb_checkpoints/features-checkpoint.py'] != []`.
+
+**GREEN.** A path is left out when any of its parts below `research/pine_gate` starts with a dot.
+
+**Tests.** `test_the_fingerprint_skips_dotfiles_and_dot_folders`.
+
+### H7. The tracker tells a misaligned candle from a missing one (`pullback.py`)
+
+**RED.** A 15m candle 5 minutes after the last one was reported as `a candle is missing: ...`.
+
+**GREEN.** A gap that is a multiple of the interval is "a candle is missing", anything else is "the candle is off the interval grid". The message also gives the gap in ms. Nothing changes on a refusal.
+
+**Tests.** `test_a_candle_off_the_interval_grid_is_refused_as_misaligned_not_missing`.
+
+### H8. `run_step0` under 50 lines (`step0.py`)
+
+**GREEN.** `_step0_doc(...)` builds the JSON document, and `run_step0` went from 60 lines to 39 with no change in behaviour. The step 0 tests compare every field of the document.
+
+### Verification (high-level review fix wave)
+
+Run on 2026-10-18 on the working tree of this commit. Python 3.10.20 (`.venv`), `PYTHONPATH=src`.
+
+```text
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests
+(no output; exit 0)
+
+PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<scratch>/coveragerc -m unittest discover -s tests
+Ran 2290 tests in 643.912s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<scratch>/coveragerc
+TOTAL                                         15004   1388    91%
+(exit 0; the gate is 80 %)
+
+git diff --check
+(no output; exit 0)
+```
+
+- **Full suite.** 2,290 tests: the 2,284 of the code-review fix wave plus 6 new ones. The run took 644 s because the 3.11 run below was going at the same time; the first run of this wave took 143 s.
+- **Coverage.** New code (`bot/strategy/modes/` and `research/mode_backtest/`): 1,916 statements, 1 missed, the import line of `__main__.py`, which only the subprocess test runs.
+  - The first full run left `import_closure`'s old path-only wrapper uncovered, because nothing called it any more. `import_closure` now returns each module's path and bytes, and `code_files` calls it, so `lock.py` is at 100 %.
+- **Python 3.11.15** (scratch environment): `test_modes_config`, `_pullback`, `test_mode_backtest_lock`, `_structure`, `_loop`, `_frames`, `_step0`, `_simulate` and `test_pine_gate_structure` ran 434 tests, OK.
+- **Lint.** `ruff check --select F,E,W,B --line-length 100` on the changed files gives the same findings as at `2ee5389`, none new.
+- **The fingerprint** still covers 62 files.
+
 ## Commit trail
 
-`git log --oneline --reverse 772cd16..HEAD`: 31 commits, and this one (Task 15's `72e12e9`, the final review fix wave and the code-review fix wave are the last six). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
+`git log --oneline --reverse 772cd16..HEAD`: 32 commits, and this one (Task 15's `72e12e9`, the final review fix wave and the two review fix waves are the last seven). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
 
 - `40569bd` — `test: pin telemetry cancellation against swallowed wait_for` (main, PR #37)
 - `d3da0c5` — `fix: telemetry waits never swallow a cancellation` (main, PR #37)
@@ -1831,7 +1934,8 @@ git diff --check
 - `a9e2967` — `test: pin the close-above-EMA clause and the touch side of Mode A` (final review fix wave, items 2 and 3)
 - `40de062` — `test: pin that no live module imports the rule core` (final review fix wave, item 4)
 - `d50a05a` — `docs: final review fixes for the LONG module phase 1 docs` (final review fix wave, items 5 to 9 and its evidence)
-- this commit — `fix: apply the PR #39 code-review findings` (code-review fix wave, all 15 findings and this evidence)
+- `2ee5389` — `fix: apply the PR #39 code-review findings` (code-review fix wave, all 15 findings and its evidence)
+- this commit — `fix: apply the PR #39 high-level review findings` (high-level review fix wave, all 8 findings and this evidence)
 
 ## Deployment gate
 

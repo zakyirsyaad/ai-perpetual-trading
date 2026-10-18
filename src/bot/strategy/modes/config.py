@@ -11,9 +11,11 @@ What is accepted:
 * Percent fields stay in percent (``tp_persen: 0.40`` is 0.40 %), exactly as written.
 * A whole number is accepted, and returned as a float, where a float is expected. A ``bool`` is
   never a number, and a float is never a whole number.
-* A number is written in plain decimals (``15``, ``-150``, ``0.035``). What YAML 1.1 would read as
-  another number stays text and is refused as the wrong type: a leading zero (``015`` is octal
-  13), ``0x`` and ``0b`` literals, base 60 (``1:30`` is 90) and underscores (``25_000``).
+* A number is written in plain decimals (``15``, ``-150``, ``0.035``) and a flag as ``true`` or
+  ``false``. What YAML 1.1 would read as another number or as a flag stays text and is refused as
+  the wrong type: a leading zero (``015`` is octal 13), ``0x`` and ``0b`` literals, base 60
+  (``1:30`` is 90), underscores (``25_000``), and ``yes``, ``no``, ``on`` and ``off``. An explicit
+  ``!!int``, ``!!float`` or ``!!bool`` tag needs a plain value as well.
 * A merge key (``<<``) is refused: it would set keys a second time.
 * Dates are quoted strings such as ``"2025-08-01T00:00:00+07:00"`` (YAML turns an unquoted one
   into a datetime of its own). They must be midnight in Asia/Jakarta, because the data is stored
@@ -515,41 +517,58 @@ def parse_modes_config(doc: Mapping[str, Any]) -> ModesConfig:
 
 _INT_TAG = "tag:yaml.org,2002:int"
 _FLOAT_TAG = "tag:yaml.org,2002:float"
+_BOOL_TAG = "tag:yaml.org,2002:bool"
 _MERGE_TAG = "tag:yaml.org,2002:merge"
+_PLAIN_INT = re.compile(r"^[-+]?(?:0|[1-9][0-9]*)$")
+_PLAIN_FLOAT = re.compile(r"^[-+]?(?:0|[1-9][0-9]*)\.[0-9]+$")
+_PLAIN_BOOL = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+# The values a tag may carry, whether the file writes it or the loader resolves it.
+_PLAIN = {
+    _INT_TAG: (_PLAIN_INT,),
+    _FLOAT_TAG: (_PLAIN_INT, _PLAIN_FLOAT),
+    _BOOL_TAG: (_PLAIN_BOOL,),
+}
 
 
-class _PlainNumberLoader(yaml.SafeLoader):
-    """``yaml.SafeLoader`` that reads a number only in plain decimals: ``15``, ``-150``, ``0.035``.
+class _PlainScalarLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that reads a number only in plain decimals (``15``, ``-150``,
+    ``0.035``) and a flag only as ``true`` or ``false``.
 
     Its YAML 1.1 rules also read ``015`` as octal 13, ``0x15``, ``0b1111``, ``1:30`` (base 60, so
-    90) and ``25_000``. Here those stay text, so the readers refuse them as the wrong type."""
+    90), ``25_000``, and ``yes``, ``no``, ``on`` and ``off`` as flags. Here those stay text, so
+    the readers refuse them as the wrong type."""
 
     yaml_implicit_resolvers = {
-        first: [(tag, regexp) for tag, regexp in resolvers if tag not in (_INT_TAG, _FLOAT_TAG)]
+        first: [(tag, regexp) for tag, regexp in resolvers if tag not in _PLAIN]
         for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
     }
 
 
 _DIGITS = list("-+0123456789")
-_PlainNumberLoader.add_implicit_resolver(_INT_TAG, re.compile(r"^[-+]?(?:0|[1-9][0-9]*)$"), _DIGITS)
-_PlainNumberLoader.add_implicit_resolver(
-    _FLOAT_TAG, re.compile(r"^[-+]?(?:0|[1-9][0-9]*)\.[0-9]+$"), _DIGITS
-)
+_PlainScalarLoader.add_implicit_resolver(_INT_TAG, _PLAIN_INT, _DIGITS)
+_PlainScalarLoader.add_implicit_resolver(_FLOAT_TAG, _PLAIN_FLOAT, _DIGITS)
+_PlainScalarLoader.add_implicit_resolver(_BOOL_TAG, _PLAIN_BOOL, list("tTfF"))
 
 
-def _refuse_repeated_keys(node: yaml.Node, path: str, visited: set[int]) -> None:
-    """Refuse a key written twice in one mapping, which ``yaml.safe_load`` resolves silently
-    by keeping the last, and a merge key (``<<``), which sets keys a second time out of sight:
-    the file must say each thing once.
+def _check_nodes(node: yaml.Node, path: str, visited: set[int]) -> None:
+    """Refuse what PyYAML would build into something other than what the file shows.
+
+    That is a key written twice in one mapping (``yaml.safe_load`` keeps the last), a merge key
+    (``<<``, which sets keys a second time out of sight), and an explicit ``!!int``, ``!!float``
+    or ``!!bool`` on a value that is not plain (the YAML 1.1 constructor reads ``!!int 015`` as
+    octal 13). The file must say each thing once, as it means it.
 
     An alias points at a node that is already checked, and may point back at its own ancestor,
     so a node is walked once."""
     if id(node) in visited:
         return
     visited.add(id(node))
-    if isinstance(node, yaml.SequenceNode):
+    if isinstance(node, yaml.ScalarNode) and node.tag in _PLAIN:
+        if not any(pattern.match(node.value) for pattern in _PLAIN[node.tag]):
+            raise _fail(path, f"{_show(node.value)} is not a plain number or true/false")
+    elif isinstance(node, yaml.SequenceNode):
         for item in node.value:
-            _refuse_repeated_keys(item, path, visited)
+            _check_nodes(item, path, visited)
     elif isinstance(node, yaml.MappingNode):
         seen: set[str] = set()
         for key_node, value_node in node.value:
@@ -561,7 +580,7 @@ def _refuse_repeated_keys(node: yaml.Node, path: str, visited: set[int]) -> None
                 if key_node.value in seen:
                     raise _fail(child, "key written twice")
                 seen.add(key_node.value)
-            _refuse_repeated_keys(value_node, child, visited)
+            _check_nodes(value_node, child, visited)
 
 
 def _unreadable(exc: Exception) -> ModesConfigError:
@@ -574,16 +593,16 @@ def _parse_yaml(text: str) -> Any:
     Whatever PyYAML raises leaves as a ``ModesConfigError``: a ``YAMLError`` for bad syntax, but
     also a bare ``ValueError`` for an unquoted date no calendar has (``2025-13-01``), a
     ``KeyError`` for ``!!bool maybe`` or a ``RecursionError`` for absurd nesting. Only the library
-    calls sit inside a ``try``, so the repeated-key refusal below is not wrapped a second time.
-    Both calls use ``_PlainNumberLoader``, a ``SafeLoader``: safe loading, as ``yaml.safe_load``."""
+    calls sit inside a ``try``, so the refusals of ``_check_nodes`` are not wrapped a second time.
+    Both calls use ``_PlainScalarLoader``, a ``SafeLoader``: safe loading, as ``yaml.safe_load``."""
     try:
-        root = yaml.compose(text, Loader=_PlainNumberLoader)  # builds nodes only, no Python objects
+        root = yaml.compose(text, Loader=_PlainScalarLoader)  # builds nodes only, no Python objects
     except Exception as exc:
         raise _unreadable(exc) from exc
     if root is not None:
-        _refuse_repeated_keys(root, "", set())
+        _check_nodes(root, "", set())
     try:
-        return yaml.load(text, Loader=_PlainNumberLoader)
+        return yaml.load(text, Loader=_PlainScalarLoader)
     except Exception as exc:
         raise _unreadable(exc) from exc
 

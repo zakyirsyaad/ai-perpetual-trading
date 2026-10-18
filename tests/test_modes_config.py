@@ -653,10 +653,16 @@ class YamlFileTests(ConfigCase):
         for name, (old, new) in cases.items():
             with self.subTest(name):
                 self.assertFileRefuses(text.replace(old, new))
-        for name in ("an hour no clock has", "year zero", "an explicit !!bool that is no boolean"):
+        for name in ("an hour no clock has", "year zero"):
             old, new = cases[name]
             with self.subTest(name, says="cannot read as YAML"):
                 self.assertFileRefuses(text.replace(old, new), "cannot read as YAML")
+        # An explicit tag on a value that is not plain is refused before PyYAML builds it.
+        for name, named in (("an explicit !!bool that is no boolean", "umum.ai_boleh_buka_tutup"),
+                            ("an explicit !!int that is no integer", "umum.jeda_menit")):
+            old, new = cases[name]
+            with self.subTest(name, says=named):
+                self.assertFileRefuses(text.replace(old, new), named, "not a plain")
 
     def test_a_hex_number_too_long_for_python_to_print_is_a_config_error(self):
         # PyYAML reads a hex literal of any length (the digit limit covers decimal only), then
@@ -701,10 +707,40 @@ class YamlFileTests(ConfigCase):
                 self.assertIn(old, text)
                 message = self.assertFileRefuses(text.replace(old, new, 1), named)
                 self.assertIn(f"'{written}' (str)", message)
-        for written, value in (("0", 0), ("+15", 15)):
+        for written, value in (("0", 0), ("+15", 15), ("!!int 15", 15)):
             with self.subTest(written=written):
                 path = self.written(text.replace(pause, f"  jeda_menit: {written}\n"))
                 self.assertEqual(load_modes_config(path).umum.jeda_menit, value)
+
+    def test_an_explicit_tag_cannot_bring_the_yaml_1_1_forms_back(self):
+        # PyYAML's constructor still reads !!int 015 as octal 13, !!float 1:30 as 90.0 and
+        # !!bool yes as True; an explicit tag must name a plain value too.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        pause, flag = "  jeda_menit: 15\n", "  ai_boleh_buka_tutup: false\n"
+        cases = {
+            "!!int 015": (pause, "  jeda_menit: !!int 015\n", "umum.jeda_menit"),
+            "!!int 0x15": (pause, "  jeda_menit: !!int 0x15\n", "umum.jeda_menit"),
+            "!!float 1:30": (pause, "  jeda_menit: !!float 1:30\n", "umum.jeda_menit"),
+            "!!bool off": (flag, "  ai_boleh_buka_tutup: !!bool off\n", "umum.ai_boleh_buka_tutup"),
+        }
+        for written, (old, new, named) in cases.items():
+            with self.subTest(written=written):
+                message = self.assertFileRefuses(text.replace(old, new), named, "plain")
+                self.assertNotIn("cannot read as YAML", message)
+
+    def test_a_flag_is_true_or_false_and_no_other_yaml_1_1_word(self):
+        # YAML 1.1 also reads yes, no, on and off as booleans; here they stay text.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        flag = "  ai_boleh_buka_tutup: false\n"
+        for written in ("off", "no", "Off", "NO"):
+            with self.subTest(written=written):
+                case = text.replace(flag, f"  ai_boleh_buka_tutup: {written}\n")
+                message = self.assertFileRefuses(case, "umum.ai_boleh_buka_tutup")
+                self.assertIn(f"'{written}' (str)", message)
+        for written in ("false", "False", "FALSE"):
+            with self.subTest(written=written):
+                path = self.written(text.replace(flag, f"  ai_boleh_buka_tutup: {written}\n"))
+                self.assertIs(load_modes_config(path).umum.ai_boleh_buka_tutup, False)
 
     def test_a_merge_key_is_refused_and_names_its_path(self):
         # ``<<`` sets keys a second time, out of sight of the repeated-key refusal.

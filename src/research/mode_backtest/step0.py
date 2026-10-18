@@ -492,6 +492,35 @@ def _fields(replayed: Metrics) -> List[str]:
                    for key in row})
 
 
+def _step0_doc(now: datetime, paths: Mapping[str, Path], holdout_doc: Mapping[str, Any],
+               config_sha: str, period: HoldoutPeriod, exec_cfg: ExecConfig, replayed: Metrics,
+               rows: Sequence[Step0Row]) -> Dict[str, Any]:
+    """The JSON document of step 0: its inputs and their hashes, the period, the reproduction and
+    the rows."""
+    return {
+        "created_at": now.isoformat(),
+        "seed": SEED,
+        "inputs": {
+            "holdout_file": PINE_FILES["holdout"],
+            "holdout_sha256": file_sha256(paths["holdout"]),
+            "selection_sha256": file_sha256(paths["selection"]),
+            "calibration_sha256": file_sha256(paths["calibration"]),
+            # check_inputs refused any other: this is the sha256 of the data that was loaded
+            "data_sha256": holdout_doc.get("data_sha256"),
+            "config_sha256": config_sha,
+            "code_sha256": code_sha256(),
+            "holdout_code_sha256": holdout_doc.get("code_sha256"),
+            "python_version": python_version(),
+        },
+        "period": period.to_dict(),
+        "label_days": [LABEL_FIRST_DAY.isoformat(), LABEL_LAST_DAY.isoformat()],
+        "exec": asdict(exec_cfg),
+        "reproduction": {"contenders": list(replayed), "symbols": list(SYMBOLS),
+                         "fields": _fields(replayed), "differences": 0},
+        "rows": [asdict(row) for row in rows],
+    }
+
+
 def run_step0(
     data_dir: PathLike, pine_dir: PathLike, config_path: PathLike, out_dir: PathLike,
     now: datetime,
@@ -525,28 +554,7 @@ def run_step0(
 
     rows = split_rows(trades, label_lookup(frames, cfg.pemilih_mode),
                       notional_usdt=exec_cfg.notional_usdt)
-    doc = {
-        "created_at": now.isoformat(),
-        "seed": SEED,
-        "inputs": {
-            "holdout_file": PINE_FILES["holdout"],
-            "holdout_sha256": file_sha256(paths["holdout"]),
-            "selection_sha256": file_sha256(paths["selection"]),
-            "calibration_sha256": file_sha256(paths["calibration"]),
-            # check_inputs refused any other: this is the sha256 of the data that was loaded
-            "data_sha256": holdout_doc.get("data_sha256"),
-            "config_sha256": config_sha,
-            "code_sha256": code_sha256(),
-            "holdout_code_sha256": holdout_doc.get("code_sha256"),
-            "python_version": python_version(),
-        },
-        "period": period.to_dict(),
-        "label_days": [LABEL_FIRST_DAY.isoformat(), LABEL_LAST_DAY.isoformat()],
-        "exec": asdict(exec_cfg),
-        "reproduction": {"contenders": list(replayed), "symbols": list(SYMBOLS),
-                         "fields": _fields(replayed), "differences": 0},
-        "rows": [asdict(row) for row in rows],
-    }
+    doc = _step0_doc(now, paths, holdout_doc, config_sha, period, exec_cfg, replayed, rows)
     markdown = step0_markdown(rows, holdout_file=PINE_FILES["holdout"],
                               first_day=wib_day(period.start_ms),
                               last_day=wib_day(period.end_ms - 1), seed=SEED, exec_cfg=exec_cfg)

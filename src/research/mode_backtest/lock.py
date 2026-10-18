@@ -168,34 +168,37 @@ def _names_in_source(source: bytes, module: str, is_package: bool) -> FrozenSet[
     return frozenset(imported_names(ast.parse(source), module, is_package))
 
 
-def import_closure(paths: Iterable[Path]) -> Dict[str, Path]:
+def import_closure(paths: Iterable[Path]) -> Dict[str, Tuple[Path, bytes]]:
     """Every project module that the modules at ``paths`` import, followed transitively, by
-    name; the modules at ``paths`` are included."""
+    name, with its file and the bytes it was parsed from (each file is read once); the modules
+    at ``paths`` are included."""
     todo = [module_name(path) for path in paths]
-    seen: Dict[str, Path] = {}
+    seen: Dict[str, Tuple[Path, bytes]] = {}
     while todo:
         name = todo.pop()
         if name in seen:
             continue
         path = module_source(name)
-        seen[name] = path
-        names = _names_in_source(path.read_bytes(), name, path.name == "__init__.py")
-        todo += project_modules(names)
+        source = path.read_bytes()
+        seen[name] = (path, source)
+        todo += project_modules(_names_in_source(source, name, path.name == "__init__.py"))
     return seen
 
 
 def code_files() -> List[Tuple[str, str]]:
     """``(path relative to src, sha256)`` of every file the code fingerprint covers, sorted: the
-    modules of ``CODE_DIRS`` and everything they import (``import_closure``)."""
+    modules of ``CODE_DIRS`` and everything they import (``import_closure``), each hashed from
+    the bytes the walk parsed. A file whose name is no module name (an editor's lock file, a
+    macOS AppleDouble file, a ``stages.v2.py`` backup) cannot be imported and is left out."""
     starts = [
         path
         for folder in CODE_DIRS
         for path in sorted((SRC_ROOT / folder).glob("*.py"))
-        if not path.name.startswith(".")  # an editor's lock file or a macOS AppleDouble file
+        if path.stem.isidentifier()
     ]
     return sorted(
-        (path.relative_to(SRC_ROOT).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
-        for path in import_closure(starts).values()
+        (path.relative_to(SRC_ROOT).as_posix(), hashlib.sha256(source).hexdigest())
+        for path, source in import_closure(starts).values()
     )
 
 

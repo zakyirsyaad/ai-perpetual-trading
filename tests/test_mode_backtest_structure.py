@@ -6,8 +6,10 @@ run on small synthetic sources, so a rule cannot pass just because it looks at n
 
 The code fingerprint of the lock is the package, the rule core and every module they
 import: ``lock.import_closure``, an AST walk of every import statement followed from module
-to module through ``bot`` and ``research``. It is held against the modules a fresh Python
-process has loaded once it has imported every module of the package.
+to module through ``bot`` and ``research``. It is held against two walks written apart from
+it: the standard library's ``modulefinder``, which reads the compiled imports (those inside
+functions too), and the modules a fresh Python process has loaded once it has imported every
+module of the package.
 
 One rule looks the other way: no live module (every source under ``src`` outside
 ``research/`` and the rule core ``bot/strategy/modes/``) imports the rule core.
@@ -15,6 +17,7 @@ One rule looks the other way: no live module (every source under ``src`` outside
 
 import ast
 import json
+import modulefinder
 import os
 import re
 import subprocess
@@ -24,7 +27,7 @@ from pathlib import Path
 from typing import List, Set
 
 from research.mode_backtest import lock
-from research.mode_backtest.lock import import_closure, imported_names, module_name, project_modules
+from research.mode_backtest.lock import imported_names, module_name, project_modules
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 PACKAGE = SRC / "research" / "mode_backtest"
@@ -371,14 +374,28 @@ class FileWriteTests(unittest.TestCase):
                 self.assertEqual(file_writes(parse(source)), [])
 
 
+# ``modulefinder`` opens a package on its way to an excluded module (``bot.storage`` before the
+# Supabase store). Python never runs that import, so the fingerprint leaves the package out.
+OPENED_ON_THE_WAY = frozenset({"bot/storage/__init__.py"})
+
+
+def found_by_modulefinder(paths: List[Path]) -> Set[str]:
+    """The project files the standard library's ``modulefinder`` reaches from the modules at
+    ``paths``: a second walk, apart from the lock's, over the compiled code of every import
+    statement, those inside functions and ``TYPE_CHECKING`` blocks included."""
+    finder = modulefinder.ModuleFinder(path=[str(SRC)], excludes=sorted(lock.IO_ONLY_IMPORTS))
+    for path in paths:
+        finder.import_hook(module_name(path))
+    files = {Path(module.__file__).resolve() for module in finder.modules.values()
+             if module.__file__}
+    return {relative(path) for path in files if path.is_relative_to(SRC)} - OPENED_ON_THE_WAY
+
+
 class CodeFingerprintTests(unittest.TestCase):
     def imported_from_outside(self) -> Set[str]:
         """The files of the modules the package imports that are not its own."""
-        return {
-            relative(path)
-            for name, path in import_closure(modules()).items()
-            if not name.startswith("research.mode_backtest")
-        }
+        own = {relative(path) for path in modules()}
+        return found_by_modulefinder(modules()) - own
 
     def covered(self) -> Set[str]:
         return {rel for rel, _sha in lock.code_files()}
@@ -400,9 +417,9 @@ class CodeFingerprintTests(unittest.TestCase):
             self.assertIn(followed, imported)
         self.assertEqual(sorted(imported - self.covered()), [])
 
-    def test_the_fingerprint_holds_nothing_the_package_and_the_rule_core_do_not_import(self):
+    def test_the_fingerprint_is_what_an_independent_walk_reaches(self):
         starts = [*modules(), *sorted(RULE_CORE_DIR.glob("*.py"))]
-        reached = {relative(path) for path in import_closure(starts).values()}
+        reached = found_by_modulefinder(starts)
 
         self.assertEqual(sorted(self.covered() - reached), [])
         self.assertEqual(sorted(reached - self.covered()), [])

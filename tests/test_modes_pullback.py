@@ -353,6 +353,19 @@ class MisuseTests(unittest.TestCase):
         # the rejected candle changed nothing: candle 2 still confirms the touch
         self.assertIsNotNone(tracker.on_candle(green_above(2), EMA, SMA, ATR))
 
+    def test_a_candle_off_the_interval_grid_is_refused_as_misaligned_not_missing(self):
+        # Five minutes after a 15m candle is a wrong feed or a duplicate, not a gap.
+        tracker = new_tracker()
+        feed(tracker, [touch_red(0)])
+        early = dataclasses.replace(red_above(1), close_ms=touch_red(0).close_ms + STEP_MS // 3)
+
+        with self.assertRaises(ValueError) as caught:
+            tracker.on_candle(early, EMA, SMA, ATR)
+
+        self.assertIn("off the interval grid", str(caught.exception))
+        self.assertNotIn("missing", str(caught.exception))
+        self.assertIsNotNone(tracker.on_candle(green_above(1), EMA, SMA, ATR))  # nothing changed
+
     def test_the_interval_must_be_a_whole_number_of_milliseconds_above_zero(self):
         for bad in (0, -STEP_MS, float(STEP_MS), True, str(STEP_MS), None):
             with self.subTest(interval_ms=bad), self.assertRaisesRegex(ValueError, "interval_ms"):

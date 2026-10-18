@@ -101,7 +101,7 @@ from research.pine_gate.bars import Bars, entry_index_for, interval_to_ms, wib_d
 from research.pine_gate.features import INTERVAL_1M
 from research.pine_gate.spec import WIB
 
-from .frames import TRIGGER_TIMEFRAMES, HourlyContext, PairFrames, TriggerSeries
+from .frames import TRIGGER_TIMEFRAMES, FrameParams, HourlyContext, PairFrames, TriggerSeries
 
 __all__ = [
     "BLOCK_REASONS",
@@ -425,10 +425,11 @@ def _check_inputs(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> None:
         )
     if frames.bars_1m.interval_ms != INTERVAL_1M:
         raise ValueError(f"expected 1m bars, got {frames.bars_1m.interval_ms} ms")
-    if frames.cfg != cfg:
+    if frames.params != FrameParams.of(cfg):
         raise ValueError(
-            "the frames were built under another config: its periods are in their series and "
-            "the rest would come from this one, so build them again with build_pair_frames"
+            "the frames were built under another config: its periods (FrameParams) are in their "
+            "series and the rest would come from this one, so build them again with "
+            "build_pair_frames"
         )
 
 
@@ -658,7 +659,7 @@ def simulate_run(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> RunResul
 
     Raises ``ValueError`` when the frames or the config do not fit the run: frames of another pair,
     a pair the config does not have, an ``otomatis`` ``faktor_k``, more than one position per pair,
-    bars of the wrong interval, frames built under another config (``frames.cfg``), or a column
+    bars of the wrong interval, frames built with other periods (``frames.params``), or a column
     (EMA, stretch) that does not match its candles. Raises
     ``RuntimeError`` for a hole in the data the run needs: a missing trigger candle, no 1m bar
     opening at a signal that passed every gate, or a walk that cannot end."""
