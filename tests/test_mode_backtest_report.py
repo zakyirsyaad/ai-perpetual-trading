@@ -19,6 +19,7 @@ from research.mode_backtest.report import (
     NO_TRADING,
     LiveRow,
     ReportRow,
+    live_no_trading_row,
     live_status_line,
     live_table,
     mode_table,
@@ -318,6 +319,18 @@ class LiveTableTests(unittest.TestCase):
             "50 / 40 / 20 / 13 | – |",
         )
         self.assertEqual(len(table), 4)
+
+    def test_the_no_trading_row_of_a_live_stage(self):
+        row = live_no_trading_row(BTC, "Ujian", 52, 70)
+
+        self.assertEqual((row.mode, row.versi, row.tahap), (NO_TRADING, "–", "Ujian"))
+        self.assertEqual((row.metrics.posisi, row.metrics.hasil_per_1_juta), (0, 0.0))
+        self.assertEqual(
+            live_table([row]).splitlines()[2],
+            "| Tidak trading | – | BTC-USDT | Ujian | 0 | 0,00 | 0,00 | – | 0 | 0 / 0 / 0 / 0 | – |",
+        )
+        none = live_no_trading_row(BTC, "Ujian", 0, 0).metrics
+        self.assertEqual((none.entry_per_hari_aktif, none.entry_per_hari_kalender), (None, None))
 
     def test_an_empty_live_table_is_the_header_alone(self):
         self.assertEqual(len(live_table([]).splitlines()), 2)

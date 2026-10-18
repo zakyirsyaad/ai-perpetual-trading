@@ -234,11 +234,12 @@ def live_table(rows: Iterable[LiveRow]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _no_trading(hari_naik: int) -> StageMetrics:
+def _no_trading(hari_naik: int, hari_kalender: Optional[int] = None) -> StageMetrics:
     """The comparator that never trades: no position and a result of exactly 0.
 
     It has no TP or SL, so Menang is missing, and no hold. Its entries per NAIK day are 0 when the
-    stage has a NAIK day and missing when it has none, as for every other row."""
+    stage has a NAIK day and missing when it has none, as for every other row; its entries per
+    calendar day likewise, from ``hari_kalender`` (missing when not given, as in Mode A's table)."""
     return StageMetrics(
         posisi=0,
         entry_per_hari_aktif=0.0 if hari_naik > 0 else None,
@@ -250,7 +251,15 @@ def _no_trading(hari_naik: int) -> StageMetrics:
         rata_lama_menit=None,
         hasil_tanpa_teratas=None,
         hari_naik=hari_naik,
+        entry_per_hari_kalender=0.0 if hari_kalender else None,
     )
+
+
+def live_no_trading_row(pair: str, tahap: str, hari_naik: int, hari_kalender: int) -> LiveRow:
+    """The "Tidak trading" line of the mode L table for one stage (spec section 4: the comparator
+    that never opens a position, a result of 0). It has no exit version, so Versi is "–";
+    ``hari_naik`` is the stage's NAIK days and ``hari_kalender`` its WIB calendar days."""
+    return LiveRow(NO_TRADING, NA, pair, tahap, _no_trading(hari_naik, hari_kalender))
 
 
 def mode_table(rows: Iterable[ReportRow]) -> str:

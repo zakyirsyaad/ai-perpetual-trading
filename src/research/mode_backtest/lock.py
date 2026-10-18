@@ -10,8 +10,9 @@ for that lock folder whatever data folder a rerun names, so a fresh copy of the 
 second test. All three are written through ``research.pine_gate.fileio``, so none is ever
 overwritten.
 
-``check_lock`` holds four bindings against the current run, and its ``LockError`` lists every one
-that differs:
+``check_lock`` holds four bindings against the current run, plus any ``extra`` one a mode adds
+(mode L binds ``live_config_sha256``, the sha256 of ``config/modes_live_exit.yaml``), and its
+``LockError`` lists every one that differs:
 
 * ``config_sha256``: the sha256 of the configuration bytes the numbers were parsed from;
 * ``code_sha256``: ``code_sha256()``, over the files of ``code_files()``;
@@ -44,6 +45,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     Any,
     Dict,
@@ -278,12 +280,14 @@ def check_lock(
     code_sha: str,
     train_manifest_sha: str,
     python: str,
+    extra: Mapping[str, str] = MappingProxyType({}),
 ) -> None:
     """Refuse unless the lock binds these values; the ``LockError`` lists every mismatch.
 
     ``config_sha`` is the sha256 of the configuration bytes, ``code_sha`` the current
     ``code_sha256()``, ``train_manifest_sha`` the sha256 of the current training manifest and
-    ``python`` the current ``python_version()``."""
+    ``python`` the current ``python_version()``. ``extra`` holds further bindings by their key in
+    the lock (mode L's ``live_config_sha256``): each key must be in the lock with that value."""
     if not isinstance(doc, Mapping):
         raise LockError("the lock is not a JSON object")
     bound = (
@@ -291,6 +295,7 @@ def check_lock(
         ("code_sha256", code_sha, "the code"),
         ("train_manifest_sha256", train_manifest_sha, "the training files"),
         ("python", python, "this Python"),
+        *((key, current, "an extra binding") for key, current in extra.items()),
     )
     problems = []
     for key, current, source in bound:

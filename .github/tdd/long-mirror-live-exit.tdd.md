@@ -247,3 +247,69 @@ changed; `LockedMetricsShapeTests` in `tests/test_mode_backtest_lock.py` pins th
 $ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock.LockedMetricsShapeTests
 Ran 2 tests ... OK
 ```
+
+## Task 7
+
+Lock and the train/test stages for mode L. `lock.check_lock(..., extra=...)` holds further bindings by
+their key in the lock (every key must be there with that value; each mismatch is listed). The new
+`research/mode_backtest/stages_live.py` has `train_live_stage(config_path, live_config_path, data_dir,
+out_dir, pair, now)` and `test_live_stage(...)`, running `L_i_NAIK`, `L_ii_NAIK`, `S_i_TURUN`,
+`S_ii_TURUN` and "Tidak trading" on the Phase 1 lock pattern. The lock `mode_L_BTC-USDT_lock.json` binds
+`config_sha256`, `live_config_sha256` (through `extra`), `code_sha256`, `train_manifest_sha256` and
+`python`; the start record is `mode_L_BTC-USDT_test_started.json` and the marker
+`holdout_runs/mode_L_BTC-USDT_<lock sha>.json`, so Mode A's records and mode L's never refuse each
+other. `test_live_stage` keeps Phase 1's order: configs and lock read, training files hashed, lock
+checked (bindings, mode, pair, stage bounds, a summary of all four runs) → started/outputs/day-file
+refusals (test days only `stat`-ed) → start record claimed → marker claimed → only then the test days
+hashed and read → outputs written exclusively, with `loaded_manifest_sha256` and
+`test_days_manifest_sha256`. L is measured on NAIK days and S on TURUN days, counted from the first
+hour in which the first 3m stretch is known (controller ruling 2); every run carries entries per WIB
+calendar day of its stage. Pass status and `live_status_line` are given for L(i) and L(ii) only
+(ruling 3). `aktif: false`, a pair other than BTC-USDT and a live trigger other than Mode D's are refused
+before anything is written.
+
+Helpers of `stages.py` made public, no behaviour change: `Period`, `training_period`, `testing_period`,
+`outputs_for`, `stamp`, `refuse_existing`, `Bindings`, `training_manifest_sha` (the brief's list) and,
+beyond it, `Outputs`, `run_metrics` (gains an optional `hari_kalender`, so `stage_metrics` keeps its one
+call site), `locked_metrics`, `refuse_after_the_test`, `refuse_before_the_marker`, `read_data`, `ReadData`
+and `require_warm`. `report.live_no_trading_row(pair, tahap, hari_naik, hari_kalender)` gives the "Tidak
+trading" line of the live table. `FileReads` moved from `tests/test_mode_backtest_lock.py` to
+`tests/mode_backtest_stages.py`, shared by both stage test modules.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_stages tests.test_mode_backtest_lock
+ImportError: cannot import name 'stages_live' from 'research.mode_backtest'
+ERROR: test_check_lock_holds_every_extra_binding_against_the_lock (tests.test_mode_backtest_lock.LockFileTests)
+TypeError: check_lock() got an unexpected keyword argument 'extra'
+Ran 46 tests in 75.753s
+FAILED (errors=2)
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock tests.test_mode_backtest_structure
+Ran 68 tests in 25.750s
+OK            (after the renames, before stages_live existed)
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_stages tests.test_mode_backtest_report
+Ran 46 tests in 4.207s
+OK
+```
+
+```
+$ PYTHONPATH=src .venv/bin/python -m coverage run -m unittest discover -s tests   (rcfile = the pyproject settings; Python 3.10 has no tomllib)
+Ran 2435 tests in 135.417s
+OK
+$ PYTHONPATH=src .venv/bin/python -m coverage report
+src/research/mode_backtest/lock.py           137   0  100%
+src/research/mode_backtest/report.py          83   0  100%
+src/research/mode_backtest/stages.py         279   0  100%
+src/research/mode_backtest/stages_live.py    185   0  100%
+TOTAL                                      15479 1390   91%
+```
+
+`compileall` and `git diff --check` are clean. Seven hand mutants of `stages_live.py` each fail the new tests: reading the test days before the claims,
+dropping the `extra` binding, dropping the refusals before the marker, measuring S on NAIK days, not
+claiming the start record, a status line for S, and ignoring the first-stretch start of the day count.

@@ -11,7 +11,6 @@ import ast
 import contextlib
 import csv
 import dataclasses
-import gzip
 import hashlib
 import io
 import json
@@ -37,6 +36,7 @@ from research.pine_gate.bars import wib_day_start_ms
 from tests.mode_backtest_helpers import MINUTE_MS, write_days, write_warmups
 from tests.mode_backtest_stages import (
     CLOCK,
+    FileReads,
     STAMP,
     SYMBOL,
     TEST_DAYS,
@@ -77,43 +77,6 @@ def flip_gzip_mtime(path):
     raw = bytearray(path.read_bytes())
     raw[4] ^= 0x01
     path.write_bytes(bytes(raw))
-
-
-class FileReads:
-    """Every path opened through ``gzip.open`` or read through ``Path.read_bytes`` while active.
-
-    ``events`` holds ``(path, probe())`` for each, so a test can ask what was true at that read."""
-
-    def __init__(self, probe=lambda: None):
-        self.probe = probe
-        self.events = []
-        self._patches = []
-
-    def __enter__(self):
-        real_open, real_read = gzip.open, Path.read_bytes
-
-        def opening(filename, *args, **kwargs):
-            self.events.append((Path(filename), self.probe()))
-            return real_open(filename, *args, **kwargs)
-
-        def reading(path):
-            self.events.append((Path(path), self.probe()))
-            return real_read(path)
-
-        self._patches = [
-            mock.patch.object(gzip, "open", opening),
-            mock.patch.object(Path, "read_bytes", reading),
-        ]
-        for patch in self._patches:
-            patch.start()
-        return self
-
-    def __exit__(self, *exc_info):
-        for patch in reversed(self._patches):
-            patch.stop()
-
-    def paths(self):
-        return [path for path, _probe in self.events]
 
 
 def blocked_none():
@@ -252,6 +215,27 @@ class LockFileTests(unittest.TestCase):
         for doc in ([], "lock", None):
             with self.subTest(doc=doc), self.assertRaises(lock.LockError):
                 lock.check_lock(doc, **self.bound())
+
+    def test_check_lock_holds_every_extra_binding_against_the_lock(self):
+        doc = {"config_sha256": "c" * 64, "code_sha256": "d" * 64,
+               "train_manifest_sha256": "e" * 64, "python": "3.10",
+               "live_config_sha256": "a" * 64}
+
+        self.assertIsNone(lock.check_lock(doc, **self.bound(),
+                                          extra={"live_config_sha256": "a" * 64}))
+        with self.assertRaises(lock.LockError) as changed:
+            lock.check_lock(doc, **self.bound(), extra={"live_config_sha256": "b" * 64})
+        with self.assertRaises(lock.LockError) as missing:
+            lock.check_lock(doc, **self.bound(), extra={"other_sha256": "b" * 64})
+        with self.assertRaises(lock.LockError) as both:
+            lock.check_lock({**doc, "python": "3.9"}, **self.bound(),
+                            extra={"live_config_sha256": "b" * 64})
+
+        (line,) = changed.exception.problems
+        self.assertTrue(line.startswith("live_config_sha256: locked " + "a" * 64), line)
+        self.assertIn("b" * 64, line)
+        self.assertEqual(missing.exception.problems, ("other_sha256: missing from the lock",))
+        self.assertEqual(len(both.exception.problems), 2, both.exception.problems)
 
     def test_read_lock_returns_the_document_and_the_sha256_of_its_bytes(self):
         path = self.root / "mode_A_BTC-USDT_lock.json"
@@ -886,7 +870,7 @@ class LockedMetricsShapeTests(unittest.TestCase):
         # hash first, and Mode A's one-shot test is spent.
         old = dict(zip(self.PHASE1_FIELDS, (40, 2.0, 50.0, -100.0, 20, 20, 0, 30.0, -200.0, 20)))
 
-        metrics, problem = stages._locked_metrics({"mode_a": old}, "mode_a")
+        metrics, problem = stages.locked_metrics({"mode_a": old}, "mode_a")
 
         self.assertIsNone(metrics)
         self.assertEqual(problem, "summary.mode_a: not the metrics of a training run")
@@ -897,7 +881,7 @@ class LockedMetricsShapeTests(unittest.TestCase):
             tp=20, sl=20, waktu=0, rata_lama_menit=30.0, hasil_tanpa_teratas=-200.0, hari_naik=20,
         )
 
-        metrics, problem = stages._locked_metrics({"mode_a": dataclasses.asdict(m)}, "mode_a")
+        metrics, problem = stages.locked_metrics({"mode_a": dataclasses.asdict(m)}, "mode_a")
 
         self.assertIsNone(problem)
         self.assertEqual(metrics, m)
