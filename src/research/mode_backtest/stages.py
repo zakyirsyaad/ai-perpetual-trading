@@ -63,7 +63,7 @@ from . import lock
 from .data import day_files, load_pair, manifest, manifest_sha256, stage_files
 from .frames import PairFrames, build_pair_frames
 from .metrics import StageMetrics, pass_status, stage_metrics, wants_5m
-from .report import ReportRow, mode_table
+from .report import ReportRow, exact as _exact, mode_table, status_figures
 from .simulate import MODE_A, MODE_D, RunResult, RunSpec, simulate_run
 from .tradelog import write_trade_log
 
@@ -199,13 +199,6 @@ def _stamp(now: datetime) -> str:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError(f"now must be timezone-aware, got {now!r}")
     return now.astimezone(WIB).strftime("%Y%m%d")
-
-
-def _exact(value: Optional[float]) -> str:
-    """A number as the rules compare it: ``repr`` of a float, a whole number as it is."""
-    if value is None:
-        return NA
-    return str(value) if isinstance(value, int) else repr(float(value))
 
 
 def _refuse_existing(paths: Iterable[Path]) -> None:
@@ -547,11 +540,7 @@ def _refuse_before_the_marker(data_dir: PathLike, mode: str, pair: str, outputs:
 def _test_status(mode: str, pair: str, cfg: ModesConfig, run: _Run, status: str) -> str:
     m, uji = run.metrics, cfg.uji
     return (
-        f"Ujian Mode {mode} {pair} ({run.spec.tf}): {status}. Posisi {m.posisi} (minimal "
-        f"{uji.lolos_minimal_posisi}); Hasil per 1 juta = {_exact(m.hasil_per_1_juta)} (lolos "
-        f"bila > {_exact(uji.lolos_hasil_per_1_juta_lebih_dari)}); tanpa "
-        f"{uji.lolos_buang_posisi_teratas} posisi teratas = {_exact(m.hasil_tanpa_teratas)} "
-        f"(lolos bila > {_exact(uji.lolos_hasil_tanpa_teratas_lebih_dari)})."
+        f"Ujian Mode {mode} {pair} ({run.spec.tf}): {status}. {status_figures(m, uji)}"
     )
 
 

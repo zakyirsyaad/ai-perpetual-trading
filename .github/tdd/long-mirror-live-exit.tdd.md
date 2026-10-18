@@ -197,3 +197,38 @@ OK
 The golden test passes after the refactor, so Mode A's log is byte-identical. Four hand mutants of
 `simulate_live_run` (cut always on, wrong segment-edge limit, wrong trigger band, a defaulted ATR
 percent) each fail the live-sim tests. `compileall` and `git diff --check` are clean.
+
+## Task 6
+
+Metrics, trade log and table for mode L. `StageMetrics` gains `potong` and `entry_per_hari_kalender`
+(defaulted, appended after Phase 1's fields); `stage_metrics(..., hari_kalender=None)` counts POTONG
+exits, makes Menang `TP / (TP + SL + POTONG)` and divides positions by the calendar days. `LIVE_COLUMNS`
+= the 23 Mode A columns + `versi`, `sl_persen`, `harga_potong`, written only by `trade_log_text(...,
+live=True)`. `report.live_table(rows)` (rows are `LiveRow(mode, versi, pair, tahap, metrics)`) and
+`report.live_status_line(versi, m, uji, pair, mode="L")` give "Ujian mode L versi ii BTC-USDT: GAGAL.
+Posisi ...". The status figures and `exact` moved from `stages.py` into `report.py` (`status_figures`,
+`exact`) and Phase 1's test status line now calls them, so both lines share one text.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_metrics tests.test_mode_backtest_tradelog tests.test_mode_backtest_report
+ImportError: cannot import name 'LIVE_COLUMNS' from 'research.mode_backtest.tradelog'
+ImportError: cannot import name 'LiveRow' from 'research.mode_backtest.report'
+TypeError: stage_metrics() got an unexpected keyword argument 'hari_kalender'  (9 metrics tests)
+Ran 74 tests in 0.029s
+FAILED (errors=14)
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_metrics tests.test_mode_backtest_tradelog tests.test_mode_backtest_report tests.test_mode_backtest_simulate
+Ran 221 tests ... OK   (incl. the Mode A golden log sha, unchanged)
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2416 tests in 391.905s
+OK
+```
+
+`compileall` and `git diff --check` are clean. One Phase 1 test changed: the field-order test of
+`StageMetrics` now expects the two new fields appended after `hari_naik`.

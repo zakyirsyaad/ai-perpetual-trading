@@ -15,8 +15,14 @@ from pathlib import Path
 
 from bot.strategy.modes.position_rules import LONG, SHORT
 from bot.strategy.modes.regime import NAIK, TURUN
-from research.mode_backtest.simulate import EXIT_SL, EXIT_TP, EXIT_WAKTU, MODE_D
-from research.mode_backtest.tradelog import COLUMNS, trade_log_text, wib_iso, write_trade_log
+from research.mode_backtest.simulate import EXIT_POTONG, EXIT_SL, EXIT_TP, EXIT_WAKTU, MODE_D
+from research.mode_backtest.tradelog import (
+    COLUMNS,
+    LIVE_COLUMNS,
+    trade_log_text,
+    wib_iso,
+    write_trade_log,
+)
 from research.pine_gate.bars import wib_day_start_ms
 from tests.mode_backtest_helpers import MINUTE_MS
 from tests.mode_backtest_trades import make_context, make_trade, spec_log_columns
@@ -396,6 +402,41 @@ class WriteTests(unittest.TestCase):
 
         self.assertFalse(path.exists())
         self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class LiveLogTests(unittest.TestCase):
+    def test_live_log_has_the_extra_columns_and_mode_a_log_does_not(self):
+        t = long_trade(mode="L", versi="ii", sl_pct=0.28, potong=99.90999)
+
+        plain = trade_log_text([t])
+        live = trade_log_text([t], live=True)
+
+        self.assertEqual(LIVE_COLUMNS, COLUMNS + ("versi", "sl_persen", "harga_potong"))
+        self.assertEqual(len(COLUMNS), 23)
+        self.assertEqual(plain.splitlines()[0].split(","), list(COLUMNS))
+        self.assertEqual(live.splitlines()[0].split(","), list(LIVE_COLUMNS))
+        row = rows_of(live)[0]
+        self.assertEqual(row["versi"], "ii")
+        self.assertEqual(row["sl_persen"], "0.28")
+        self.assertEqual(row["harga_potong"], "99.90999")
+        # the first 23 cells of a live row are the plain row
+        self.assertEqual(live.splitlines()[1].rsplit(",", 3)[0], plain.splitlines()[1])
+
+    def test_version_i_leaves_the_cut_cell_empty(self):
+        row = rows_of(trade_log_text([long_trade(mode="L", versi="i", sl_pct=0.4)], live=True))[0]
+
+        self.assertEqual((row["versi"], row["sl_persen"], row["harga_potong"]), ("i", "0.4", ""))
+
+    def test_a_mode_a_trade_in_a_live_log_has_three_empty_cells(self):
+        row = rows_of(trade_log_text([long_trade()], live=True))[0]
+
+        self.assertEqual((row["versi"], row["sl_persen"], row["harga_potong"]), ("", "", ""))
+
+    def test_potong_reason_in_the_log(self):
+        t = long_trade(mode="L", versi="ii", sl_pct=0.3, potong=99.9, exit_reason=EXIT_POTONG)
+
+        self.assertEqual(rows_of(trade_log_text([t]))[0]["alasan_exit"], "POTONG")
+        self.assertEqual(rows_of(trade_log_text([t], live=True))[0]["alasan_exit"], "POTONG")
 
 
 if __name__ == "__main__":

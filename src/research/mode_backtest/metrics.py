@@ -10,10 +10,14 @@ The definitions (spec section 5):
 * Hasil per 1 juta is ``1,000,000 x sum(pnl_usdt) / sum(volume_usdt)``, pooled over the trades and
   not a mean of per-trade ratios. It is ``None`` without trades. Sums are exact (``math.fsum``),
   so the same set of trades always gives the same number, in whatever order it is listed.
-* Menang is ``100 x TP / (TP + SL)``. A time exit counts in Posisi and in the result and not in
-  Menang; it is ``None`` when no trade ended on a TP or an SL.
+* Menang is ``100 x TP / (TP + SL + POTONG)``. A time exit counts in Posisi and in the result and
+  not in Menang; it is ``None`` when no trade ended on a TP, an SL or a cut. POTONG (the cut of
+  mode L version ii) is a loss, and is 0 for Mode A, whose values stay what they were.
 * Entry per hari aktif is the positions over the NAIK days of the stage, ``None`` with no NAIK day
   (never a ``ZeroDivisionError``).
+* Entry per hari kalender is the positions over the WIB calendar days of the stage; ``None``
+  when the caller gives no day count or 0 days. For mode S the ``hari_naik`` argument carries the
+  TURUN days (the parameter keeps its name).
 * Rata-rata lama posisi is the mean of ``exit_ms - entry_ms`` in minutes.
 * Without the top ``drop_top`` drops the ``drop_top`` trades with the highest ``pnl_usdt`` (ties:
   the earliest entry first) and recomputes Hasil per 1 juta; ``None`` when nothing remains.
@@ -42,7 +46,7 @@ from typing import Iterable, Optional, Sequence
 from bot.strategy.modes.checks import is_finite, is_whole
 from bot.strategy.modes.config import TestConfig
 
-from .simulate import EXIT_SL, EXIT_TP, EXIT_WAKTU, Trade
+from .simulate import EXIT_POTONG, EXIT_SL, EXIT_TP, EXIT_WAKTU, Trade
 
 __all__ = [
     "BELUM_CUKUP_SAMPEL",
@@ -58,7 +62,7 @@ LOLOS = "LOLOS"
 GAGAL = "GAGAL"
 BELUM_CUKUP_SAMPEL = "BELUM CUKUP SAMPEL"
 
-_EXIT_REASONS = (EXIT_TP, EXIT_SL, EXIT_WAKTU)
+_EXIT_REASONS = (EXIT_TP, EXIT_SL, EXIT_WAKTU, EXIT_POTONG)
 _PER_MILLION = 1_000_000
 _MS_PER_MINUTE = 60_000
 
@@ -67,9 +71,10 @@ _MS_PER_MINUTE = 60_000
 class StageMetrics:
     """The results of one run over one stage, in the columns of the table of spec section 2.9.
 
-    ``posisi`` counts every trade and ``tp``, ``sl`` and ``waktu`` count the exits by reason, so
-    they add up to it. ``entry_per_hari_aktif`` is ``posisi / hari_naik`` and ``menang_pct`` the
-    share of TP among the TP and SL exits; ``hasil_per_1_juta`` is the net result per 1M of volume
+    ``posisi`` counts every trade and ``tp``, ``sl``, ``waktu`` and ``potong`` count the exits by
+    reason, so they add up to it. ``entry_per_hari_aktif`` is ``posisi / hari_naik`` and
+    ``entry_per_hari_kalender`` the positions over the calendar days of the stage (``None``
+    unless given); ``menang_pct`` is the share of TP among the TP, SL and POTONG exits; ``hasil_per_1_juta`` is the net result per 1M of volume
     and ``hasil_tanpa_teratas`` the same without the best positions. ``rata_lama_menit`` is the
     mean hold. Each of these is ``None`` where it is not defined (see the module docstring)."""
 
@@ -83,6 +88,8 @@ class StageMetrics:
     rata_lama_menit: Optional[float]
     hasil_tanpa_teratas: Optional[float]
     hari_naik: int
+    potong: int = 0
+    entry_per_hari_kalender: Optional[float] = None
 
 
 def _require_count(name: str, value: object) -> None:
@@ -117,23 +124,33 @@ def _result_per_million(trades: Sequence[Trade]) -> Optional[float]:
     return _PER_MILLION * profit / volume
 
 
-def stage_metrics(trades: Iterable[Trade], hari_naik: int, drop_top: int) -> StageMetrics:
+def stage_metrics(
+    trades: Iterable[Trade],
+    hari_naik: int,
+    drop_top: int,
+    hari_kalender: Optional[int] = None,
+) -> StageMetrics:
     """The metrics of ``trades``, the positions of one run over one stage.
 
     ``hari_naik`` is the number of NAIK days of the stage and ``drop_top`` the number of best
     positions to leave out of ``hasil_tanpa_teratas`` (``uji.lolos_buang_posisi_teratas``). The
+    ``hari_kalender`` is the number of WIB calendar days of the stage, for ``entry_per_hari_kalender``
+    (``None`` when not given or 0). For mode S the caller passes the TURUN days as ``hari_naik``. The
     trades may be listed in any order and any iterable is read once; they are not changed.
 
-    Raises ``ValueError`` for a ``hari_naik`` or a ``drop_top`` that is not a whole number of at
-    least 0, and for a trade whose ``exit_reason`` is not TP, SL or WAKTU, whose ``pnl_usdt`` is
+    Raises ``ValueError`` for a ``hari_naik``, a ``drop_top`` or a ``hari_kalender`` that is not a
+    whole number of at least 0, and for a trade whose ``exit_reason`` is not TP, SL, WAKTU or POTONG, whose ``pnl_usdt`` is
     not finite or whose ``volume_usdt`` is not a finite number above 0."""
     _require_count("hari_naik", hari_naik)
     _require_count("drop_top", drop_top)
+    if hari_kalender is not None:
+        _require_count("hari_kalender", hari_kalender)
     book = tuple(trades)
     _check_trades(book)
     exits = Counter(t.exit_reason for t in book)
     tp, sl, waktu = exits[EXIT_TP], exits[EXIT_SL], exits[EXIT_WAKTU]
-    decided = tp + sl
+    potong = exits[EXIT_POTONG]
+    decided = tp + sl + potong
     best_first = sorted(book, key=lambda t: (-t.pnl_usdt, t.entry_ms))
     held_ms = sum(t.exit_ms - t.entry_ms for t in book)
     return StageMetrics(
@@ -147,6 +164,8 @@ def stage_metrics(trades: Iterable[Trade], hari_naik: int, drop_top: int) -> Sta
         rata_lama_menit=held_ms / (len(book) * _MS_PER_MINUTE) if book else None,
         hasil_tanpa_teratas=_result_per_million(best_first[drop_top:]),
         hari_naik=hari_naik,
+        potong=potong,
+        entry_per_hari_kalender=len(book) / hari_kalender if hari_kalender else None,
     )
 
 

@@ -28,7 +28,7 @@ from research.mode_backtest.metrics import (
     stage_metrics,
     wants_5m,
 )
-from research.mode_backtest.simulate import EXIT_SL, EXIT_TP, EXIT_WAKTU
+from research.mode_backtest.simulate import EXIT_POTONG, EXIT_SL, EXIT_TP, EXIT_WAKTU
 from tests.mode_backtest_helpers import MINUTE_MS
 from tests.mode_backtest_trades import FIRST_ENTRY_MS, make_trade
 
@@ -130,6 +130,9 @@ class FixtureTests(unittest.TestCase):
                 "rata_lama_menit",
                 "hasil_tanpa_teratas",
                 "hari_naik",
+                # added for mode L, after Phase 1's fields and with defaults
+                "potong",
+                "entry_per_hari_kalender",
             ],
         )
 
@@ -685,6 +688,77 @@ class EndToEndTests(unittest.TestCase):
 
         self.assertEqual(m.hasil_tanpa_teratas, -250.0)
         self.assertEqual(status, GAGAL)
+
+
+class LiveMetricsTests(unittest.TestCase):
+    """POTONG (the cut of version ii) and the calendar-day rate of mode L."""
+
+    def test_potong_counts_as_a_loss_in_menang(self):
+        trades = [
+            trade(10.0, reason=EXIT_TP, minute=0),
+            trade(10.0, reason=EXIT_TP, minute=100),
+            trade(-5.0, reason=EXIT_SL, minute=200),
+            trade(-3.0, reason=EXIT_POTONG, minute=300),
+            trade(-3.0, reason=EXIT_POTONG, minute=400),
+            trade(1.0, reason=EXIT_WAKTU, minute=500),
+        ]
+
+        m = stage_metrics(trades, hari_naik=3, drop_top=DROP_TOP)
+
+        # 2 TP of 2 TP + 1 SL + 2 POTONG = 5 decided; the time exit stays out
+        self.assertEqual(m.potong, 2)
+        self.assertEqual((m.tp, m.sl, m.waktu), (2, 1, 1))
+        self.assertEqual(m.posisi, 6)
+        self.assertEqual(m.posisi, m.tp + m.sl + m.waktu + m.potong)
+        self.assertEqual(m.menang_pct, 40.0)
+
+    def test_only_potong_and_waktu_exits_give_zero_menang(self):
+        m = stage_metrics([trade(-3.0, reason=EXIT_POTONG)], hari_naik=1, drop_top=DROP_TOP)
+        self.assertEqual(m.menang_pct, 0.0)
+        m = stage_metrics([trade(1.0, reason=EXIT_WAKTU)], hari_naik=1, drop_top=DROP_TOP)
+        self.assertIsNone(m.menang_pct)
+
+    def test_calendar_entries_per_day(self):
+        m = stage_metrics(book(*[1.0] * 70), hari_naik=35, drop_top=DROP_TOP, hari_kalender=70)
+
+        self.assertEqual(m.entry_per_hari_kalender, 1.0)
+        self.assertEqual(m.entry_per_hari_aktif, 2.0)
+
+    def test_calendar_rate_is_none_without_days_or_without_the_argument(self):
+        for days in (None, 0):
+            with self.subTest(days=days):
+                m = stage_metrics(book(1.0, 1.0), 1, DROP_TOP, hari_kalender=days)
+                self.assertIsNone(m.entry_per_hari_kalender)
+        self.assertIsNone(stage_metrics(book(1.0), 1, DROP_TOP).entry_per_hari_kalender)
+
+    def test_no_positions_over_calendar_days_is_zero(self):
+        self.assertEqual(stage_metrics([], 1, DROP_TOP, hari_kalender=7).entry_per_hari_kalender, 0.0)
+
+    def test_a_calendar_count_that_is_not_a_whole_number_is_refused(self):
+        for bad in (-1, 1.5, True, "7"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "hari_kalender"):
+                    stage_metrics(book(1.0), 1, DROP_TOP, hari_kalender=bad)
+
+    def test_mode_a_metrics_unchanged(self):
+        trades = [
+            trade(10.0, reason=EXIT_TP, minute=0, hold_min=30),
+            trade(-40.0, reason=EXIT_SL, minute=100, hold_min=60),
+            trade(0.0, reason=EXIT_WAKTU, minute=200, hold_min=90),
+        ]
+
+        m = stage_metrics(trades, hari_naik=2, drop_top=3)
+
+        self.assertEqual(m.potong, 0)
+        self.assertIsNone(m.entry_per_hari_kalender)
+        self.assertEqual(m.posisi, 3)
+        self.assertEqual(m.entry_per_hari_aktif, 1.5)
+        self.assertEqual(m.menang_pct, 50.0)
+        self.assertEqual(m.hasil_per_1_juta, -200.0)
+        self.assertEqual((m.tp, m.sl, m.waktu), (1, 1, 1))
+        self.assertEqual(m.rata_lama_menit, 60.0)
+        self.assertIsNone(m.hasil_tanpa_teratas)
+        self.assertEqual(m.hari_naik, 2)
 
 
 if __name__ == "__main__":

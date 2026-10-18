@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import TYPE_CHECKING, Any, Iterable, List, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence
 
 from research.pine_gate.report_format import NA, as_number
 from research.pine_gate.spec import ExecConfig
 
-from .metrics import StageMetrics
+from bot.strategy.modes.config import TestConfig
+
+from .metrics import StageMetrics, pass_status
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; step0 imports this module
     from .step0 import Step0Row
@@ -40,6 +42,44 @@ MODE_HEADER = (
     "Keluar TP / SL / waktu", "Rata-rata lama posisi",
 )
 NO_TRADING = "Tidak trading"  # the comparator that never opens a position
+
+# The results table of mode L and comparator S (spec section 6): Mode A's, with the exit version,
+# the entries per calendar day and the cut as a fourth kind of exit.
+LIVE_HEADER = (
+    "Mode", "Versi", "Pair", "Tahap", "Posisi", "Entry per hari aktif",
+    "Entry per hari kalender", "Menang", "Hasil per 1 juta",
+    "Keluar TP / SL / potong / waktu", "Rata-rata lama posisi",
+)
+
+
+def exact(value: Optional[float]) -> str:
+    """A number as the rules compare it: ``repr`` of a float, a whole number as it is; "–" for
+    None."""
+    if value is None:
+        return NA
+    return str(value) if isinstance(value, int) else repr(float(value))
+
+
+def status_figures(m: StageMetrics, uji: TestConfig) -> str:
+    """The figures of a test status line, the part after the verdict: the positions against the
+    minimum, then both results against their pass limits, exactly as the rule compares them."""
+    return (
+        f"Posisi {m.posisi} (minimal {uji.lolos_minimal_posisi}); Hasil per 1 juta = "
+        f"{exact(m.hasil_per_1_juta)} (lolos bila > {exact(uji.lolos_hasil_per_1_juta_lebih_dari)}); "
+        f"tanpa {uji.lolos_buang_posisi_teratas} posisi teratas = {exact(m.hasil_tanpa_teratas)} "
+        f"(lolos bila > {exact(uji.lolos_hasil_tanpa_teratas_lebih_dari)})."
+    )
+
+
+def live_status_line(
+    versi: str, m: StageMetrics, uji: TestConfig, pair: str, mode: str = "L"
+) -> str:
+    """The status line of one live-exit version over the test stage, e.g.
+    "Ujian mode L versi ii BTC-USDT: GAGAL. Posisi 40 (minimal 40); ...".
+
+    The verdict is ``pass_status(m, uji)``, so it is the Phase 1 pass rule applied to this
+    version's own metrics; ``mode`` is "L" or the comparator "S"."""
+    return f"Ujian mode {mode} versi {versi} {pair}: {pass_status(m, uji)}. {status_figures(m, uji)}"
 
 
 def format_number(value: Any, decimals: int) -> str:
@@ -156,6 +196,42 @@ def _mode_line(mode: str, pair: str, tahap: str, m: StageMetrics) -> str:
         " / ".join(format_number(count, 0) for count in (m.tp, m.sl, m.waktu)),
         _minutes(m.rata_lama_menit),
     ))
+
+
+@dataclass(frozen=True)
+class LiveRow:
+    """One line of the mode L table: a ``ReportRow`` with the exit version ("i" or "ii")."""
+
+    mode: str
+    versi: str
+    pair: str
+    tahap: str
+    metrics: StageMetrics
+
+
+def live_table(rows: Iterable[LiveRow]) -> str:
+    """The results table of mode L and comparator S: one line per row, in the rows' order.
+
+    Hasil per 1 juta is a whole number, the entry rates have two decimals, Menang one decimal,
+    and the hold is in minutes; a missing value is "–". An empty ``rows`` gives the header alone.
+    The table rounds for reading; the exact numbers stay in ``StageMetrics``."""
+    lines: List[str] = [_table_line(LIVE_HEADER), "|" + "---|" * len(LIVE_HEADER)]
+    for row in rows:
+        m = row.metrics
+        lines.append(_table_line((
+            row.mode,
+            row.versi,
+            row.pair,
+            row.tahap,
+            format_number(m.posisi, 0),
+            format_number(m.entry_per_hari_aktif, 2),
+            format_number(m.entry_per_hari_kalender, 2),
+            format_percent(m.menang_pct, 1),
+            format_number(m.hasil_per_1_juta, 0),
+            " / ".join(format_number(count, 0) for count in (m.tp, m.sl, m.potong, m.waktu)),
+            _minutes(m.rata_lama_menit),
+        )))
+    return "\n".join(lines) + "\n"
 
 
 def _no_trading(hari_naik: int) -> StageMetrics:
