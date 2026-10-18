@@ -146,17 +146,17 @@ class BracketTests(unittest.TestCase):
             bracket.tp = 0.0
 
     def test_a_side_that_is_not_long_or_short_is_refused(self):
-        for side in (0, 2, -2, 0.5, True, False, None, "LONG"):
+        for side in (0, 2, -2, 0.5, 1.0, -1.0, True, False, None, "LONG"):
             with self.subTest(side=side), self.assertRaises(ValueError):
                 bracket_prices(100.0, side, 0.40, 0.25)
 
     def test_an_entry_fill_that_is_not_a_positive_number_is_refused(self):
-        for entry in (0.0, -100.0, math.nan, math.inf, None, "100", 10**400):
+        for entry in (0.0, -100.0, math.nan, math.inf, None, "100", 10**400, True):
             with self.subTest(entry=short_repr(entry)), self.assertRaises(ValueError):
                 bracket_prices(entry, LONG, 0.40, 0.25)
 
     def test_a_percent_that_would_misplace_a_level_is_refused(self):
-        for bad in (0.0, -0.25, math.nan, math.inf, None, "0.4", 10**400):
+        for bad in (0.0, -0.25, math.nan, math.inf, None, "0.4", 10**400, True):
             with self.subTest(bad=short_repr(bad)):
                 with self.assertRaises(ValueError):
                     bracket_prices(100.0, LONG, bad, 0.25)
@@ -207,7 +207,7 @@ class AdverseFillTests(unittest.TestCase):
         self.assertAlmostEqual(adverse_fill(100.0, LONG, 0.01, True), 99.99)
 
     def test_a_side_that_is_not_long_or_short_is_refused(self):
-        for side in (0, 2, 0.5, True, None, "SHORT"):
+        for side in (0, 2, 0.5, 1.0, -1.0, True, None, "SHORT"):
             with self.subTest(side=side), self.assertRaises(ValueError):
                 adverse_fill(100.0, side, 0.01, False)
 
@@ -217,12 +217,12 @@ class AdverseFillTests(unittest.TestCase):
                 adverse_fill(100.0, LONG, 0.01, closing)
 
     def test_a_slippage_that_would_help_the_position_is_refused(self):
-        for slippage in (-0.01, math.nan, math.inf, None, "0.01", 10**400):
+        for slippage in (-0.01, math.nan, math.inf, None, "0.01", 10**400, True, False):
             with self.subTest(slippage=short_repr(slippage)), self.assertRaises(ValueError):
                 adverse_fill(100.0, LONG, slippage, False)
 
     def test_a_price_that_is_not_a_positive_number_is_refused(self):
-        for price in (0.0, -100.0, math.nan, math.inf, None, "100", 10**400):
+        for price in (0.0, -100.0, math.nan, math.inf, None, "100", 10**400, True):
             with self.subTest(price=short_repr(price)), self.assertRaises(ValueError):
                 adverse_fill(price, LONG, 0.01, False)
 

@@ -323,17 +323,52 @@ class LockFileTests(unittest.TestCase):
         for rel, sha in files:
             self.assertEqual(sha, hashlib.sha256((src / rel).read_bytes()).hexdigest(), rel)
 
-    def test_code_files_cover_the_package_the_rule_core_and_code_extra(self):
+    def test_code_files_cover_the_package_the_rule_core_and_what_they_import(self):
         covered = {rel for rel, _sha in lock.code_files()}
         src = PACKAGE.parents[1]
-        expected = {p.relative_to(src).as_posix() for p in PACKAGE.glob("*.py")}
-        expected |= {p.relative_to(src).as_posix()
-                     for p in (src / "bot" / "strategy" / "modes").glob("*.py")}
-        expected |= set(lock.CODE_EXTRA)
+        own = {p.relative_to(src).as_posix() for p in PACKAGE.glob("*.py")}
+        own |= {p.relative_to(src).as_posix()
+                for p in (src / "bot" / "strategy" / "modes").glob("*.py")}
 
-        self.assertEqual(covered, expected)
+        self.assertLessEqual(own, covered)
+        for imported in ("bot/arena/__init__.py", "bot/arena/factors.py", "bot/models.py",
+                         "research/pine_gate/features.py", "bot/strategy/indicators.py"):
+            self.assertIn(imported, covered)
+        self.assertNotIn("bot/config.py", covered)  # imported for I/O only, never called
         self.assertIn("research/mode_backtest/stages.py", covered)
         self.assertIn("bot/strategy/modes/near_mean.py", covered)
+
+    def copy_of_src(self) -> Path:
+        """A copy of ``src`` under the test's temp folder, caches left out."""
+        src = self.root / "src"
+        shutil.copytree(PACKAGE.parents[1], src, ignore=shutil.ignore_patterns("__pycache__"))
+        return src
+
+    def test_a_new_import_of_a_module_the_package_reaches_needs_no_list_edit(self):
+        # bot/arena/__init__.py is live-bot code that the package imports through setup_profile.
+        src = self.copy_of_src()
+        arena = src / "bot" / "arena" / "__init__.py"
+        arena.write_text(arena.read_text(encoding="utf-8") + "\nfrom bot import logger\n",
+                         encoding="utf-8")
+
+        with mock.patch.object(lock, "SRC_ROOT", src):
+            covered = {rel for rel, _sha in lock.code_files()}
+
+        self.assertIn("bot/logger.py", covered)
+        self.assertNotIn("bot/logger.py", {rel for rel, _sha in lock.code_files()})
+
+    def test_dotfiles_beside_the_modules_are_not_fingerprinted(self):
+        src = self.copy_of_src()
+        folder = src / "research" / "mode_backtest"
+        (folder / ".#stages.py").symlink_to("someone@host.1234:1700000000")  # an editor lock
+        (folder / "._stages.py").write_bytes(b"\x00\x05\x16\x07")  # a macOS AppleDouble file
+
+        with mock.patch.object(lock, "SRC_ROOT", src):
+            names = [rel for rel, _sha in lock.code_files()]
+            sha = lock.code_sha256()
+
+        self.assertEqual([name for name in names if Path(name).name.startswith(".")], [])
+        self.assertEqual(sha, lock.code_sha256())  # the same bytes as the real tree
 
     def test_python_version_is_major_dot_minor(self):
         self.assertEqual(lock.python_version(), f"{sys.version_info[0]}.{sys.version_info[1]}")
@@ -347,7 +382,8 @@ class TrainStageTests(StageCase):
         doc = read_json(path)
         self.assertEqual((doc["stage"], doc["mode"], doc["pair"], doc["tf"]),
                          ("train", "A", SYMBOL, "15m"))
-        self.assertEqual(doc["naik_days"], [d.isoformat() for d in TRAIN_DAYS])
+        # Monday is no NAIK day: the 15m EMA20 is first known on Tuesday (see the test below).
+        self.assertEqual(doc["naik_days"], [d.isoformat() for d in TRAIN_DAYS[1:]])
         self.assertEqual(sorted(doc["runs"]), TRAIN_RUNS)
         for key, run in doc["runs"].items():
             with self.subTest(run=key):
@@ -355,7 +391,7 @@ class TrainStageTests(StageCase):
                 self.assertEqual(rows[0], list(COLUMNS))
                 self.assertGreater(run["metrics"]["posisi"], 0)
                 self.assertEqual(len(rows) - 1, run["metrics"]["posisi"])
-                self.assertEqual(run["metrics"]["hari_naik"], 3)
+                self.assertEqual(run["metrics"]["hari_naik"], 2)
                 self.assertEqual(sorted(run["blocked"]), sorted(BLOCK_REASONS))  # keys sorted
                 exits = [wib(row[COLUMNS.index("waktu_exit")]) for row in rows[1:]]
                 self.assertLess(max(exits), wib("2026-07-09T00:00:00+07:00"))
@@ -447,14 +483,45 @@ class TrainStageTests(StageCase):
         self.assertEqual((doc["tf"], doc["switch_5m"]["pindah"]), ("15m", False))
         self.assertEqual(read_json(self.lock_file())["tf"], "15m")
 
+    def test_naik_days_start_when_mode_a_can_enter(self):
+        # Spec section 5: a NAIK hour is one in which Mode A could enter. Training starts on
+        # Monday at 00:00 WIB with no 1m bar before it, and the EMA20 needs 160 candles, so the
+        # 15m one is first known on Tuesday at 16:00 WIB and the 5m one on Monday at 13:20 WIB.
+        # Monday is no NAIK day of the 15m run nor of the comparator measured with it, while it
+        # is one of the 5m run, which can enter from 13:20.
+        with mock.patch.object(stages, "wants_5m", return_value=True):
+            doc = read_json(self.train())
+
+        self.assertEqual((doc["naik_days"], doc["hari_naik"]), (["2026-07-07", "2026-07-08"], 2))
+        self.assertEqual({key: run["metrics"]["hari_naik"] for key, run in doc["runs"].items()},
+                         {"A_15m_NAIK": 2, "A_5m_NAIK": 3, "D_3m_NAIK": 2})
+        self.assertEqual(read_json(self.lock_file())["summary"]["hari_naik"], 2)
+
+    def test_a_training_too_short_for_the_trigger_ema_has_no_naik_day(self):
+        # One training day is 96 15m candles, short of the 160 the EMA20 needs: Mode A never
+        # signals on 15m, so no hour is a NAIK hour and the switch cannot be evaluated. Counted
+        # as before, Monday would be a NAIK day with 0 entries and lock 5m on a cold EMA.
+        write_stage_config(self.config, latihan_selesai='"2026-07-07T00:00:00+07:00"')
+
+        code, _out, err = self.cli("train")
+
+        self.assertEqual(code, 1, err)
+        self.assertIn("5m switch cannot be evaluated", self.assert_one_error_line(err))
+        self.assertFalse(self.out.exists())
+
     def test_naik_days_follow_the_minimum_hours_of_the_config(self):
-        # Monday has 17 window hours (closes 07:00 to 23:00 WIB), Tuesday and Wednesday 24.
-        write_stage_config(self.config, hari_naik_minimal_jam_naik=18)
+        # Mode A on 15m can enter in 8 hours of Tuesday (the closes 16:00 to 23:00 WIB) and in
+        # all 24 of Wednesday; Monday has none (see the test above).
+        for minimum, expected in ((8, ["2026-07-07", "2026-07-08"]), (9, ["2026-07-08"])):
+            with self.subTest(minimum=minimum):
+                self.setUp()
+                write_stage_config(self.config, hari_naik_minimal_jam_naik=minimum)
 
-        doc = read_json(self.train())
+                doc = read_json(self.train())
 
-        self.assertEqual(doc["naik_days"], ["2026-07-07", "2026-07-08"])
-        self.assertEqual({run["metrics"]["hari_naik"] for run in doc["runs"].values()}, {2})
+                self.assertEqual(doc["naik_days"], expected)
+                self.assertEqual({run["metrics"]["hari_naik"] for run in doc["runs"].values()},
+                                 {len(expected)})
 
     def test_train_refuses_a_warm_up_too_short_for_the_first_day(self):
         for hours_1h, bars_4h, series in ((WARM_HOURS_1H - 1, WARM_BARS_4H, "atr_median"),
@@ -651,7 +718,7 @@ class TestStageTests(StageCase):
         raw = self.lock_file().read_bytes()
         original = json.loads(raw)
         edits = (
-            ("tf", "tf", {"tf": "5m"}),  # 12 entries on 3 NAIK days: the switch rule keeps 15m
+            ("tf", "tf", {"tf": "5m"}),  # 12 entries on 2 NAIK days: the switch rule keeps 15m
             ("latihan", "latihan",
              {"latihan": {**original["latihan"], "start": "2026-07-07T00:00:00+07:00"}}),
             ("pair", "pair", {"pair": "ETH-USDT"}),
@@ -815,17 +882,18 @@ class VerdictTests(StageCase):
                 self.assertEqual((test["drop_top"], test["status"]), (drop_top, status))
 
     def test_the_status_lines_and_the_json_carry_the_exact_numbers(self):
-        # 7 entries on 3 NAIK days (7/3) moves training to 5m; the test sits at -149.63 per 1M,
-        # which the table rounds to -150 while the rule passes it.
+        # 5 entries on the 2 NAIK days of the 15m run (5/2) move training to 5m, whose run has 3
+        # (it can enter on Monday); the test sits at -149.63 per 1M, which the table rounds to
+        # -150 while the rule passes it.
         train_5m = trades_from(TRAIN_START_MS, [10.0 / 3.0] * 40)
         test_5m = trades_from(TEST_START_MS, [-7.48] * 39 + [-7.54])
-        by_run = {("A", "15m", "latihan"): trades_from(TRAIN_START_MS, [5.0] * 7),
+        by_run = {("A", "15m", "latihan"): trades_from(TRAIN_START_MS, [5.0] * 5),
                   ("A", "5m", "latihan"): train_5m,
                   ("A", "5m", "ujian"): test_5m}
 
         train, test = self.staged(by_run)
 
-        rate = 7 / 3
+        rate = 5 / 2
         self.assertEqual(train["switch_5m"]["entry_per_hari_naik_15m"], rate)
         self.assertIn(repr(rate), train["status_line"])
         locked = stage_metrics(train_5m, 3, 3)

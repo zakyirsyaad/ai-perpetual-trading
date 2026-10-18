@@ -22,7 +22,7 @@ Not wired into the live bot.
 from __future__ import annotations
 
 from statistics import fmean, median, pstdev
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 DEFAULT_WARMUP_PERIODS = 8
 RSI_NEUTRAL = 50.0
@@ -209,7 +209,9 @@ def rolling_min(values: Sequence[float], n: int) -> Series:
     return _rolling(values, n, min)
 
 
-def _rolling_complete(values: Sequence[Optional[float]], n: int, pick) -> Series:
+def _rolling_complete(
+    values: Sequence[Optional[float]], n: int, pick: Callable[[Sequence[float]], float]
+) -> Series:
     """``_rolling`` that also gives ``None`` while the window holds a ``None``."""
     return _rolling(values, n, lambda window: None if None in window else pick(window))
 

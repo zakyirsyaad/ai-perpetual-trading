@@ -39,6 +39,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
+from bot.strategy.modes.checks import is_finite, is_whole
 from bot.strategy.modes.config import TestConfig
 
 from .simulate import EXIT_SL, EXIT_TP, EXIT_WAKTU, Trade
@@ -84,23 +85,8 @@ class StageMetrics:
     hari_naik: int
 
 
-def _is_whole(value: object) -> bool:
-    """Whether ``value`` is an ``int``; a bool is not one for this purpose."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_finite(value: object) -> bool:
-    """Whether ``value`` is a finite number; None, text, a bool, NaN and infinity are not."""
-    if isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(value)
-    except (TypeError, OverflowError):  # not a number at all; an int too large for a float
-        return False
-
-
 def _require_count(name: str, value: object) -> None:
-    if not _is_whole(value) or value < 0:
+    if not is_whole(value) or value < 0:
         raise ValueError(f"{name} must be a whole number of at least 0, got {value!r}")
 
 
@@ -112,11 +98,11 @@ def _check_trades(trades: Sequence[Trade]) -> None:
                 f"trade {number}: exit_reason must be one of {', '.join(_EXIT_REASONS)}, "
                 f"got {t.exit_reason!r}"
             )
-        if not _is_finite(t.pnl_usdt):
+        if not is_finite(t.pnl_usdt):
             raise ValueError(
                 f"trade {number}: pnl_usdt must be a finite number, got {t.pnl_usdt!r}"
             )
-        if not (_is_finite(t.volume_usdt) and t.volume_usdt > 0):
+        if not (is_finite(t.volume_usdt) and t.volume_usdt > 0):
             raise ValueError(
                 f"trade {number}: volume_usdt must be finite and above 0, got {t.volume_usdt!r}"
             )
@@ -166,7 +152,7 @@ def stage_metrics(trades: Iterable[Trade], hari_naik: int, drop_top: int) -> Sta
 
 def _require_result(name: str, value: Optional[float]) -> float:
     """A result the pass rule needs: present and finite, or the rule cannot be evaluated."""
-    if not _is_finite(value):
+    if not is_finite(value):
         raise ValueError(f"{name} is {value!r}: the pass rule cannot be evaluated")
     return value
 
@@ -199,7 +185,7 @@ def wants_5m(m15: StageMetrics, uji: TestConfig) -> bool:
     ``ValueError`` when the run has no entries-per-NAIK-day figure (no NAIK day in training): the
     pre-registered rule cannot be evaluated, and a silent answer would decide the test."""
     rate = m15.entry_per_hari_aktif
-    if not _is_finite(rate):
+    if not is_finite(rate):
         raise ValueError(
             f"entries per NAIK day is {rate!r} (the training run has no NAIK day): "
             "the 5m switch cannot be evaluated"

@@ -66,7 +66,9 @@ def tall_at_cap(n):
 
 
 def new_tracker(confirm_within=3, max_distance_atr=1.0):
-    return PullbackTracker(confirm_within=confirm_within, max_distance_atr=max_distance_atr)
+    return PullbackTracker(
+        confirm_within=confirm_within, max_distance_atr=max_distance_atr, interval_ms=STEP_MS
+    )
 
 
 def feed(tracker, candles):
@@ -342,6 +344,20 @@ class MisuseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "close_ms"):
                     tracker.on_candle(later, EMA, SMA, ATR)
 
+    def test_a_missing_candle_is_refused_instead_of_widening_the_window(self):
+        # The window counts candles, so a hole would stretch three candles past 45 minutes.
+        tracker = new_tracker()
+        feed(tracker, [touch_red(0), red_above(1)])
+        with self.assertRaisesRegex(ValueError, "missing"):
+            tracker.on_candle(green_above(3), EMA, SMA, ATR)  # candle 2 never came
+        # the rejected candle changed nothing: candle 2 still confirms the touch
+        self.assertIsNotNone(tracker.on_candle(green_above(2), EMA, SMA, ATR))
+
+    def test_the_interval_must_be_a_whole_number_of_milliseconds_above_zero(self):
+        for bad in (0, -STEP_MS, float(STEP_MS), True, str(STEP_MS), None):
+            with self.subTest(interval_ms=bad), self.assertRaisesRegex(ValueError, "interval_ms"):
+                PullbackTracker(confirm_within=3, max_distance_atr=1.0, interval_ms=bad)
+
     def test_the_first_candle_may_have_any_close_time(self):
         zero = Candle(close_ms=0, open=99.5, high=101.0, low=99.0, close=101.0)
         self.assertIsNotNone(new_tracker().on_candle(zero, EMA, SMA, ATR))
@@ -372,13 +388,13 @@ class MisuseTests(unittest.TestCase):
         for bad in (0, -1, 2.5, True, "3", None):
             with self.subTest(confirm_within=bad):
                 with self.assertRaisesRegex(ValueError, "confirm_within"):
-                    PullbackTracker(confirm_within=bad, max_distance_atr=1.0)
+                    PullbackTracker(confirm_within=bad, max_distance_atr=1.0, interval_ms=STEP_MS)
 
     def test_the_cap_must_be_a_finite_number_above_zero(self):
         for bad in (0, 0.0, -1.0, math.nan, math.inf, 10**400, True, "1", None):
             with self.subTest(max_distance_atr=repr(bad)[:20]):
                 with self.assertRaisesRegex(ValueError, "max_distance_atr"):
-                    PullbackTracker(confirm_within=3, max_distance_atr=bad)
+                    PullbackTracker(confirm_within=3, max_distance_atr=bad, interval_ms=STEP_MS)
 
     def test_a_whole_number_cap_is_accepted(self):
         tracker = new_tracker(max_distance_atr=1)

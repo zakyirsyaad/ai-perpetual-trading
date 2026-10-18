@@ -20,9 +20,10 @@ spec bind the tracker:
   too high) leaves the touches alone as well. ``consume()`` drops every touch whose window holds
   the signal candle.
 
-The caller sends every closed trigger candle in time order, also while a position is open and
-also those that have no EMA yet, because a window counts the candles received. When ``on_candle``
-returns a signal and every gate of the caller passes, it opens the position and calls
+The caller sends every closed trigger candle in time order, one ``interval_ms`` apart, also while a
+position is open and also those that have no EMA yet, because a window counts the candles
+received: a candle that is missing would stretch it, so the tracker refuses the next one. When
+``on_candle`` returns a signal and every gate of the caller passes, it opens the position and calls
 ``consume()``; when a gate blocks, it does not.
 
 A ``None`` among ``ema``, ``sma20_1h`` and ``atr14_1h`` means that check cannot pass: without
@@ -33,17 +34,19 @@ comparison with it is false.
 Misuse raises instead of passing silently:
 
 * ``ValueError`` for a constructor argument the rule cannot work with (a window under one candle,
-  a cap that is not a finite number above 0) and for a candle whose ``close_ms`` does not come
-  after the previous one. A rejected candle changes nothing.
+  a cap that is not a finite number above 0, an interval that is not whole milliseconds above 0)
+  and for a candle whose ``close_ms`` is not one interval after the previous one's: an older or
+  repeated candle, or one after a missing candle. A rejected candle changes nothing.
 * ``RuntimeError`` for ``consume()`` when the latest candle holds no unconsumed signal.
 
 The module takes numbers only: no I/O, no bars and no indicator code, and no live module imports
 it. Mode A is LONG-only here; the mirrored SHORT variant (D2) comes in a later phase.
 """
 
-import math
 from dataclasses import dataclass
 from typing import Optional
+
+from bot.strategy.modes.checks import is_finite, is_whole
 
 __all__ = ["Candle", "PullbackSignal", "PullbackTracker"]
 
@@ -68,32 +71,25 @@ class PullbackSignal:
     close_ms: int
 
 
-def _is_positive_finite(value: object) -> bool:
-    """A number (a bool is not one) above 0 and below infinity; a whole number too large for a
-    float is not."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    try:
-        number = float(value)
-    except OverflowError:
-        return False
-    return math.isfinite(number) and number > 0
-
-
 class PullbackTracker:
     """Touch and confirmation state of Mode A over a stream of closed candles."""
 
-    def __init__(self, confirm_within: int, max_distance_atr: float) -> None:
-        if not isinstance(confirm_within, int) or isinstance(confirm_within, bool):
+    def __init__(self, confirm_within: int, max_distance_atr: float, interval_ms: int) -> None:
+        if not is_whole(confirm_within):
             raise ValueError(f"confirm_within must be a whole number, got {confirm_within!r}")
         if confirm_within < 1:
             raise ValueError(f"confirm_within must be at least 1, got {confirm_within!r}")
-        if not _is_positive_finite(max_distance_atr):
+        if not (is_finite(max_distance_atr) and max_distance_atr > 0):
             raise ValueError(
                 f"max_distance_atr must be a finite number above 0, got {max_distance_atr!r}"
             )
+        if not (is_whole(interval_ms) and interval_ms > 0):
+            raise ValueError(
+                f"interval_ms must be a whole number of milliseconds above 0, got {interval_ms!r}"
+            )
         self._confirm_within = confirm_within
         self._max_distance_atr = max_distance_atr
+        self._interval_ms = interval_ms
         self._candles_seen = 0
         self._last_close_ms: Optional[int] = None
         self._touches: list[int] = []  # indices of the touches whose window is still open
@@ -113,6 +109,14 @@ class PullbackTracker:
             raise ValueError(
                 f"candles must come in increasing close_ms, got {candle.close_ms} "
                 f"after {self._last_close_ms}"
+            )
+        if self._last_close_ms is not None and (
+            candle.close_ms != self._last_close_ms + self._interval_ms
+        ):
+            raise ValueError(
+                f"a candle is missing: close_ms {candle.close_ms} is not one interval "
+                f"({self._interval_ms} ms) after {self._last_close_ms}, and the window counts "
+                "candles"
             )
         index = self._candles_seen
         self._candles_seen = index + 1

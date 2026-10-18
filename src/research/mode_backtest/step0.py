@@ -20,10 +20,12 @@ Two checks come before anything is written, and nothing is adjusted to pass them
   and floats are compared exactly: JSON keeps every bit of them).
 
 A difference raises ``ReproductionError``. Only after both checks is each trade labelled with its
-side and with ``pilih_mode`` at its signal time, read from ``HourlyFrame``s built on the same
-production day files (``load_pair``, 2025-08-01 to 2026-10-13), and ``split_rows`` gives one row
-per contender, symbol, side and condition. ``run_step0`` writes ``step0_<YYYYMMDD>.json`` and
-``.md``, dated by the WIB day of its clock, through ``research.pine_gate.fileio``.
+side and with ``pilih_mode`` at its signal time, read from ``HourlyFrame``s on the replay's own 1h
+and 4h series (``label_lookup``): the same production day files and warm-ups, 2025-08-01 to
+2026-10-13, read once. ``split_rows`` gives one row per contender, symbol, side and condition.
+``run_step0`` writes ``step0_<YYYYMMDD>.json`` and ``.md``, dated by the WIB day of its clock,
+through ``research.pine_gate.fileio``, and records the code fingerprint of
+``research.mode_backtest.lock``, which covers the selector that makes the labels.
 """
 
 from __future__ import annotations
@@ -38,10 +40,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from bot.strategy.modes.config import SelectorConfig, config_sha256, load_modes_config
 from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN
-from research.pine_gate.bars import wib_day
+from research.pine_gate.bars import Bars, wib_day
 from research.pine_gate.calibrate import Calibration
 from research.pine_gate.cli_common import file_sha256, load_calibration_file, read_json
 from research.pine_gate.dataset import SYMBOLS, Dataset, load_dataset
+from research.pine_gate.features import FeatureFrame
 from research.pine_gate.fileio import exists_message, json_text, write_exclusive
 from research.pine_gate.holdout_replay import (
     Holdout,
@@ -51,7 +54,7 @@ from research.pine_gate.holdout_replay import (
     symbol_metrics,
     trades_of,
 )
-from research.pine_gate.lock import code_sha256, latencies_sha256, python_version
+from research.pine_gate.lock import latencies_sha256
 from research.pine_gate.pipeline import purge_tick_minutes
 from research.pine_gate.simulate import Trade
 from research.pine_gate.spec import (
@@ -66,8 +69,9 @@ from research.pine_gate.spec import (
 )
 from research.pine_gate.stats import mean_gross_bps, win_rate
 
-from .data import PairData, PathLike, load_pair
+from .data import PairData, PathLike
 from .frames import HourlyFrame
+from .lock import code_sha256, python_version
 from .report import step0_markdown
 
 PINE_FILES: Mapping[str, str] = MappingProxyType({
@@ -227,15 +231,19 @@ def replay_main_runs(
     """Every contender's main run on the holdout, as the Pine test stage ran it.
 
     Loads the whole dataset as the stage did (``load_dataset(data_dir, None)``), refuses inputs
-    that differ from the holdout file's (``check_inputs``) before any run, then runs
-    ``h.run(c.signal)`` for every contender of ``build_contenders``, in its order. Returns the
-    trades per contender name and the ``Holdout``."""
+    that differ from the holdout file's (``check_inputs``) and a missing or unused 1h or 4h
+    warm-up (``ValueError``: a spec run had them all, and the labels read the series they start)
+    before any run, then runs ``h.run(c.signal)`` for every contender of ``build_contenders``, in
+    its order. Returns the trades per contender name and the ``Holdout``."""
     paths = pine_paths(pine_dir)
     holdout_doc = _json_object(paths["holdout"])
     selection = _json_object(paths["selection"])
     calib = load_calibration_file(paths["calibration"])
     dataset = load_dataset(data_dir, None)
     check_inputs(pine_dir, holdout_doc, dataset)
+    if dataset.missing_warmups:
+        raise ValueError("the replay and its labels need every 1h and 4h warm-up; missing or "
+                         "unused: " + ", ".join(dataset.missing_warmups))
     h = holdout_context(dataset, calib)
     contenders, _skipped = build_contenders(selection, h.frames, h.period)
     return {c.name: h.run(c.signal) for c in contenders}, h
@@ -412,13 +420,36 @@ def condition_lookup(pairs: Sequence[PairData], selector: SelectorConfig) -> Kon
     frames: Dict[str, HourlyFrame] = {}
     spans: Dict[str, Tuple[int, int]] = {}
     for pair in pairs:
-        bars = pair.bars_1m
         if pair.symbol in frames:
             raise ValueError(f"{pair.symbol} is given twice")
-        if not len(bars):
-            raise ValueError(f"{pair.symbol} has no 1m bars")
         frames[pair.symbol] = HourlyFrame.build(pair, selector)
-        spans[pair.symbol] = (bars.open_ms[0], bars.open_ms[-1] + bars.interval_ms)
+        spans[pair.symbol] = _span(pair.symbol, pair.bars_1m)
+    return _lookup(frames, spans)
+
+
+def label_lookup(features: Mapping[str, FeatureFrame], selector: SelectorConfig) -> KondisiAt:
+    """``condition_lookup`` on the replay's own frames, so no day file is read a second time.
+
+    A ``FeatureFrame`` holds the 1h and 4h series with their warm-ups joined, the series
+    ``HourlyFrame.build`` makes from the same day files (``replay_main_runs`` refuses a missing
+    or unused warm-up). A frame without 1m bars raises ``ValueError``."""
+    frames: Dict[str, HourlyFrame] = {}
+    spans: Dict[str, Tuple[int, int]] = {}
+    for symbol, feature in features.items():
+        bars_1m, _bars_5m, bars_1h, bars_4h, _bars_3m = feature.series()
+        frames[symbol] = HourlyFrame(bars_1h, bars_4h, selector)
+        spans[symbol] = _span(symbol, bars_1m)
+    return _lookup(frames, spans)
+
+
+def _span(symbol: str, bars: Bars) -> Tuple[int, int]:
+    if not len(bars):
+        raise ValueError(f"{symbol} has no 1m bars")
+    return bars.open_ms[0], bars.open_ms[-1] + bars.interval_ms
+
+
+def _lookup(frames: Mapping[str, HourlyFrame], spans: Mapping[str, Tuple[int, int]]) -> KondisiAt:
+    """``kondisi_at`` over hourly frames, each answering only inside its 1m span."""
 
     def kondisi_at(symbol: str, t_ms: int) -> str:
         if symbol not in frames:
@@ -430,14 +461,6 @@ def condition_lookup(pairs: Sequence[PairData], selector: SelectorConfig) -> Kon
         return frames[symbol].context_at(t_ms).kondisi
 
     return kondisi_at
-
-
-def label_lookup(data_dir: PathLike, selector: SelectorConfig) -> KondisiAt:
-    """``condition_lookup`` on both pairs over ``LABEL_FIRST_DAY`` to ``LABEL_LAST_DAY``.
-
-    ``load_pair`` refuses a missing day file and a missing or unusable warm-up."""
-    pairs = [load_pair(data_dir, symbol, LABEL_FIRST_DAY, LABEL_LAST_DAY) for symbol in SYMBOLS]
-    return condition_lookup(pairs, selector)
 
 
 # --------------------------------------------------------------------------- run
@@ -492,15 +515,15 @@ def run_step0(
 
     trades, h = replay_main_runs(Path(data_dir), Path(pine_dir))
     replayed = replayed_metrics(trades, h)
-    exec_cfg, period = h.exec_cfg, h.period
-    del h  # the dataset's frames and markets are not needed for the labels
+    exec_cfg, period, frames = h.exec_cfg, h.period, h.frames
+    del h  # the markets are not needed for the labels, only the frames' 1h and 4h series
     mismatches = reproduction_mismatches(replayed, holdout_doc)
     if mismatches:
         raise ReproductionError(
             f"the replay does not reproduce {PINE_FILES['holdout']}: {len(mismatches)} "
             "differences: " + "; ".join(mismatches), mismatches)
 
-    rows = split_rows(trades, label_lookup(Path(data_dir), cfg.pemilih_mode),
+    rows = split_rows(trades, label_lookup(frames, cfg.pemilih_mode),
                       notional_usdt=exec_cfg.notional_usdt)
     doc = {
         "created_at": now.isoformat(),

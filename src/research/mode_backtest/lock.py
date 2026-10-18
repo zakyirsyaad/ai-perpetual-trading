@@ -23,30 +23,46 @@ The lock also records the mode, the pair, the chosen trigger timeframe, the stag
 training summary; the test stage checks those itself.
 
 ``code_files()`` covers every module of the package (``research/mode_backtest/*.py``), every module
-of the rule core (``bot/strategy/modes/*.py``) and ``CODE_EXTRA``: every other module of ``bot`` and
-``research`` that Python loads when the package is imported. That is each module an import statement
-names, followed from module to module, and each package around one, whose ``__init__`` runs first
-(``bot.arena``'s brings in the arena modules). ``tests/test_mode_backtest_structure.py`` fails when
-the package imports a module this list misses, or when the list names one it does not import. Two
-imports are left out: they sit inside functions the package never calls and only read the live
-settings and Supabase (``bot.config`` in ``research.pine_gate.cli_common`` and
-``bot.storage.supabase_trade_store`` in ``research.pine_gate.calibrate``).
+of the rule core (``bot/strategy/modes/*.py``) and every other module of ``bot`` and ``research``
+they import, found by ``import_closure``. That is each module an import statement names, followed
+from module to module, and each package around one, whose ``__init__`` runs first (``bot.arena``'s
+brings in the arena modules). The walk runs each time, so a new import on main is covered with no
+list to edit; ``tests/test_mode_backtest_structure.py`` holds it against the modules a fresh Python
+process loads. Two imports are left out (``IO_ONLY_IMPORTS``): they sit inside functions the
+package never calls and only read the live settings and Supabase (``bot.config`` in
+``research.pine_gate.cli_common`` and ``bot.storage.supabase_trade_store`` in
+``research.pine_gate.calibrate``). A file whose name starts with a dot is no module.
 """
 
 from __future__ import annotations
 
+import ast
+import functools
 import hashlib
 import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from research.pine_gate.bars import check_symbol
 from research.pine_gate.fileio import write_json_exclusive
 
 __all__ = [
-    "CODE_EXTRA",
+    "CODE_DIRS",
+    "IO_ONLY_IMPORTS",
     "MARKER_DIR",
     "LockError",
     "check_lock",
@@ -55,8 +71,13 @@ __all__ = [
     "code_files",
     "code_sha256",
     "existing_markers",
+    "import_closure",
+    "imported_names",
     "lock_path",
     "marker_path",
+    "module_name",
+    "module_source",
+    "project_modules",
     "python_version",
     "read_lock",
     "run_name",
@@ -68,51 +89,12 @@ PathLike = Union[str, Path]
 MARKER_DIR = "holdout_runs"  # under the data folder, as the Pine gate keeps its markers
 SRC_ROOT = Path(__file__).resolve().parents[2]
 CODE_DIRS = ("research/mode_backtest", "bot/strategy/modes")  # every module, imported or not
-CODE_EXTRA: Tuple[str, ...] = (
-    "bot/__init__.py",
-    "bot/arena/__init__.py",
-    "bot/arena/agents.py",
-    "bot/arena/attribution.py",
-    "bot/arena/expression_engine.py",
-    "bot/arena/factors.py",
-    "bot/arena/flow_signals.py",
-    "bot/arena/program_trader.py",
-    "bot/arena/setup_profile.py",
-    "bot/arena/signals.py",
-    "bot/core/__init__.py",
-    "bot/core/entry_window.py",
-    "bot/data/__init__.py",
-    "bot/data/market_signals.py",
-    "bot/models.py",
-    "bot/strategy/__init__.py",
-    "bot/strategy/indicators.py",
-    "bot/strategy/pine_indicators.py",
-    "bot/volume/__init__.py",
-    "bot/volume/profile.py",
-    "research/__init__.py",
-    "research/pine_gate/__init__.py",
-    "research/pine_gate/bars.py",
-    "research/pine_gate/calibrate.py",
-    "research/pine_gate/checks.py",
-    "research/pine_gate/cli_common.py",
-    "research/pine_gate/dataset.py",
-    "research/pine_gate/features.py",
-    "research/pine_gate/fetch.py",
-    "research/pine_gate/fileio.py",
-    "research/pine_gate/holdout_gate.py",
-    "research/pine_gate/holdout_replay.py",
-    "research/pine_gate/lock.py",
-    "research/pine_gate/metalabel.py",
-    "research/pine_gate/outcomes.py",
-    "research/pine_gate/pipeline.py",
-    "research/pine_gate/report_format.py",
-    "research/pine_gate/rules.py",
-    "research/pine_gate/selection.py",
-    "research/pine_gate/simulate.py",
-    "research/pine_gate/spec.py",
-    "research/pine_gate/stats.py",
-    "research/pine_gate/timeparse.py",
-)
+PROJECT_ROOTS = ("bot", "research")  # the packages under src that the walk follows
+# Imported inside functions the package never calls, to read the live settings and Supabase
+# (``research.pine_gate.cli_common.make_settings`` and ``research.pine_gate.calibrate``'s
+# ``make_get_rows``): neither shapes a computed result, so the walk neither keeps nor follows
+# them, as ``tests/test_pine_gate_structure.py`` leaves them out of the Pine fingerprint.
+IO_ONLY_IMPORTS = frozenset({"bot.config", "bot.storage.supabase_trade_store"})
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MODE = re.compile(r"[A-Z][0-9]?")  # A, B, C, D, D2
@@ -128,13 +110,92 @@ class LockError(RuntimeError):
         self.problems: Tuple[str, ...] = tuple(problems)
 
 
+def module_name(path: Path) -> str:
+    """The dotted name of a source file under ``SRC_ROOT``; a package is named by its folder."""
+    parts = list(path.relative_to(SRC_ROOT).with_suffix("").parts)
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def module_source(name: str) -> Optional[Path]:
+    """The source file of module ``name`` under ``SRC_ROOT``, or None when it is no project
+    module (another library, or a name inside a module such as a class)."""
+    if name.split(".")[0] not in PROJECT_ROOTS:
+        return None
+    base = SRC_ROOT.joinpath(*name.split("."))
+    for path in (base.with_suffix(".py"), base / "__init__.py"):
+        if path.is_file():
+            return path
+    return None
+
+
+def imported_names(tree: ast.AST, module: str, is_package: bool) -> Set[str]:
+    """Every dotted name an import statement anywhere in ``module`` may load, relative ones
+    resolved: ``import a.b`` names ``a.b``, and ``from a import b`` names both ``a`` and
+    ``a.b``, because ``b`` may be a submodule. Imports inside functions count too."""
+    package = module if is_package else module.rpartition(".")[0]
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".")
+                base = ".".join(parts[: len(parts) - node.level + 1])
+                source = f"{base}.{node.module}" if node.module else base
+            else:
+                source = node.module
+            names.add(source)
+            names.update(f"{source}.{alias.name}" for alias in node.names)
+    return names
+
+
+def project_modules(names: Iterable[str]) -> Set[str]:
+    """The names that are project modules, each with the packages around it, whose
+    ``__init__`` Python runs first; ``IO_ONLY_IMPORTS`` are left out."""
+    found = set()
+    for name in names:
+        if name in IO_ONLY_IMPORTS or module_source(name) is None:
+            continue
+        parts = name.split(".")
+        found.update(".".join(parts[:k]) for k in range(1, len(parts) + 1))
+    return found
+
+
+@functools.lru_cache(maxsize=None)
+def _names_in_source(source: bytes, module: str, is_package: bool) -> FrozenSet[str]:
+    """``imported_names`` of a module's source. Parsing is the slow part of the walk, and the
+    same bytes always name the same modules, so it is done once per process."""
+    return frozenset(imported_names(ast.parse(source), module, is_package))
+
+
+def import_closure(paths: Iterable[Path]) -> Dict[str, Path]:
+    """Every project module that the modules at ``paths`` import, followed transitively, by
+    name; the modules at ``paths`` are included."""
+    todo = [module_name(path) for path in paths]
+    seen: Dict[str, Path] = {}
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        path = module_source(name)
+        seen[name] = path
+        names = _names_in_source(path.read_bytes(), name, path.name == "__init__.py")
+        todo += project_modules(names)
+    return seen
+
+
 def code_files() -> List[Tuple[str, str]]:
-    """``(path relative to src, sha256)`` of every file the code fingerprint covers, sorted."""
-    paths = {path for folder in CODE_DIRS for path in (SRC_ROOT / folder).glob("*.py")}
-    paths |= {SRC_ROOT / rel for rel in CODE_EXTRA}
+    """``(path relative to src, sha256)`` of every file the code fingerprint covers, sorted: the
+    modules of ``CODE_DIRS`` and everything they import (``import_closure``)."""
+    starts = [
+        path
+        for folder in CODE_DIRS
+        for path in sorted((SRC_ROOT / folder).glob("*.py"))
+        if not path.name.startswith(".")  # an editor's lock file or a macOS AppleDouble file
+    ]
     return sorted(
         (path.relative_to(SRC_ROOT).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
-        for path in paths
+        for path in import_closure(starts).values()
     )
 
 

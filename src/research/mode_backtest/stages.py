@@ -29,8 +29,11 @@ stage and writes ``mode_A_BTC-USDT_test_<YYYYMMDD>.json``, a trade log per run a
 report: the table of spec section 2.9 (the Latihan rows from the lock), the status line, LOLOS,
 GAGAL or BELUM CUKUP SAMPEL, and the lock, the marker and the two manifests.
 
-Every run of a stage trades only in NAIK and shares the stage's NAIK days (``naik_days`` with the
-weekly window and ``uji.hari_naik_minimal_jam_naik``). ``stage_metrics`` is called in one place,
+Every run of a stage trades only in NAIK and is measured on the stage's NAIK days (``naik_days``
+with the weekly window and ``uji.hari_naik_minimal_jam_naik``), counted from the first hour in
+which Mode A can signal (``_naik_days``): the first 40 hours of training have no 15m EMA yet, so
+they hold no NAIK hour of the 15m run or of the comparator measured with it, and the 5m run counts
+from its own EMA. ``stage_metrics`` is called in one place,
 with ``uji.lolos_buang_posisi_teratas``. The status lines print the exact numbers the rules compare
 (``repr`` of each float), because the table rounds them.
 
@@ -52,6 +55,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from bot.core.entry_window import parse_weekly_window
 from bot.strategy.modes.config import ModesConfig, TestConfig, load_modes_config_with_sha256
 from bot.strategy.modes.regime import NAIK
+from research.pine_gate.features import INTERVAL_1H
 from research.pine_gate.fileio import write_exclusive, write_json_exclusive
 from research.pine_gate.spec import WIB, ms
 
@@ -225,11 +229,20 @@ def _refuse_after_the_test(data_dir: PathLike, out_dir: PathLike, mode: str, pai
         )
 
 
-def _naik_days(frames: PairFrames, cfg: ModesConfig, period: _Period) -> List[date]:
-    """The NAIK days of the stage: every run of it is measured on these."""
+def _naik_days(frames: PairFrames, cfg: ModesConfig, period: _Period, tf: str) -> List[date]:
+    """The NAIK days of the stage for Mode A on ``tf`` candles: the runs are measured on these.
+
+    An hour counts only once Mode A can signal in it (spec section 5): the 1h close at ``h`` is
+    the condition of the trigger closes in ``[h, h + 1h)``, so the hour counts when the first
+    known trigger EMA comes before ``h + 1h``. Training starts with no 1m bar before it, so its
+    first 160 candles (40 hours on 15m) have no EMA and hold no NAIK hour."""
+    known_ms = frames.triggers[tf].first_known_ms()
+    if known_ms is None or known_ms >= period.end_ms:
+        return []
     window = parse_weekly_window(cfg.umum.jendela_entry_mingguan)
+    start_ms = max(period.start_ms, known_ms - INTERVAL_1H + 1)
     days = frames.hourly.naik_days(
-        period.start_ms, period.end_ms, window, cfg.uji.hari_naik_minimal_jam_naik
+        start_ms, period.end_ms, window, cfg.uji.hari_naik_minimal_jam_naik
     )
     return sorted(days)
 
@@ -309,11 +322,15 @@ def _train(data_dir: PathLike, pair: str, cfg: ModesConfig) -> _Training:
     manifest_sha = manifest_sha256(manifest(data_dir, files))
     frames = build_pair_frames(pair_data, cfg)
     _require_warm(frames, period)
-    naik = tuple(_naik_days(frames, cfg, period))
+    naik = tuple(_naik_days(frames, cfg, period, cfg.mode_a.tf_pemicu))
     first = _run(frames, cfg, MODE_A, cfg.mode_a.tf_pemicu, period, len(naik))
     comparator = _comparator(frames, cfg, period, len(naik))
     switched = wants_5m(first.metrics, cfg.uji)
-    locked = _run(frames, cfg, MODE_A, SWITCH_TF, period, len(naik)) if switched else first
+    if switched:
+        naik_5m = _naik_days(frames, cfg, period, SWITCH_TF)
+        locked = _run(frames, cfg, MODE_A, SWITCH_TF, period, len(naik_5m))
+    else:
+        locked = first
     switch = {
         "entry_per_hari_naik_15m": first.metrics.entry_per_hari_aktif,
         "pindah_bila_kurang_dari": cfg.uji.pindah_5m_jika_entry_per_hari_naik_kurang_dari,
@@ -419,13 +436,13 @@ def _training_manifest_sha(data_dir: PathLike, pair: str, uji: TestConfig) -> st
         raise lock.LockError(f"the training files are not those of the lock: {exc}") from exc
 
 
-def _locked_metrics(summary: Any, key: str, problems: List[str]) -> Optional[StageMetrics]:
+def _locked_metrics(summary: Any, key: str) -> Tuple[Optional[StageMetrics], Optional[str]]:
+    """The metrics the lock's summary holds under ``key``, or None and why they cannot be."""
     names = sorted(field.name for field in fields(StageMetrics))
     part = summary.get(key) if isinstance(summary, Mapping) else None
     if not isinstance(part, Mapping) or sorted(part) != names:
-        problems.append(f"summary.{key}: not the metrics of a training run")
-        return None
-    return StageMetrics(**part)
+        return None, f"summary.{key}: not the metrics of a training run"
+    return StageMetrics(**part), None
 
 
 def _switch_problem(tf: Any, m15: StageMetrics, cfg: ModesConfig) -> Optional[str]:
@@ -447,16 +464,16 @@ def _locked_rows(doc: Mapping[str, Any], path: Path, mode: str, pair: str,
     gives for its own 15m run; the ``LockError`` lists everything that is not so."""
     wanted = (("mode", mode), ("pair", pair), ("latihan", _training(cfg.uji).record()),
               ("ujian", _testing(cfg.uji).record()))
-    problems = [f"{key}: locked {doc.get(key)!r}, this run has {value!r}"
-                for key, value in wanted if doc.get(key) != value]
+    mismatches = [f"{key}: locked {doc.get(key)!r}, this run has {value!r}"
+                  for key, value in wanted if doc.get(key) != value]
     summary = doc.get("summary")
-    m15 = _locked_metrics(summary, "mode_a_15m", problems)
-    mode_a = _locked_metrics(summary, "mode_a", problems)
-    comparator = _locked_metrics(summary, "pembanding", problems)
+    m15, m15_problem = _locked_metrics(summary, "mode_a_15m")
+    mode_a, mode_a_problem = _locked_metrics(summary, "mode_a")
+    comparator, comparator_problem = _locked_metrics(summary, "pembanding")
     tf = doc.get("tf")
-    problem = _switch_problem(tf, m15, cfg) if m15 is not None else None
-    if problem is not None:
-        problems.append(problem)
+    switch_problem = _switch_problem(tf, m15, cfg) if m15 is not None else None
+    found = (m15_problem, mode_a_problem, comparator_problem, switch_problem)
+    problems = [*mismatches, *(problem for problem in found if problem is not None)]
     if problems:
         raise lock.LockError(
             f"{path}: the lock is not the one of this run: {'; '.join(problems)}", problems)
@@ -619,7 +636,7 @@ def test_stage(
     training, period = _training(cfg.uji), _testing(cfg.uji)
     read = _read_data(data_dir, pair, cfg.uji)
     frames = build_pair_frames(load_pair(data_dir, pair, training.first_day, period.last_day), cfg)
-    naik = _naik_days(frames, cfg, period)
+    naik = _naik_days(frames, cfg, period, tf)
     runs = (_run(frames, cfg, MODE_A, tf, period, len(naik)),
             _comparator(frames, cfg, period, len(naik)))
     doc = _test_doc(mode, pair, cfg, tf, runs, naik, bound, read, outputs, lock_ref, now)

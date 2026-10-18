@@ -67,6 +67,15 @@ class CodeFingerprintCoverageTests(unittest.TestCase):
         covered = {rel for rel, _sha in lock.code_files()}
         self.assertEqual(sorted(imported - covered), [])
 
+    def test_the_fingerprint_holds_no_research_package_but_the_pine_gate(self):
+        # Edits to another research package (the mode backtest) must not move this sha.
+        research = [rel for rel, _sha in lock.code_files() if rel.startswith("research/")]
+
+        self.assertIn("research/pine_gate/lock.py", research)
+        self.assertIn("research/__init__.py", research)
+        self.assertEqual([rel for rel in research if rel != "research/__init__.py"
+                          and not rel.startswith("research/pine_gate/")], [])
+
 
 class ExclusiveWriterTests(unittest.TestCase):
     def test_only_fileio_hard_links_files(self):

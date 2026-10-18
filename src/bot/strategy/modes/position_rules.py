@@ -28,18 +28,25 @@ A gate that has no usable number refuses the entry, so a missing input never let
 "no", so they raise ``ValueError`` instead of returning a wrong price: for a ``side`` that is not
 ``LONG`` or ``SHORT``, a ``closing`` that is not a bool, and a price or percent that is not a
 finite number above 0 (a slippage of 0 is allowed), because any of these would put a level on the
-wrong side of the entry or fill in the position's favour without a word.
+wrong side of the entry or fill in the position's favour without a word. These checks come from
+``checks``, the one copy the backtest uses too: a bool is no number and ``1.0`` no side.
 
 The module takes numbers only: no I/O, no bars, and no indicator or research code. No live module
 imports it.
 """
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bot.core.entry_window import WeeklyWindow, window_is_open
+from bot.strategy.modes.checks import (
+    LONG,
+    SHORT,
+    check_side,
+    require_not_negative,
+    require_positive,
+)
 
 __all__ = [
     "LONG",
@@ -52,9 +59,6 @@ __all__ = [
     "under_daily_caps",
     "volatility_ok",
 ]
-
-LONG = 1
-SHORT = -1
 
 # Asia/Jakarta (the config's ``zona_waktu``) has been UTC+7 without daylight saving time since
 # 1964, and the research side reads WIB the same way, so a fixed offset is the same zone and needs
@@ -72,39 +76,16 @@ class Bracket:
     sl: float
 
 
-def _check_side(side: object) -> None:
-    if isinstance(side, bool) or side not in (LONG, SHORT):
-        raise ValueError(f"side must be LONG ({LONG}) or SHORT ({SHORT}), got {side!r}")
-
-
-def _is_finite(value: object) -> bool:
-    """Whether ``value`` is a finite number; None, text, NaN and infinity are not."""
-    try:
-        return math.isfinite(value)
-    except (TypeError, OverflowError):  # not a number at all; an int too large for a float
-        return False
-
-
-def _require_positive(name: str, value: float) -> None:
-    if not (_is_finite(value) and value > 0):
-        raise ValueError(f"{name} must be a finite number above 0, got {value!r}")
-
-
-def _require_not_negative(name: str, value: float) -> None:
-    if not (_is_finite(value) and value >= 0):
-        raise ValueError(f"{name} must be a finite number of at least 0, got {value!r}")
-
-
 def bracket_prices(entry_fill: float, side: int, tp_pct: float, sl_pct: float) -> Bracket:
     """The take-profit and the stop-loss of a position that filled at ``entry_fill``.
 
     ``tp_pct`` and ``sl_pct`` are percents (0.40 is 0.40 %). A LONG takes profit above the fill and
     stops out below it; a SHORT the other way round. Raises ``ValueError`` for a ``side`` that is
     not ``LONG`` or ``SHORT`` and for a fill or percent that is not a finite number above 0."""
-    _check_side(side)
-    _require_positive("entry_fill", entry_fill)
-    _require_positive("tp_pct", tp_pct)
-    _require_positive("sl_pct", sl_pct)
+    check_side(side)
+    require_positive("entry_fill", entry_fill)
+    require_positive("tp_pct", tp_pct)
+    require_positive("sl_pct", sl_pct)
     return Bracket(
         tp=entry_fill * (1 + side * tp_pct / 100),
         sl=entry_fill * (1 - side * sl_pct / 100),
@@ -118,11 +99,11 @@ def adverse_fill(price: float, side: int, slippage_pct: float, closing: bool) ->
     Raises ``ValueError`` for a ``side`` that is not ``LONG`` or ``SHORT``, a ``closing`` that is
     not a bool, a ``price`` that is not a finite number above 0 and a ``slippage_pct`` that is not
     a finite number of at least 0."""
-    _check_side(side)
+    check_side(side)
     if not isinstance(closing, bool):
         raise ValueError(f"closing must be True (an exit) or False (an entry), got {closing!r}")
-    _require_positive("price", price)
-    _require_not_negative("slippage_pct", slippage_pct)
+    require_positive("price", price)
+    require_not_negative("slippage_pct", slippage_pct)
     against = -side if closing else side
     return price * (1 + against * slippage_pct / 100)
 

@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple, Union
 
+from bot.strategy.modes.checks import check_side, is_whole
 from bot.strategy.modes.position_rules import LONG, SHORT
 from research.pine_gate.fileio import write_exclusive
 from research.pine_gate.spec import WIB
@@ -70,7 +71,7 @@ def wib_iso(t_ms: int) -> str:
 
     Raises ``ValueError`` for a time that is not a whole number of milliseconds (a bool, a float
     and None are not) and for one that is not a whole second, which the format would cut."""
-    if isinstance(t_ms, bool) or not isinstance(t_ms, int):
+    if not is_whole(t_ms):
         raise ValueError(f"a time must be whole milliseconds, got {t_ms!r}")
     if t_ms % _MS_PER_SECOND:
         raise ValueError(f"a time must be a whole second, got {t_ms} ms")
@@ -78,8 +79,7 @@ def wib_iso(t_ms: int) -> str:
 
 
 def _sisi(side: object) -> str:
-    if isinstance(side, bool) or side not in _SIDES:
-        raise ValueError(f"side must be LONG ({LONG}) or SHORT ({SHORT}), got {side!r}")
+    check_side(side)
     return _SIDES[side]
 
 

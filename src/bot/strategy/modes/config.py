@@ -11,6 +11,10 @@ What is accepted:
 * Percent fields stay in percent (``tp_persen: 0.40`` is 0.40 %), exactly as written.
 * A whole number is accepted, and returned as a float, where a float is expected. A ``bool`` is
   never a number, and a float is never a whole number.
+* A number is written in plain decimals (``15``, ``-150``, ``0.035``). What YAML 1.1 would read as
+  another number stays text and is refused as the wrong type: a leading zero (``015`` is octal
+  13), ``0x`` and ``0b`` literals, base 60 (``1:30`` is 90) and underscores (``25_000``).
+* A merge key (``<<``) is refused: it would set keys a second time.
 * Dates are quoted strings such as ``"2025-08-01T00:00:00+07:00"`` (YAML turns an unquoted one
   into a datetime of its own). They must be midnight in Asia/Jakarta, because the data is stored
   per WIB day, and they come back as aware datetimes in that zone.
@@ -206,7 +210,8 @@ _Reader = Callable[[Any, str], Any]
 
 def _show(value: object) -> str:
     """``repr(value)`` that cannot raise. CPython will not print an int of more than 4300 digits,
-    yet PyYAML reads a hex literal of any length, so a value named in a message must be safe."""
+    yet a mapping given to ``parse_modes_config`` may hold one, so a value named in a message
+    must be safe."""
     try:
         return repr(value)
     except ValueError:
@@ -471,6 +476,12 @@ def _read_test(raw: Any, path: str) -> TestConfig:
             "latihan_mulai < latihan_selesai < ujian_selesai must hold: "
             "training ends on the day the test starts",
         )
+    if not test.lolos_minimal_posisi > test.lolos_buang_posisi_teratas:
+        raise _fail(
+            path,
+            "lolos_minimal_posisi > lolos_buang_posisi_teratas must hold: with no more positions "
+            "than are trimmed, the pass rule has no result without the best ones to judge",
+        )
     return test
 
 
@@ -502,9 +513,34 @@ def parse_modes_config(doc: Mapping[str, Any]) -> ModesConfig:
     )
 
 
+_INT_TAG = "tag:yaml.org,2002:int"
+_FLOAT_TAG = "tag:yaml.org,2002:float"
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class _PlainNumberLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that reads a number only in plain decimals: ``15``, ``-150``, ``0.035``.
+
+    Its YAML 1.1 rules also read ``015`` as octal 13, ``0x15``, ``0b1111``, ``1:30`` (base 60, so
+    90) and ``25_000``. Here those stay text, so the readers refuse them as the wrong type."""
+
+    yaml_implicit_resolvers = {
+        first: [(tag, regexp) for tag, regexp in resolvers if tag not in (_INT_TAG, _FLOAT_TAG)]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+_DIGITS = list("-+0123456789")
+_PlainNumberLoader.add_implicit_resolver(_INT_TAG, re.compile(r"^[-+]?(?:0|[1-9][0-9]*)$"), _DIGITS)
+_PlainNumberLoader.add_implicit_resolver(
+    _FLOAT_TAG, re.compile(r"^[-+]?(?:0|[1-9][0-9]*)\.[0-9]+$"), _DIGITS
+)
+
+
 def _refuse_repeated_keys(node: yaml.Node, path: str, visited: set[int]) -> None:
     """Refuse a key written twice in one mapping, which ``yaml.safe_load`` resolves silently
-    by keeping the last: the file must say each thing once.
+    by keeping the last, and a merge key (``<<``), which sets keys a second time out of sight:
+    the file must say each thing once.
 
     An alias points at a node that is already checked, and may point back at its own ancestor,
     so a node is walked once."""
@@ -520,6 +556,8 @@ def _refuse_repeated_keys(node: yaml.Node, path: str, visited: set[int]) -> None
             child = path
             if isinstance(key_node, yaml.ScalarNode):
                 child = _join(path, key_node.value)
+                if key_node.tag == _MERGE_TAG:
+                    raise _fail(child, "a merge key is not allowed: write each key once")
                 if key_node.value in seen:
                     raise _fail(child, "key written twice")
                 seen.add(key_node.value)
@@ -536,15 +574,16 @@ def _parse_yaml(text: str) -> Any:
     Whatever PyYAML raises leaves as a ``ModesConfigError``: a ``YAMLError`` for bad syntax, but
     also a bare ``ValueError`` for an unquoted date no calendar has (``2025-13-01``), a
     ``KeyError`` for ``!!bool maybe`` or a ``RecursionError`` for absurd nesting. Only the library
-    calls sit inside a ``try``, so the repeated-key refusal below is not wrapped a second time."""
+    calls sit inside a ``try``, so the repeated-key refusal below is not wrapped a second time.
+    Both calls use ``_PlainNumberLoader``, a ``SafeLoader``: safe loading, as ``yaml.safe_load``."""
     try:
-        root = yaml.compose(text, Loader=yaml.SafeLoader)  # builds nodes only, no Python objects
+        root = yaml.compose(text, Loader=_PlainNumberLoader)  # builds nodes only, no Python objects
     except Exception as exc:
         raise _unreadable(exc) from exc
     if root is not None:
         _refuse_repeated_keys(root, "", set())
     try:
-        return yaml.safe_load(text)
+        return yaml.load(text, Loader=_PlainNumberLoader)
     except Exception as exc:
         raise _unreadable(exc) from exc
 

@@ -5,8 +5,10 @@ Not a test module: the name does not match ``test*.py``, so discovery skips it. 
 
 The market covers one trading week, Monday 6 to Friday 10 July 2026, inside the weekly window
 ``mon 07:00-sat 00:00``. ``stage_config_text`` moves the ``uji`` dates of ``config/modes.yaml``
-onto it: training is Monday to Wednesday and the test Thursday and Friday, so each stage has every
-day as a NAIK day. ``naik_price`` rises about 0.06 % an hour and swings 0.4 % every 50 minutes, so
+onto it: training is Monday to Wednesday and the test Thursday and Friday. Every day of the test is
+a NAIK day; of training, Tuesday and Wednesday are for the 15m run, whose EMA20 is first known on
+Tuesday at 16:00 WIB (160 candles after the first minute), and all three days for the 5m run.
+``naik_price`` rises about 0.06 % an hour and swings 0.4 % every 50 minutes, so
 the hourly frame reads NAIK, the 15m and 5m candles pull back to their EMA and Mode A trades, and
 the 3m candles come near their mean, so the comparator trades too. The warm-ups are built from the
 same minute prices (``write_minute_warmups``) and are just long enough for every hourly series to

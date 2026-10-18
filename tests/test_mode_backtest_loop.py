@@ -170,13 +170,16 @@ def minutes(first_open, end, edits=None):
 # --- frames and runs ------------------------------------------------------------------------------
 
 
-def make_frames(bars_1m, hourly, m15=None, m5=None, stretch_of=None, symbol=PAIR):
+def make_frames(bars_1m, hourly, m15=None, m5=None, stretch_of=None, symbol=PAIR, cfg=CFG):
+    """Frames written by hand; they record ``cfg`` as the config they were built under."""
     triggers = {
         "15m": m15 or TriggerSeries(bars_from_rows([], M15), ()),
         "5m": m5 or TriggerSeries(bars_from_rows([], M5), ()),
     }
     stretch_bars, values = stretch_of or (bars_from_rows([], M3), ())
-    return PairFrames(symbol, bars_1m, hourly, MappingProxyType(triggers), stretch_bars, values)
+    return PairFrames(
+        symbol, bars_1m, hourly, MappingProxyType(triggers), stretch_bars, values, cfg
+    )
 
 
 def run_a(kinds, start, end, *, hourly=None, edits=None, cfg=CFG, tf="15m", series=None):
@@ -184,7 +187,9 @@ def run_a(kinds, start, end, *, hourly=None, edits=None, cfg=CFG, tf="15m", seri
     step = M15 if tf == "15m" else M5
     series = series or candles(start, end - step, kinds, step)
     bars = minutes(start - step, end, edits)
-    frames = make_frames(bars, hourly or StubHourly(), **{"m15" if tf == "15m" else "m5": series})
+    frames = make_frames(
+        bars, hourly or StubHourly(), cfg=cfg, **{"m15" if tf == "15m" else "m5": series}
+    )
     return simulate_run(frames, cfg, RunSpec(MODE_A, PAIR, tf, NAIK, start, end))
 
 
@@ -194,6 +199,7 @@ def run_d(values, start, end, *, hourly=None, edits=None, cfg=CFG, gate=TURUN):
         minutes(start - M3, end, edits),
         hourly or StubHourly(fixed(context(gate))),
         stretch_of=stretch(start, end - M3, values),
+        cfg=cfg,
     )
     return simulate_run(frames, cfg, RunSpec(MODE_D, PAIR, "3m", gate, start, end))
 
@@ -1169,6 +1175,7 @@ class ArgumentTests(unittest.TestCase):
             MappingProxyType({"15m": series}),
             three_minute[0],
             three_minute[1],
+            CFG,
         )
         cases = {
             "frames of another pair": (
@@ -1224,6 +1231,20 @@ class ArgumentTests(unittest.TestCase):
                 variant(umum={"maks_posisi_per_pair": 2}),
                 spec_a,
                 "maks_posisi_per_pair is 2",
+            ),
+            # The EMA period is in the frames' series and the take-profit is read from the
+            # config: a run of the two would trade a configuration nobody wrote.
+            "frames built under another config": (
+                make_frames(bars, StubHourly(), m15=series),
+                variant(mode_a={"ema_pemicu": 10, "tp_persen": 0.30}),
+                spec_a,
+                "built under another config",
+            ),
+            "a config differing in a number the loop reads itself": (
+                make_frames(bars, StubHourly(), m15=series),
+                variant(umum={"jeda_menit": 5}),
+                spec_a,
+                "built under another config",
             ),
         }
         for name, (frames, cfg, spec, message) in cases.items():

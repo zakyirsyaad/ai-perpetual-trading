@@ -32,6 +32,8 @@ from research.mode_backtest.simulate import (
     settle,
 )
 from research.pine_gate.bars import bars_from_rows, concat
+from research.pine_gate.outcomes import bracket_outcome
+from research.pine_gate.spec import ExecConfig
 from tests.mode_backtest_helpers import MINUTE_MS, minute_rows
 
 START_MS = 29_833_334 * MINUTE_MS  # a minute boundary in October 2026
@@ -607,6 +609,64 @@ class RandomWalkTests(unittest.TestCase):
 
         self.assertGreaterEqual(with_hole, 100)
         self.assertGreaterEqual(on_a_level, 1_000)
+
+
+class PineCascadeCrossCheckTests(unittest.TestCase):
+    """``resolve_exit`` and the Pine gate's ``bracket_outcome`` walk a bar in the same order: an
+    open beyond the stop, an open beyond the target, a touch of the stop (also when the bar
+    reaches both), a touch of the target. Nothing else ties the two, so a fix to one would part
+    them without a word; here they are held together on random walks.
+
+    Pine fills at the close of its entry bar ``E`` and walks from ``E + 1``. So the mode's walk
+    starts on bar ``E + 1``, with Pine's own levels and a limit one minute shorter, which puts
+    both limits on bar ``E + time_stop_min``. That bar is the one deliberate difference (spec D7):
+    Pine still reads its range and exits a time stop at its close, while the mode exits at its
+    open without looking."""
+
+    def test_both_walks_end_alike_except_on_the_time_limit_bar(self):
+        rng = random.Random(20261018)
+        counts = Counter()
+        for case in range(2_500):
+            # Pine's own bracket and limit, and wider or shorter ones, so time exits come too.
+            cfg = dataclasses.replace(ExecConfig(), bracket_pct=rng.choice((0.2, 0.2, 0.5, 1.0)),
+                                      time_stop_min=rng.choice((2, 3, 5, 10, 60)))
+            rows = random_rows(rng, rng.randint(10, 3 * cfg.time_stop_min + 10), hole_chance=0.0)
+            bars = bars_of(rows)
+            entry = rng.randint(0, len(rows) - 2)
+            side = rng.choice((LONG, SHORT))
+            fill = bars.close[entry] * (1 + side * cfg.entry_slip_bps / 10_000)
+            take = fill * (1 + side * cfg.bracket_pct / 100)
+            stop = fill * (1 - side * cfg.bracket_pct / 100)
+            limit_idx = entry + cfg.time_stop_min
+
+            pine = bracket_outcome(bars, entry, side, cfg)
+            mode = resolve_exit(bars, entry + 1, side, take, stop, cfg.time_stop_min - 1)
+
+            with self.subTest(case=case, side=side, entry=entry):
+                if pine is None or mode is None:
+                    self.assertEqual((pine, mode), (None, None))
+                    counts["data ends first"] += 1
+                elif mode.reason == EXIT_WAKTU:
+                    self.assertEqual((pine.exit_idx, mode.exit_idx), (limit_idx, limit_idx))
+                    self.assertEqual(mode.raw_price, bars.open[limit_idx])
+                    counts["time limit" if pine.kind == "TIME" else "D7: Pine decides it"] += 1
+                else:
+                    self.assertEqual(
+                        (pine.kind, pine.exit_idx, pine.raw_exit_price, pine.gapped,
+                         pine.both_touched),
+                        (mode.reason, mode.exit_idx, mode.raw_price, mode.gapped,
+                         mode.both_touched),
+                    )
+                    counts[(mode.reason, "gap" if mode.gapped else "touch",
+                            "both" if mode.both_touched else "single")] += 1
+
+        # The comparison is not vacuous: every branch of both cascades is reached.
+        for kind in ((EXIT_TP, "touch", "single"), (EXIT_TP, "gap", "single"),
+                     (EXIT_SL, "touch", "single"), (EXIT_SL, "touch", "both"),
+                     (EXIT_SL, "gap", "single"), "time limit", "D7: Pine decides it",
+                     "data ends first"):
+            with self.subTest(kind=kind):
+                self.assertGreaterEqual(counts[kind], 10, counts)
 
 
 class WalkArgumentTests(unittest.TestCase):

@@ -7,5 +7,6 @@ same rules into the engine. The rules take numbers, never bar arrays, so none of
 ``near_mean`` takes one short window of highs, lows and closes and measures it with the live bot's
 own ``bot.strategy.indicators`` and setup profile, so its stretch is the number the live gate gets.
 ``position_rules`` holds the bracket and slippage arithmetic and the entry gates that every mode
-shares, and reads the weekly window through the live ``bot.core.entry_window``.
+shares, and reads the weekly window through the live ``bot.core.entry_window``. ``checks`` is the
+one copy of the number and side checks that the rules and the backtest share.
 """

@@ -805,6 +805,17 @@ class TriggerSeriesTests(WavyCase):
         with self.assertRaises(ValueError):  # 3m bars would aggregate to 15m without a word
             frames.trigger_series(aggregate(self.pair.bars_1m, M3), "15m", TRIGGER_EMA)
 
+    def test_the_first_known_ema_is_known_when_its_candle_closes(self):
+        for tf, interval_ms in (("15m", M15), ("5m", M5)):
+            with self.subTest(tf):
+                ts = frames.trigger_series(self.pair.bars_1m, tf, TRIGGER_EMA)
+                first_close = ts.bars.open_ms[FIRST_TRIGGER_EMA_INDEX] + interval_ms
+
+                self.assertEqual(ts.first_known_ms(), first_close)
+                self.assertEqual(first_close, at(MON) + 8 * TRIGGER_EMA * interval_ms)
+        short = minute_bars(MON, 154, wavy, start_minute=7)  # 9 candles: no EMA at all
+        self.assertIsNone(frames.trigger_series(short, "15m", TRIGGER_EMA).first_known_ms())
+
     def test_a_trigger_series_is_frozen_and_lists_the_candles_first(self):
         ts = frames.trigger_series(self.pair.bars_1m, "15m", TRIGGER_EMA)
 
@@ -975,6 +986,12 @@ class PairFramesTests(WavyCase):
         self.assertEqual(built.stretch, stretch)
         self.assertEqual(built.stretch_bars.interval_ms, M3)
 
+    def test_the_frames_record_the_config_they_were_built_under(self):
+        other = self.other_config()
+
+        self.assertIs(self.built.cfg, self.cfg)
+        self.assertIs(frames.build_pair_frames(self.pair, other).cfg, other)
+
     def test_the_symbol_is_the_pairs_own(self):
         eth = dataclasses.replace(self.pair, symbol="ETH-USDT")
 
@@ -1018,7 +1035,7 @@ class PairFramesTests(WavyCase):
         names = [field.name for field in dataclasses.fields(frames.PairFrames)]
 
         self.assertEqual(
-            names, ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch"]
+            names, ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch", "cfg"]
         )
 
 

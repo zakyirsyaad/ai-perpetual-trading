@@ -69,7 +69,6 @@ The event loop (spec section 9.1, decisions D2, D4, D5 and D10):
 
 from __future__ import annotations
 
-import math
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
@@ -78,6 +77,12 @@ from types import MappingProxyType
 from typing import Iterator, List, Mapping, Optional, Protocol, Tuple, Union
 
 from bot.core.entry_window import parse_weekly_window
+from bot.strategy.modes.checks import (
+    check_side,
+    is_whole,
+    require_not_negative,
+    require_positive,
+)
 from bot.strategy.modes.config import GeneralConfig, ModesConfig, PullbackConfig
 from bot.strategy.modes.near_mean import near_mean_short
 from bot.strategy.modes.position_rules import (
@@ -178,36 +183,6 @@ class Money:
     volume_usdt: float
 
 
-def _is_whole(value: object) -> bool:
-    """Whether ``value`` is an ``int``; a bool is not one for this purpose."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_finite(value: object) -> bool:
-    """Whether ``value`` is a finite number; None, text, a bool, NaN and infinity are not."""
-    if isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(value)
-    except (TypeError, OverflowError):  # not a number at all; an int too large for a float
-        return False
-
-
-def _require_positive(name: str, value: object) -> None:
-    if not (_is_finite(value) and value > 0):
-        raise ValueError(f"{name} must be a finite number above 0, got {value!r}")
-
-
-def _require_not_negative(name: str, value: object) -> None:
-    if not (_is_finite(value) and value >= 0):
-        raise ValueError(f"{name} must be a finite number of at least 0, got {value!r}")
-
-
-def _check_side(side: object) -> None:
-    if not _is_whole(side) or side not in (LONG, SHORT):
-        raise ValueError(f"side must be LONG ({LONG}) or SHORT ({SHORT}), got {side!r}")
-
-
 def _reaches_sl(side: int, price: float, sl: float) -> bool:
     """Whether ``price`` is at or beyond the stop-loss.
 
@@ -227,17 +202,17 @@ def _check_walk(
 ) -> None:
     if bars_1m.interval_ms != INTERVAL_1M:
         raise ValueError(f"expected 1m bars, got {bars_1m.interval_ms} ms")
-    _check_side(side)
-    if not _is_whole(entry_idx) or not 0 <= entry_idx < len(bars_1m):
+    check_side(side)
+    if not is_whole(entry_idx) or not 0 <= entry_idx < len(bars_1m):
         raise ValueError(
             f"entry_idx must be a bar index from 0 to {len(bars_1m) - 1}, got {entry_idx!r}"
         )
-    if not _is_whole(limit_min) or limit_min < 1:
+    if not is_whole(limit_min) or limit_min < 1:
         raise ValueError(
             f"limit_min must be a whole number of minutes of at least 1, got {limit_min!r}"
         )
-    _require_positive("tp", tp)
-    _require_positive("sl", sl)
+    require_positive("tp", tp)
+    require_positive("sl", sl)
     if not (tp > sl if side == LONG else tp < sl):
         where = "above" if side == LONG else "below"
         raise ValueError(f"the take-profit must be {where} the stop-loss, got tp {tp!r}, sl {sl!r}")
@@ -303,9 +278,9 @@ def settle(
     Raises ``ValueError`` for a ``side`` that is not ``LONG`` or ``SHORT``, a price that is not a
     finite number above 0, a ``notional`` that is not a finite number above 0, and a ``fee_pct`` or
     ``slippage_pct`` that is not a finite number of at least 0."""
-    _check_side(side)
-    _require_positive("notional", notional)
-    _require_not_negative("fee_pct", fee_pct)
+    check_side(side)
+    require_positive("notional", notional)
+    require_not_negative("fee_pct", fee_pct)
     entry_fill = adverse_fill(entry_open, side, slippage_pct, False)
     exit_fill = adverse_fill(raw_exit, side, slippage_pct, True)
     qty = notional / entry_fill
@@ -347,7 +322,7 @@ class RunSpec:
                 f"Mode {self.mode} runs in {' or '.join(_GATES[self.mode])}, "
                 f"got {self.kondisi_gate!r}"
             )
-        if not (_is_whole(self.start_ms) and _is_whole(self.end_ms)):
+        if not (is_whole(self.start_ms) and is_whole(self.end_ms)):
             raise ValueError(
                 f"start_ms and end_ms must be whole milliseconds, got {self.start_ms!r} and "
                 f"{self.end_ms!r}"
@@ -450,6 +425,11 @@ def _check_inputs(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> None:
         )
     if frames.bars_1m.interval_ms != INTERVAL_1M:
         raise ValueError(f"expected 1m bars, got {frames.bars_1m.interval_ms} ms")
+    if frames.cfg != cfg:
+        raise ValueError(
+            "the frames were built under another config: its periods are in their series and "
+            "the rest would come from this one, so build them again with build_pair_frames"
+        )
 
 
 def _terms(cfg: ModesConfig, run: RunSpec) -> _Terms:
@@ -475,7 +455,9 @@ class _PullbackTrigger:
         self._ema = series.ema
         self._hourly = hourly
         self._tracker = PullbackTracker(
-            rules.konfirmasi_dalam_candle, rules.maks_jarak_sma20_1h_kali_atr
+            rules.konfirmasi_dalam_candle,
+            rules.maks_jarak_sma20_1h_kali_atr,
+            series.bars.interval_ms,
         )
 
     def signal_at(self, i: int, t_ms: int) -> Optional[HourlyContext]:
@@ -676,7 +658,8 @@ def simulate_run(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> RunResul
 
     Raises ``ValueError`` when the frames or the config do not fit the run: frames of another pair,
     a pair the config does not have, an ``otomatis`` ``faktor_k``, more than one position per pair,
-    bars of the wrong interval, or a column (EMA, stretch) that does not match its candles. Raises
+    bars of the wrong interval, frames built under another config (``frames.cfg``), or a column
+    (EMA, stretch) that does not match its candles. Raises
     ``RuntimeError`` for a hole in the data the run needs: a missing trigger candle, no 1m bar
     opening at a signal that passed every gate, or a walk that cannot end."""
     _check_inputs(frames, cfg, run)

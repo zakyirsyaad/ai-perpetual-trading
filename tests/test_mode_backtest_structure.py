@@ -4,10 +4,10 @@ Every rule runs over each ``*.py`` file of ``src/research/mode_backtest``, so a 
 added by a later task is covered without touching this file. Each detector is also
 run on small synthetic sources, so a rule cannot pass just because it looks at nothing.
 
-The code fingerprint of the lock is held to the modules the package imports, found two
-ways: an AST walk of every import statement, followed from module to module through
-``bot`` and ``research``, and the modules a fresh Python process has loaded once it has
-imported every module of the package.
+The code fingerprint of the lock is the package, the rule core and every module they
+import: ``lock.import_closure``, an AST walk of every import statement followed from module
+to module through ``bot`` and ``research``. It is held against the modules a fresh Python
+process has loaded once it has imported every module of the package.
 
 One rule looks the other way: no live module (every source under ``src`` outside
 ``research/`` and the rule core ``bot/strategy/modes/``) imports the rule core.
@@ -21,9 +21,10 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import List, Set
 
 from research.mode_backtest import lock
+from research.mode_backtest.lock import import_closure, imported_names, module_name, project_modules
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 PACKAGE = SRC / "research" / "mode_backtest"
@@ -151,12 +152,6 @@ def file_writes(tree: ast.AST) -> List[str]:
     return found
 
 
-# Imported inside functions the package never calls, to read the live settings and Supabase
-# (``research.pine_gate.cli_common.make_settings`` and ``research.pine_gate.calibrate``'s
-# ``make_get_rows``): neither shapes a computed result, so the walk neither keeps nor follows
-# them, as ``tests/test_pine_gate_structure.py`` leaves them out of the Pine fingerprint.
-IO_ONLY_IMPORTS = frozenset({"bot.config", "bot.storage.supabase_trade_store"})
-
 # Run by a fresh interpreter: import every module of the package, then print the source files
 # under ``src`` (the first argument) of every module Python has loaded.
 LOADED_BY_THE_PACKAGE = """
@@ -173,72 +168,6 @@ files = {
 }
 print(json.dumps(sorted(files)))
 """
-
-
-def module_name(path: Path) -> str:
-    """The dotted name of a source file under ``src``; a package is named by its folder."""
-    parts = list(path.relative_to(SRC).with_suffix("").parts)
-    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
-
-
-def module_source(name: str) -> Optional[Path]:
-    """The source file of module ``name`` under ``src``, or None when it is no project module."""
-    if name.split(".")[0] not in PROJECT_ROOTS:
-        return None
-    base = SRC.joinpath(*name.split("."))
-    for path in (base.with_suffix(".py"), base / "__init__.py"):
-        if path.is_file():
-            return path
-    return None
-
-
-def imported_names(tree: ast.AST, module: str, is_package: bool) -> Set[str]:
-    """Every dotted name an import statement anywhere in ``module`` may load, relative ones
-    resolved: ``import a.b`` names ``a.b``, and ``from a import b`` names both ``a`` and
-    ``a.b``, because ``b`` may be a submodule. Imports inside functions count too."""
-    package = module if is_package else module.rpartition(".")[0]
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                parts = package.split(".")
-                base = ".".join(parts[: len(parts) - node.level + 1])
-                source = f"{base}.{node.module}" if node.module else base
-            else:
-                source = node.module
-            names.add(source)
-            names.update(f"{source}.{alias.name}" for alias in node.names)
-    return names
-
-
-def project_modules(names: Iterable[str]) -> Set[str]:
-    """The names that are project modules, each with the packages around it, whose
-    ``__init__`` Python runs first; ``IO_ONLY_IMPORTS`` are left out."""
-    found = set()
-    for name in names:
-        if name in IO_ONLY_IMPORTS or module_source(name) is None:
-            continue
-        parts = name.split(".")
-        found.update(".".join(parts[:k]) for k in range(1, len(parts) + 1))
-    return found
-
-
-def import_closure(paths: Iterable[Path]) -> Dict[str, Path]:
-    """Every project module that the modules at ``paths`` import, followed transitively, by
-    name; the modules at ``paths`` are included."""
-    todo = [module_name(path) for path in paths]
-    seen: Dict[str, Path] = {}
-    while todo:
-        name = todo.pop()
-        if name in seen:
-            continue
-        path = module_source(name)
-        seen[name] = path
-        tree = parse(path.read_text(encoding="utf-8"))
-        todo += project_modules(imported_names(tree, name, path.name == "__init__.py"))
-    return seen
 
 
 def relative(path: Path) -> str:
@@ -471,14 +400,12 @@ class CodeFingerprintTests(unittest.TestCase):
             self.assertIn(followed, imported)
         self.assertEqual(sorted(imported - self.covered()), [])
 
-    def test_code_extra_names_only_modules_the_package_imports(self):
-        extra = list(lock.CODE_EXTRA)
-        globbed = {relative(path) for path in modules()}
-        globbed |= {relative(path) for path in (SRC / "bot" / "strategy" / "modes").glob("*.py")}
+    def test_the_fingerprint_holds_nothing_the_package_and_the_rule_core_do_not_import(self):
+        starts = [*modules(), *sorted(RULE_CORE_DIR.glob("*.py"))]
+        reached = {relative(path) for path in import_closure(starts).values()}
 
-        self.assertEqual(len(extra), len(set(extra)))
-        self.assertEqual(sorted(set(extra) & globbed), [])
-        self.assertEqual(sorted(set(extra) - self.imported_from_outside()), [])
+        self.assertEqual(sorted(self.covered() - reached), [])
+        self.assertEqual(sorted(reached - self.covered()), [])
 
     def test_python_loads_no_project_module_the_fingerprint_misses(self):
         env = {**os.environ, "PYTHONPATH": str(SRC)}
@@ -529,6 +456,26 @@ class CodeFingerprintTests(unittest.TestCase):
                  "research.pine_gate.bars.Bars", "bot.no_such_module"}
 
         self.assertEqual(project_modules(names), set())
+
+
+class SharedCheckTests(unittest.TestCase):
+    """The number and side checks have one copy, ``bot.strategy.modes.checks``: copies drift."""
+
+    NAMES = ("is_whole", "is_finite", "is_positive_finite", "require_positive",
+             "require_not_negative", "check_side")
+
+    def test_no_module_writes_its_own_number_or_side_check(self):
+        paths = [*modules(), *sorted(RULE_CORE_DIR.glob("*.py"))]
+        self.assertIn(RULE_CORE_DIR / "checks.py", paths)
+
+        defined = [
+            f"{relative(path)}: {node.name}"
+            for path in paths if path.name != "checks.py"
+            for node in ast.walk(parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.FunctionDef) and node.name.lstrip("_") in self.NAMES
+        ]
+
+        self.assertEqual(defined, [])
 
 
 class RuleCoreIsolationTests(unittest.TestCase):

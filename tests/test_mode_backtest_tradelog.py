@@ -222,7 +222,7 @@ class RowTests(unittest.TestCase):
         self.assertEqual((row["harga_entry"], row["harga_exit"]), ("100.01", "99.74"))
 
     def test_a_side_that_is_neither_long_nor_short_is_refused(self):
-        for side in (0, 2, True, None, "LONG"):
+        for side in (0, 2, 1.0, -1.0, True, None, "LONG"):
             with self.subTest(side=side):
                 with self.assertRaisesRegex(ValueError, "side"):
                     trade_log_text([long_trade(side=side)])

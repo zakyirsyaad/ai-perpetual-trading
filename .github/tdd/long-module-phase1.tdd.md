@@ -1579,9 +1579,226 @@ git diff --check
 - **End to end** through `python -m research.mode_backtest` on the synthetic week in a temporary folder, never the real data: `train` exit 0; `test` exit 0, with `loaded_files` 7, `test_day_files` 2 and both sha256s in the result and in the `.md`; a second `test` exit 2 ("already ran").
 - The fingerprint still covers 61 files: this wave changed two of them (`stages.py`, `data.py`) and added none.
 
+## Code-review fix wave (2026-10-18)
+
+A `/code-review` of PR #39 at max effort reported 15 findings. It ran ten finder angles, one verifier per candidate and a sweep. The user asked for all 15 to be applied with minimal edits.
+
+Every source change lands before the first real `train`, because each touched file is in the lock's code fingerprint. The user journey is the same as in Task 14: the operator runs `train` on the real data and reads the 5m-switch decision. Two things must hold:
+- The numbers behind that decision must be the ones the spec defines.
+- A configuration mistake must fail at `load` or `train`, not after the one-shot `test` has claimed its records.
+
+The RED runs below are the actual failures before each change, with the new or updated tests in place.
+
+### 1. A NAIK day counts only hours in which Mode A can signal (`frames.py`, `stages.py`)
+
+**Finding.** The training denominator of the pre-registered 5m switch counted the first training day. On the real data that is Friday 2025-08-01, inside the window. The 15m EMA20 gets no warm-up (no 1m bar before 2025-08-01), so it is first known only after 160 candles, 40 hours in. Spec section 5 defines the NAIK day by "an hour in which Mode A could enter".
+
+**RED.** `tests.test_mode_backtest_frames.TriggerSeriesTests` plus `tests.test_mode_backtest_lock`: `FAILED (failures=9, errors=3)`.
+- `TriggerSeries` had no `first_known_ms`.
+- On the synthetic week the training NAIK days were `['2026-07-06', '2026-07-07', '2026-07-08'] != ['2026-07-07', '2026-07-08']`. Monday was counted while the 15m EMA is cold until Tuesday 16:00 WIB.
+- The 5m-switch rate was `1.6666666666666667 != 2.5`.
+
+**GREEN.**
+- `TriggerSeries.first_known_ms()` gives the close of the first candle with a known EMA.
+- `stages._naik_days(frames, cfg, period, tf)` counts the 1h close at `h` only when that first known EMA comes before `h + 1h`. The close at `h` is the condition of the trigger closes in `[h, h + 1h)`.
+- The 15m run and the comparator are measured on the 15m days, and those are the days the train result and the lock record.
+- A switched 5m run counts from its own EMA, 13 h 20 min in.
+- In the test stage both EMAs are warm, so nothing changes there.
+
+**Tests.**
+- New: `test_the_first_known_ema_is_known_when_its_candle_closes`; `TrainStageTests.test_naik_days_start_when_mode_a_can_enter`, which checks 15m and the comparator at 2 days and 5m at 3.
+- Updated: the train test (2 NAIK days); the minimum-hours test (Tuesday has 8 such hours, so a minimum of 8 keeps it and 9 drops it); the exact-numbers test (5 entries on 2 days moves to 5m); and the synthetic-week docstring.
+
+### 2. A pass rule that can always be judged (`config.py`)
+
+**Finding.** `_read_test` checked only the date order. With `lolos_minimal_posisi` ≤ `lolos_buang_posisi_teratas`, a test of that few positions has no result without the best ones. `pass_status` then raises after the one-shot claims.
+
+**RED.** For 2/3, 3/3, 40/40 and 40/50: `ModesConfigError not raised`.
+
+**GREEN.** `_read_test` refuses unless `lolos_minimal_posisi > lolos_buang_posisi_teratas` (the shipped 40 > 3).
+
+**Tests.** `test_the_minimum_positions_must_outnumber_the_trimmed_ones`. `test_counts_and_periods_have_minimums` now accepts a minimum of 1 position against a trim of 0.
+
+### 3. Plain-decimal numbers and no merge keys (`config.py`)
+
+**Finding.** PyYAML's YAML 1.1 rules read `015` as octal 13, `0x15`, `0b1111`, `1:0.25` as 60.25 (base 60) and `25_000`. A `<<:` merge key set a key a second time out of sight of the repeated-key refusal.
+
+**RED.** `ModesConfigError not raised` for each of `015`, `0x15`, `0b1111`, `0_15`, `1:30`, `025000`, `25_000`, `0.4_0`, `1:0.25` and `-0150`, and for a merge key beside its key or alone. An explicit `!!merge` key was merged in, and the only refusal was `umum.extra: unknown key`.
+
+**GREEN.**
+- `_PlainNumberLoader`, a `SafeLoader` (so loading stays safe), keeps every implicit resolver except int and float. Its own two read only `[-+]?(0|[1-9][0-9]*)` and `[-+]?(0|[1-9][0-9]*)\.[0-9]+`, so a non-canonical number stays text and its reader refuses it as the wrong type.
+- `_refuse_repeated_keys` refuses a merge-tagged key and names its path (`umum.<<: a merge key is not allowed`).
+- The shipped file loads the same values. `test_loading_a_file_matches_parsing_its_mapping` compares it with `yaml.safe_load`.
+
+**Tests.** `test_numbers_must_be_written_as_plain_decimals` (which also accepts `0` and `+15`) and `test_a_merge_key_is_refused_and_names_its_path`.
+
+### 4. Frames run only under the config they were built under (`frames.py`, `simulate.py`)
+
+**Finding.** `PairFrames` bakes in `ema_pemicu`, the selector periods and Mode D's window, while the loop reads TP, SL, `konfirmasi`, the gates and the costs from the config it is given. `_check_inputs` never compared the two.
+
+**RED.** 76 errors `PairFrames.__init__() takes 7 positional arguments but 8 were given`, once the hand-built test frames record a config.
+
+**GREEN.** `PairFrames.cfg` records the config of `build_pair_frames`, and `_check_inputs` raises `ValueError` ("built under another config") when the run's config differs.
+
+**Tests.** Two new refusal cases in `test_frames_and_config_that_do_not_fit_the_run_are_refused`: a baked period with a live one, and a loop-only number. Also `test_the_frames_record_the_config_they_were_built_under`. The loop helpers pass their config to the frames they write.
+
+### 5. Step 0 records the mode lock's fingerprint (`step0.py`)
+
+**Finding.** Step 0 recorded `research.pine_gate.lock.code_sha256()`. That misses `bot/strategy/modes/regime.py` and `config.py`, which make its labels.
+
+**RED.** `test_the_json_records_inputs_reproduction_and_caveat` FAILED on `code_sha256`.
+
+**GREEN.** `code_sha256` and `python_version` come from `research.mode_backtest.lock`, so the version is `"3.10"`, not `[3, 10]`. The latency hash stays Pine's.
+
+### 6. Dotfiles are not fingerprinted (`lock.py`, `pine_gate/lock.py`)
+
+**Finding.** `glob("*.py")` takes an editor's lock file `.#stages.py` (a dangling symlink) and a macOS `._stages.py`.
+
+**RED.** In a copy of `src`: `FileNotFoundError: [Errno 2] No such file or directory: '.../src/research/mode_backtest/.#stages.py'`.
+
+**GREEN.** Both locks skip names that start with a dot.
+
+**Tests.** `test_dotfiles_beside_the_modules_are_not_fingerprinted`. Its copy with both dotfiles has the same `code_sha256` as the real tree.
+
+### 7. The documented LONG-only test command (`CLAUDE.md`)
+
+**Finding.** `-p 'test_mode*.py'` skipped the core's import guards (`tests/test_pine_gate_structure.py::IsolationTests`) and the new `WindowStatisticTests`.
+
+**GREEN.** A second line runs `tests.test_pine_gate_structure tests.test_pine_indicators`.
+
+### 8. The tracker refuses a missing candle (`pullback.py`)
+
+**Finding.** The confirm window counts candles received, and only their order was checked. A feed that skips a candle stretched "3 candles". The harness guards spacing, but the spec says the live engine will call the same rules.
+
+**RED.** `TypeError: PullbackTracker.__init__() got an unexpected keyword argument 'interval_ms'` in every tracker test.
+
+**GREEN.** `PullbackTracker(confirm_within, max_distance_atr, interval_ms)` refuses a candle whose close is not one interval after the previous one's ("a candle is missing"), and changes nothing. `simulate._PullbackTrigger` passes its candles' interval.
+
+**Tests.** `test_a_missing_candle_is_refused_instead_of_widening_the_window` and `test_the_interval_must_be_a_whole_number_of_milliseconds_above_zero`.
+
+### 9. The import closure is computed, not kept by hand (`lock.py`)
+
+**Finding.** `CODE_EXTRA` listed 43 transitive imports. A main-branch change to a live-bot module's imports turned this research test red until the list was edited.
+
+**RED.** With `from bot import logger` added to a copy's `bot/arena/__init__.py`: `'bot/logger.py' not found in {...}`. The structure test could not import `import_closure` from the lock.
+
+**GREEN.**
+- The AST walk moved from `tests/test_mode_backtest_structure.py` into the lock: `module_name`, `module_source`, `imported_names`, `project_modules`, `import_closure` and `IO_ONLY_IMPORTS`.
+- `code_files()` is now `CODE_DIRS` plus their closure: 62 files, the 61 of before plus the new `checks.py`.
+- Parsing is cached per source bytes (`functools.lru_cache`), so a second call in one process takes 0.05 s, not 1.3 s. Without it the lock and structure tests took 3 min 15 s at a load average of 40+, against 19 s with it.
+- The test keeps its independent check, the modules a fresh interpreter loads. `test_code_extra_names_only_modules_the_package_imports` became `test_the_fingerprint_holds_nothing_the_package_and_the_rule_core_do_not_import`.
+
+**Tests.** `test_a_new_import_of_a_module_the_package_reaches_needs_no_list_edit`. The coverage test now checks for transitive modules and leaves out the I/O-only `bot/config.py`.
+
+### 10. Pine's fingerprint holds the Pine package only (`pine_gate/lock.py`)
+
+**Finding.** Pine's `code_files` used an rglob over all of `src/research`, so it hashed the 12 `mode_backtest` files.
+
+**RED.** `test_the_fingerprint_holds_no_research_package_but_the_pine_gate` FAILED.
+
+**GREEN.** The fingerprint covers `research/__init__.py`, `research/pine_gate/**` and the three bot modules. Step 0 no longer needs the broad rglob (item 5).
+- The 2026-10-16 holdout's sha already differed from the merge base, and no Pine stage is pending in this repo.
+- On the VPS, Pine runs from its frozen snapshot.
+
+### 11. One copy of the number and side checks (`bot/strategy/modes/checks.py`)
+
+**Finding.** The finite, bool and side guards were copied across `simulate`, `metrics`, `position_rules`, `pullback` and `tradelog`, and had drifted.
+- `position_rules` took `True` as a price or a slippage: `settle(slippage_pct=True)` ran at 1 %.
+- `position_rules` and `tradelog` took side `1.0`.
+
+**RED.** `FAILED (failures=12, errors=77)`.
+- side 1.0 and -1.0 were accepted by `bracket_prices`, `adverse_fill` and the trade log;
+- `True` was accepted as an entry fill, a percent and a price, and `True`/`False` as the slippage;
+- `SharedCheckTests` listed the copies.
+
+**GREEN.** `checks.py` holds `LONG`, `SHORT`, `is_whole`, `is_finite`, `require_positive`, `require_not_negative` and `check_side`, all strict: a bool is no number, a side is a whole `LONG` or `SHORT`.
+- The five modules import them.
+- `position_rules` re-exports `LONG` and `SHORT`.
+- `config.py` keeps its own readers, whose messages name the YAML path.
+
+**Tests.** `SharedCheckTests.test_no_module_writes_its_own_number_or_side_check`, plus the extended refusal lists in `test_modes_position_rules` and `test_mode_backtest_tradelog`.
+
+### 12. The two exit cascades are held together (tests only)
+
+**Finding.** `resolve_exit` re-implements the cascade of `research.pine_gate.outcomes.bracket_outcome`, and no test compared them.
+
+**GREEN.** `PineCascadeCrossCheckTests` runs 2,500 random walks with Pine's bracket and limit and wider and shorter ones.
+- Pine's entry bar `E` maps to the mode's walk from `E + 1`, with Pine's levels and a limit one minute shorter.
+- Every outcome must agree in kind, bar, raw price, gap and both-touched, except on the time-limit bar (D7).
+- Counts: time limit 795, SL touch 586, data ends first 397, TP touch 390, SL gap 132, D7 (Pine decides on the limit bar) 127, TP gap 52, SL touch on a bar that reached both 21.
+- Mutation check (scratch): a `resolve_exit` that takes the target first on a bar reaching both levels fails the test, e.g. `('SL', 2, 99.60289001, False, True) != ('TP', 2, 100.00209998999999, False, False)`.
+
+### 13. `_locked_metrics` returns its problem (`stages.py`)
+
+**Finding.** It appended to the caller's list. That breaks the user's rule "ALWAYS create new objects, NEVER mutate existing ones".
+
+**GREEN.** It returns `(metrics, problem)`, and `_locked_rows` builds one list. The refactor changes no behaviour, and `test_a_hand_edited_lock_is_refused_before_the_marker` still names every edit.
+
+### 14. Step 0 reads the day files once (`step0.py`)
+
+**Finding.** `label_lookup` reloaded both pairs' 439 day files with `load_pair` after `load_dataset` had read them.
+
+**RED.** `['load_dataset', 'load_pair', 'load_pair'] != ['load_dataset']`, and `label_lookup` took a data folder (`TypeError ... not mappingproxy`).
+
+**GREEN.**
+- `label_lookup(frames, selector)` builds each `HourlyFrame` from the replay's own `FeatureFrame` 1h and 4h series, warm-ups joined. `condition_lookup` and it share `_lookup`.
+- `replay_main_runs` refuses a missing or unused warm-up (`Dataset.missing_warmups`) before any run, as the Pine pipeline refuses one for a spec run. That replaces `load_pair`'s refusal.
+
+**Tests.**
+- `test_the_label_lookup_labels_as_the_day_files_do_without_reading_them`: every reference trade gets the label `condition_lookup` gives on `load_pair`'s days.
+- `test_labels_come_from_the_dataset_the_replay_loaded`.
+- `test_a_missing_or_unused_warm_up_stops_step0_before_the_replay`.
+- `test_the_rows_are_split_rows_of_the_replayed_trades` still compares the rows with `load_pair`-based labels.
+
+### 15. `pick` is annotated (`pine_indicators.py`)
+
+`_rolling_complete(..., pick: Callable[[Sequence[float]], float])`, per the user's rule "Use **type annotations** on all function signatures".
+
+### Item 1 again: the line coverage found
+
+The full run left one new line unexecuted: the `return []` of `_naik_days` for a trigger EMA never known in the period. `TrainStageTests.test_a_training_too_short_for_the_trigger_ema_has_no_naik_day` now runs it. With one training day there are 96 15m candles, short of the 160 the EMA20 needs, so `train` must exit 1 because the 5m switch cannot be evaluated.
+
+**RED.** A scratch probe ran the test with the old `_naik_days` patched back in. Result: `AssertionError: 0 != 1`. The old count made Monday a NAIK day with 0 entries, and `train` exited 0 having locked 5m on a cold 15m EMA. That is the bias of item 1 in its plainest form.
+
+### Verification (code-review fix wave)
+
+Run on 2026-10-18 on the working tree of this commit. Python 3.10.20 (`.venv`), `PYTHONPATH=src`. The machine's load average was 12–52.
+
+```text
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests
+(no output; exit 0)
+
+PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<scratch>/coveragerc -m unittest discover -s tests
+Ran 2283 tests in 235.247s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<scratch>/coveragerc
+TOTAL                                         14979   1388    91%
+(exit 0; the gate is 80 %)
+
+git diff --check
+(no output; exit 0)
+```
+
+- **Full suite.** 2,283 tests: the 2,269 of the final review fix wave plus 14 new ones, all OK. The short-training test came after this run and passes on its own and in `test_mode_backtest_lock`, so the count is now 2,284.
+  - The two documented LONG-only commands: `-p 'test_mode*.py'`, 695 tests, OK; `tests.test_pine_gate_structure tests.test_pine_indicators`, 39 tests, OK.
+- **Coverage.** Same scratch rcfile with the project's `[tool.coverage]` settings.
+  - New code (`bot/strategy/modes/` and `research/mode_backtest/`): 1,891 statements, 2 missed. One is `__main__.py`'s import line, which only the subprocess test runs. The other is the `_naik_days` line that the short-training test now covers.
+  - `research/pine_gate/lock.py`: 97 %. Its four missed lines are older than this wave.
+- **Python 3.11.15** (the scratch environment, CI's version): the changed modules ran 602 + 147 tests, OK. These are `test_modes_config`, `_pullback`, `_position_rules`, `test_mode_backtest_lock`, `_structure`, `_simulate`, `_loop`, `_frames`, `_tradelog`, `_metrics`, `_step0`, `_cli`, `_data`, `test_pine_gate_structure` and `test_pine_gate_cli`.
+- **Lint and hygiene.**
+  - `ruff check --select F,E,W,B --line-length 100` finds nothing new in the changed files: the source findings are the seven older ones in `pine_indicators.py` and `pine_gate/lock.py`, and the test files hold 34 before and after.
+  - `uv pip check`: 17 packages, all compatible. `tests.test_secret_hygiene` OK with this document tracked.
+- **End to end** through `python -m research.mode_backtest`, on the synthetic week in a scratch folder, never the real data:
+  - `train` exits 0, with NAIK days `2026-07-07` and `2026-07-08` and `entry_per_hari_naik_15m` 6.0 (12 entries on 2 days, not 4.0 on 3), so no switch.
+  - `test` exits 0 (`BELUM CUKUP SAMPEL`, `loaded_files` 7), and a second `test` exits 2 ("already ran").
+  - The lock's `code_sha256` equals the current one over 62 files.
+- **The fingerprint now covers 62 files**: the 61 of before plus `bot/strategy/modes/checks.py`, found by the walk with no list to edit. Every lock written before this wave is void, as intended: no real `train` has run.
+
 ## Commit trail
 
-`git log --oneline --reverse 772cd16..HEAD`: 30 commits, and this one (Task 15's `72e12e9` and the final review fix wave are the last five). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
+`git log --oneline --reverse 772cd16..HEAD`: 31 commits, and this one (Task 15's `72e12e9`, the final review fix wave and the code-review fix wave are the last six). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
 
 - `40569bd` — `test: pin telemetry cancellation against swallowed wait_for` (main, PR #37)
 - `d3da0c5` — `fix: telemetry waits never swallow a cancellation` (main, PR #37)
@@ -1613,7 +1830,8 @@ git diff --check
 - `1ba29da` — `fix: record the test-period data manifests in the one-shot result` (final review fix wave, Important 1)
 - `a9e2967` — `test: pin the close-above-EMA clause and the touch side of Mode A` (final review fix wave, items 2 and 3)
 - `40de062` — `test: pin that no live module imports the rule core` (final review fix wave, item 4)
-- this commit — `docs: final review fixes for the LONG module phase 1 docs` (final review fix wave, items 5 to 9 and this evidence)
+- `d50a05a` — `docs: final review fixes for the LONG module phase 1 docs` (final review fix wave, items 5 to 9 and its evidence)
+- this commit — `fix: apply the PR #39 code-review findings` (code-review fix wave, all 15 findings and this evidence)
 
 ## Deployment gate
 
@@ -1624,7 +1842,7 @@ Nothing is deployed. The live bot, `.env`, pm2 (`ai-perp-volume`) and the VPS ar
 - Still to do, in Task 16 and only after the merge and the user's go-ahead: `train`, then `verify-copy`, then the one-shot `test`. Task 16 operator notes (the reasons are in Task 14, "Notes for later tasks"):
   - Run `verify-copy` immediately before `test`, with nothing in between. Before its claims `test` re-hashes the training days and both warm-ups against the lock, but of the test-period days it checks only that each is a regular file.
   - Stay on the Python 3.10 `.venv` for both `train` and `test`. The lock binds major.minor, so a `test` on 3.11 (CI's version, or a scratch 3.11 environment) exits 2 against a lock that 3.10 wrote.
-  - Do not pull or merge `main` between `train` and `test`. The 61 fingerprinted files include `bot/arena/*`, `bot/models.py`, `bot/core/entry_window.py` and `bot/strategy/indicators.py`, live-bot modules that main can change at any time, so any change there makes `test` exit 2. The YAML, the training files and the Python minor version are bound as well.
+  - Do not pull or merge `main` between `train` and `test`. The 62 fingerprinted files (since the code-review fix wave, the package, the rule core and every module they import, found anew on each run) include `bot/arena/*`, `bot/models.py`, `bot/core/entry_window.py` and `bot/strategy/indicators.py`. Main can change those live-bot modules at any time, and any change there makes `test` exit 2. The YAML, the training files and the Python minor version are bound as well.
   - Use one `--out-dir` and one `--data-dir` for both stages. Never rehearse in the out-dir of the real run, and never point a rehearsal at the real data dir (`~/replay/mode_backtest/data`): its `test` would read the real test-period days and leave a marker that refuses the real run. Rehearse on synthetic data only, such as the week `tests/mode_backtest_stages.py` builds.
   - A start record left behind by a failed marker claim: see Task 14.
   - After the run, replace the sentence "As of 2026-10-18 Mode A's `train` and `test` have not run." in CLAUDE.md's `research.mode_backtest` entry with the outcome: the status line, the result file, and the lock, marker and data-manifest sha256s the result records.

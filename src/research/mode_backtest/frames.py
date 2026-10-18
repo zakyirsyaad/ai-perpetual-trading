@@ -197,6 +197,14 @@ class TriggerSeries:
     bars: Bars
     ema: Column
 
+    def first_known_ms(self) -> Optional[int]:
+        """The close of the first candle whose EMA is known, or ``None`` when none has one: from
+        then on Mode A can signal on these candles."""
+        for i, value in enumerate(self.ema):
+            if value is not None:
+                return self.bars.open_ms[i] + self.bars.interval_ms
+        return None
+
 
 def trigger_series(bars_1m: Bars, tf: str, ema_period: int) -> TriggerSeries:
     """The ``tf`` candles (``"15m"`` or ``"5m"``) of the 1m bars and their EMA of ``ema_period``.
@@ -263,7 +271,9 @@ class PairFrames:
 
     ``hourly`` answers the market condition at any time. ``triggers`` maps ``"15m"`` and ``"5m"``
     to Mode A's candles with their EMA. ``stretch_bars`` are Mode D's 3m candles and ``stretch``
-    holds the stretch of each, index for index. ``triggers`` is read-only."""
+    holds the stretch of each, index for index. ``triggers`` is read-only. ``cfg`` is the config
+    the frames were built under: its periods are in the series, so ``simulate_run`` refuses to
+    run them under another one."""
 
     symbol: str
     bars_1m: Bars
@@ -271,6 +281,7 @@ class PairFrames:
     triggers: Mapping[str, TriggerSeries]
     stretch_bars: Bars
     stretch: Column
+    cfg: ModesConfig
 
 
 def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
@@ -293,4 +304,5 @@ def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
         MappingProxyType(triggers),
         stretch_bars,
         stretch,
+        cfg,
     )

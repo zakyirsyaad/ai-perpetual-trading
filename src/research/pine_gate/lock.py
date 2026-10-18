@@ -6,7 +6,7 @@ A selection file is usable by the test stage only when it was written by a
 spec run: the current spec sha256, the spec's own configs and segments and the
 real ``train_meta``. ``load_selection_checked`` enforces that. The file also
 binds the calibration (``latencies_sha256``) and the code (``code_sha256``,
-the research package plus ``pine_indicators.py``) it was made with.
+the Pine gate package plus ``pine_indicators.py``) it was made with.
 """
 
 from __future__ import annotations
@@ -234,8 +234,12 @@ def latencies_sha256(latencies_ms: Sequence[float]) -> str:
 
 
 def code_files() -> List[Tuple[str, str]]:
-    """(path relative to ``src``, sha256) of every research .py plus the bot modules it imports."""
-    paths = sorted((_SRC_ROOT / "research").rglob("*.py"))
+    """(path relative to ``src``, sha256) of every Pine gate .py, ``research/__init__.py`` and the
+    bot modules it imports. Other research packages are left out, so an edit to one of them
+    leaves this fingerprint alone, and so are files whose name starts with a dot."""
+    package = sorted((_SRC_ROOT / "research" / "pine_gate").rglob("*.py"))
+    paths = [_SRC_ROOT / "research" / "__init__.py"]
+    paths += [p for p in package if not p.name.startswith(".")]
     paths += [_SRC_ROOT / rel for rel in _CODE_EXTRA]
     files = [(p.relative_to(_SRC_ROOT).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
              for p in paths]

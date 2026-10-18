@@ -448,7 +448,10 @@ class ValueRefusalTests(ConfigCase):
                 with self.subTest(key=dotted, bad=bad):
                     self.assertRefuses(edited(dotted, bad), dotted, "at least 1")
             with self.subTest(key=dotted, good=1):
-                self.assertEqual(self.assertAccepts(dotted, 1), 1)
+                doc = edited(dotted, 1)
+                if dotted == "uji.lolos_minimal_posisi":  # one position must outnumber the trim
+                    doc["uji"]["lolos_buang_posisi_teratas"] = 0
+                self.assertEqual(value_at(parse_modes_config(doc), dotted), 1)
         for dotted in WHOLE_AT_LEAST_ZERO:
             with self.subTest(key=dotted, bad=-1):
                 self.assertRefuses(edited(dotted, -1), dotted, "at least 0")
@@ -557,6 +560,19 @@ class ValueRefusalTests(ConfigCase):
                 message = self.assertRefuses(doc, "uji")
                 self.assertIn("latihan_mulai < latihan_selesai < ujian_selesai", message)
 
+    def test_the_minimum_positions_must_outnumber_the_trimmed_ones(self):
+        # With no more positions than are trimmed, nothing is left for the result without the
+        # best ones, and the pass rule would fail only once the one-shot test has started.
+        for minimal, trimmed in ((2, 3), (3, 3), (40, 40), (40, 50)):
+            with self.subTest(minimal=minimal, trimmed=trimmed):
+                doc = valid_doc()
+                doc["uji"].update(lolos_minimal_posisi=minimal, lolos_buang_posisi_teratas=trimmed)
+                message = self.assertRefuses(doc, "uji")
+                self.assertIn("lolos_minimal_posisi > lolos_buang_posisi_teratas", message)
+        doc = valid_doc()
+        doc["uji"].update(lolos_minimal_posisi=4, lolos_buang_posisi_teratas=3)
+        self.assertEqual(parse_modes_config(doc).uji.lolos_minimal_posisi, 4)
+
 
 class YamlFileTests(ConfigCase):
     def setUp(self):
@@ -659,6 +675,50 @@ class YamlFileTests(ConfigCase):
         for name, (old, new, named) in cases.items():
             with self.subTest(name):
                 self.assertFileRefuses(text.replace(old, new), named)
+
+    def test_numbers_must_be_written_as_plain_decimals(self):
+        # YAML 1.1 reads 015 as octal 13, 0x15 as 21, 0b1111 as 15, 1:30 as 90 (base 60) and
+        # 0_15 as 15. Each stays text here, so its reader refuses it instead of the run using a
+        # number nobody reading the file sees.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        pause, size, tp = "  jeda_menit: 15\n", "  notional_usdt: 25000", "    tp_persen: 0.40\n"
+        sl, floor = "    sl_persen: 0.25\n", "  lolos_hasil_per_1_juta_lebih_dari: -150\n"
+        cases = {
+            "015": (pause, "  jeda_menit: 015\n", "umum.jeda_menit"),
+            "0x15": (pause, "  jeda_menit: 0x15\n", "umum.jeda_menit"),
+            "0b1111": (pause, "  jeda_menit: 0b1111\n", "umum.jeda_menit"),
+            "0_15": (pause, "  jeda_menit: 0_15\n", "umum.jeda_menit"),
+            "1:30": (pause, "  jeda_menit: 1:30\n", "umum.jeda_menit"),
+            "025000": (size, "  notional_usdt: 025000", "umum.notional_usdt"),
+            "25_000": (size, "  notional_usdt: 25_000", "umum.notional_usdt"),
+            "0.4_0": (tp, "    tp_persen: 0.4_0\n", "mode.A_pullback_long.tp_persen"),
+            "1:0.25": (sl, "    sl_persen: 1:0.25\n", "mode.A_pullback_long.sl_persen"),
+            "-0150": (floor, "  lolos_hasil_per_1_juta_lebih_dari: -0150\n",
+                      "uji.lolos_hasil_per_1_juta_lebih_dari"),
+        }
+        for written, (old, new, named) in cases.items():
+            with self.subTest(written=written):
+                self.assertIn(old, text)
+                message = self.assertFileRefuses(text.replace(old, new, 1), named)
+                self.assertIn(f"'{written}' (str)", message)
+        for written, value in (("0", 0), ("+15", 15)):
+            with self.subTest(written=written):
+                path = self.written(text.replace(pause, f"  jeda_menit: {written}\n"))
+                self.assertEqual(load_modes_config(path).umum.jeda_menit, value)
+
+    def test_a_merge_key_is_refused_and_names_its_path(self):
+        # ``<<`` sets keys a second time, out of sight of the repeated-key refusal.
+        text = REPO_CONFIG.read_text(encoding="utf-8")
+        pause = "  jeda_menit: 15\n"
+        cases = {
+            "beside the key it sets": pause + "  <<: {jeda_menit: 45}\n",
+            "alone": "  <<: {jeda_menit: 15}\n",
+            "with an explicit tag": pause + "  ? !!merge <<\n  : {extra: 1}\n",
+        }
+        for name, new in cases.items():
+            with self.subTest(name):
+                message = self.assertFileRefuses(text.replace(pause, new), "umum.<<", "merge key")
+                self.assertNotIn("cannot read as YAML", message)
 
     def test_absurdly_deep_nesting_is_a_config_error(self):
         text = REPO_CONFIG.read_text(encoding="utf-8")

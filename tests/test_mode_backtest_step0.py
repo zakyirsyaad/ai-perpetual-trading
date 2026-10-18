@@ -3,11 +3,12 @@ field by field against the holdout file, and split by side and by the selector's
 
 The real Pine data and files live outside the repository, so the replay runs on a small
 synthetic data directory (23 days at the end of the holdout) loaded with ``start_day``: the
-tests patch ``step0.load_dataset`` to return it and ``step0.load_pair`` to read the same days.
+tests patch ``step0.load_dataset`` to return it.
 The reference trades are simulated directly with ``simulate_holdout`` and the spec settings,
 not through the code under test.
 """
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ from unittest import mock
 
 from bot.strategy.modes.config import config_sha256, load_modes_config
 from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN
+from research.mode_backtest import lock as mode_lock
 from research.mode_backtest import report, step0
 from research.mode_backtest.data import PairData, load_pair
 from research.mode_backtest.frames import HourlyFrame
@@ -285,20 +287,14 @@ def tearDownModule():
 
 @contextmanager
 def small_data():
-    """``load_dataset`` returns the shared dataset and ``load_pair`` reads its days; both
-    record what they were asked for."""
+    """``load_dataset`` returns the shared dataset and records what it was asked for."""
     calls = []
 
     def fake_load_dataset(data_dir, until_ms, **kwargs):
         calls.append(("load_dataset", Path(data_dir), until_ms, kwargs))
         return shared().dataset
 
-    def fake_load_pair(data_dir, symbol, first_day, last_day):
-        calls.append(("load_pair", symbol, first_day, last_day))
-        return load_pair(data_dir, symbol, FIRST_DAY, LAST_DAY)
-
-    with mock.patch.object(step0, "load_dataset", side_effect=fake_load_dataset), \
-            mock.patch.object(step0, "load_pair", side_effect=fake_load_pair):
+    with mock.patch.object(step0, "load_dataset", side_effect=fake_load_dataset):
         yield calls
 
 
@@ -598,12 +594,11 @@ class RunStep0Tests(unittest.TestCase):
         self.assertEqual(self.path, self.out / f"step0_{STAMP}.json")
         self.assertEqual(files_in(self.out), [f"step0_{STAMP}.json", f"step0_{STAMP}.md"])
 
-    def test_labels_come_from_the_day_files_the_pine_load_read(self):
+    def test_labels_come_from_the_dataset_the_replay_loaded(self):
+        # The day files are read once: the labels use the replay's own 1h and 4h series.
         self.assertEqual(LABEL_FIRST_DAY, date(2025, 8, 1))
         self.assertEqual(LABEL_LAST_DAY, date(2026, 10, 13))
-        pair_calls = [call for call in self.calls if call[0] == "load_pair"]
-        self.assertEqual(pair_calls, [("load_pair", s, LABEL_FIRST_DAY, LABEL_LAST_DAY)
-                                      for s in SYMBOLS])
+        self.assertEqual([call[0] for call in self.calls], ["load_dataset"])
 
     def test_rows_count_every_trade_once_by_side_and_condition(self):
         cfg = load_modes_config(CONFIG)
@@ -641,8 +636,9 @@ class RunStep0Tests(unittest.TestCase):
         self.assertEqual(inputs["data_sha256"], self.s.dataset.data_sha256)
         self.assertEqual(inputs["config_sha256"], config_sha256(CONFIG))
         self.assertEqual(inputs["holdout_code_sha256"], "c" * 64)
-        self.assertRegex(inputs["code_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(inputs["python_version"], list(sys.version_info[:2]))
+        # The mode lock's fingerprint: it covers regime.py and config.py, which make the labels.
+        self.assertEqual(inputs["code_sha256"], mode_lock.code_sha256())
+        self.assertEqual(inputs["python_version"], f"{sys.version_info[0]}.{sys.version_info[1]}")
         self.assertEqual(doc["seed"], 0)
         self.assertEqual(doc["created_at"], NOW.isoformat())
         self.assertEqual(doc["label_days"], ["2025-08-01", "2026-10-13"])
@@ -662,14 +658,23 @@ class RunStep0Tests(unittest.TestCase):
         self.assertIn("seed 0", self.markdown)
         self.assertIn("25.000 USDT", self.markdown)
 
-    def test_the_label_lookup_reads_the_label_days(self):
+    def test_the_label_lookup_labels_as_the_day_files_do_without_reading_them(self):
+        selector = load_modes_config(CONFIG).pemilih_mode
+        pairs = [load_pair(self.s.data_dir, s, FIRST_DAY, LAST_DAY) for s in SYMBOLS]
+        from_days = condition_lookup(pairs, selector)
+
         with small_data() as calls:
-            kondisi_at = label_lookup(self.s.data_dir, load_modes_config(CONFIG).pemilih_mode)
-        self.assertEqual(calls, [("load_pair", s, LABEL_FIRST_DAY, LABEL_LAST_DAY)
-                                 for s in SYMBOLS])
-        trade = self.s.reference["c2"][0]
-        self.assertIn(kondisi_at(trade.symbol, trade.signal_ms),
-                      (NAIK, TURUN, SIDEWAYS, TIDAK_ENTRY))
+            kondisi_at = label_lookup(self.s.dataset.frames, selector)
+
+        self.assertEqual(calls, [])
+        trades = [t for ts in self.s.reference.values() for t in ts]
+        self.assertGreater(len(trades), 20)
+        for t in trades:
+            self.assertEqual(kondisi_at(t.symbol, t.signal_ms), from_days(t.symbol, t.signal_ms))
+        self.assertGreater(len({kondisi_at(t.symbol, t.signal_ms) for t in trades}), 1)
+        first = self.s.dataset.frames[BTC].bars_1m.open_ms[0]
+        with self.assertRaisesRegex(ValueError, "outside the loaded 1m bars"):
+            kondisi_at(BTC, first - 1)
 
     def test_a_second_run_never_overwrites(self):
         with mock.patch.object(step0, "replay_main_runs") as replay:
@@ -692,9 +697,9 @@ class RunStep0RefusalTests(TempDirTestCase):
     def sample_replay(self):
         with mock.patch.object(step0, "replay_main_runs",
                                return_value=(sample_trades(), stub_holdout())) as replay, \
-                mock.patch.object(step0, "load_pair",
-                                  side_effect=AssertionError("labelled")) as pairs:
-            yield replay, pairs
+                mock.patch.object(step0, "label_lookup",
+                                  side_effect=AssertionError("labelled")) as labels:
+            yield replay, labels
 
     def test_the_sample_reproduces(self):
         """The control for the next test: unchanged, the sample replay passes the check."""
@@ -704,7 +709,7 @@ class RunStep0RefusalTests(TempDirTestCase):
                                   return_value=lambda symbol, t: NAIK) as labels:
             path = run_step0(self.data, self.pine, CONFIG, self.out, NOW)
         self.assertEqual(files_in(self.out), [path.name, f"step0_{STAMP}.md"])
-        labels.assert_called_once_with(self.data, load_modes_config(CONFIG).pemilih_mode)
+        labels.assert_called_once_with({}, load_modes_config(CONFIG).pemilih_mode)  # its frames
 
     def test_one_changed_field_is_reported_and_stops_step0(self):
         replayed = metrics_of(sample_trades())["c2"][ETH]["gross_bps"]
@@ -713,7 +718,7 @@ class RunStep0RefusalTests(TempDirTestCase):
             doc["c2"]["symbols"][ETH]["gross_bps"] = replayed + 0.5
 
         self.write_sample_pine_dir(change)
-        with self.sample_replay() as (replay, pairs):
+        with self.sample_replay() as (replay, labels):
             with self.assertRaises(ReproductionError) as caught:
                 run_step0(self.data, self.pine, CONFIG, self.out, NOW)
 
@@ -722,7 +727,7 @@ class RunStep0RefusalTests(TempDirTestCase):
         ))
         self.assertIn("c2 ETH-USDT gross_bps", str(caught.exception))
         replay.assert_called_once_with(self.data, self.pine)
-        pairs.assert_not_called()
+        labels.assert_not_called()
         self.assertEqual(files_in(self.out), [])
 
     def test_an_existing_output_refuses_before_the_replay(self):
@@ -732,7 +737,7 @@ class RunStep0RefusalTests(TempDirTestCase):
                 existing = self.out / f"step0_{STAMP}{suffix}"
                 existing.parent.mkdir(parents=True, exist_ok=True)
                 existing.write_text("earlier run\n", encoding="utf-8")
-                with self.sample_replay() as (replay, _pairs):
+                with self.sample_replay() as (replay, _labels):
                     with self.assertRaises(FileExistsError):
                         run_step0(self.data, self.pine, CONFIG, self.out, NOW)
                 replay.assert_not_called()
@@ -743,7 +748,7 @@ class RunStep0RefusalTests(TempDirTestCase):
         self.write_sample_pine_dir()
         (self.pine / PINE_FILES["calibration"]).unlink()
         (self.pine / PINE_FILES["holdout"]).unlink()
-        with self.sample_replay() as (replay, _pairs):
+        with self.sample_replay() as (replay, _labels):
             with self.assertRaises(FileNotFoundError) as caught:
                 run_step0(self.data, self.pine, CONFIG, self.out, NOW)
         replay.assert_not_called()
@@ -755,7 +760,7 @@ class RunStep0RefusalTests(TempDirTestCase):
     def test_a_holdout_file_that_is_not_an_object_refuses_before_the_replay(self):
         self.write_sample_pine_dir()
         (self.pine / PINE_FILES["holdout"]).write_text("[]", encoding="utf-8")
-        with self.sample_replay() as (replay, _pairs):
+        with self.sample_replay() as (replay, _labels):
             with self.assertRaisesRegex(ValueError, "expected a JSON object"):
                 run_step0(self.data, self.pine, CONFIG, self.out, NOW)
         replay.assert_not_called()
@@ -765,14 +770,14 @@ class RunStep0RefusalTests(TempDirTestCase):
         broken = self.root / "modes.yaml"
         broken.write_text(CONFIG.read_text(encoding="utf-8").replace("ema_4h: 50", "ema_4h: 0"),
                           encoding="utf-8")
-        with self.sample_replay() as (replay, _pairs):
+        with self.sample_replay() as (replay, _labels):
             with self.assertRaises(ValueError):
                 run_step0(self.data, self.pine, broken, self.out, NOW)
         replay.assert_not_called()
 
     def test_a_clock_without_a_zone_is_refused(self):
         self.write_sample_pine_dir()
-        with self.sample_replay() as (replay, _pairs):
+        with self.sample_replay() as (replay, _labels):
             with self.assertRaises(ValueError):
                 run_step0(self.data, self.pine, CONFIG, self.out, datetime(2026, 10, 17, 18, 30))
         replay.assert_not_called()
@@ -784,6 +789,18 @@ class RunStep0RefusalTests(TempDirTestCase):
                 mock.patch.object(step0, "label_lookup", return_value=lambda symbol, t: NAIK):
             path = run_step0(self.data, self.pine, CONFIG, self.out, late_utc)
         self.assertEqual(path.name, "step0_20261017.json")
+
+    def test_a_missing_or_unused_warm_up_stops_step0_before_the_replay(self):
+        # A spec run had every 1h/4h warm-up, and the labels read the series they start.
+        s = shared()
+        write_pine_dir(self.pine, s.dataset.data_sha256, contenders_doc(metrics_of(s.reference)))
+        broken = dataclasses.replace(s.dataset, missing_warmups=("BTC-USDT 4h (unused)",))
+        with mock.patch.object(step0, "load_dataset", return_value=broken), \
+                mock.patch.object(step0, "build_contenders") as contenders:
+            with self.assertRaisesRegex(ValueError, "warm-up.*BTC-USDT 4h"):
+                run_step0(s.data_dir, self.pine, CONFIG, self.out, NOW)
+        contenders.assert_not_called()
+        self.assertEqual(files_in(self.out), [])
 
     def test_inputs_that_differ_write_nothing(self):
         s = shared()
