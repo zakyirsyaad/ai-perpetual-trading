@@ -44,7 +44,8 @@ Supabase schema. Its settings are a copy of the live `.env` with these overrides
 | `COOLDOWN_MINUTES_AFTER_EXIT` (new) | `0` (off) | `15` |
 | `COOLDOWN_MINUTES_AFTER_ENTRY` / `_AFTER_STOP` | live values | `0` / `0` (the 15-minute pause replaces them) |
 | `TRADE_TARGET_PER_DAY` | live value | `6` |
-| `VOLUME_DAILY_TARGET_USDT`, `VOLUME_DAILY_FEE_BUDGET_USDT` | live values | `0` (no volume pacing) |
+| `VOLUME_STOP_AT_TARGET_ENABLED`, `VOLUME_DAILY_FEE_BUDGET_USDT` | live values | `false`, `0` (no volume pacing; `VOLUME_DAILY_TARGET_USDT` keeps the live value, refined 2026-10-19) |
+| `VOLUME_ATTEMPT_TARGET_PER_DAY` | live value | `6` (the cap read while a target is set) |
 | `ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR` | live value | `0` |
 | `ENTRY_WEEKLY_WINDOW` | live value | `mon 07:00-sat 00:00` |
 | `VOLUME_CYCLE_STARTED_AT` | live cycle | the forward start |
