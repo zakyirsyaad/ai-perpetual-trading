@@ -75,3 +75,42 @@ The net-reaches-N property is also checked from gross minus both fee legs.
 
 Full suite: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` -> `Ran 2322 tests, OK`;
 `compileall` and `git diff --check` clean.
+
+## Task 3: ATR % on the 3m candles, and condition days for any condition
+
+`frames.py` gains `stretch_and_atr_series` (the stretch loop plus the live ATR over the same
+window, divided by the candle's close, times 100, `None` wherever the stretch is), `atr_pct_series`
+(the same column from 3m bars alone), `PairFrames.atr_pct_3m` (last field, default `()`, filled by
+`build_pair_frames`) and `HourlyFrame.condition_days`. `stretch_series` is a wrapper, so the
+Pine-equality test is untouched; `naik_days` keeps its signature and is `condition_days(..., NAIK)`.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames
+ERROR: test_atr_pct_matches_the_live_atr_on_each_window
+AttributeError: module 'research.mode_backtest.frames' has no attribute 'atr_pct_series'
+ERROR: test_atr_pct_is_none_where_the_stretch_is_none
+AttributeError: module 'research.mode_backtest.frames' has no attribute 'stretch_and_atr_series'
+ERROR: test_turun_days_count_like_naik_days
+AttributeError: 'HourlyFrame' object has no attribute 'condition_days'
+ERROR: test_the_frames_carry_the_atr_percent_of_each_stretch_candle
+AttributeError: 'PairFrames' object has no attribute 'atr_pct_3m'
+FAIL: test_the_fields_come_in_the_order_the_event_loop_reads_them
+Ran 68 tests in 3.219s
+FAILED (failures=1, errors=11)
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_frames
+Ran 68 tests in 5.075s
+OK
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2330 tests in 108.665s
+OK
+```
+
+The existing NAIK-day tests and `test_stretch_series_matches_pine_feature_frame` pass untouched;
+`compileall` and `git diff --check` are clean.
