@@ -149,6 +149,17 @@ class RescoreRowsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "trade 1"):
                     rescore.rescore_rows([row], COSTS, FEE_PCT, OLD_PCT)
 
+    def test_a_log_priced_with_another_slippage_is_refused(self):
+        trade = logged(LONG, 100.0, 100.40, EXIT_TP)
+        rows = rows_of([trade])
+
+        (result,) = rescore.rescore_rows(rows, COSTS, FEE_PCT, OLD_PCT)
+        self.assertAlmostEqual(result.raw_entry_open, 100.0, places=9)
+        for fee_pct, slippage_pct in ((FEE_PCT, 0.02), (0.05, OLD_PCT)):
+            with self.subTest(fee_pct=fee_pct, slippage_pct=slippage_pct):
+                with self.assertRaisesRegex(ValueError, "trade 1.*(fee_usdt|pnl_usdt|slippage_usdt)"):
+                    rescore.rescore_rows(rows, COSTS, fee_pct, slippage_pct)
+
     def test_a_row_missing_a_column_is_refused(self):
         row = rows_of([logged(LONG, 100.0, 100.4, EXIT_TP)])[0]
         del row["harga_exit"]
@@ -178,7 +189,7 @@ class RescoreStageTests(unittest.TestCase):
     def test_rescore_stage_writes_json_and_report_labelled_a_sensitivity(self):
         path = self.run_stage()
 
-        self.assertEqual(path.name, "rescore_20261018.json")
+        self.assertEqual(path.name, "rescore_20261018_190000.json")
         doc = json.loads(path.read_text(encoding="utf-8"))
         md = path.with_suffix(".md").read_text(encoding="utf-8")
         self.assertEqual(doc["label"], "sensitivitas biaya, bukan uji")
@@ -217,6 +228,14 @@ class RescoreStageTests(unittest.TestCase):
             self.run_stage()
 
         self.assertEqual(first.read_text(encoding="utf-8"), before)
+
+    def test_a_second_rescore_the_same_day_is_written_beside_the_first(self):
+        first = self.run_stage()
+        later = self.run_stage(now=datetime(2026, 10, 18, 12, 0, 1, tzinfo=timezone.utc))
+
+        self.assertEqual(later.name, "rescore_20261018_190001.json")
+        self.assertTrue(first.is_file() and later.is_file())
+        self.assertTrue(later.with_suffix(".md").is_file())
 
     def test_rescore_leaves_no_partial_output_when_a_log_is_bad(self):
         bad = self.root / "bad.csv"
@@ -270,9 +289,9 @@ class RescoreCliTests(unittest.TestCase):
         code, out, err = self.run_cli(self.argv())
 
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("rescore_20261018.json", out)
-        self.assertIn("rescore_20261018.md", out)
-        self.assertTrue((self.out / "rescore_20261018.json").is_file())
+        self.assertIn("rescore_20261018_190000.json", out)
+        self.assertIn("rescore_20261018_190000.md", out)
+        self.assertTrue((self.out / "rescore_20261018_190000.json").is_file())
 
     def test_rescore_twice_exits_1_with_one_error_line(self):
         self.run_cli(self.argv())

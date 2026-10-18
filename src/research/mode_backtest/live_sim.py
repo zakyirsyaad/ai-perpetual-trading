@@ -107,6 +107,7 @@ MODE_S = "S"  # the comparator: the same rule as SHORT
 VERSION_I = "i"  # the live exits: stop and take-profit
 VERSION_II = "ii"  # version (i) plus the loss cut
 _VERSIONS = (VERSION_I, VERSION_II)
+_EXIT_REASONS = (EXIT_TP, EXIT_SL, EXIT_POTONG, EXIT_WAKTU)
 _GATE_OF_SIDE = {LONG: NAIK, SHORT: TURUN}
 _BPS_PER_PERCENT = 100.0  # 1 percent = 100 bps
 
@@ -197,10 +198,15 @@ def settle_live(
     * ``pnl = side x qty x (exit_fill - entry_fill) - fee``;
     * ``slippage = qty x |entry_fill - entry_open| + qty x |raw - exit_fill|``.
 
-    Raises ``ValueError`` for a ``side`` that is not ``LONG`` or ``SHORT``, a price that is not a
-    finite number above 0, a ``notional`` that is not a finite number above 0, and a ``fee_pct`` or
-    slippage that is not a finite number of at least 0."""
+    Raises ``ValueError`` for a ``side`` that is not ``LONG`` or ``SHORT``, an ``outcome.reason`` that
+    is not TP, SL, POTONG or WAKTU, a price that is not a finite number above 0, a ``notional`` that
+    is not a finite number above 0, and a ``fee_pct`` or slippage that is not a finite number of at
+    least 0."""
     check_side(side)
+    if outcome.reason not in _EXIT_REASONS:
+        raise ValueError(
+            f"outcome.reason must be one of {', '.join(_EXIT_REASONS)}, got {outcome.reason!r}"
+        )
     require_positive("notional", notional)
     require_not_negative("fee_pct", fee_pct)
     exit_bps = costs.slippage_tp_bps if outcome.reason == EXIT_TP else costs.slippage_exit_market_bps
@@ -260,6 +266,11 @@ def _check_live_frames(frames: PairFrames, cfg: ModesConfig, live: LiveExitConfi
             f"pair.{run.pair}.faktor_k is 'otomatis', which Phase 1 cannot compute: "
             "the pair cannot run"
         )
+    if faktor_k != 1.0:
+        raise ValueError(
+            f"pair.{run.pair}.faktor_k is {faktor_k!r}: mode L does not scale its levels by "
+            "faktor_k, so only 1.0 is accepted"
+        )
     interval_ms = interval_to_ms(live.mode_l.tf_pemicu)
     check_column(frames.stretch_bars, frames.stretch, interval_ms, "3m candles", "stretch")
     check_column(frames.stretch_bars, frames.atr_pct_3m, interval_ms, "3m candles", "ATR percent")
@@ -295,10 +306,26 @@ def _open_live_position(
             "minute is missing or the data ends before its exit"
         )
     money = settle_live(entry_open, outcome, side, umum.notional_usdt, umum.fee_taker_persen, costs)
+    exit_ms = outcome_exit_ms(bars_1m, outcome)
+    return _live_trade(run, faktor_k, t_ms, context, levels, outcome, exit_ms, money, umum.notional_usdt)
+
+
+def _live_trade(
+    run: LiveRunSpec,
+    faktor_k: float,
+    t_ms: int,
+    context: HourlyContext,
+    levels: LiveExitLevels,
+    outcome: ExitOutcome,
+    exit_ms: int,
+    money: Money,
+    notional: float,
+) -> Trade:
+    """The ``Trade`` record of one settled mode L or comparator S position."""
     return Trade(
-        mode=MODE_L if side == LONG else MODE_S,
+        mode=MODE_L if run.side == LONG else MODE_S,
         pair=run.pair,
-        side=side,
+        side=run.side,
         kondisi=context.kondisi,
         context=context,
         faktor_k=faktor_k,
@@ -307,13 +334,13 @@ def _open_live_position(
         entry_fill=money.entry_fill,
         tp=levels.tp,
         sl=levels.sl,
-        exit_ms=outcome_exit_ms(bars_1m, outcome),
+        exit_ms=exit_ms,
         exit_fill=money.exit_fill,
         exit_reason=outcome.reason,
         gapped=outcome.gapped,
         both_touched=outcome.both_touched,
         qty=money.qty,
-        notional_usdt=umum.notional_usdt,
+        notional_usdt=notional,
         fee_usdt=money.fee_usdt,
         slippage_usdt=money.slippage_usdt,
         pnl_usdt=money.pnl_usdt,
@@ -338,7 +365,7 @@ def simulate_live_run(
 
     Raises ``ValueError`` when the frames or the configs do not fit the run: a trigger in
     ``live`` that differs from Mode D's (``ModesConfigError``), frames of another pair or built
-    with other periods, more than one position per pair, an ``otomatis`` ``faktor_k``, bars of the
+    with other periods, more than one position per pair, an ``otomatis`` ``faktor_k`` or one other than 1.0, bars of the
     wrong interval, and a stretch or ATR percent column that does not match the 3m candles (an
     empty ``atr_pct_3m`` included). Raises ``RuntimeError`` for a hole in the data the run needs: a
     missing 3m candle, a signal without an ATR percent, no 1m bar opening at a signal that passed

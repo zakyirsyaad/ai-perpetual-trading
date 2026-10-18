@@ -966,14 +966,16 @@ class StretchSeriesTests(WavyCase):
 
         self.assertEqual(stretch, (None,) * len(bars_3m))
 
-    def atr_pct(self, bars_3m, window, atr_period):
-        return frames.atr_pct_series(bars_3m, window, atr_period)
+    def atr_pct(self, window=STRETCH_WINDOW, atr_period=STRETCH_ATR):
+        return frames.stretch_and_atr_series(
+            self.pair.bars_1m, window, STRETCH_EMA, atr_period
+        )[2]
 
     def test_atr_pct_matches_the_live_atr_on_each_window(self):
         bars_3m, _ = self.stretch()
         highs, lows, closes = list(bars_3m.high), list(bars_3m.low), list(bars_3m.close)
 
-        series = self.atr_pct(bars_3m, STRETCH_WINDOW, STRETCH_ATR)
+        series = self.atr_pct()
 
         self.assertEqual(len(series), len(bars_3m))
         for i in (38, 39, 100, 500, len(closes) - 1):
@@ -995,7 +997,6 @@ class StretchSeriesTests(WavyCase):
         self.assertEqual(stretch, self.stretch()[1])
         self.assertEqual([a is None for a in atr_pct], [s is None for s in stretch])
         self.assertEqual(atr_pct[: STRETCH_WINDOW - 1], (None,) * (STRETCH_WINDOW - 1))
-        self.assertEqual(atr_pct, self.atr_pct(bars_3m, STRETCH_WINDOW, STRETCH_ATR))
 
         flat = minute_bars(MON, 1440, flat_price)  # ATR 0 everywhere: stretch and ATR % are None
         flat_bars, flat_stretch, flat_atr = frames.stretch_and_atr_series(
@@ -1003,16 +1004,11 @@ class StretchSeriesTests(WavyCase):
         )
         self.assertEqual(flat_stretch, (None,) * len(flat_bars))
         self.assertEqual(flat_atr, (None,) * len(flat_bars))
-        self.assertEqual(self.atr_pct(flat_bars, STRETCH_WINDOW, STRETCH_ATR),
-                         (None,) * len(flat_bars))
 
     def test_atr_pct_refuses_what_the_stretch_refuses(self):
-        bars_3m, _ = self.stretch()
         for window, atr_period in ((0, 14), (14, 14), (39, 0)):
             with self.subTest((window, atr_period)), self.assertRaises(ValueError):
-                self.atr_pct(bars_3m, window, atr_period)
-        with self.assertRaises(ValueError):  # 1m bars are not 3m candles
-            self.atr_pct(self.pair.bars_1m, STRETCH_WINDOW, STRETCH_ATR)
+                self.atr_pct(window, atr_period)
         with self.assertRaises(ValueError):
             frames.stretch_and_atr_series(
                 aggregate(self.pair.bars_1m, M3), STRETCH_WINDOW, STRETCH_EMA, STRETCH_ATR
@@ -1086,13 +1082,17 @@ class PairFramesTests(WavyCase):
         self.assertEqual([a is None for a in built.atr_pct_3m], [s is None for s in built.stretch])
         self.assertEqual(
             built.atr_pct_3m,
-            frames.atr_pct_series(
-                built.stretch_bars, self.cfg.mode_d.candle_jendela, self.cfg.mode_d.atr_periode
-            ),
+            frames.stretch_and_atr_series(
+                self.pair.bars_1m, self.cfg.mode_d.candle_jendela, self.cfg.mode_d.ema_periode,
+                self.cfg.mode_d.atr_periode,
+            )[2],
         )
         other = frames.build_pair_frames(self.pair, self.other_config())
         self.assertEqual(
-            other.atr_pct_3m, frames.atr_pct_series(other.stretch_bars, 20, 5)
+            other.atr_pct_3m,
+            frames.stretch_and_atr_series(
+                self.pair.bars_1m, 20, 10, 5
+            )[2],
         )
         self.assertNotEqual(other.atr_pct_3m, built.atr_pct_3m)
 

@@ -278,6 +278,12 @@ class SettleLiveTests(unittest.TestCase):
         expected = m.qty * abs(m.entry_fill - 100.0) + m.qty * abs(100.1 - m.exit_fill)
         self.assertAlmostEqual(m.slippage_usdt, expected, places=9)
 
+    def test_an_unknown_exit_reason_is_refused(self):
+        out = ExitOutcome("BUKAN", 1, 99.0, False, False)
+
+        with self.assertRaisesRegex(ValueError, "BUKAN"):
+            settle_live(100.0, out, LONG, 25_000.0, 0.035, COSTS)
+
     def test_bad_inputs_are_refused(self):
         out = ExitOutcome(EXIT_SL, 1, 99.0, False, False)
         nan_out = ExitOutcome(EXIT_SL, 1, float("nan"), False, False)
@@ -485,6 +491,17 @@ class LiveEntryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "otomatis"):
             run_live({SIGNAL: 0.4}, cfg=cfg)
+
+    def test_a_pair_whose_factor_is_not_one_is_refused(self):
+        # mode L's levels are not scaled by faktor_k; recording a k that did nothing would mislead
+        for k in (1.5, 2.0, 0.5):
+            with self.subTest(k=k):
+                pairs = dict(CFG.pair)
+                pairs[PAIR] = dataclasses.replace(pairs[PAIR], faktor_k=k)
+                cfg = dataclasses.replace(CFG, pair=MappingProxyType(pairs))
+
+                with self.assertRaisesRegex(ValueError, "faktor_k"):
+                    run_live({SIGNAL: 0.4}, cfg=cfg)
 
 
 class LiveGateTests(unittest.TestCase):

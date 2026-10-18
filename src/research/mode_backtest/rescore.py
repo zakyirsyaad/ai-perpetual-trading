@@ -20,6 +20,10 @@ that gapped was filled at the bar's open, not at its level, and the inverse give
 touch gives the level). The new money is then ``settle_live`` on those numbers with the row's own
 exit reason and notional, so the formulas of spec section 5 live in one place.
 
+A row whose own ``fee_usdt``, ``pnl_usdt`` and ``slippage_usdt`` the config's fee and old slippage do not reproduce
+(``simulate.settle`` on the recovered raw prices) is refused, naming the trade: the log was priced
+with other costs and the inversion would be wrong.
+
 Only the 23 columns of a Phase 1 log are accepted. A mode L log already carries the new costs,
 and repricing it again would count them twice, so a log with any other columns is refused.
 
@@ -47,12 +51,13 @@ from bot.strategy.modes.config import (
 )
 from bot.strategy.modes.position_rules import LONG, SHORT
 from research.pine_gate.fileio import write_exclusive, write_json_exclusive
+from research.pine_gate.spec import WIB
 
 from .frames import HourlyContext
 from .live_sim import settle_live
 from .metrics import StageMetrics, stage_metrics
 from .report import format_number
-from .simulate import EXIT_POTONG, EXIT_SL, EXIT_TP, EXIT_WAKTU, ExitOutcome, Trade
+from .simulate import EXIT_POTONG, EXIT_SL, EXIT_TP, EXIT_WAKTU, ExitOutcome, Trade, settle
 from .stages import refuse_existing, stamp
 from .tradelog import COLUMNS
 
@@ -65,6 +70,8 @@ _SIDES = {"LONG": LONG, "SHORT": SHORT}
 _REASONS = (EXIT_TP, EXIT_SL, EXIT_WAKTU, EXIT_POTONG)
 _NO_CONTEXT = HourlyContext(None, None, None, None, None, None, "")
 _PERCENT = 100.0
+_MONEY_REL_TOL = 1e-9
+_MONEY_ABS_TOL = 1e-6
 
 
 @dataclass(frozen=True)
@@ -136,11 +143,30 @@ def _old_trade(row: Mapping[str, str], n: int) -> Trade:
     )
 
 
+def _check_old_money(old: Trade, raw_entry: float, raw_exit: float, fee_pct: float,
+                     old_slippage_pct: float) -> None:
+    """Refuse a row whose own fee, profit and slippage the given fee and slippage do not reproduce.
+
+    The slippage column is part of the check because ``settle`` on prices recovered with a wrong
+    slippage returns the logged fills back, so fee and profit alone would agree anyway."""
+    money = settle(raw_entry, raw_exit, old.side, old.notional_usdt, fee_pct, old_slippage_pct)
+    for name, logged, recomputed in (("fee_usdt", old.fee_usdt, money.fee_usdt),
+                                     ("pnl_usdt", old.pnl_usdt, money.pnl_usdt),
+                                     ("slippage_usdt", old.slippage_usdt, money.slippage_usdt)):
+        if not math.isclose(logged, recomputed, rel_tol=_MONEY_REL_TOL, abs_tol=_MONEY_ABS_TOL):
+            raise ValueError(
+                f"the log's {name} {logged!r} is not what the fee {fee_pct}% and the slippage "
+                f"{old_slippage_pct}% of the config give ({recomputed!r}); the log was priced "
+                "with other costs"
+            )
+
+
 def _reprice(old: Trade, costs: CostConfig, fee_pct: float, old_slippage_pct: float):
     """The new ``Trade`` of ``old`` with the raw prices recovered from its fills."""
     side = old.side
     raw_entry = old.entry_fill / (1 + side * old_slippage_pct / _PERCENT)
     raw_exit = old.exit_fill / (1 - side * old_slippage_pct / _PERCENT)
+    _check_old_money(old, raw_entry, raw_exit, fee_pct, old_slippage_pct)
     outcome = ExitOutcome(old.exit_reason, 0, raw_exit, False, False)
     money = settle_live(raw_entry, outcome, side, old.notional_usdt, fee_pct, costs)
     new = replace(
@@ -261,12 +287,12 @@ def rescore_stage(
     out_dir: PathLike,
     now: datetime,
 ) -> Path:
-    """Reprice each log of ``trade_logs`` and write ``rescore_<stamp>.json`` and ``.md`` in
-    ``out_dir``; returns the JSON path.
+    """Reprice each log of ``trade_logs`` and write ``rescore_<YYYYMMDD>_<HHMMSS>.json`` and
+    ``.md`` (the WIB time of ``now``) in ``out_dir``; returns the JSON path.
 
     The costs come from ``live_config_path`` (``biaya``); the fee, the old slippage and the number
     of best positions to leave out come from ``config_path``. Everything is computed before
-    anything is written, and an existing output raises ``FileExistsError`` before the first write.
+    anything is written, and an existing output (the same second) raises ``FileExistsError`` before the first write.
     Raises ``ValueError`` for no log, a log whose columns are not Phase 1's or whose row cannot be
     priced, and a naive ``now``."""
     if not trade_logs:
@@ -281,7 +307,7 @@ def rescore_stage(
         rows, sha = _read_log(Path(path))
         logs.append(_log_doc(Path(path), rows, sha, live.biaya, fee_pct, old_pct, drop_top))
     out = Path(out_dir)
-    json_path = out / f"rescore_{day}.json"
+    json_path = out / f"rescore_{day}_{now.astimezone(WIB).strftime('%H%M%S')}.json"
     md_path = json_path.with_suffix(".md")
     refuse_existing([json_path, md_path])
     doc = {

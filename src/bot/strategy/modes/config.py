@@ -761,6 +761,12 @@ def _read_live_mode(raw: Any, path: str) -> LiveExitModeConfig:
             f"must be less than sl_minimal_persen ({mode.sl_minimal_persen!r}), "
             f"got {mode.potong_rugi_persen!r}: the cut has to sit inside the tightest stop",
         )
+    if mode.potong_rugi_setelah_menit >= mode.batas_waktu_menit:
+        raise _fail(
+            _join(path, "potong_rugi_setelah_menit"),
+            f"must be less than batas_waktu_menit ({mode.batas_waktu_menit!r}), "
+            f"got {mode.potong_rugi_setelah_menit!r}: the cut would never act",
+        )
     return mode
 
 

@@ -206,6 +206,16 @@ class RefusalTest(unittest.TestCase):
                 )
                 self.assertIn("sl_minimal_persen", message)
 
+    def test_cut_must_start_before_the_time_exit(self):
+        parse_live_exit_config(with_value(f"{MODE}.potong_rugi_setelah_menit", 59))
+        for value in (60, 61):
+            with self.subTest(value=value):
+                message = self.assert_refused(
+                    with_value(f"{MODE}.potong_rugi_setelah_menit", value),
+                    f"{MODE}.potong_rugi_setelah_menit",
+                )
+                self.assertIn("batas_waktu_menit", message)
+
 
 class TriggerMatchTest(unittest.TestCase):
     @classmethod

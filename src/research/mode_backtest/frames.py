@@ -317,34 +317,6 @@ def stretch_series(
     return bars, stretch
 
 
-def atr_pct_series(bars_3m: Bars, window: int, atr_period: int) -> Column:
-    """The ATR percent of each 3m candle: the live ATR of the ``window`` candles ending with it,
-    over its close, times 100.
-
-    It is ``None`` for the first ``window - 1`` candles and wherever the ATR is 0 (a flat window),
-    which is where the stretch is ``None`` too. ``bars_3m`` must be 3m candles. A window shorter
-    than ``atr_period + 1`` (the live ATR is 0 below that) or a period below 1 raises
-    ``ValueError``."""
-    if bars_3m.interval_ms != INTERVAL_3M:
-        raise ValueError(f"expected 3m candles, got {bars_3m.interval_ms} ms")
-    if atr_period < 1 or window < atr_period + 1:
-        raise ValueError(
-            f"a window of {window} candles is too short for an ATR of {atr_period}: "
-            f"it needs {atr_period + 1}"
-        )
-    highs, lows, closes = list(bars_3m.high), list(bars_3m.low), list(bars_3m.close)
-    out: List[Optional[float]] = []
-    for end in range(1, len(closes) + 1):
-        if end < window:
-            out.append(None)
-            continue
-        start = end - window
-        out.append(
-            _atr_pct_of_window(highs[start:end], lows[start:end], closes[start:end], atr_period)
-        )
-    return tuple(out)
-
-
 @dataclass(frozen=True)
 class FrameParams:
     """The numbers of a config that ``build_pair_frames`` bakes into the series.

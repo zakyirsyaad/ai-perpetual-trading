@@ -455,6 +455,8 @@ b82caa2 feat: train and one-shot test stages for mode L
 dcf5325 feat: rescore stage for the cost sensitivity
 532991c docs: mode L commands, notes and TDD evidence
 this commit: fix: apply the mode L final review findings
+a3d4a37 test: make the Mode A golden log platform-independent
+this commit: fix: apply the PR #41 code-review findings
 ```
 
 ## Deployment gate
@@ -526,3 +528,49 @@ Verification: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` ra
   | `settle` mutated to add 1e-4 USDT to each pnl | — | — | fails |
 
   So the golden still catches a change in Mode A's walk or money, and no longer depends on the platform's libm.
+
+## PR #41 review fixes
+
+Eight findings from the PR #41 code review, minimal edits. Mode A and Mode D behaviour is unchanged
+(`tests/test_mode_backtest_simulate.py`, including the golden, passes).
+
+1. **Rescore checks the old costs reproduce the log.** `rescore._reprice` now recomputes the old money
+   with `simulate.settle(raw_entry, raw_exit, side, notional, fee_pct, old_slippage_pct)` and refuses
+   (`ValueError`, "trade N: ...") when it does not match the row's `fee_usdt`, `pnl_usdt` and
+   `slippage_usdt` (`math.isclose`, rel 1e-9, abs 1e-6). The slippage column is checked as well as
+   fee and pnl because `settle` on prices recovered with a wrong slippage returns the logged fills
+   and so agrees on fee and pnl by construction; only `slippage_usdt` exposes it. Test:
+   `RescoreRowsTests.test_a_log_priced_with_another_slippage_is_refused` (a consistent log passes;
+   slippage 0.02 and fee 0.05 are refused). RED: `AssertionError: ValueError not raised`
+   (3 subtests, the first run with fee and pnl only: the slippage 0.02 subtest still failed, which
+   showed the gap above). GREEN after adding `slippage_usdt`.
+2. **Cut minute must be before the time exit.** `config._read_live_mode` refuses
+   `potong_rugi_setelah_menit >= batas_waktu_menit`, naming
+   `mode.mode_l.potong_rugi_setelah_menit`. Test: `RefusalTest.test_cut_must_start_before_the_time_exit`
+   (59 accepted; 60 and 61 refused). RED: `FAIL ... (value=60)`, `(value=61)`.
+3. **Mode L refuses a `faktor_k` other than 1.0.** `live_sim._check_live_frames` raises `ValueError`
+   saying mode L does not scale its levels by `faktor_k`. Test:
+   `LiveEntryTests.test_a_pair_whose_factor_is_not_one_is_refused` (0.5, 1.5, 2.0). RED: three
+   `FAIL ... (k=...)`.
+4. **Rescore outputs are named by WIB date and time.** `rescore_<YYYYMMDD>_<HHMMSS>.json/.md`
+   from `now` (WIB); the exclusive write stays, so the same second still refuses
+   (`test_rescore_never_overwrites`, `test_rescore_twice_exits_1_with_one_error_line`). Tests:
+   `test_a_second_rescore_the_same_day_is_written_beside_the_first`; the file-name assertions were
+   updated to `rescore_20261018_190000`. RED: `'rescore_20261018.json' != 'rescore_20261018_190000.json'`.
+   CLAUDE.md does not name the file pattern, so it is unchanged.
+5. **`settle_live` validates `outcome.reason`.** It must be TP, SL, POTONG or WAKTU, else `ValueError`.
+   Test: `SettleLiveTests.test_an_unknown_exit_reason_is_refused`. RED: `AssertionError: ValueError not raised`.
+6. **Guard pins rescore.py positively.** `tests/test_mode_backtest_lock.py` keeps the stages.py single
+   call-site check and adds `test_rescore_passes_the_config_drop_top_to_every_stage_metrics_call`
+   (AST: every `stage_metrics` call in rescore.py passes `drop_top`, `rescore_stage` assigns
+   `drop_top = cfg.uji.lolos_buang_posisi_teratas` and hands it to every `_log_doc` call). No behaviour change.
+7. **`atr_pct_series` removed** from `frames.py` (it had no `__all__` entry); its tests now call
+   `stretch_and_atr_series` on the 1m bars with the same assertions (live ATR on hand slices, `None`
+   where the stretch is `None`, refusals). Two tautological assertions that compared the function with
+   itself were dropped.
+8. **`_open_live_position` under 50 lines** (now 34): the `Trade(...)` construction moved to
+   `_live_trade`. No behaviour change.
+
+Verification: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` ran 2469 tests, OK
+(2463 before; +6 new tests); `compileall -q src tests` exit 0; `git diff --check` clean. Changed bound
+modules (`config.py`, `frames.py`, `live_sim.py`) move `code_sha256`; `train` has not run, so no lock is affected.

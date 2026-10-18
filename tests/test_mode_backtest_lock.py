@@ -961,11 +961,9 @@ class VerdictTests(StageCase):
 
     def test_stage_metrics_has_one_call_site_and_it_passes_the_config_drop_top(self):
         calls = []
-        # rescore.py reprices logs for a cost sensitivity and gives no verdict, so it is not a
-        # second call site of the verdict path; it uses the same helper for the trimmed result.
         for path in sorted(PACKAGE.glob("*.py")):
             if path.name == "rescore.py":
-                continue
+                continue  # a cost sensitivity, no verdict: pinned positively in the next test
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "stage_metrics":
@@ -977,6 +975,28 @@ class VerdictTests(StageCase):
             k.value for k in node.keywords if k.arg == "drop_top")
         self.assertTrue(ast.unparse(drop_top).endswith(".uji.lolos_buang_posisi_teratas"),
                         ast.unparse(drop_top))
+
+    def test_rescore_passes_the_config_drop_top_to_every_stage_metrics_call(self):
+        # rescore.py gives no verdict, so it may call stage_metrics for the trimmed result, but
+        # only with the drop_top rescore_stage reads from cfg.uji.lolos_buang_posisi_teratas.
+        tree = ast.parse((PACKAGE / "rescore.py").read_text(encoding="utf-8"))
+        metrics_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                         and getattr(n.func, "id", None) == "stage_metrics"]
+        self.assertTrue(metrics_calls)
+        for node in metrics_calls:
+            third = node.args[2] if len(node.args) > 2 else next(
+                k.value for k in node.keywords if k.arg == "drop_top")
+            self.assertEqual(ast.unparse(third), "drop_top")
+        stage = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == "rescore_stage")
+        reads = [ast.unparse(n.value) for n in ast.walk(stage) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["drop_top"]]
+        self.assertEqual(reads, ["cfg.uji.lolos_buang_posisi_teratas"])
+        log_calls = [n for n in ast.walk(stage) if isinstance(n, ast.Call)
+                     and getattr(n.func, "id", None) == "_log_doc"]
+        self.assertTrue(log_calls)
+        for node in log_calls:
+            self.assertEqual(ast.unparse(node.args[-1]), "drop_top")
 
 
 if __name__ == "__main__":
