@@ -1,6 +1,6 @@
 # LONG mirror of the live SHORT bot, with the live exits and measured costs — design
 
-Date: 2026-10-18 · Status: draft for review · Source: the manager's answers of 2026-10-18 (relayed
+Date: 2026-10-18 · Status: decisions settled 2026-10-18, awaiting final review · Source: the manager's answers of 2026-10-18 (relayed
 by the user, quoted in §2) to three questions about the live exit rules, plus his earlier request to
 replace the slippage assumption with measured fills · Builds on:
 `docs/superpowers/specs/2026-10-17-long-module-phase1-design.md` (Phase 1: harness, data, split and
@@ -105,9 +105,12 @@ is not modelled: the manager set 0.5 bps for every market exit.
 - Condition selector, closed-candle discipline (D2), warm-up rules (D3), segment edges (D10).
 - General rules from `config/modes.yaml` `umum`: one position per pair, 15-minute pause after an
   exit, 6 entries per pair and 10 in total per WIB day, the volatility guard, the weekly window Mon
-  07:00 – Sat 00:00 WIB, notional 25,000 USDT. **Default, needs a yes:** the live bot has its own
-  limits (one position in total, cooldowns, daily trade target); this spec keeps the document's
-  general rules because they apply to every mode and make L and S comparable inside one harness.
+  07:00 – Sat 00:00 WIB, notional 25,000 USDT. **Decided 2026-10-18:** the document's general rules,
+  not the live bot's own limits (one position in total, cooldowns, daily trade target). They apply
+  to every mode, so L and S compare inside one harness; the live limits are tied to the AI's
+  behaviour and cannot be copied without it; and the live daily trade target can force low-quality
+  entries, which these rules do not. Reports add the **mean entries per calendar day** of each run
+  beside the entries per NAIK day, to show the gap to the live bot's pace.
 - Stages and the one-shot lock pattern: `train` (training 2025-08-01 – 2026-08-04 WIB, writes the
   lock) and `test` (2026-08-05 – 2026-10-13 WIB, once, start record and marker before any test-day
   read). Nothing is selected in training; it runs for the report and the lock.
@@ -180,9 +183,24 @@ a new VST account and API key that the user creates, its own pm2 app and working
 own Supabase rows (an account tag or separate tables, so the live bot's daily guards, volume and
 dashboard never count them), a LONG-only NAIK gate, and the mirrored exits with the AI close.
 
-**Question for the manager before that spec:** his document says (p. 7) that if the AI is used,
-it should be "a separate test after the pure rules pass". Should the AI forward test start only if
-L(i) or L(ii) passes this backtest, or start now in parallel?
+**Decided 2026-10-18: start it now, in parallel with this backtest.** The document (p. 7) asks for
+the AI to be "a separate test after the pure rules pass"; the decision keeps its intent, since the
+AI never mixes into a rule test: the AI can only be measured forward, a failure of L(i) and L(ii)
+would not say whether the AI adds value, about 150 positions take weeks to collect, and the
+separate account keeps both this backtest and the SHORT forward test clean.
+
+Requirements for that spec:
+
+- It works exactly like the live SHORT bot; the only differences are direction LONG and the NAIK
+  condition gate.
+- The general limits and the weekly window are the ones of this backtest (§6), not the live bot's.
+- Every AI decision is recorded with its conviction score: entries, refusals and closes.
+- Stop if after 60 positions the result is worse than −500 per 1M. Decide at 150 positions: continue
+  if it is better than −250 per 1M.
+- Every week, compare it with mode L (both versions) backtested on the same dates, so the AI's
+  contribution shows directly. This needs the production 1m data of those weeks.
+- The account owner creates the second VST account's API key with trading permission only, no
+  withdrawal, and with an IP whitelist on the VPS address if BingX offers one.
 
 ## 11. Risks and limits
 
