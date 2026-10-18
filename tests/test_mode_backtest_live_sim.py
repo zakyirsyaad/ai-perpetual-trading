@@ -292,9 +292,6 @@ class SettleLiveTests(unittest.TestCase):
                 settle_live(*args)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # --- the event loop ---------------------------------------------------------------------------------
 
@@ -704,3 +701,7 @@ class LiveVersionTests(unittest.TestCase):
 
         self.assertEqual([t.entry_ms for t in long.trades], [t.entry_ms for t in short.trades])
         self.assertEqual(len(long.trades), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

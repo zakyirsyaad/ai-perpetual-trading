@@ -31,14 +31,18 @@ from research.mode_backtest.report import LiveRow, live_status_line, live_table
 from research.mode_backtest.simulate import BLOCK_REASONS, EXIT_TP, MODE_A, RunResult
 from research.mode_backtest.tradelog import LIVE_COLUMNS
 from research.pine_gate.bars import UnreadableDayError, wib_day_start_ms
-from tests.mode_backtest_helpers import MINUTE_MS
+from tests.mode_backtest_helpers import MINUTE_MS, write_days, write_minute_warmups
 from tests.mode_backtest_stages import (
     CLOCK,
     STAMP,
     SYMBOL,
     TEST_DAYS,
     TRAIN_DAYS,
+    ALL_DAYS,
+    WARM_BARS_4H,
+    WARM_HOURS_1H,
     FileReads,
+    naik_price,
     write_naik_market,
     write_stage_config,
 )
@@ -485,6 +489,80 @@ class LiveVerdictTests(LiveStageCase):
         self.assertEqual(doc["runs"]["S_i_TURUN"]["metrics"]["entry_per_hari_kalender"], 20.0)
         self.assertNotIn("mode S", doc["status_line"])
         self.assertNotIn("LOLOS", doc["status_line"])
+
+
+def turun_price(m: int) -> float:
+    """The mirror of ``naik_price``: the same wave on a price that falls at the same rate."""
+    return 10000.0 / naik_price(m)
+
+
+def write_turun_market(data_dir):
+    """The synthetic week and both warm-ups on the falling price (S's market, no NAIK hour)."""
+    write_days(data_dir, SYMBOL, ALL_DAYS, turun_price)
+    write_minute_warmups(data_dir, SYMBOL, min(ALL_DAYS), WARM_HOURS_1H, WARM_BARS_4H,
+                         turun_price)
+
+
+class FallingMarketStageTests(LiveStageCase):
+    """Comparator S trades and L does not: the TURUN-side code of both stages runs with trades."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(self.data)
+        write_turun_market(self.data)
+
+    def check_record(self, record, calendar, turun):
+        self.assertEqual(record["hari_kalender"], calendar)
+        self.assertEqual((record["naik_days"], record["hari_naik"]), ([], 0))
+        self.assertEqual((record["turun_days"], record["hari_turun"]), (turun, len(turun)))
+        self.assertGreater(len(turun), 0)
+        for key, run in record["runs"].items():
+            metrics = run["metrics"]
+            with self.subTest(stage=record["stage"], run=key):
+                rows = read_log(self.out / run["trade_log"])
+                self.assertEqual(rows[0], list(LIVE_COLUMNS))
+                self.assertEqual(len(rows[0]), 26)
+                self.assertEqual(len(rows) - 1, metrics["posisi"])
+                self.assertEqual(metrics["entry_per_hari_kalender"], metrics["posisi"] / calendar)
+                self.assertEqual(run["versi"], key.split("_")[1])
+                columns = rows[0]
+                body = rows[1:]
+                if key.startswith("S"):
+                    self.assertGreater(metrics["posisi"], 0)
+                    self.assertEqual(metrics["hari_naik"], len(turun))
+                    self.assertEqual({r[columns.index("sisi")] for r in body}, {"SHORT"})
+                    self.assertEqual({r[columns.index("versi")] for r in body}, {run["versi"]})
+                    self.assertEqual({r[columns.index("mode")] for r in body}, {"S"})
+                    self.assertEqual({r[columns.index("kondisi")] for r in body}, {TURUN})
+                else:
+                    self.assertEqual(metrics["posisi"], 0)
+                    self.assertEqual(metrics["hari_naik"], 0)
+                    self.assertEqual(body, [])
+
+    def test_s_trades_and_l_does_not_in_both_stages(self):
+        train_doc = read_json(self.train())
+        self.check_record(train_doc, 3, [d.isoformat() for d in TRAIN_DAYS])
+        doc = read_json(self.run_test_stage())
+        self.check_record(doc, 2, [d.isoformat() for d in TEST_DAYS])
+
+        # S has no pass status and L has no trade: both versions wait for a sample.
+        self.assertEqual(doc["status"], {"i": "BELUM CUKUP SAMPEL", "ii": "BELUM CUKUP SAMPEL"})
+        locked = read_json(self.lock_file())["summary"]["runs"]
+        for key in LIVE_RUNS:
+            self.assertEqual(locked[key], train_doc["runs"][key]["metrics"])
+        for tahap, record in (("Latihan", train_doc), ("Ujian", doc)):
+            for versi in ("i", "ii"):
+                metrics = StageMetrics(**record["runs"][f"S_{versi}_TURUN"]["metrics"])
+                row = LiveRow("S", versi, SYMBOL, tahap, metrics)
+                report = self.out / f"mode_L_BTC-USDT_test_{STAMP}.md"
+                self.assertIn(live_table([row]).splitlines()[2],
+                              report.read_text(encoding="utf-8"))
+        # The S logs hold real exits: at least one take-profit.
+        reasons = set()
+        for key in ("S_i_TURUN", "S_ii_TURUN"):
+            rows = read_log(self.out / doc["runs"][key]["trade_log"])
+            reasons |= {r[rows[0].index("alasan_exit")] for r in rows[1:]}
+        self.assertIn(EXIT_TP, reasons)
 
 
 if __name__ == "__main__":

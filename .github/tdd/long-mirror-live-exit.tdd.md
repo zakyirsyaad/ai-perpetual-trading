@@ -453,7 +453,8 @@ e34e683 test: pin that pre-mode-L lock summaries are refused
 b82caa2 feat: train and one-shot test stages for mode L
 0d59f25 feat: CLI for mode L
 dcf5325 feat: rescore stage for the cost sensitivity
-this commit: docs: mode L commands, notes and TDD evidence
+532991c docs: mode L commands, notes and TDD evidence
+this commit: fix: apply the mode L final review findings
 ```
 
 ## Deployment gate
@@ -474,3 +475,37 @@ user's go-ahead, with the Phase 1 operator notes:
   and leaves a marker in `holdout_runs/` that refuses the real run. Rehearse on synthetic data only.
 - Once `test` has claimed its start record, the shot is spent; never delete the start record or the
   marker.
+
+## Final review fix wave
+
+The final whole-branch review raised five findings; all five are applied in one commit.
+
+1. **S trading at stage level (test only).** `tests/test_mode_backtest_live_stages.py` gains
+   `FallingMarketStageTests`, on `turun_price(m) = 10000 / naik_price(m)` (the mirror of the
+   synthetic week, written with `write_days` and `write_minute_warmups` into a temporary folder).
+   Through `train_live_stage` and `test_live_stage` it asserts: S trades and L does not; the TURUN
+   days are the three training and the two test days and the NAIK days are 0; S's logs are live
+   logs (26 columns, `sisi` SHORT, `mode` S, `kondisi` TURUN, `versi` i or ii), L's logs hold the
+   header only; the summary in the lock equals the train result; the status stays "BELUM CUKUP
+   SAMPEL" (S has no pass status); the report rows of S's counts appear in the `.md`; the S logs
+   hold at least one TP exit. The fixture gives S 18 positions in training (TP 12, SL 6) and 12 in
+   the test (TP 7, SL 5), for both versions, the numbers of the reviewer's rehearsal. It passed on
+   the first run. Evidence that it exercises the S path: with S's `kondisi` flipped to NAIK in
+   `_KINDS` (stages_live.py) and `_GATE_OF_SIDE` (live_sim.py), temporarily and reverted, it fails
+   (4 failures, 1 error, e.g. `S_ii_NAIK` posisi 0 not greater than 0).
+2. **CLAUDE.md TP wording.** The mode L bullet now says the TP level is the price where net reaches 56
+   under the bot's own 0.05 % fee estimate (`fee_perkiraan_persen`) and that the booked result uses the
+   real 0.035 %.
+3. **`__main__` guard.** Moved to the end of `tests/test_mode_backtest_live_sim.py` and
+   `tests/test_mode_backtest_simulate.py` (no test changed).
+4. **`ExitOutcome` docstring.** `both_touched` now covers a POTONG cut in mode L's `live_sim` walk as
+   well as a stop-loss.
+5. **Live config edit wording.** The CLI docstring and the CLAUDE.md mode L bullet now say: an edit
+   that still loads is refused by the lock (`test` exits 2), an edit that fails validation exits 1,
+   and neither claims the one shot.
+
+Items 2 to 5 change wording and layout only. Two docstrings in bound modules changed
+(`cli.py`, `simulate.py`), which moves `code_sha256`; `train` has not run, so no lock is affected.
+
+Verification: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` ran 2463 tests, OK;
+`compileall -q src tests` exit 0; `git diff --check` clean.

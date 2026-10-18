@@ -167,8 +167,9 @@ class ExitOutcome:
     walked bars, of the bar the exit happens in; a touch is only known to the minute. ``raw_price``
     is the exit price before its slippage: the level for a touch and the bar's open for a gap and
     for the time exit. ``gapped`` is True for an exit at the open of a bar that opened beyond a
-    level. ``both_touched`` is True for a stop-loss taken at the SL price from a bar whose range
-    also reached the take-profit: the one case the stop-first rule decided. A gap is not that case
+    level. ``both_touched`` is True for a stop-loss (or, in mode L's ``live_sim``
+    walk, a POTONG cut) taken at its price from a bar whose range also reached the take-profit:
+    the one case the stop-first rule decided. A gap is not that case
     (the open comes first, so the order is known) and neither is a time exit."""
 
     reason: str

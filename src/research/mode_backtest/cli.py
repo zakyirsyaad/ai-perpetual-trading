@@ -18,9 +18,10 @@ codes, as ``research.pine_gate.cli`` does:
   BTC-USDT only; anything else is an expected failure.
 * ``--mode L`` (the near-mean LONG with the live bot's exits, BTC-USDT only) runs
   ``stages_live.train_live_stage`` and ``test_live_stage`` instead, and needs ``--live-config``
-  (``config/modes_live_exit.yaml``); the lock binds that file's sha256, so editing it after
-  ``train`` makes ``test`` exit 2. ``--live-config`` with ``--mode A`` or ``--mode L`` without it
-  is a usage error (exit 2); any other mode exits 1.
+  (``config/modes_live_exit.yaml``); the lock binds that file's sha256. After ``train``, an edit
+  that still loads is refused by the lock (``test`` exits 2) and an edit that fails validation
+  exits 1; neither claims the one shot. ``--live-config`` with ``--mode A`` or ``--mode L``
+  without it is a usage error (exit 2); any other mode exits 1.
 * ``rescore --trade-log PATH ... --config --live-config --out-dir`` runs ``rescore.rescore_stage``:
   Mode A's Phase 1 trade logs repriced with the costs of ``config/modes_live_exit.yaml``, as a
   cost sensitivity and never a pass or fail. It reads only the logs given, no bar file, and prints

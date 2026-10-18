@@ -1094,9 +1094,6 @@ class ComposeTests(unittest.TestCase):
         self.assertGreater(money.pnl_usdt, 0.0)  # +0.2 % less the 9 bps of costs
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # The sha256 of the trade log of Mode A (5m, NAIK, the whole week as one segment) on the synthetic
 # week of tests.mode_backtest_stages, taken on the code before mode L's event loop was added (30
@@ -1118,3 +1115,7 @@ class ModeAGoldenTests(unittest.TestCase):
         self.assertEqual(len(result.trades), 30)
         text = trade_log_text(result.trades)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(), MODE_A_SYNTHETIC_LOG_SHA)
+
+
+if __name__ == "__main__":
+    unittest.main()
