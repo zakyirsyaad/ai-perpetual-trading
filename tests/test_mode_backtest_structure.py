@@ -182,6 +182,11 @@ RULE_CORE_DIR = SRC / "bot" / "strategy" / "modes"
 DYNAMIC = "<dynamic>"  # a dynamic import whose module name is not a constant
 
 
+# The one live module that may import the rule core: the LONG forward bot's regime gate, which
+# reads the backtest's own hourly selector (``bot.strategy.modes.regime``).
+RULE_CORE_USERS = frozenset({SRC / "bot" / "core" / "regime_gate.py"})
+
+
 def live_sources() -> List[Path]:
     """Every source under ``src`` outside ``research/`` and the rule core: the bot, ``main.py``
     and the scripts."""
@@ -222,6 +227,16 @@ def rule_core_imports(tree: ast.AST, module: str, is_package: bool) -> List[str]
 def rule_core_imports_of(path: Path) -> List[str]:
     tree = parse(path.read_text(encoding="utf-8"))
     return rule_core_imports(tree, module_name(path), path.name == "__init__.py")
+
+
+def rule_core_offenders(trees: "dict[Path, ast.AST]") -> List[str]:
+    """``path: name`` for each rule core import of a live module that is not in ``RULE_CORE_USERS``."""
+    return [
+        f"{relative(path)}: {name}"
+        for path, tree in trees.items()
+        if path not in RULE_CORE_USERS
+        for name in rule_core_imports(tree, module_name(path), path.name == "__init__.py")
+    ]
 
 
 class PackageLayoutTests(unittest.TestCase):
@@ -510,10 +525,10 @@ class SharedCheckTests(unittest.TestCase):
 
 
 class RuleCoreIsolationTests(unittest.TestCase):
-    """Only ``research/`` and the rule core itself import ``bot.strategy.modes``; wiring a mode
-    into the live bot is a later phase with its own spec."""
+    """Only ``research/``, the rule core itself and ``bot/core/regime_gate.py`` import
+    ``bot.strategy.modes``; wiring a mode into the live bot is a later phase with its own spec."""
 
-    def test_no_live_module_imports_the_rule_core(self):
+    def test_no_live_module_imports_the_rule_core_but_the_regime_gate(self):
         paths = live_sources()
         self.assertIn(SRC / "main.py", paths)
         self.assertGreater(len([p for p in paths if SRC / "bot" in p.parents]), 20)
@@ -526,10 +541,29 @@ class RuleCoreIsolationTests(unittest.TestCase):
         self.assertIn(RULE_CORE_DIR / "pullback.py", core)
         self.assertEqual([relative(p) for p in [stages, *core] if p in paths], [])
 
-        offenders = [f"{relative(path)}: {name}"
-                     for path in paths for name in rule_core_imports_of(path)]
+        offenders = rule_core_offenders(
+            {path: parse(path.read_text(encoding="utf-8")) for path in paths}
+        )
 
         self.assertEqual(offenders, [])
+        # the one allowed user really imports the core, so the exception is not a dead entry
+        (regime_gate,) = RULE_CORE_USERS
+        self.assertIn("bot.strategy.modes.regime", rule_core_imports_of(regime_gate))
+
+    def test_a_second_live_module_importing_the_rule_core_is_refused(self):
+        regime_gate = next(iter(RULE_CORE_USERS))
+        other = regime_gate.with_name("other_gate.py")
+        tree = parse("from bot.strategy.modes.regime import pilih_mode\n")
+
+        offenders = rule_core_offenders({regime_gate: tree, other: tree})
+
+        self.assertEqual(
+            offenders,
+            [
+                "bot/core/other_gate.py: bot.strategy.modes.regime",
+                "bot/core/other_gate.py: bot.strategy.modes.regime.pilih_mode",
+            ],
+        )
 
     def test_the_rule_core_guard_sees_every_form_of_import(self):
         sources = (

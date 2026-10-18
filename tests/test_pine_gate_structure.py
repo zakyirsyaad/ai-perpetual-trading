@@ -177,6 +177,25 @@ def _live_sources():
     return [p for p in sorted(SRC.rglob("*.py")) if "research" not in p.relative_to(SRC).parts]
 
 
+REGIME_GATE = BOT / "core" / "regime_gate.py"
+# The only live modules that may import bot.strategy.pine_indicators: the module itself and the
+# LONG forward bot's regime gate, which must compute the backtest's own hourly selector.
+PINE_INDICATOR_USERS = frozenset({BOT / "strategy" / "pine_indicators.py", REGIME_GATE})
+
+
+def _imports_pine_indicators(tree):
+    target = "bot.strategy.pine_indicators"
+    relative = [f"{node.module or ''}.{alias.name}" for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.level >= 1
+                for alias in node.names]
+    return target in list(_imports(tree)) or any("pine_indicators" in name for name in relative)
+
+
+def _pine_indicator_offenders(trees):
+    return [p.relative_to(SRC).as_posix() for p, tree in trees.items()
+            if p not in PINE_INDICATOR_USERS and _imports_pine_indicators(tree)]
+
+
 class IsolationTests(unittest.TestCase):
     """The bot never imports research; research never touches private venue code (E8)."""
 
@@ -201,20 +220,26 @@ class IsolationTests(unittest.TestCase):
                      "bot.strategy.pine_indicators"):
             self.assertIn(name, names)
 
-    def test_no_live_module_imports_pine_indicators(self):
-        target = "bot.strategy.pine_indicators"
-        offenders = []
-        for p in _live_sources():
-            if p == BOT / "strategy" / "pine_indicators.py":
-                continue
-            tree = _tree(p)
-            names = list(_imports(tree))
-            relative = [f"{node.module or ''}.{alias.name}" for node in ast.walk(tree)
-                        if isinstance(node, ast.ImportFrom) and node.level >= 1
-                        for alias in node.names]
-            if target in names or any("pine_indicators" in name for name in relative):
-                offenders.append(str(p.relative_to(SRC)))
+    def test_no_live_module_imports_pine_indicators_but_the_regime_gate(self):
+        offenders = _pine_indicator_offenders({p: _tree(p) for p in _live_sources()})
         self.assertEqual(offenders, [])
+        # the one allowed user really does import it, so the exception is not a dead entry
+        self.assertTrue(_imports_pine_indicators(_tree(REGIME_GATE)))
+
+    def test_the_pine_indicators_guard_sees_a_second_live_module(self):
+        for source in ("from bot.strategy import pine_indicators\n",
+                       "from bot.strategy.pine_indicators import atr\n",
+                       "import bot.strategy.pine_indicators as p\n",
+                       "from . import pine_indicators\n",
+                       "from .pine_indicators import atr\n"):
+            with self.subTest(source=source):
+                self.assertTrue(_imports_pine_indicators(ast.parse(source)))
+        self.assertFalse(_imports_pine_indicators(ast.parse("from bot.strategy import indicators\n")))
+        # a made-up neighbour of the regime gate is still refused
+        tree = ast.parse("from bot.strategy.pine_indicators import atr\n")
+        other = BOT / "core" / "other_gate.py"
+        self.assertEqual(_pine_indicator_offenders({REGIME_GATE: tree, other: tree}),
+                         ["bot/core/other_gate.py"])
 
     def test_research_never_references_private_venue_code(self):
         paths = sorted((SRC / "research").rglob("*.py"))

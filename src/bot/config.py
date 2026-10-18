@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
+    # Regime gate of the LONG forward bot (bot/core/regime_gate.py). "off" makes no venue call and
+    # changes nothing; "naik" lets an entry through only while the hourly mode selector reads NAIK.
+    entry_regime_gate: str = Field(default="off", alias="ENTRY_REGIME_GATE")
+    # Volatility guard: skip entries while ATR14 (1h) exceeds this multiple of its 720-hour median,
+    # and while that median is not yet known. 0 turns the guard off. Read only with the regime gate on.
+    entry_volatility_guard_mult: float = Field(default=0.0, ge=0.0, alias="ENTRY_VOLATILITY_GUARD_MULT")
+    # The selector's sideways band, in ATR (config/modes.yaml pemilih_mode.sideways_jarak_kali_atr).
+    regime_sideways_atr_mult: float = Field(default=0.2, gt=0.0, alias="REGIME_SIDEWAYS_ATR_MULT")
     # Live dashboard feed (src/bot/telemetry). Read-only and off by default. The
     # listener refuses any non-loopback host: reach it through an SSH tunnel.
     telemetry_enabled: bool = Field(default=False, alias="TELEMETRY_ENABLED")
@@ -404,6 +412,14 @@ class Settings(BaseSettings):
         if direction not in {"any", "long", "short"}:
             raise ValueError("ENTRY_GATE_DIRECTION must be one of: any, long, short.")
         return direction
+
+    @field_validator("entry_regime_gate")
+    @classmethod
+    def normalize_entry_regime_gate(cls, value: str) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode not in {"off", "naik"}:
+            raise ValueError("ENTRY_REGIME_GATE must be one of: off, naik.")
+        return mode
 
     @field_validator("telemetry_host")
     @classmethod
