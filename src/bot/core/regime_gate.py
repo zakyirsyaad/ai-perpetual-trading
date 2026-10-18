@@ -205,3 +205,27 @@ class RegimeGate:
             verdict.atr14_1h, verdict.atr_median,
             f" | {self._detail}" if verdict.reason == REASON_DATA_ERROR else "",
         )
+
+
+def build_regime_gate(settings: Any, client: Any, logger: logging.Logger) -> Optional[RegimeGate]:
+    """The gate for ``main.py``: ``None`` while ``ENTRY_REGIME_GATE`` is off.
+
+    The gate reads one symbol's candles, so a bot that trades several symbols could not tell which
+    one a verdict is about: with the gate on, anything but a single symbol refuses to boot."""
+    mode = getattr(settings, "entry_regime_gate", MODE_OFF)
+    if mode == MODE_OFF:
+        return None
+    symbols = tuple(settings.symbols)
+    if len(symbols) != 1:
+        raise ValueError(
+            f"ENTRY_REGIME_GATE={mode} needs exactly one symbol in SYMBOLS, "
+            f"got {len(symbols)}: {', '.join(symbols) or 'none'}. Run one bot per symbol."
+        )
+    return RegimeGate(
+        client,
+        symbols[0],
+        mode,
+        settings.entry_volatility_guard_mult,
+        settings.regime_sideways_atr_mult,
+        logger,
+    )

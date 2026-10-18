@@ -5,6 +5,7 @@ import asyncio
 from bot.ai.brain import GrokBrain
 from bot.ai.orchestration import AIOrchestrator
 from bot.config import Settings
+from bot.core.regime_gate import build_regime_gate
 from bot.core.trade_engine import TradeEngine
 from bot.data.providers import ExternalSignalAggregator
 from bot.exchange.bingx_client import BingXFuturesClient
@@ -52,6 +53,8 @@ async def run() -> None:
         insecure_ssl=settings.bingx_insecure_ssl,
         debug_http=settings.bingx_debug_http,
     )
+    # None while ENTRY_REGIME_GATE=off; refuses to boot on the gate with more than one symbol.
+    regime_gate = build_regime_gate(settings, client, logger)
     resolution = await resolve_venue_leverage(
         client,
         symbols=settings.symbols,
@@ -109,6 +112,7 @@ async def run() -> None:
         store,
         supabase_journal=None,
         telemetry=telemetry.observer if telemetry is not None else None,
+        regime_gate=regime_gate,
     )
 
     try:

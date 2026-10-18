@@ -42,6 +42,9 @@ class EntryCandidate:
 class AIOrchestrator:
     """Layer 2: coordinate brain decisions, risk state, market context, and learning memory."""
 
+    # Class-level default so an orchestrator built without __init__ (as several tests do) records no regime.
+    _gate_context: dict[str, Any] | None = None
+
     def __init__(
         self,
         settings: Settings,
@@ -62,6 +65,12 @@ class AIOrchestrator:
         self._compact_context = CompactDecisionContextBuilder(settings)
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
+
+    def set_gate_context(self, context: dict[str, Any]) -> None:
+        """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
+
+        Replaced, never mutated, so a stale verdict cannot leak into a later decision."""
+        self._gate_context = dict(context)
 
     async def close(self) -> None:
         await self._brain.close()
@@ -659,6 +668,8 @@ class AIOrchestrator:
         # spend can be attributed to individual decisions.
         call_metrics = getattr(self._brain, "last_call_metrics", None)
         ai_call_id = getattr(call_metrics, "call_id", None)
+        if self._gate_context:
+            gate = {**(gate or {}), "regime": self._gate_context}
         payload_json = {
             "decision": decision.model_dump(),
             "request": request_payload,

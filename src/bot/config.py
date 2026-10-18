@@ -189,6 +189,8 @@ class Settings(BaseSettings):
     entry_guard_short_rsi_min: float = Field(default=24.0, ge=0.0, le=100.0, alias="ENTRY_GUARD_SHORT_RSI_MIN")
     cooldown_minutes_after_entry: int = Field(default=10, alias="COOLDOWN_MINUTES_AFTER_ENTRY")
     cooldown_minutes_after_stop: int = Field(default=20, alias="COOLDOWN_MINUTES_AFTER_STOP")
+    # Pause after a close of any reason (stop, neutral exit, AI exit, time stop). 0 = off.
+    cooldown_minutes_after_exit: int = Field(default=0, ge=0, alias="COOLDOWN_MINUTES_AFTER_EXIT")
     max_daily_drawdown_usdt: float = Field(default=100.0, alias="MAX_DAILY_DRAWDOWN_USDT")
     max_consecutive_losses: int = Field(default=3, alias="MAX_CONSECUTIVE_LOSSES")
     prevent_new_entries_if_exchange_position_open: bool = Field(

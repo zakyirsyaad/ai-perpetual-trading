@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from bot.config import Settings
 from bot.core.entry_window import parse_weekly_window, window_is_open
+from bot.core.regime_gate import RegimeGate
 from bot.exchange.contracts import (
     ExchangeAPIError,
     FreshOrderBookProvider,
@@ -61,6 +62,7 @@ class TradeEngine:
         trade_store: TradeStoreProtocol,
         supabase_journal: SupabaseJournal | None = None,
         telemetry: EngineObserver | None = None,
+        regime_gate: RegimeGate | None = None,
     ) -> None:
         self._settings = settings
         self._logger = logger
@@ -73,6 +75,12 @@ class TradeEngine:
         self._telemetry: EngineObserver = telemetry if telemetry is not None else NULL_OBSERVER
         self._last_entry_ts: float | None = None
         self._last_stop_loss_ts: float | None = None
+        # Close time of the last trade, whatever the exit reason (pause after exit).
+        self._last_exit_ts: float | None = None
+        # None = the LONG forward bot's regime gate is not configured: the tick never reads it.
+        self._regime_gate = regime_gate
+        # Last logged state of each gate that logs on change: gate name -> blocked or not.
+        self._gate_blocked: dict[str, bool] = {}
         self._taker_fee_pct_by_symbol: dict[str, float] = {}
         self._maker_fee_pct_by_symbol: dict[str, float | None] = {}
         self._entries_blocked_reason: str | None = None
@@ -91,6 +99,7 @@ class TradeEngine:
         self._logger.info("%s VST trade engine started.", self._venue_label.upper())
         # Before the resumed position is watched: that call blocks until the position closes.
         await self._seed_dashboard_history()
+        await self._seed_last_exit()
         await self._resume_persisted_positions()
 
         while True:
@@ -119,6 +128,31 @@ class TradeEngine:
                 self._logger.info("Entry window open (%s): entries resume.", window_text)
             self._entry_window_open_state = is_open
         return is_open
+
+    def _note_gate(self, name: str, blocked: bool, blocked_message: str, resumed_message: str) -> None:
+        """Log a gate's change of state once, the way the weekly window does, not once per tick."""
+        if blocked == self._gate_blocked.get(name, False):
+            return
+        self._gate_blocked[name] = blocked
+        self._logger.info(blocked_message if blocked else resumed_message)
+
+    async def _seed_last_exit(self) -> None:
+        """Restore the pause after exit from the newest closed trade, so a restart does not forget it.
+
+        Does nothing while the pause is off. A failing read is logged and the pause stays unset:
+        startup must not depend on it."""
+        if self._pause_after_exit_seconds() <= 0:
+            return
+        try:
+            trades = await self._trade_store.recent_closed_trades(1)
+        except Exception:  # noqa: BLE001 - a missing seed must never stop startup
+            self._logger.warning("Could not seed the pause after exit from the store.", exc_info=True)
+            return
+        if trades:
+            self._last_exit_ts = trades[-1].closed_at.timestamp()
+
+    def _pause_after_exit_seconds(self) -> float:
+        return float(getattr(self._settings, "cooldown_minutes_after_exit", 0) or 0) * 60
 
     async def _seed_dashboard_history(self) -> None:
         """Fill the dashboard's History and Trades from the store once at startup.
@@ -202,6 +236,19 @@ class TradeEngine:
                 )
                 return
 
+        # Pause after a close of any reason; off (0) unless COOLDOWN_MINUTES_AFTER_EXIT is set
+        pause_seconds = self._pause_after_exit_seconds()
+        if pause_seconds > 0 and self._last_exit_ts is not None:
+            remaining = pause_seconds - (now_ts - self._last_exit_ts)
+            self._note_gate(
+                "pause_after_exit",
+                remaining > 0,
+                f"Pause after exit active ({remaining:.0f}s remaining); entries paused.",
+                "Pause after exit over; entries resume.",
+            )
+            if remaining > 0:
+                return
+
         volume_pause_reason = await self._volume_runtime_pause_reason()
         if volume_pause_reason is not None:
             self._logger.info("Volume runtime guard active: %s. Entries paused.", volume_pause_reason)
@@ -215,6 +262,20 @@ class TradeEngine:
                 daily_entry_limit,
             )
             return
+
+        if self._regime_gate is not None:
+            regime = await self._regime_gate.verdict()
+            self._note_gate(
+                "regime",
+                not regime.allowed,
+                f"Regime gate blocks entries ({regime.reason}); the model is not called.",
+                f"Regime gate allows entries ({regime.reason}).",
+            )
+            if not regime.allowed:
+                return
+            set_gate_context = getattr(self._strategy, "set_gate_context", None)
+            if set_gate_context is not None:
+                set_gate_context(self._regime_gate.as_payload())
 
         strategy_started = time.monotonic()
         plan = await self._strategy.next_trade_plan()
@@ -702,6 +763,7 @@ class TradeEngine:
             await self._supabase_journal.record_closed_trade(closed_trade)
         await self._trade_store.remove_open_position(open_position.symbol)
 
+        self._last_exit_ts = closed_at.timestamp()
         if exit_reason == "stop_loss":
             self._last_stop_loss_ts = closed_at.timestamp()
         # Last, so every piece of engine state that gates the next entry is already set.
