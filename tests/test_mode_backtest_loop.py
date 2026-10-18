@@ -288,6 +288,9 @@ class RecordTests(unittest.TestCase):
                 "slippage_usdt",
                 "pnl_usdt",
                 "volume_usdt",
+                "versi",
+                "sl_pct",
+                "potong",
             ],
         )
 

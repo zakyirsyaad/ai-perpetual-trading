@@ -153,3 +153,47 @@ OK
 The money table of the brief (LONG TP 63.512156 / fee 17.528364 / volume 50081.04052, LONG SL
 -88.721564 / 49928.7535, POTONG -43.739563, WAKTU 5.490011, SHORT TP 63.487856, SHORT SL -88.778439) is
 reproduced to 6 decimals. `compileall` and `git diff --check` are clean.
+
+## Task 5: the event loop for L and S
+
+`live_sim.py` gains `MODE_L`, `MODE_S`, `LiveRunSpec` and `simulate_live_run`: the loop of `simulate_run`
+with mode L's pieces (the near-mean trigger on the 3m candles, Phase 1's seven gates with a 60-minute
+segment edge, the levels from the entry fill and `atr_pct_3m`, the live-exit walk and `settle_live`).
+LONG runs in NAIK and trades as mode "L"; SHORT runs in TURUN as comparator "S". `simulate.py` makes
+`_Book`, `_Gates`, `_closes`, `_NearMeanTrigger` and `_check_column` public (`Book`, `Gates`,
+`candle_closes`, `NearMeanTrigger`, `check_column`) and, for the same reason (the structure test forbids
+importing a private name across modules), `_moment`, `_check_inputs` (now takes the pair name) and
+`_exit_ms` (now `outcome_exit_ms`) too. `Gates.__init__` is `(umum, kondisi_gate, end_ms, limit_min)`.
+`Trade` gains the defaulted `versi`, `sl_pct`, `potong`. The trigger now calls `near_mean` (the same
+function `near_mean_short` aliases).
+
+Golden: `MODE_A_SYNTHETIC_LOG_SHA = 39aa210b16d9a6ccdf6bf3c78718cdb0cd9411b36dd07cef8913879ca8112431`,
+computed on HEAD a4dffcc before any change: Mode A, `"5m"`, NAIK, the whole synthetic week of
+`tests/mode_backtest_stages.py` as one segment (2026-07-06 00:00 WIB to 2026-07-11 00:00 WIB), 30 trades,
+sha256 of `trade_log_text(result.trades)` (UTF-8). It was computed with `write_naik_market`, `load_pair`,
+`build_pair_frames(..., load_modes_config(REPO_CONFIG))` and `simulate_run(frames, cfg, RunSpec(MODE_A,
+"BTC-USDT", "5m", NAIK, start, end))`; the committed test is that same code.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_sim
+ImportError: cannot import name 'MODE_L' from 'research.mode_backtest.live_sim'
+Ran 1 test in 0.000s
+FAILED (errors=1)
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_sim tests.test_mode_backtest_simulate tests.test_mode_backtest_loop tests.test_mode_backtest_structure tests.test_mode_backtest_tradelog
+Ran 256 tests in 2.737s
+OK
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2400 tests in 65.578s
+OK
+```
+
+The golden test passes after the refactor, so Mode A's log is byte-identical. Four hand mutants of
+`simulate_live_run` (cut always on, wrong segment-edge limit, wrong trigger band, a defaulted ATR
+percent) each fail the live-sim tests. `compileall` and `git diff --check` are clean.

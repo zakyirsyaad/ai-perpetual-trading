@@ -13,28 +13,41 @@ mirrors the bars could repeat the mistake of the code it checks.
 """
 
 import dataclasses
+import hashlib
 import itertools
 import math
 import random
+import tempfile
 import unittest
 from array import array
 from collections import Counter
+from datetime import timedelta
 from fractions import Fraction
+from pathlib import Path
 
+from bot.strategy.modes.config import load_modes_config
 from bot.strategy.modes.position_rules import LONG, SHORT, adverse_fill, bracket_prices
+from bot.strategy.modes.regime import NAIK
+from research.mode_backtest.data import load_pair
+from research.mode_backtest.frames import build_pair_frames
 from research.mode_backtest.simulate import (
     EXIT_SL,
     EXIT_TP,
     EXIT_WAKTU,
+    MODE_A,
     ExitOutcome,
     Money,
+    RunSpec,
     resolve_exit,
     settle,
+    simulate_run,
 )
-from research.pine_gate.bars import bars_from_rows, concat
+from research.mode_backtest.tradelog import trade_log_text
+from research.pine_gate.bars import bars_from_rows, concat, wib_day_start_ms
 from research.pine_gate.outcomes import bracket_outcome
 from research.pine_gate.spec import ExecConfig
 from tests.mode_backtest_helpers import MINUTE_MS, minute_rows
+from tests.mode_backtest_stages import ALL_DAYS, REPO_CONFIG, SYMBOL, write_naik_market
 
 START_MS = 29_833_334 * MINUTE_MS  # a minute boundary in October 2026
 LIMIT_A = 90  # Mode A's time limit, minutes
@@ -1083,3 +1096,25 @@ class ComposeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The sha256 of the trade log of Mode A (5m, NAIK, the whole week as one segment) on the synthetic
+# week of tests.mode_backtest_stages, taken on the code before mode L's event loop was added (30
+# trades). Mode A's walk, money and log must stay as they were.
+MODE_A_SYNTHETIC_LOG_SHA = "39aa210b16d9a6ccdf6bf3c78718cdb0cd9411b36dd07cef8913879ca8112431"
+
+
+class ModeAGoldenTests(unittest.TestCase):
+    def test_mode_a_trade_log_unchanged_on_the_synthetic_week(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_naik_market(Path(tmp))
+            cfg = load_modes_config(REPO_CONFIG)
+            frames = build_pair_frames(load_pair(tmp, SYMBOL, ALL_DAYS[0], ALL_DAYS[-1]), cfg)
+        start = wib_day_start_ms(ALL_DAYS[0])
+        end = wib_day_start_ms(ALL_DAYS[-1] + timedelta(days=1))
+
+        result = simulate_run(frames, cfg, RunSpec(MODE_A, SYMBOL, "5m", NAIK, start, end))
+
+        self.assertEqual(len(result.trades), 30)
+        text = trade_log_text(result.trades)
+        self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(), MODE_A_SYNTHETIC_LOG_SHA)
