@@ -574,3 +574,19 @@ Eight findings from the PR #41 code review, minimal edits. Mode A and Mode D beh
 Verification: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` ran 2469 tests, OK
 (2463 before; +6 new tests); `compileall -q src tests` exit 0; `git diff --check` clean. Changed bound
 modules (`config.py`, `frames.py`, `live_sim.py`) move `code_sha256`; `train` has not run, so no lock is affected.
+
+## PR #41 bot review threads
+
+There were 13 open threads from `bridge-reviewer`. Two of them (the cut minute against the time limit) were already fixed in `2232db8`.
+
+| Thread | Fix | Covering test |
+|---|---|---|
+| `frames._atr_pct_of_window`: a NaN ATR or close fell through `<= 0` and came back as NaN | Uses `not x > 0`, so NaN gives `None` | `AtrPercentOfWindowTests`. Without the fix it fails with `AssertionError: nan is not None` |
+| `fee_perkiraan_persen` had no upper bound; 100 % or more breaks `net_target_price` (2 threads) | The loader refuses 100 or more, naming the path | `test_fee_estimate_must_be_below_100_percent`. RED: refusals at 100 and 150 not raised |
+| `net_target_price` could return a SHORT target at or below 0 (2 threads) | Refuses such a target with `ValueError` | `test_a_short_target_at_or_below_zero_is_refused`. RED: no error raised |
+| `rescore_stage(trade_logs, live_config, config, ...)` ordered its arguments unlike the stages | Now `(trade_logs, config_path, live_config_path, out_dir, now)`; the CLI call and the test helper follow | the stage tests (RED: 5 errors with the old order) |
+| `rescore._read_log`: a non-UTF-8 file raised `UnicodeDecodeError` without its path | Raises `ValueError` naming the path | `test_a_log_that_is_not_utf8_is_refused_with_its_path` |
+| `live_sim.__all__` lacked `VERSION_I`/`VERSION_II` | Added | — |
+| `cli._add_stage_parser` docstring said "five options" | Says "six" | — |
+| `_reprice` had no return annotation | `-> Tuple[Trade, float, float]` | — |
+| `stages_live._test_report` built `hari` from both versions' rows, so keys were overwritten (same values) | Reads version i explicitly | the live stage tests |

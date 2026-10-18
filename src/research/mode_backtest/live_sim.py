@@ -96,6 +96,8 @@ __all__ = [
     "BLOCK_REASONS",
     "MODE_L",
     "MODE_S",
+    "VERSION_I",
+    "VERSION_II",
     "LiveRunSpec",
     "resolve_live_exit",
     "settle_live",

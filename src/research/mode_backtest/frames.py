@@ -258,9 +258,10 @@ def _require_measurable(window: int, ema_period: int, atr_period: int) -> None:
 def _atr_pct_of_window(
     highs: List[float], lows: List[float], closes: List[float], atr_period: int
 ) -> Optional[float]:
-    """The live ATR of the window over its last close, in percent; ``None`` when the ATR is 0."""
+    """The live ATR of the window over its last close, in percent; ``None`` when the ATR is 0
+    (or not a number: ``not x > 0`` is also true for NaN)."""
     window_atr = live_atr(highs, lows, closes, atr_period)
-    if window_atr <= 0 or closes[-1] <= 0:
+    if not window_atr > 0 or not closes[-1] > 0:
         return None
     return window_atr / closes[-1] * 100
 

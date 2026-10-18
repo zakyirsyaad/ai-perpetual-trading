@@ -216,6 +216,15 @@ class RefusalTest(unittest.TestCase):
                 )
                 self.assertIn("batas_waktu_menit", message)
 
+    def test_fee_estimate_must_be_below_100_percent(self):
+        parse_live_exit_config(with_value(f"{MODE}.fee_perkiraan_persen", 99.9))
+        for value in (100, 150):
+            with self.subTest(value=value):
+                self.assert_refused(
+                    with_value(f"{MODE}.fee_perkiraan_persen", value),
+                    f"{MODE}.fee_perkiraan_persen",
+                )
+
 
 class TriggerMatchTest(unittest.TestCase):
     @classmethod

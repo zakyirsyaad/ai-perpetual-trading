@@ -104,6 +104,12 @@ class NetTargetPriceTests(unittest.TestCase):
             with self.subTest(notional=notional), self.assertRaises(ValueError):
                 net_target_price(100.0, LONG, notional, rules())
 
+    def test_a_short_target_at_or_below_zero_is_refused(self):
+        # 25,000 USDT at an entry of 100 is 250 units: a 1,000,000 USDT target needs 4,000 per
+        # unit, far more than the entry price, so the SHORT target would be negative.
+        with self.assertRaisesRegex(ValueError, "above 0"):
+            net_target_price(100.0, SHORT, NOTIONAL, rules(tp_net_usdt=1_000_000.0))
+
 
 class LiveExitLevelsTests(unittest.TestCase):
     def test_levels_from_the_reference_entry(self):

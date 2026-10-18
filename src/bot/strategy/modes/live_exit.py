@@ -60,7 +60,13 @@ def net_target_price(entry_fill: float, side: int, notional: float, rules: LiveE
     per_unit = rules.tp_net_usdt / (notional / entry_fill)
     if side == LONG:
         return (entry_fill * (1 + fee) + per_unit) / (1 - fee)
-    return (entry_fill * (1 - fee) - per_unit) / (1 + fee)
+    price = (entry_fill * (1 - fee) - per_unit) / (1 + fee)
+    if not price > 0:
+        raise ValueError(
+            f"the SHORT target {price!r} must be above 0: tp_net_usdt {rules.tp_net_usdt!r} is too "
+            f"large for a notional of {notional!r} at {entry_fill!r}"
+        )
+    return price
 
 
 def live_exit_levels(

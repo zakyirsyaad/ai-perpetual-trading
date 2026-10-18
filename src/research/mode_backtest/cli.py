@@ -136,7 +136,7 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 def cmd_rescore(args: argparse.Namespace) -> int:
-    json_path = rescore.rescore_stage(args.trade_log, args.live_config, args.config, args.out_dir,
+    json_path = rescore.rescore_stage(args.trade_log, args.config, args.live_config, args.out_dir,
                                       now())
     print(json_path)
     print(json_path.with_suffix(".md"))
@@ -145,7 +145,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
 
 def _add_stage_parser(sub: Any, name: str, handler: Callable[[argparse.Namespace], int],
                       help_text: str) -> None:
-    """``name`` with the five options both stages take; ``sub`` is the subparsers action."""
+    """``name`` with the six options both stages take; ``sub`` is the subparsers action."""
     p = sub.add_parser(name, help=help_text)
     p.add_argument("--mode", required=True, help="the mode to run (A, or L with --live-config)")
     p.add_argument("--pair", required=True, help="the pair to run (BTC-USDT)")

@@ -42,7 +42,7 @@ import math
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Union
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple, Union
 
 from bot.strategy.modes.config import (
     CostConfig,
@@ -161,7 +161,8 @@ def _check_old_money(old: Trade, raw_entry: float, raw_exit: float, fee_pct: flo
             )
 
 
-def _reprice(old: Trade, costs: CostConfig, fee_pct: float, old_slippage_pct: float):
+def _reprice(old: Trade, costs: CostConfig, fee_pct: float,
+             old_slippage_pct: float) -> Tuple[Trade, float, float]:
     """The new ``Trade`` of ``old`` with the raw prices recovered from its fills."""
     side = old.side
     raw_entry = old.entry_fill / (1 + side * old_slippage_pct / _PERCENT)
@@ -203,7 +204,10 @@ def rescore_rows(
 def _read_log(path: Path) -> tuple[List[Dict[str, str]], str]:
     """The rows of the CSV at ``path`` and the sha256 of the bytes they were read from."""
     data = Path(path).read_bytes()
-    text = data.decode("utf-8")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path}: not a UTF-8 trade log ({exc.reason})") from None
     reader = csv.DictReader(io.StringIO(text, newline=""))
     if reader.fieldnames != list(COLUMNS):
         raise ValueError(
@@ -282,8 +286,8 @@ def _report(doc: Mapping[str, Any]) -> str:
 
 def rescore_stage(
     trade_logs: Sequence[PathLike],
-    live_config_path: PathLike,
     config_path: PathLike,
+    live_config_path: PathLike,
     out_dir: PathLike,
     now: datetime,
 ) -> Path:

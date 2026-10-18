@@ -184,7 +184,7 @@ class RescoreStageTests(unittest.TestCase):
         self.log.write_text(trade_log_text(trades), encoding="utf-8")
 
     def run_stage(self, logs=None, now=CLOCK):
-        return rescore.rescore_stage(logs or [self.log], LIVE_CONFIG, CONFIG, self.out, now)
+        return rescore.rescore_stage(logs or [self.log], CONFIG, LIVE_CONFIG, self.out, now)
 
     def test_rescore_stage_writes_json_and_report_labelled_a_sensitivity(self):
         path = self.run_stage()
@@ -252,6 +252,13 @@ class RescoreStageTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "columns"):
             self.run_stage([live])
+
+    def test_a_log_that_is_not_utf8_is_refused_with_its_path(self):
+        bad = self.root / "latin.csv"
+        bad.write_bytes(b"\xff\xfe not utf-8")
+
+        with self.assertRaisesRegex(ValueError, "latin.csv"):
+            self.run_stage([bad])
 
     def test_a_naive_clock_is_refused(self):
         with self.assertRaises(ValueError):

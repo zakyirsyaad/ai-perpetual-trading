@@ -432,7 +432,8 @@ def _test_report(pair: str, cfg: ModesConfig, live: LiveExitConfig, measured: _M
     ``rows`` starts with the Latihan lines from the lock, L then S, whose ``hari_naik`` holds the
     training's NAIK and TURUN days."""
     rules, latihan, ujian = live.mode_l, training_period(cfg.uji), measured.period
-    hari = {row.mode: row.metrics.hari_naik for row in rows if row.tahap == LATIHAN}
+    hari = {row.mode: row.metrics.hari_naik for row in rows
+            if row.tahap == LATIHAN and row.versi == VERSION_I}  # both versions share the days
     return "\n".join([
         f"# Mode L {pair}: latihan dan ujian",
         "",

@@ -767,6 +767,9 @@ def _read_live_mode(raw: Any, path: str) -> LiveExitModeConfig:
             f"must be less than batas_waktu_menit ({mode.batas_waktu_menit!r}), "
             f"got {mode.potong_rugi_setelah_menit!r}: the cut would never act",
         )
+    if mode.fee_perkiraan_persen >= 100:
+        raise _fail(_join(path, "fee_perkiraan_persen"),
+                    f"must be below 100, got {mode.fee_perkiraan_persen!r}")
     return mode
 
 

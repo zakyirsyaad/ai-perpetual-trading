@@ -1035,6 +1035,18 @@ class StretchSeriesTests(WavyCase):
             self.stretch(aggregate(self.pair.bars_1m, M3))
 
 
+class AtrPercentOfWindowTests(unittest.TestCase):
+    def test_a_window_whose_atr_is_not_a_number_has_no_atr_percent(self):
+        highs = [101.0] * 15
+        lows = [99.0] * 15
+        closes = [100.0] * 14 + [math.nan]
+        self.assertIsNone(frames._atr_pct_of_window(highs, lows, closes, 14))
+
+    def test_a_normal_window_gives_its_percent(self):
+        highs, lows, closes = [101.0] * 15, [99.0] * 15, [100.0] * 15
+        self.assertAlmostEqual(frames._atr_pct_of_window(highs, lows, closes, 14), 2.0)
+
+
 class PairFramesTests(WavyCase):
     @classmethod
     def setUpClass(cls):
