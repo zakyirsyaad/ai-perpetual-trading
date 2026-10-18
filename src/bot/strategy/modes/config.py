@@ -23,7 +23,11 @@ What is accepted:
   into a datetime of its own). They must be midnight in Asia/Jakarta, because the data is stored
   per WIB day, and they come back as aware datetimes in that zone.
 
-This module reads the file and nothing else: it takes no bars and imports neither the Pine
+``config/modes_live_exit.yaml`` (mode L, the LONG mirror of the live SHORT bot with the live
+exits) is read by the same readers and the same loader, in its own functions below, so the first
+file and Mode A's lock are untouched.
+
+This module reads the files and nothing else: it takes no bars and imports neither the Pine
 indicators nor ``research``.
 """
 from __future__ import annotations
@@ -44,7 +48,10 @@ from bot.core.entry_window import parse_weekly_window
 
 __all__ = [
     "BreakoutConfig",
+    "CostConfig",
     "GeneralConfig",
+    "LiveExitConfig",
+    "LiveExitModeConfig",
     "ModesConfig",
     "ModesConfigError",
     "NearMeanConfig",
@@ -53,9 +60,12 @@ __all__ = [
     "SelectorConfig",
     "SidewaysConfig",
     "TestConfig",
+    "check_live_trigger_matches",
     "config_sha256",
+    "load_live_exit_config_with_sha256",
     "load_modes_config",
     "load_modes_config_with_sha256",
+    "parse_live_exit_config",
     "parse_modes_config",
 ]
 
@@ -626,11 +636,15 @@ def load_modes_config_with_sha256(path: Path) -> tuple[ModesConfig, str]:
     lock binds always belongs to the numbers the run used, even if the file is edited meanwhile
     (``config_sha256`` and ``load_modes_config`` each read the file). The text is read as text
     mode reads it, line ends turned into ``\\n``. Raises what ``load_modes_config`` raises."""
+    return _load_with_sha256(path, parse_modes_config)
+
+
+def _load_with_sha256(path: Path, parse: Callable[[Any], Any]) -> tuple[Any, str]:
     path = Path(path)
     data = path.read_bytes()
     try:
         text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-        return parse_modes_config(_parse_yaml(text)), hashlib.sha256(data).hexdigest()
+        return parse(_parse_yaml(text)), hashlib.sha256(data).hexdigest()
     except UnicodeDecodeError as exc:
         raise ModesConfigError(f"{path}: not valid UTF-8 text: {exc}") from exc
     except ModesConfigError as exc:
@@ -640,3 +654,147 @@ def load_modes_config_with_sha256(path: Path) -> tuple[ModesConfig, str]:
 def config_sha256(path: Path) -> str:
     """SHA-256 of the file's bytes, comments and spacing included: what the lock file binds."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------------------------
+# config/modes_live_exit.yaml: mode L, the mirror of the live bot with the live exits.
+# ---------------------------------------------------------------------------------------------
+
+_LIVE_MODE = "L_cermin_live"
+_LIVE_TOP_LEVEL = ("mode", "biaya")
+_LIVE_MODE_PATH = f"mode.{_LIVE_MODE}"
+_MODE_D_PATH = "mode.D_short_sekarang"
+# The trigger numbers the frames of Mode D carry, which mode L reuses: they must be equal.
+_TRIGGER_FIELDS = (
+    "tf_pemicu",
+    "candle_jendela",
+    "ema_periode",
+    "atr_periode",
+    "maks_jarak_ke_ema_kali_atr",
+)
+
+
+@dataclass(frozen=True)
+class LiveExitModeConfig:
+    """Mode L, ``mode.L_cermin_live``: the trigger of Mode D plus the live bot's exits.
+
+    ``sl_*_persen`` clamp the stop, in percent, around ``sl_kali_atr`` times the ATR percentage.
+    ``tp_net_usdt`` is the take-profit net of fees, priced with ``fee_perkiraan_persen`` per side.
+    The cut (``potong_rugi_*``, version ii) closes a loser at ``potong_rugi_persen`` against the
+    entry once ``potong_rugi_setelah_menit`` minutes have passed."""
+
+    aktif: bool
+    tf_pemicu: str
+    candle_jendela: int
+    ema_periode: int
+    atr_periode: int
+    maks_jarak_ke_ema_kali_atr: float
+    sl_minimal_persen: float
+    sl_kali_atr: float
+    sl_maksimal_persen: float
+    tp_net_usdt: float
+    fee_perkiraan_persen: float
+    batas_waktu_menit: int
+    potong_rugi_persen: float
+    potong_rugi_setelah_menit: int
+
+
+@dataclass(frozen=True)
+class CostConfig:
+    """Block ``biaya``: slippage in basis points. Zero is allowed (the take-profit rests as a
+    limit order and fills at its price)."""
+
+    slippage_entry_bps: float
+    slippage_exit_market_bps: float
+    slippage_tp_bps: float
+
+
+@dataclass(frozen=True)
+class LiveExitConfig:
+    """The whole of ``config/modes_live_exit.yaml``: ``mode.L_cermin_live`` and ``biaya``."""
+
+    mode_l: LiveExitModeConfig
+    biaya: CostConfig
+
+
+def _non_negative(value: Any, path: str) -> float:
+    number = _number(value, path)
+    if number < 0:
+        raise _fail(path, f"must not be negative, got {value!r}")
+    return number
+
+
+_LIVE_MODE_READERS: dict[str, _Reader] = {
+    "aktif": _boolean,
+    "tf_pemicu": _one_of("3m"),
+    "candle_jendela": _count,
+    "ema_periode": _count,
+    "atr_periode": _count,
+    "maks_jarak_ke_ema_kali_atr": _positive,
+    "sl_minimal_persen": _positive,
+    "sl_kali_atr": _positive,
+    "sl_maksimal_persen": _positive,
+    "tp_net_usdt": _positive,
+    "fee_perkiraan_persen": _positive,
+    "batas_waktu_menit": _count,
+    "potong_rugi_persen": _positive,
+    "potong_rugi_setelah_menit": _count,
+}
+_COSTS: dict[str, _Reader] = {
+    "slippage_entry_bps": _non_negative,
+    "slippage_exit_market_bps": _non_negative,
+    "slippage_tp_bps": _non_negative,
+}
+
+
+def _read_live_mode(raw: Any, path: str) -> LiveExitModeConfig:
+    mode = _read_block(raw, path, LiveExitModeConfig, _LIVE_MODE_READERS)
+    if mode.sl_minimal_persen > mode.sl_maksimal_persen:
+        raise _fail(
+            _join(path, "sl_minimal_persen"),
+            f"must not exceed sl_maksimal_persen ({mode.sl_maksimal_persen!r}), "
+            f"got {mode.sl_minimal_persen!r}: the stop would have no room",
+        )
+    if mode.potong_rugi_persen >= mode.sl_minimal_persen:
+        raise _fail(
+            _join(path, "potong_rugi_persen"),
+            f"must be less than sl_minimal_persen ({mode.sl_minimal_persen!r}), "
+            f"got {mode.potong_rugi_persen!r}: the cut has to sit inside the tightest stop",
+        )
+    return mode
+
+
+def parse_live_exit_config(doc: Mapping[str, Any]) -> LiveExitConfig:
+    """Validate a mapping read from ``config/modes_live_exit.yaml`` and return it as dataclasses."""
+    _check_keys(doc, "", _LIVE_TOP_LEVEL)
+    modes = doc["mode"]
+    _check_keys(modes, "mode", (_LIVE_MODE,))
+    return LiveExitConfig(
+        mode_l=_read_live_mode(modes[_LIVE_MODE], _LIVE_MODE_PATH),
+        biaya=_read_block(doc["biaya"], "biaya", CostConfig, _COSTS),
+    )
+
+
+def check_live_trigger_matches(live: LiveExitConfig, cfg: ModesConfig) -> None:
+    """Refuse a mode L whose trigger numbers differ from Mode D's in ``config/modes.yaml``.
+
+    The frames carry Mode D's window and periods, so a mismatch would silently mix two sets of
+    numbers. Raises ``ModesConfigError`` naming every field that differs."""
+    problems = []
+    for field in _TRIGGER_FIELDS:
+        mine, theirs = getattr(live.mode_l, field), getattr(cfg.mode_d, field)
+        if mine != theirs:
+            problems.append(
+                f"{_join(_LIVE_MODE_PATH, field)}: must equal "
+                f"{_join(_MODE_D_PATH, field)} in config/modes.yaml ({theirs!r}), got {mine!r}"
+            )
+    if problems:
+        raise ModesConfigError("; ".join(problems))
+
+
+def load_live_exit_config_with_sha256(path: Path) -> tuple[LiveExitConfig, str]:
+    """The mode L configuration of ``path`` and the SHA-256 of the bytes it was parsed from.
+
+    Read once, hashed and parsed from the same bytes, exactly as ``load_modes_config_with_sha256``
+    does; it raises what that function raises."""
+    return _load_with_sha256(path, parse_live_exit_config)
