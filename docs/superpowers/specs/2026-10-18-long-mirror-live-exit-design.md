@@ -1,6 +1,6 @@
 # LONG mirror of the live SHORT bot, with the live exits and measured costs — design
 
-Date: 2026-10-18 · Status: decisions settled 2026-10-18, awaiting final review · Source: the manager's answers of 2026-10-18 (relayed
+Date: 2026-10-18 · Status: approved 2026-10-18 · Source: the manager's answers of 2026-10-18 (relayed
 by the user, quoted in §2) to three questions about the live exit rules, plus his earlier request to
 replace the slippage assumption with measured fills · Builds on:
 `docs/superpowers/specs/2026-10-17-long-module-phase1-design.md` (Phase 1: harness, data, split and

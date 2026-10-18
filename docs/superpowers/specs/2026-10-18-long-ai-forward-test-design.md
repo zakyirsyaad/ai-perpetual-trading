@@ -1,6 +1,6 @@
 # LONG AI forward test on a second VST account — design
 
-Date: 2026-10-18 · Status: draft for review · Source: the manager's decisions of 2026-10-18 (relayed
+Date: 2026-10-18 · Status: approved 2026-10-18 · Source: the manager's decisions of 2026-10-18 (relayed
 by the user) · Companion: `docs/superpowers/specs/2026-10-18-long-mirror-live-exit-design.md` (the
 backtest of the same idea without the AI, "mode L"), whose §3 lists the live rules this mirrors.
 
@@ -139,10 +139,10 @@ the single allowed live import of the core. Nothing in the tests calls the venue
   rising.
 - **The second account's fee** must be read from the startup log; the live account pays 0.035 %.
 
-## 9. Open points needing a yes
+## 9. Decided with the user (2026-10-18)
 
 1. **Daily risk guards** (`MAX_STOP_LOSS_PER_DAY`, `MAX_DAILY_DRAWDOWN_USDT`,
-   `MAX_CONSECUTIVE_LOSSES`): proposed off, set out of reach, so the limits match the backtest; the
+   `MAX_CONSECUTIVE_LOSSES`): off, set out of reach, so the limits match the backtest; the
    forward guard of §4.4 is the stop.
-2. **The kill check**: proposed at every close from the 60th position on, not only once at 60.
-3. **AI provider key**: proposed a separate key for this bot, so its quota never touches the live bot.
+2. **The kill check**: at every close from the 60th position on, not only once at 60.
+3. **AI provider key**: a separate key for this bot, so its quota never touches the live bot.
