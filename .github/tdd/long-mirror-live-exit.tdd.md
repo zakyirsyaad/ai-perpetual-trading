@@ -114,3 +114,42 @@ OK
 
 The existing NAIK-day tests and `test_stretch_series_matches_pine_feature_frame` pass untouched;
 `compileall` and `git diff --check` are clean.
+
+## Task 4: the live-exit walk and per-kind fills
+
+New module `src/research/mode_backtest/live_sim.py` (`resolve_live_exit`, `settle_live`); `simulate.py`
+gains `EXIT_POTONG = "POTONG"` and makes its three walk helpers public (`check_walk`, `reaches_sl`,
+`reaches_tp`: a pure rename, because `test_no_module_imports_a_private_name_of_another` forbids
+importing a private name across modules). Mode A's `resolve_exit` and `settle` are unchanged.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_sim
+    from research.mode_backtest.live_sim import resolve_live_exit, settle_live
+ModuleNotFoundError: No module named 'research.mode_backtest.live_sim'
+Ran 1 test in 0.000s
+FAILED (errors=1)
+```
+
+A first GREEN attempt also failed the structure guard, which is how the rename was found:
+
+```
+FAIL: test_no_module_imports_a_private_name_of_another
+AssertionError: ['live_sim.py: line 47: _check_walk', 'live_sim.py: line 47: _reaches_sl', ...]
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_live_sim
+Ran 33 tests in 0.010s
+OK
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2363 tests in 135.313s
+OK
+```
+
+The money table of the brief (LONG TP 63.512156 / fee 17.528364 / volume 50081.04052, LONG SL
+-88.721564 / 49928.7535, POTONG -43.739563, WAKTU 5.490011, SHORT TP 63.487856, SHORT SL -88.778439) is
+reproduced to 6 decimals. `compileall` and `git diff --check` are clean.

@@ -105,6 +105,7 @@ from .frames import TRIGGER_TIMEFRAMES, FrameParams, HourlyContext, PairFrames, 
 
 __all__ = [
     "BLOCK_REASONS",
+    "EXIT_POTONG",
     "EXIT_SL",
     "EXIT_TP",
     "EXIT_WAKTU",
@@ -115,6 +116,9 @@ __all__ = [
     "RunResult",
     "RunSpec",
     "Trade",
+    "check_walk",
+    "reaches_sl",
+    "reaches_tp",
     "resolve_exit",
     "settle",
     "simulate_run",
@@ -123,6 +127,7 @@ __all__ = [
 EXIT_TP = "TP"
 EXIT_SL = "SL"
 EXIT_WAKTU = "WAKTU"
+EXIT_POTONG = "POTONG"  # Mode L version (ii): the loss cut, see ``live_sim``
 
 MODE_A = "A"  # the pullback LONG
 MODE_D = "D"  # the near-mean SHORT
@@ -149,7 +154,8 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 class ExitOutcome:
     """How a position ended.
 
-    ``reason`` is ``EXIT_TP``, ``EXIT_SL`` or ``EXIT_WAKTU``. ``exit_idx`` is the index, in the
+    ``reason`` is ``EXIT_TP``, ``EXIT_SL`` or ``EXIT_WAKTU`` (``EXIT_POTONG`` only from mode L's
+    ``live_sim`` walk). ``exit_idx`` is the index, in the
     walked bars, of the bar the exit happens in; a touch is only known to the minute. ``raw_price``
     is the exit price before its slippage: the level for a touch and the bar's open for a gap and
     for the time exit. ``gapped`` is True for an exit at the open of a bar that opened beyond a
@@ -183,21 +189,21 @@ class Money:
     volume_usdt: float
 
 
-def _reaches_sl(side: int, price: float, sl: float) -> bool:
+def reaches_sl(side: int, price: float, sl: float) -> bool:
     """Whether ``price`` is at or beyond the stop-loss.
 
     A LONG's stop is below its entry, so beyond it is at or below; a SHORT's is the mirror."""
     return price <= sl if side == LONG else price >= sl
 
 
-def _reaches_tp(side: int, price: float, tp: float) -> bool:
+def reaches_tp(side: int, price: float, tp: float) -> bool:
     """Whether ``price`` is at or beyond the take-profit.
 
     A LONG's target is above its entry, so beyond it is at or above; a SHORT's is the mirror."""
     return price >= tp if side == LONG else price <= tp
 
 
-def _check_walk(
+def check_walk(
     bars_1m: Bars, entry_idx: int, side: int, tp: float, sl: float, limit_min: int
 ) -> None:
     if bars_1m.interval_ms != INTERVAL_1M:
@@ -232,7 +238,7 @@ def resolve_exit(
     Raises ``ValueError`` for bars that are not 1m, a ``side`` that is not ``LONG`` or ``SHORT``,
     an ``entry_idx`` outside the bars, a ``limit_min`` that is not a whole number of at least 1,
     and levels that are not finite positive numbers or are on the wrong sides of each other."""
-    _check_walk(bars_1m, entry_idx, side, tp, sl, limit_min)
+    check_walk(bars_1m, entry_idx, side, tp, sl, limit_min)
     open_ms, opens, highs, lows = bars_1m.open_ms, bars_1m.open, bars_1m.high, bars_1m.low
     limit_idx = entry_idx + limit_min
     for i in range(entry_idx, min(limit_idx, len(bars_1m) - 1) + 1):
@@ -241,14 +247,14 @@ def resolve_exit(
         bar_open = opens[i]
         if i == limit_idx:
             return ExitOutcome(EXIT_WAKTU, i, bar_open, False, False)
-        if _reaches_sl(side, bar_open, sl):
+        if reaches_sl(side, bar_open, sl):
             return ExitOutcome(EXIT_SL, i, bar_open, True, False)
-        if _reaches_tp(side, bar_open, tp):
+        if reaches_tp(side, bar_open, tp):
             return ExitOutcome(EXIT_TP, i, bar_open, True, False)
         worst, best = (lows[i], highs[i]) if side == LONG else (highs[i], lows[i])
-        if _reaches_sl(side, worst, sl):
-            return ExitOutcome(EXIT_SL, i, float(sl), False, _reaches_tp(side, best, tp))
-        if _reaches_tp(side, best, tp):
+        if reaches_sl(side, worst, sl):
+            return ExitOutcome(EXIT_SL, i, float(sl), False, reaches_tp(side, best, tp))
+        if reaches_tp(side, best, tp):
             return ExitOutcome(EXIT_TP, i, float(tp), False, False)
     return None
 
