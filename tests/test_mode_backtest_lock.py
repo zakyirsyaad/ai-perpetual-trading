@@ -10,6 +10,7 @@ comparator trade. A check that must end in an exit code runs through ``cli.main`
 import ast
 import contextlib
 import csv
+import dataclasses
 import gzip
 import hashlib
 import io
@@ -869,6 +870,37 @@ class TestStageTests(StageCase):
                 self.assertFalse(self.marker().exists())
                 existing.unlink()
         self.assertEqual(self.snapshot(), before)
+
+
+class LockedMetricsShapeTests(unittest.TestCase):
+    """The summary of a lock must hold exactly the fields of ``StageMetrics``."""
+
+    PHASE1_FIELDS = (
+        "posisi", "entry_per_hari_aktif", "menang_pct", "hasil_per_1_juta", "tp", "sl", "waktu",
+        "rata_lama_menit", "hasil_tanpa_teratas", "hari_naik",
+    )
+
+    def test_a_pre_mode_l_summary_with_ten_fields_is_refused(self):
+        # Deliberate: StageMetrics gained ``potong`` and ``entry_per_hari_kalender`` for mode L, so
+        # a summary written by Phase 1 code is no longer readable. It would fail the lock's code
+        # hash first, and Mode A's one-shot test is spent.
+        old = dict(zip(self.PHASE1_FIELDS, (40, 2.0, 50.0, -100.0, 20, 20, 0, 30.0, -200.0, 20)))
+
+        metrics, problem = stages._locked_metrics({"mode_a": old}, "mode_a")
+
+        self.assertIsNone(metrics)
+        self.assertEqual(problem, "summary.mode_a: not the metrics of a training run")
+
+    def test_a_summary_with_every_current_field_is_read(self):
+        m = StageMetrics(
+            posisi=40, entry_per_hari_aktif=2.0, menang_pct=50.0, hasil_per_1_juta=-100.0,
+            tp=20, sl=20, waktu=0, rata_lama_menit=30.0, hasil_tanpa_teratas=-200.0, hari_naik=20,
+        )
+
+        metrics, problem = stages._locked_metrics({"mode_a": dataclasses.asdict(m)}, "mode_a")
+
+        self.assertIsNone(problem)
+        self.assertEqual(metrics, m)
 
 
 class VerdictTests(StageCase):

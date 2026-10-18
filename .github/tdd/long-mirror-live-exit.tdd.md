@@ -232,3 +232,18 @@ OK
 
 `compileall` and `git diff --check` are clean. One Phase 1 test changed: the field-order test of
 `StageMetrics` now expects the two new fields appended after `hari_naik`.
+
+### Fix round 1: the lock summary shape (deliberate)
+
+`StageMetrics` has 12 fields now (10 before). `stages._locked_metrics` requires the summary of a lock to
+hold exactly the fields of `StageMetrics`, so a lock summary written by Phase 1 code (the 10-field shape,
+e.g. `~/replay/mode_backtest/out/mode_A_BTC-USDT_lock.json`) is reported as "not the metrics of a training
+run". This is harmless and deliberate: the lock also binds `code_sha256` over the package, which this
+branch changes, so an old lock is refused on the code hash first; Mode A's one-shot test is spent; and
+the real Mode A records (lock, start record, marker) still refuse any Mode A rerun. The code path is not
+changed; `LockedMetricsShapeTests` in `tests/test_mode_backtest_lock.py` pins the behaviour.
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_lock.LockedMetricsShapeTests
+Ran 2 tests ... OK
+```
