@@ -10,8 +10,11 @@ from bot.strategy.pine_indicators import (
     percent_rank,
     rma,
     rolling_max,
+    rolling_median,
     rolling_min,
     rsi,
+    sma,
+    stdev,
     true_range,
 )
 
@@ -164,6 +167,64 @@ class PineIndicatorTests(unittest.TestCase):
                         self.assertEqual(got[k - 1], want[k - 1], name)
                 else:
                     self.assertEqual(value[k - 1], full[name][k - 1], name)
+
+
+class WindowStatisticTests(unittest.TestCase):
+    def test_sma_none_until_full_then_mean(self) -> None:
+        self.assertEqual(sma([1, 2, 3, 4], 2), [None, 1.5, 2.5, 3.5])
+
+    def test_window_holding_none_is_none(self) -> None:
+        self.assertEqual(sma([None, 2, 3], 2), [None, None, 2.5])
+
+    def test_stdev_is_population(self) -> None:
+        self.assertEqual(stdev([2, 4, 4, 4, 5, 5, 7, 9], 8)[-1], 2.0)
+
+    def test_stdev_of_a_flat_window_is_exactly_zero(self) -> None:
+        self.assertEqual(stdev([0.1, 0.1, 0.1, 0.1], 3), [None, None, 0.0, 0.0])
+
+    def test_rolling_median_odd_and_even(self) -> None:
+        self.assertEqual(rolling_median([5, 1, 3, 2], 3), [None, None, 3, 2])
+        self.assertEqual(rolling_median([1, 2, 3, 4], 4)[-1], 2.5)
+
+    def test_every_statistic_is_none_while_its_window_holds_a_none(self) -> None:
+        # The leading Nones stand for an indicator still warming up (ATR, say); the
+        # later gap blanks exactly the windows that contain it and no others.
+        values = [None, None, 4.0, 1.0, 3.0, None, 2.0, 5.0, 6.0]
+        complete = [False, False, False, False, True, False, False, False, True]
+        for fn in (sma, stdev, rolling_median):
+            with self.subTest(fn.__name__):
+                out = fn(values, 3)
+                self.assertEqual([v is not None for v in out], complete)
+                self.assertEqual(out[4], fn([4.0, 1.0, 3.0], 3)[-1])
+                self.assertEqual(out[8], fn([2.0, 5.0, 6.0], 3)[-1])
+
+    def test_short_and_empty_inputs_are_all_none(self) -> None:
+        for fn in (sma, stdev, rolling_median):
+            with self.subTest(fn.__name__):
+                self.assertEqual(fn([], 3), [])
+                self.assertEqual(fn([1.0, 2.0], 3), [None, None])
+
+    def test_period_below_one_is_rejected(self) -> None:
+        for fn in (sma, stdev, rolling_median):
+            with self.subTest(fn.__name__):
+                with self.assertRaises(ValueError):
+                    fn([1.0, 2.0, 3.0], 0)
+
+    def test_prefix_stability(self) -> None:
+        _, _, closes = _random_bars(300, 5)
+        # A gap every 25th value, so roughly a third of the windows hold a None.
+        values = [None if i % 25 == 10 else c for i, c in enumerate(closes)]
+        windowed = {
+            "sma": lambda v: sma(v, 7),
+            "stdev": lambda v: stdev(v, 7),
+            "median": lambda v: rolling_median(v, 9),
+        }
+        full = {name: fn(values) for name, fn in windowed.items()}
+        rng = random.Random(6)
+        for _ in range(20):
+            k = rng.randint(30, 300)
+            for name, fn in windowed.items():
+                self.assertEqual(fn(values[:k])[k - 1], full[name][k - 1], name)
 
 
 if __name__ == "__main__":

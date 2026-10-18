@@ -11,12 +11,18 @@ first ``n`` valid values, as TradingView does, and report ``None`` until
 which lets the seed's influence decay. Output at index ``i`` is valid once
 ``i >= min_bars - 1``.
 
+Window statistics (``sma``, ``stdev``, ``rolling_median``) are ``None`` until ``n``
+values exist and for as long as the last ``n`` values include a ``None``, for
+instance an indicator that is still warming up. ``stdev`` is the population
+deviation, as in TradingView's ``ta.stdev``.
+
 Not wired into the live bot.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from statistics import fmean, median, pstdev
+from typing import Callable, Optional, Sequence
 
 DEFAULT_WARMUP_PERIODS = 8
 RSI_NEUTRAL = 50.0
@@ -185,7 +191,7 @@ def dmi(
     return _mask(plus_di, warmup), _mask(minus_di, warmup), _mask(adx, warmup)
 
 
-def _rolling(values: Sequence[float], n: int, pick) -> Series:
+def _rolling(values: Sequence[Optional[float]], n: int, pick) -> Series:
     _require_period(n)
     return [
         pick(values[i - n + 1 : i + 1]) if i >= n - 1 else None
@@ -201,6 +207,28 @@ def rolling_max(values: Sequence[float], n: int) -> Series:
 def rolling_min(values: Sequence[float], n: int) -> Series:
     """Minimum over the last ``n`` values including the current one."""
     return _rolling(values, n, min)
+
+
+def _rolling_complete(
+    values: Sequence[Optional[float]], n: int, pick: Callable[[Sequence[float]], float]
+) -> Series:
+    """``_rolling`` that also gives ``None`` while the window holds a ``None``."""
+    return _rolling(values, n, lambda window: None if None in window else pick(window))
+
+
+def sma(values: Sequence[Optional[float]], n: int) -> Series:
+    """Simple moving average of the last ``n`` values including the current one."""
+    return _rolling_complete(values, n, fmean)
+
+
+def stdev(values: Sequence[Optional[float]], n: int) -> Series:
+    """Population standard deviation over the last ``n`` values, like ``ta.stdev``."""
+    return _rolling_complete(values, n, pstdev)
+
+
+def rolling_median(values: Sequence[Optional[float]], n: int) -> Series:
+    """Median of the last ``n`` values; the mean of the middle two when ``n`` is even."""
+    return _rolling_complete(values, n, median)
 
 
 def percent_rank(values: Sequence[float], n: int) -> Series:
