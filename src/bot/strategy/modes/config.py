@@ -12,7 +12,9 @@ What is accepted:
 * A whole number is accepted, and returned as a float, where a float is expected. A ``bool`` is
   never a number, and a float is never a whole number.
 * A number is written in plain decimals (``15``, ``-150``, ``0.035``) and a flag as ``true`` or
-  ``false``. What YAML 1.1 would read as another number or as a flag stays text and is refused as
+  ``false``, in YAML 1.2's three spellings of each (``true``, ``True``, ``TRUE``; ``false``,
+  ``False``, ``FALSE``). What YAML 1.1 would read as another number or as a flag stays text and is
+  refused as
   the wrong type: a leading zero (``015`` is octal 13), ``0x`` and ``0b`` literals, base 60
   (``1:30`` is 90), underscores (``25_000``), and ``yes``, ``no``, ``on`` and ``off``. An explicit
   ``!!int``, ``!!float`` or ``!!bool`` tag needs a plain value as well.
@@ -532,7 +534,8 @@ _PLAIN = {
 
 class _PlainScalarLoader(yaml.SafeLoader):
     """``yaml.SafeLoader`` that reads a number only in plain decimals (``15``, ``-150``,
-    ``0.035``) and a flag only as ``true`` or ``false``.
+    ``0.035``) and a flag only as ``true`` or ``false`` (YAML 1.2's core spellings, ``True``,
+    ``TRUE``, ``False`` and ``FALSE`` included).
 
     Its YAML 1.1 rules also read ``015`` as octal 13, ``0x15``, ``0b1111``, ``1:30`` (base 60, so
     90), ``25_000``, and ``yes``, ``no``, ``on`` and ``off`` as flags. Here those stay text, so

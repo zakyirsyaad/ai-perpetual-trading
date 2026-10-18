@@ -374,31 +374,43 @@ class FileWriteTests(unittest.TestCase):
                 self.assertEqual(file_writes(parse(source)), [])
 
 
-# ``modulefinder`` opens a package on its way to an excluded module (``bot.storage`` before the
-# Supabase store). Python never runs that import, so the fingerprint leaves the package out.
-OPENED_ON_THE_WAY = frozenset({"bot/storage/__init__.py"})
+# Imported inside functions the package never calls, only to read the live settings and
+# Supabase (``research.pine_gate.cli_common.make_settings``, ``research.pine_gate.calibrate``).
+# Written here and in the lock, so a module added to the lock's list by mistake cannot drop out
+# of the fingerprint and of this check at once.
+IO_ONLY = frozenset({"bot.config", "bot.storage.supabase_trade_store"})
+
+# The packages around an excluded module: ``modulefinder`` opens them on its way to it, Python
+# never runs that import, and either side may or may not hold them.
+AROUND_IO_ONLY = frozenset(
+    "/".join(name.split(".")[:k]) + "/__init__.py"
+    for name in IO_ONLY for k in range(1, name.count(".") + 1)
+)
 
 
 def found_by_modulefinder(paths: List[Path]) -> Set[str]:
     """The project files the standard library's ``modulefinder`` reaches from the modules at
     ``paths``: a second walk, apart from the lock's, over the compiled code of every import
     statement, those inside functions and ``TYPE_CHECKING`` blocks included."""
-    finder = modulefinder.ModuleFinder(path=[str(SRC)], excludes=sorted(lock.IO_ONLY_IMPORTS))
+    finder = modulefinder.ModuleFinder(path=[str(SRC)], excludes=sorted(IO_ONLY))
     for path in paths:
         finder.import_hook(module_name(path))
     files = {Path(module.__file__).resolve() for module in finder.modules.values()
              if module.__file__}
-    return {relative(path) for path in files if path.is_relative_to(SRC)} - OPENED_ON_THE_WAY
+    return {relative(path) for path in files if path.is_relative_to(SRC)}
 
 
 class CodeFingerprintTests(unittest.TestCase):
     def imported_from_outside(self) -> Set[str]:
         """The files of the modules the package imports that are not its own."""
         own = {relative(path) for path in modules()}
-        return found_by_modulefinder(modules()) - own
+        return found_by_modulefinder(modules()) - own - AROUND_IO_ONLY
 
     def covered(self) -> Set[str]:
         return {rel for rel, _sha in lock.code_files()}
+
+    def test_the_lock_leaves_out_only_the_io_only_imports_named_here(self):
+        self.assertEqual(lock.IO_ONLY_IMPORTS, IO_ONLY)
 
     def test_fingerprint_covers_every_bot_and_pine_gate_module_the_package_imports(self):
         imported = self.imported_from_outside()
@@ -419,10 +431,12 @@ class CodeFingerprintTests(unittest.TestCase):
 
     def test_the_fingerprint_is_what_an_independent_walk_reaches(self):
         starts = [*modules(), *sorted(RULE_CORE_DIR.glob("*.py"))]
-        reached = found_by_modulefinder(starts)
+        reached = found_by_modulefinder(starts) - AROUND_IO_ONLY
+        covered = self.covered() - AROUND_IO_ONLY
 
-        self.assertEqual(sorted(self.covered() - reached), [])
-        self.assertEqual(sorted(reached - self.covered()), [])
+        self.assertIn("bot/storage/__init__.py", AROUND_IO_ONLY)
+        self.assertEqual(sorted(covered - reached), [])
+        self.assertEqual(sorted(reached - covered), [])
 
     def test_python_loads_no_project_module_the_fingerprint_misses(self):
         env = {**os.environ, "PYTHONPATH": str(SRC)}

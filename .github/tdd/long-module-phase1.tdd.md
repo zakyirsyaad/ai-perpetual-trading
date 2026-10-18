@@ -1899,9 +1899,43 @@ git diff --check
 - **Lint.** `ruff check --select F,E,W,B --line-length 100` on the changed files gives the same findings as at `2ee5389`, none new.
 - **The fingerprint** still covers 62 files.
 
+## Second high-level review fix wave (2026-10-18)
+
+After `982efd7` the user asked for one more `/code-review` at high effort, to be posted on the PR, with every finding fixed before the merge. It reported 5 findings, all low severity, and the review was posted as a PR comment. No finding touches a result, the lock rules or the pending `train`/`test`.
+
+1. **Pine's fingerprint skips files no import can name** (`pine_gate/lock.py`).
+   - **RED:** `test_the_fingerprint_skips_files_no_import_can_name` reported `['research/pine_gate/features.v2.py', 'research/pine_gate/lock copy.py'] != []`.
+   - **GREEN:** a path must have an identifier stem and no dot folder below `research/pine_gate`. This is the mode lock's rule plus the dot-folder filter. The copy with the four strays has the same `code_sha256` as the real tree.
+2. **The lock docstring states the identifier rule** (`lock.py`), not the old dotfile one.
+3. **The flag docs name YAML 1.2's spellings** (`config.py` twice, `CLAUDE.md`): `True`/`TRUE` and `False`/`FALSE` pass, `yes`/`no`/`on`/`off` do not. `test_a_flag_is_true_or_false_and_no_other_yaml_1_1_word` already pins both sides.
+4. **The fingerprint oracle owns its exclusions** (`tests/test_mode_backtest_structure.py`).
+   - **Change:** `IO_ONLY` is written in the test, and `test_the_lock_leaves_out_only_the_io_only_imports_named_here` requires the lock's to equal it. `AROUND_IO_ONLY`, the packages around those modules, is derived from it, not written by hand, and is ignored on both sides.
+   - **Mutation check (scratch):** `research.pine_gate.fetch` was added to `lock.IO_ONLY_IMPORTS`, which brought the fingerprint to 61 files. Four tests fail: the new one, both oracle tests and the subprocess check. Before this change the oracle took the lock's exclusions and would have shrunk with them.
+5. **One block for the tracker's order and spacing checks** (`pullback.py`). The gap is computed once with three branches, and the messages are unchanged. This is a refactor, so the tracker's tests are the evidence.
+
+### Verification (second high-level review fix wave)
+
+Run on 2026-10-18 on the working tree of this commit. Python 3.10.20 (`.venv`), `PYTHONPATH=src`.
+
+```text
+PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<scratch>/coveragerc -m unittest discover -s tests
+Ran 2291 tests in 343.096s
+
+OK
+
+PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<scratch>/coveragerc
+TOTAL                                         15005   1387    91%
+(exit 0; the gate is 80 %)
+```
+
+- **Full suite.** 2,291 tests: the 2,290 of the previous wave plus `test_the_lock_leaves_out_only_the_io_only_imports_named_here`. The Pine dot-folder test was renamed and extended.
+- **Coverage.** New code: 1,917 statements, 1 missed (`__main__.py`, run only by the subprocess test).
+- **Python 3.11.15** (scratch environment): `test_pine_gate_structure`, `test_mode_backtest_structure`, `test_modes_pullback`, `test_modes_config` and `test_pine_gate_cli` ran 229 tests, OK.
+- **Other checks.** `compileall` and `git diff --check` are clean. `ruff check --select F,E,W,B --line-length 100` gives the same findings as at `982efd7`.
+
 ## Commit trail
 
-`git log --oneline --reverse 772cd16..HEAD`: 32 commits, and this one (Task 15's `72e12e9`, the final review fix wave and the two review fix waves are the last seven). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
+`git log --oneline --reverse 772cd16..HEAD`: 33 commits, and this one (Task 15's `72e12e9`, the final review fix wave and the three review fix waves are the last eight). Four of them (`40569bd`, `d3da0c5`, `f1f4086`, `5ad899b`) are main's PR #37, the telemetry cancellation fix that Task 1's note mentions; the branch has them through the merge `3eb7065`.
 
 - `40569bd` — `test: pin telemetry cancellation against swallowed wait_for` (main, PR #37)
 - `d3da0c5` — `fix: telemetry waits never swallow a cancellation` (main, PR #37)
@@ -1935,7 +1969,8 @@ git diff --check
 - `40de062` — `test: pin that no live module imports the rule core` (final review fix wave, item 4)
 - `d50a05a` — `docs: final review fixes for the LONG module phase 1 docs` (final review fix wave, items 5 to 9 and its evidence)
 - `2ee5389` — `fix: apply the PR #39 code-review findings` (code-review fix wave, all 15 findings and its evidence)
-- this commit — `fix: apply the PR #39 high-level review findings` (high-level review fix wave, all 8 findings and this evidence)
+- `982efd7` — `fix: apply the PR #39 high-level review findings` (high-level review fix wave, all 8 findings and its evidence)
+- this commit — `fix: apply the second PR #39 high-level review findings` (second high-level review fix wave, all 5 findings and this evidence)
 
 ## Deployment gate
 

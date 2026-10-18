@@ -31,7 +31,8 @@ list to edit; ``tests/test_mode_backtest_structure.py`` holds it against the mod
 process loads. Two imports are left out (``IO_ONLY_IMPORTS``): they sit inside functions the
 package never calls and only read the live settings and Supabase (``bot.config`` in
 ``research.pine_gate.cli_common`` and ``bot.storage.supabase_trade_store`` in
-``research.pine_gate.calibrate``). A file whose name starts with a dot is no module.
+``research.pine_gate.calibrate``). A file whose stem is no module name (an editor's lock file, a
+macOS AppleDouble file, a ``stages.v2.py`` backup) is no module, so it is left out.
 """
 
 from __future__ import annotations

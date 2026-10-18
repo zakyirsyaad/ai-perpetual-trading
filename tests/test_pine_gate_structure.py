@@ -77,20 +77,27 @@ class CodeFingerprintCoverageTests(unittest.TestCase):
         self.assertEqual([rel for rel in research if rel != "research/__init__.py"
                           and not rel.startswith("research/pine_gate/")], [])
 
-    def test_the_fingerprint_skips_dotfiles_and_dot_folders(self):
-        # A notebook's checkpoints and an editor's lock file are no modules of the package.
+    def test_the_fingerprint_skips_files_no_import_can_name(self):
+        # A notebook's checkpoints, an editor's lock file and a backup copy are no modules of
+        # the package, so they must not move its sha.
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "src"
             shutil.copytree(SRC, src, ignore=shutil.ignore_patterns("__pycache__"))
-            checkpoints = src / "research" / "pine_gate" / ".ipynb_checkpoints"
+            package = src / "research" / "pine_gate"
+            checkpoints = package / ".ipynb_checkpoints"
             checkpoints.mkdir()
             (checkpoints / "features-checkpoint.py").write_text("x = 1\n", encoding="utf-8")
-            (src / "research" / "pine_gate" / "._lock.py").write_bytes(b"\x00\x05\x16\x07")
+            (package / "._lock.py").write_bytes(b"\x00\x05\x16\x07")
+            (package / "lock copy.py").write_text("x = 1\n", encoding="utf-8")
+            (package / "features.v2.py").write_text("x = 1\n", encoding="utf-8")
             with mock.patch.object(lock, "_SRC_ROOT", src):
                 names = [rel for rel, _sha in lock.code_files()]
+                sha = lock.code_sha256()
 
         self.assertIn("research/pine_gate/lock.py", names)
         self.assertEqual([n for n in names if any(p.startswith(".") for p in n.split("/"))], [])
+        self.assertEqual([n for n in names if not Path(n).stem.isidentifier()], [])
+        self.assertEqual(sha, lock.code_sha256())  # the same bytes as the real tree
 
 
 class ExclusiveWriterTests(unittest.TestCase):

@@ -236,12 +236,13 @@ def latencies_sha256(latencies_ms: Sequence[float]) -> str:
 def code_files() -> List[Tuple[str, str]]:
     """(path relative to ``src``, sha256) of every Pine gate .py, ``research/__init__.py`` and the
     bot modules it imports. Other research packages are left out, so an edit to one of them
-    leaves this fingerprint alone, and so is every file or folder whose name starts with a dot
-    (an editor's lock file, a notebook's ``.ipynb_checkpoints``)."""
+    leaves this fingerprint alone, and so is every file no import can name: one whose stem is no
+    module name (an editor's lock file, a ``lock copy.py`` backup) or that sits in a folder whose
+    name starts with a dot (a notebook's ``.ipynb_checkpoints``)."""
     folder = _SRC_ROOT / "research" / "pine_gate"
     paths = [_SRC_ROOT / "research" / "__init__.py"]
-    paths += [p for p in sorted(folder.rglob("*.py"))
-              if not any(part.startswith(".") for part in p.relative_to(folder).parts)]
+    paths += [p for p in sorted(folder.rglob("*.py")) if p.stem.isidentifier()
+              and not any(part.startswith(".") for part in p.relative_to(folder).parts)]
     paths += [_SRC_ROOT / rel for rel in _CODE_EXTRA]
     files = [(p.relative_to(_SRC_ROOT).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
              for p in paths]

@@ -106,19 +106,21 @@ class PullbackTracker:
         """Take the next closed candle with the indicator values at its close.
 
         Returns the signal when the candle confirms an open touch within the cap, else None."""
-        if self._last_close_ms is not None and candle.close_ms <= self._last_close_ms:
-            raise ValueError(
-                f"candles must come in increasing close_ms, got {candle.close_ms} "
-                f"after {self._last_close_ms}"
-            )
-        gap = None if self._last_close_ms is None else candle.close_ms - self._last_close_ms
-        if gap is not None and gap != self._interval_ms:
-            what = ("a candle is missing" if gap % self._interval_ms == 0
-                    else "the candle is off the interval grid")
-            raise ValueError(
-                f"{what}: close_ms {candle.close_ms} is {gap} ms after {self._last_close_ms}, "
-                f"the interval is {self._interval_ms} ms, and the window counts candles"
-            )
+        if self._last_close_ms is not None:
+            gap = candle.close_ms - self._last_close_ms
+            if gap <= 0:
+                raise ValueError(
+                    f"candles must come in increasing close_ms, got {candle.close_ms} "
+                    f"after {self._last_close_ms}"
+                )
+            if gap != self._interval_ms:
+                what = ("a candle is missing" if gap % self._interval_ms == 0
+                        else "the candle is off the interval grid")
+                raise ValueError(
+                    f"{what}: close_ms {candle.close_ms} is {gap} ms after "
+                    f"{self._last_close_ms}, the interval is {self._interval_ms} ms, and the "
+                    "window counts candles"
+                )
         index = self._candles_seen
         self._candles_seen = index + 1
         self._last_close_ms = candle.close_ms
