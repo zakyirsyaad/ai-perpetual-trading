@@ -313,3 +313,40 @@ TOTAL                                      15479 1390   91%
 `compileall` and `git diff --check` are clean. Seven hand mutants of `stages_live.py` each fail the new tests: reading the test days before the claims,
 dropping the `extra` binding, dropping the refusals before the marker, measuring S on NAIK days, not
 claiming the start record, a status line for S, and ignoring the first-stretch start of the day count.
+
+## Task 8: CLI for mode L
+
+`train` and `test` take `--mode L` with a required `--live-config` and call
+`stages_live.train_live_stage` / `test_live_stage`; `--mode A` keeps `stages.train_stage` /
+`test_stage` unchanged. `--live-config` with `--mode A` and `--mode L` without it are usage errors
+(exit 2, one `error:` line); any other mode, or mode L on another pair, exits 1.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_cli
+error: unrecognized arguments: --live-config ...   (argparse, exit 2)
+Ran 30 tests in 0.313s
+FAILED (failures=18)
+  test_train_mode_l_dispatches_to_the_live_stage (x2), test_mode_l_without_live_config_is_a_usage_error (x2),
+  test_live_config_with_mode_a_is_a_usage_error (x2), test_other_modes_exit_1 (x8),
+  test_mode_l_on_another_pair_exits_1_and_writes_nothing (x2), test_a_lock_refusal_of_mode_l_exits_2,
+  test_test_after_the_live_config_was_edited_exits_2_and_leaves_no_record
+```
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_mode_backtest_cli
+Ran 30 tests in 0.504s
+OK
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
+Ran 2443 tests in 58.187s
+OK
+```
+
+The Task 7 carry-over is shown by `LiveLockEndToEndTests`: the real stages on the synthetic week in
+a temporary folder (never `~/replay/mode_backtest`), `train --mode L` exits 0, a comment appended to
+the live config, then `test --mode L` exits 2 with a `live_config_sha256` line on stdout, one
+`error:` line, and no test result, start record or `holdout_runs` marker. `compileall`,
+`git diff --check` and the secret-hygiene test are clean. The Phase 1 tests are unchanged and pass.

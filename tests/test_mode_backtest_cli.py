@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,13 +17,16 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from research.mode_backtest import cli, stages, step0
+from research.mode_backtest import cli, stages, stages_live, step0
 from research.mode_backtest.lock import LockError
 from research.mode_backtest.step0 import PINE_FILES, ReproductionError
 from tests.mode_backtest_helpers import sha256sum_text, write_days, write_warmups
+from tests.mode_backtest_stages import CLOCK as STAGE_CLOCK
+from tests.mode_backtest_stages import write_naik_market, write_stage_config
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "config" / "modes.yaml"
+LIVE_CONFIG = REPO / "config" / "modes_live_exit.yaml"
 SYMBOL = "BTC-USDT"
 CLOCK = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
 
@@ -306,6 +310,148 @@ class StageCommandTests(CliTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertEqual(self.assert_one_error_line(err), "error: the warm-up is too short")
+
+
+class LiveStageCommandTests(CliTestCase):
+    """``--mode L`` runs the live-exit stages of ``stages_live``; mode A keeps its Phase 1 path."""
+
+    def live_args(self, command, mode="L", pair=SYMBOL, live_config=LIVE_CONFIG, config=CONFIG,
+                  data=None, out=None):
+        args = [command, "--mode", mode, "--pair", pair, "--config", str(config),
+                "--data-dir", str(data or self.data), "--out-dir", str(out or self.out)]
+        if live_config is not None:
+            args += ["--live-config", str(live_config)]
+        return args
+
+    def written_result(self, stage, marker=None):
+        self.out.mkdir(exist_ok=True)
+        path = self.out / f"mode_L_BTC-USDT_{stage}_20261017.json"
+        doc = {"files": [f"mode_L_BTC-USDT_{stage}_20261017_L_i_NAIK.csv", path.name],
+               "status_line": f"Status L {stage}: LOLOS"}
+        if marker is not None:
+            doc["marker"] = marker
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path, doc
+
+    def test_train_mode_l_dispatches_to_the_live_stage(self):
+        marker = str(self.data / "holdout_runs" / ("mode_L_BTC-USDT_" + "b" * 64 + ".json"))
+        for command, name, marker_line in (("train", "train_live_stage", None),
+                                           ("test", "test_live_stage", marker)):
+            with self.subTest(command=command):
+                path, doc = self.written_result(command, marker_line)
+                with mock.patch.object(stages_live, name, return_value=path) as live, \
+                        mock.patch.object(stages, "train_stage") as phase1_train, \
+                        mock.patch.object(stages, "test_stage") as phase1_test, \
+                        mock.patch.object(cli, "now", return_value=CLOCK):
+                    code, out, err = run_cli(self.live_args(command))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err, "")
+                live.assert_called_once_with(CONFIG, LIVE_CONFIG, self.data, self.out, SYMBOL,
+                                             CLOCK)
+                phase1_train.assert_not_called()
+                phase1_test.assert_not_called()
+                expected = [str(self.out / name) for name in doc["files"]]
+                expected += [marker_line] if marker_line else []
+                self.assertEqual(out.splitlines(), expected + [doc["status_line"]])
+
+    def test_mode_l_without_live_config_is_a_usage_error(self):
+        for command in ("train", "test"):
+            with self.subTest(command=command), \
+                    mock.patch.object(stages_live, "train_live_stage") as train, \
+                    mock.patch.object(stages_live, "test_live_stage") as test:
+                code, out, err = run_cli(self.live_args(command, live_config=None))
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("--live-config", self.assert_one_error_line(err))
+                train.assert_not_called()
+                test.assert_not_called()
+                self.assertFalse(self.out.exists())
+
+    def test_live_config_with_mode_a_is_a_usage_error(self):
+        for command in ("train", "test"):
+            with self.subTest(command=command), \
+                    mock.patch.object(stages, "train_stage") as train, \
+                    mock.patch.object(stages, "test_stage") as test:
+                code, out, err = run_cli(self.live_args(command, mode="A"))
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("--live-config", self.assert_one_error_line(err))
+                train.assert_not_called()
+                test.assert_not_called()
+
+    def test_mode_a_unchanged(self):
+        for command, name in (("train", "train_stage"), ("test", "test_stage")):
+            with self.subTest(command=command):
+                self.out.mkdir(exist_ok=True)
+                path = self.out / f"mode_A_BTC-USDT_{command}_20261017.json"
+                path.write_text(json.dumps({"files": [path.name], "status_line": "Status A"}),
+                                encoding="utf-8")
+                with mock.patch.object(stages, name, return_value=path) as stage, \
+                        mock.patch.object(stages_live, "train_live_stage") as live_train, \
+                        mock.patch.object(stages_live, "test_live_stage") as live_test, \
+                        mock.patch.object(cli, "now", return_value=CLOCK):
+                    code, out, err = run_cli(self.live_args(command, mode="A", live_config=None))
+                self.assertEqual(code, 0, err)
+                stage.assert_called_once_with(CONFIG, self.data, self.out, "A", SYMBOL, CLOCK)
+                live_train.assert_not_called()
+                live_test.assert_not_called()
+                self.assertEqual(out.splitlines(), [str(path), "Status A"])
+
+    def test_other_modes_exit_1(self):
+        for command in ("train", "test"):
+            for mode in ("B", "C", "D", "l"):
+                for live_config in (None, LIVE_CONFIG):
+                    with self.subTest(command=command, mode=mode, live=live_config is not None):
+                        code, out, err = run_cli(self.live_args(command, mode=mode,
+                                                                live_config=live_config))
+                        self.assertEqual(code, 1)
+                        self.assertEqual(out, "")
+                        self.assert_one_error_line(err)
+                        self.assertFalse(self.out.exists())
+                        self.assertFalse(self.data.exists())
+
+    def test_mode_l_on_another_pair_exits_1_and_writes_nothing(self):
+        for command in ("train", "test"):
+            with self.subTest(command=command):
+                code, out, err = run_cli(self.live_args(command, pair="ETH-USDT"))
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn("BTC-USDT", self.assert_one_error_line(err))
+                self.assertFalse(self.out.exists())
+                self.assertFalse(self.data.exists())
+
+    def test_a_lock_refusal_of_mode_l_exits_2(self):
+        error = LockError("the lock does not match", ("live_config_sha256: locked 1, now 2",))
+        with mock.patch.object(stages_live, "test_live_stage", side_effect=error):
+            code, out, err = run_cli(self.live_args("test"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out.splitlines(), list(error.problems))
+        self.assert_one_error_line(err)
+
+
+class LiveLockEndToEndTests(CliTestCase):
+    """The real stages on the synthetic week: an edited live config makes ``test`` exit 2."""
+
+    def test_test_after_the_live_config_was_edited_exits_2_and_leaves_no_record(self):
+        config = write_stage_config(self.root / "modes.yaml")
+        live = self.root / "modes_live_exit.yaml"
+        shutil.copyfile(LIVE_CONFIG, live)
+        write_naik_market(self.data)
+        args = ["--mode", "L", "--pair", SYMBOL, "--config", str(config), "--live-config",
+                str(live), "--data-dir", str(self.data), "--out-dir", str(self.out)]
+        with mock.patch.object(cli, "now", return_value=STAGE_CLOCK):
+            code, _out, err = run_cli(["train"] + args)
+            self.assertEqual(code, 0, err)
+            live.write_bytes(live.read_bytes() + b"# edited after train\n")
+            code, out, err = run_cli(["test"] + args)
+
+        self.assertEqual(code, 2)
+        self.assertTrue(any(line.startswith("live_config_sha256") for line in out.splitlines()),
+                        out)
+        self.assert_one_error_line(err)
+        self.assertEqual(list(self.out.glob("*_test_*")), [])
+        self.assertFalse((self.data / "holdout_runs").exists())
 
 
 if __name__ == "__main__":
