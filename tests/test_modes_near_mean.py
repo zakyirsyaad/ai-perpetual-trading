@@ -12,7 +12,7 @@ import unittest
 
 from bot.arena.setup_profile import build_setup_profile
 from bot.strategy import indicators as live
-from bot.strategy.modes.near_mean import near_mean_short, stretch_from_window
+from bot.strategy.modes.near_mean import near_mean, near_mean_short, stretch_from_window
 
 LIVE_WINDOW = 39  # closed 3m bars the live gate reads
 EMA_PERIOD = 21
@@ -77,6 +77,17 @@ class NearMeanShortTests(unittest.TestCase):
         for stretch in (None, math.nan, math.inf, -math.inf):
             with self.subTest(stretch=stretch):
                 self.assertIs(near_mean_short(stretch, MAX_ABS), False)
+
+
+class NearMeanSideNeutralTests(unittest.TestCase):
+    def test_near_mean_is_side_neutral_and_mode_d_name_still_works(self):
+        # Mode L (LONG) and Mode D / comparator S (SHORT) read the same trigger.
+        self.assertIs(near_mean_short, near_mean)
+        for stretch, expected in ((0.0, True), (0.75, True), (-0.75, True), (0.7501, False),
+                                  (-0.7501, False), (None, False), (math.nan, False)):
+            with self.subTest(stretch=stretch):
+                self.assertIs(near_mean(stretch, MAX_ABS), expected)
+                self.assertIs(near_mean_short(stretch, MAX_ABS), expected)
 
 
 class StretchFromWindowTests(unittest.TestCase):

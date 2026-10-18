@@ -39,3 +39,39 @@ and parsed from the same bytes); `tests.test_modes_config` passes unchanged. Ful
 the task report.
 
 Full suite before commit: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` -> `Ran 2306 tests in 196.763s, OK`.
+
+## Task 2: Exit-level formulas and a side-neutral near-mean trigger
+
+Files: `src/bot/strategy/modes/live_exit.py` (`LiveExitLevels`, `stop_pct`, `net_target_price`,
+`live_exit_levels`), `src/bot/strategy/modes/near_mean.py` (`near_mean`; `near_mean_short` is the same
+function under Mode D's name), `tests/test_modes_live_exit.py`, `tests/test_modes_near_mean.py`.
+Numbers only, no bars and no I/O; the expected prices in the tests are worked out by hand from spec section 4.
+
+### RED
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_live_exit tests.test_modes_near_mean
+  File ".../tests/test_modes_near_mean.py", line 15, in <module>
+    from bot.strategy.modes.near_mean import near_mean, near_mean_short, stretch_from_window
+ImportError: cannot import name 'near_mean' from 'bot.strategy.modes.near_mean'
+Ran 2 tests in 0.000s
+FAILED (errors=2)
+```
+
+(`tests.test_modes_live_exit` fails the same way on `bot.strategy.modes.live_exit`, which did not exist.)
+
+### GREEN
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_modes_live_exit tests.test_modes_near_mean
+Ran 28 tests in 0.004s
+OK
+```
+
+Reference values reproduced: stop pct 0.28 / 0.30 / 0.40 for ATR 0.10 / 0.20 / 0.30; TP ratio
+1.0032416208 (LONG) and 0.9967616192 (SHORT) at 25,000; entry 100.003 LONG gives sl 99.722992,
+tp 100.327172, cut 99.902997; entry 99.997 SHORT gives sl 100.276992, tp 99.673172, cut 100.096997.
+The net-reaches-N property is also checked from gross minus both fee legs.
+
+Full suite: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests` -> `Ran 2322 tests, OK`;
+`compileall` and `git diff --check` clean.
