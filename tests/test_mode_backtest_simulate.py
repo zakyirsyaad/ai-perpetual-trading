@@ -12,29 +12,44 @@ and each SHORT case is written out by hand and not derived from the LONG one: a 
 mirrors the bars could repeat the mistake of the code it checks.
 """
 
+import csv
 import dataclasses
+import hashlib
+import io
 import itertools
 import math
 import random
+import tempfile
 import unittest
 from array import array
 from collections import Counter
+from datetime import timedelta
 from fractions import Fraction
+from pathlib import Path
 
+from bot.strategy.modes.config import load_modes_config
 from bot.strategy.modes.position_rules import LONG, SHORT, adverse_fill, bracket_prices
+from bot.strategy.modes.regime import NAIK
+from research.mode_backtest.data import load_pair
+from research.mode_backtest.frames import build_pair_frames
 from research.mode_backtest.simulate import (
     EXIT_SL,
     EXIT_TP,
     EXIT_WAKTU,
+    MODE_A,
     ExitOutcome,
     Money,
+    RunSpec,
     resolve_exit,
     settle,
+    simulate_run,
 )
-from research.pine_gate.bars import bars_from_rows, concat
+from research.mode_backtest.tradelog import trade_log_text
+from research.pine_gate.bars import bars_from_rows, concat, wib_day_start_ms
 from research.pine_gate.outcomes import bracket_outcome
 from research.pine_gate.spec import ExecConfig
 from tests.mode_backtest_helpers import MINUTE_MS, minute_rows
+from tests.mode_backtest_stages import ALL_DAYS, REPO_CONFIG, SYMBOL, write_naik_market
 
 START_MS = 29_833_334 * MINUTE_MS  # a minute boundary in October 2026
 LIMIT_A = 90  # Mode A's time limit, minutes
@@ -1079,6 +1094,51 @@ class ComposeTests(unittest.TestCase):
         expected = exact_money(100.0, 100.2, LONG, NOTIONAL, FEE_PCT, SLIPPAGE_PCT)
         self.assertAlmostEqual(money.pnl_usdt, float(expected[5]), places=9)
         self.assertGreater(money.pnl_usdt, 0.0)  # +0.2 % less the 9 bps of costs
+
+
+
+# The sha256 of the trade log of Mode A (5m, NAIK, the whole week as one segment) on the synthetic
+# week of tests.mode_backtest_stages, with every number rounded to 6 decimals (30 trades). The full
+# log text was identical to the one of the code before mode L's event loop was added (a4dffcc). The
+# synthetic prices come from math.exp and math.sin, whose last digit differs between the macOS and
+# the glibc libm, and the log writes floats with repr, so the unrounded text is not the same on CI.
+# Mode A's walk, money and log must stay as they were.
+MODE_A_SYNTHETIC_LOG_SHA = "33938329605fccdaa9528b901320529b5e81c1ad1d6e6dc704fcd284675bec59"
+
+
+def rounded_log(text: str) -> str:
+    """The trade log with each decimal number rounded to 6 decimals; other cells as they are."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    for row in csv.reader(io.StringIO(text)):
+        writer.writerow([format(float(cell), ".6f") if _is_decimal(cell) else cell for cell in row])
+    return out.getvalue()
+
+
+def _is_decimal(cell: str) -> bool:
+    if "." not in cell and "e" not in cell:
+        return False
+    try:
+        float(cell)
+    except ValueError:
+        return False
+    return True
+
+
+class ModeAGoldenTests(unittest.TestCase):
+    def test_mode_a_trade_log_unchanged_on_the_synthetic_week(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_naik_market(Path(tmp))
+            cfg = load_modes_config(REPO_CONFIG)
+            frames = build_pair_frames(load_pair(tmp, SYMBOL, ALL_DAYS[0], ALL_DAYS[-1]), cfg)
+        start = wib_day_start_ms(ALL_DAYS[0])
+        end = wib_day_start_ms(ALL_DAYS[-1] + timedelta(days=1))
+
+        result = simulate_run(frames, cfg, RunSpec(MODE_A, SYMBOL, "5m", NAIK, start, end))
+
+        self.assertEqual(len(result.trades), 30)
+        text = rounded_log(trade_log_text(result.trades))
+        self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(), MODE_A_SYNTHETIC_LOG_SHA)
 
 
 if __name__ == "__main__":

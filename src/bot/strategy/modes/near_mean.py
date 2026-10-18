@@ -6,7 +6,8 @@ close from the EMA of the window, in ATRs, taken from ``bot.strategy.indicators`
 to four decimals. The side passed to the profile is ``LONG`` because the stretch is signed by
 price, not by side: positive above the mean, negative below it.
 
-``near_mean_short`` is the trigger on that number. The band is inclusive, as the live gate blocks
+``near_mean`` is the trigger on that number, the same for either side: Mode D reads it for SHORT
+(under the name ``near_mean_short``, kept) and mode L for LONG. The band is inclusive, as the live gate blocks
 only when ``abs(stretch) > max``. A stretch that could not be measured is ``None`` (a flat window
 has an ATR of 0, a window of fewer than ``atr_period + 1`` bars has none) and is no signal: the
 live gate lets such an entry through, the trigger of a backtest needs a measured value.
@@ -22,7 +23,7 @@ from typing import Optional, Sequence
 from bot.arena.setup_profile import build_setup_profile
 from bot.strategy.indicators import atr, ema
 
-__all__ = ["near_mean_short", "stretch_from_window"]
+__all__ = ["near_mean", "near_mean_short", "stretch_from_window"]
 
 _STRETCH_SIDE = "LONG"  # the stretch is signed by price, not by side
 
@@ -59,8 +60,11 @@ def stretch_from_window(
     return build_setup_profile(features, _STRETCH_SIDE)["stretch_atr"]
 
 
-def near_mean_short(stretch_atr: Optional[float], max_abs: float) -> bool:
-    """Whether the price sits within ``max_abs`` ATRs of its mean: Mode D's SHORT trigger.
+def near_mean(stretch_atr: Optional[float], max_abs: float) -> bool:
+    """Whether the price sits within ``max_abs`` ATRs of its mean, whatever the side.
 
     Inclusive on both sides of the mean. ``None``, NaN and infinity are not near it."""
     return stretch_atr is not None and abs(stretch_atr) <= max_abs
+
+
+near_mean_short = near_mean  # Mode D's name for the same trigger; the Phase 1 harness imports it

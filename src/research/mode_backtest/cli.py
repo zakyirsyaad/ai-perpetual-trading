@@ -16,9 +16,20 @@ codes, as ``research.pine_gate.cli`` does:
   refuse (exit 2): the marker for its data folder, the start record for its out folder whatever
   data folder a rerun names. So run both stages with one pair of folders. Phase 1 runs Mode A on
   BTC-USDT only; anything else is an expected failure.
+* ``--mode L`` (the near-mean LONG with the live bot's exits, BTC-USDT only) runs
+  ``stages_live.train_live_stage`` and ``test_live_stage`` instead, and needs ``--live-config``
+  (``config/modes_live_exit.yaml``); the lock binds that file's sha256. After ``train``, an edit
+  that still loads is refused by the lock (``test`` exits 2) and an edit that fails validation
+  exits 1; neither claims the one shot. ``--live-config`` with ``--mode A`` or ``--mode L``
+  without it is a usage error (exit 2); any other mode exits 1.
+* ``rescore --trade-log PATH ... --config --live-config --out-dir`` runs ``rescore.rescore_stage``:
+  Mode A's Phase 1 trade logs repriced with the costs of ``config/modes_live_exit.yaml``, as a
+  cost sensitivity and never a pass or fail. It reads only the logs given, no bar file, and prints
+  the JSON and the Indonesian report it wrote.
 
 Exit codes: 0 success, 1 an expected failure (one ``error:`` line on stderr and no traceback,
-unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error or a lock refusal (``lock.LockError``: a
+unless ``MODE_BACKTEST_DEBUG=1``), 2 a usage error (argparse's, or a ``--live-config`` that does
+not fit the mode) or a lock refusal (``lock.LockError``: a
 missing or changed lock, or a test that already ran; every mismatch is printed on stdout before
 the error line). Output files are never overwritten.
 """
@@ -36,11 +47,12 @@ from typing import Any, Callable, Optional, Sequence
 
 from research.pine_gate.cli_common import CliError, one_line
 
-from . import stages, step0
+from . import rescore, stages, stages_live, step0
 from .data import verify_copy
 from .lock import LockError
 
 DEBUG_ENV = "MODE_BACKTEST_DEBUG"
+LIVE_MODE = "L"
 _EXPECTED_ERRORS = (CliError, step0.ReproductionError, OSError, ValueError)
 
 
@@ -87,25 +99,60 @@ def _print_outputs(result: Path) -> None:
     print(doc["status_line"])
 
 
+class UsageError(Exception):
+    """The options do not fit together; ``main`` prints one error line and exits 2."""
+
+
+def _check_live_config(args: argparse.Namespace) -> bool:
+    """True when the run is mode L. ``--live-config`` goes with mode L and with nothing else."""
+    is_live = args.mode == LIVE_MODE
+    if is_live and args.live_config is None:
+        raise UsageError(f"--mode {LIVE_MODE} needs --live-config")
+    if not is_live and args.live_config is not None and args.mode == stages.PHASE1_MODE:
+        raise UsageError(f"--live-config is for --mode {LIVE_MODE} only, not --mode {args.mode}")
+    return is_live
+
+
 def cmd_train(args: argparse.Namespace) -> int:
-    _print_outputs(stages.train_stage(args.config, args.data_dir, args.out_dir, args.mode,
-                                      args.pair, now()))
+    if _check_live_config(args):
+        result = stages_live.train_live_stage(args.config, args.live_config, args.data_dir,
+                                              args.out_dir, args.pair, now())
+    else:
+        result = stages.train_stage(args.config, args.data_dir, args.out_dir, args.mode,
+                                    args.pair, now())
+    _print_outputs(result)
     return 0
 
 
 def cmd_test(args: argparse.Namespace) -> int:
-    _print_outputs(stages.test_stage(args.config, args.data_dir, args.out_dir, args.mode,
-                                     args.pair, now()))
+    if _check_live_config(args):
+        result = stages_live.test_live_stage(args.config, args.live_config, args.data_dir,
+                                             args.out_dir, args.pair, now())
+    else:
+        result = stages.test_stage(args.config, args.data_dir, args.out_dir, args.mode,
+                                   args.pair, now())
+    _print_outputs(result)
+    return 0
+
+
+def cmd_rescore(args: argparse.Namespace) -> int:
+    json_path = rescore.rescore_stage(args.trade_log, args.config, args.live_config, args.out_dir,
+                                      now())
+    print(json_path)
+    print(json_path.with_suffix(".md"))
     return 0
 
 
 def _add_stage_parser(sub: Any, name: str, handler: Callable[[argparse.Namespace], int],
                       help_text: str) -> None:
-    """``name`` with the five options both stages take; ``sub`` is the subparsers action."""
+    """``name`` with the six options both stages take; ``sub`` is the subparsers action."""
     p = sub.add_parser(name, help=help_text)
-    p.add_argument("--mode", required=True, help="the mode to run (Phase 1: A)")
-    p.add_argument("--pair", required=True, help="the pair to run (Phase 1: BTC-USDT)")
+    p.add_argument("--mode", required=True, help="the mode to run (A, or L with --live-config)")
+    p.add_argument("--pair", required=True, help="the pair to run (BTC-USDT)")
     p.add_argument("--config", required=True, type=_path, help="config/modes.yaml")
+    p.add_argument("--live-config", type=_path, default=None,
+                   help="config/modes_live_exit.yaml; required with --mode L, refused with "
+                        "--mode A")
     p.add_argument("--data-dir", required=True, type=_path,
                    help="the copied production data (the folder holding prod/); the run markers "
                         "go in its holdout_runs/")
@@ -141,6 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
                       "run the training stage and write its results and the lock")
     _add_stage_parser(sub, "test", cmd_test,
                       "run the one-shot test against the lock and write the verdict")
+
+    p = sub.add_parser("rescore", help="reprice Phase 1 trade logs with the live-exit costs "
+                                       "(a cost sensitivity, not a test)")
+    p.add_argument("--trade-log", required=True, action="append", type=_path,
+                   help="a Phase 1 trade log CSV; repeat for several")
+    p.add_argument("--config", required=True, type=_path, help="config/modes.yaml")
+    p.add_argument("--live-config", required=True, type=_path,
+                   help="config/modes_live_exit.yaml (its biaya block gives the new costs)")
+    p.add_argument("--out-dir", required=True, type=_path)
+    p.set_defaults(handler=cmd_rescore)
     return parser
 
 
@@ -159,6 +216,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return exc.code if isinstance(exc.code, int) else 2
     try:
         return args.handler(args)
+    except UsageError as exc:
+        _fail(exc)
+        return 2
     except LockError as exc:
         for problem in exc.problems:
             print(problem)

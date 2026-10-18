@@ -22,6 +22,7 @@ from unittest import mock
 from bot.core.entry_window import parse_weekly_window
 from bot.strategy.modes.config import SelectorConfig, load_modes_config
 from bot.strategy.modes.near_mean import stretch_from_window
+from bot.strategy.indicators import atr as live_atr
 from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN
 from bot.strategy.pine_indicators import atr, ema
 from research.mode_backtest import frames
@@ -637,6 +638,47 @@ class NaikDaysTests(WeekCase):
             with self.subTest(window=window, minimum=minimum):
                 self.assertEqual(self.week_days(window, minimum), expected)
 
+    def test_turun_days_count_like_naik_days(self):
+        week_range = self.WEEK_RANGE
+        kondisi = {
+            at(MON, 7): NAIK, at(MON, 8): NAIK,
+            at(TUE, 9): TURUN, at(TUE, 10): TURUN, at(WED, 9): TURUN,
+            at(THU, 9): SIDEWAYS, at(FRI, 9): TIDAK_ENTRY,
+            at(MON, 6): TURUN,  # before the window opens: never counts
+            at(SAT, 12): TURUN,  # outside the window
+        }
+        with self.kondisi_is(lambda t_ms: kondisi.get(t_ms, TIDAK_ENTRY)):
+            day = self.week.frame.condition_days
+            self.assertEqual(day(*week_range, WINDOW, 1, TURUN), {TUE, WED})
+            self.assertEqual(day(*week_range, WINDOW, 2, TURUN), {TUE})
+            self.assertEqual(day(*week_range, WINDOW, 1, NAIK), {MON})
+            self.assertEqual(day(*week_range, WINDOW, 1, SIDEWAYS), {THU})
+            self.assertEqual(day(*week_range, WINDOW, 1, TIDAK_ENTRY).issuperset({FRI}), True)
+            self.assertEqual(day(*week_range, None, 1, TURUN), {MON, TUE, WED, SAT})
+            self.assertEqual(day(*week_range, WINDOW, 1, NAIK), self.week_days())
+            # the same range, window and minimum: NAIK days are the NAIK condition days
+            self.assertEqual(
+                self.week.frame.naik_days(*week_range, WINDOW, 2),
+                day(*week_range, WINDOW, 2, NAIK),
+            )
+
+    def test_condition_days_refuses_what_naik_days_refuses_and_an_unknown_condition(self):
+        day = self.week.frame.condition_days
+        with self.assertRaises(ValueError):
+            day(at(WED, 13), at(WED, 12), None, 1, TURUN)
+        with self.assertRaises(ValueError):
+            day(*self.WEEK_RANGE, None, 0, TURUN)
+        for bad in ("naik", "UP", "", None):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                day(*self.WEEK_RANGE, None, 1, bad)
+
+    def test_naik_days_is_condition_days_of_naik(self):
+        with mock.patch.object(HourlyFrame, "condition_days", autospec=True,
+                               return_value=frozenset({MON})) as spy:
+            result = self.week.frame.naik_days(*self.WEEK_RANGE, WINDOW, 3)
+        self.assertEqual(result, {MON})
+        spy.assert_called_once_with(self.week.frame, *self.WEEK_RANGE, WINDOW, 3, NAIK)
+
     def test_naik_days_of_a_falling_week_is_empty(self):
         down = Fixture(self.addCleanup, MON, 7, 200, WARM_4H, hourly_price(MON, falling))
 
@@ -924,6 +966,54 @@ class StretchSeriesTests(WavyCase):
 
         self.assertEqual(stretch, (None,) * len(bars_3m))
 
+    def atr_pct(self, window=STRETCH_WINDOW, atr_period=STRETCH_ATR):
+        return frames.stretch_and_atr_series(
+            self.pair.bars_1m, window, STRETCH_EMA, atr_period
+        )[2]
+
+    def test_atr_pct_matches_the_live_atr_on_each_window(self):
+        bars_3m, _ = self.stretch()
+        highs, lows, closes = list(bars_3m.high), list(bars_3m.low), list(bars_3m.close)
+
+        series = self.atr_pct()
+
+        self.assertEqual(len(series), len(bars_3m))
+        for i in (38, 39, 100, 500, len(closes) - 1):
+            with self.subTest(bar=i):
+                start = i + 1 - STRETCH_WINDOW
+                expected = (
+                    live_atr(highs[start : i + 1], lows[start : i + 1], closes[start : i + 1],
+                             STRETCH_ATR)
+                    / closes[i] * 100
+                )
+                self.assertEqual(series[i], expected)
+                self.assertGreater(series[i], 0)
+        self.assertEqual(len({series[38], series[500], series[-1]}), 3)  # not a constant
+
+    def test_atr_pct_is_none_where_the_stretch_is_none(self):
+        bars_3m, stretch, atr_pct = frames.stretch_and_atr_series(
+            self.pair.bars_1m, STRETCH_WINDOW, STRETCH_EMA, STRETCH_ATR
+        )
+        self.assertEqual(stretch, self.stretch()[1])
+        self.assertEqual([a is None for a in atr_pct], [s is None for s in stretch])
+        self.assertEqual(atr_pct[: STRETCH_WINDOW - 1], (None,) * (STRETCH_WINDOW - 1))
+
+        flat = minute_bars(MON, 1440, flat_price)  # ATR 0 everywhere: stretch and ATR % are None
+        flat_bars, flat_stretch, flat_atr = frames.stretch_and_atr_series(
+            flat, STRETCH_WINDOW, STRETCH_EMA, STRETCH_ATR
+        )
+        self.assertEqual(flat_stretch, (None,) * len(flat_bars))
+        self.assertEqual(flat_atr, (None,) * len(flat_bars))
+
+    def test_atr_pct_refuses_what_the_stretch_refuses(self):
+        for window, atr_period in ((0, 14), (14, 14), (39, 0)):
+            with self.subTest((window, atr_period)), self.assertRaises(ValueError):
+                self.atr_pct(window, atr_period)
+        with self.assertRaises(ValueError):
+            frames.stretch_and_atr_series(
+                aggregate(self.pair.bars_1m, M3), STRETCH_WINDOW, STRETCH_EMA, STRETCH_ATR
+            )
+
     def test_a_window_the_live_maths_cannot_measure_is_refused(self):
         cases = (
             ("no candles", 0, 21, 14),
@@ -943,6 +1033,18 @@ class StretchSeriesTests(WavyCase):
     def test_only_1m_bars_are_accepted(self):
         with self.assertRaises(ValueError):
             self.stretch(aggregate(self.pair.bars_1m, M3))
+
+
+class AtrPercentOfWindowTests(unittest.TestCase):
+    def test_a_window_whose_atr_is_not_a_number_has_no_atr_percent(self):
+        highs = [101.0] * 15
+        lows = [99.0] * 15
+        closes = [100.0] * 14 + [math.nan]
+        self.assertIsNone(frames._atr_pct_of_window(highs, lows, closes, 14))
+
+    def test_a_normal_window_gives_its_percent(self):
+        highs, lows, closes = [101.0] * 15, [99.0] * 15, [100.0] * 15
+        self.assertAlmostEqual(frames._atr_pct_of_window(highs, lows, closes, 14), 2.0)
 
 
 class PairFramesTests(WavyCase):
@@ -985,6 +1087,30 @@ class PairFramesTests(WavyCase):
         self.assertEqual(built.stretch_bars, stretch_bars)
         self.assertEqual(built.stretch, stretch)
         self.assertEqual(built.stretch_bars.interval_ms, M3)
+
+    def test_the_frames_carry_the_atr_percent_of_each_stretch_candle(self):
+        built = self.built
+        self.assertEqual(len(built.atr_pct_3m), len(built.stretch))
+        self.assertEqual([a is None for a in built.atr_pct_3m], [s is None for s in built.stretch])
+        self.assertEqual(
+            built.atr_pct_3m,
+            frames.stretch_and_atr_series(
+                self.pair.bars_1m, self.cfg.mode_d.candle_jendela, self.cfg.mode_d.ema_periode,
+                self.cfg.mode_d.atr_periode,
+            )[2],
+        )
+        other = frames.build_pair_frames(self.pair, self.other_config())
+        self.assertEqual(
+            other.atr_pct_3m,
+            frames.stretch_and_atr_series(
+                self.pair.bars_1m, 20, 10, 5
+            )[2],
+        )
+        self.assertNotEqual(other.atr_pct_3m, built.atr_pct_3m)
+
+    def test_a_pair_frames_built_without_atr_pct_has_an_empty_column(self):
+        by_name = {f.name: f for f in dataclasses.fields(frames.PairFrames)}
+        self.assertEqual(by_name["atr_pct_3m"].default, ())  # direct constructions keep working
 
     def test_the_frames_record_the_numbers_they_were_built_with(self):
         other = self.other_config()
@@ -1040,7 +1166,9 @@ class PairFramesTests(WavyCase):
         names = [field.name for field in dataclasses.fields(frames.PairFrames)]
 
         self.assertEqual(
-            names, ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch", "params"]
+            names,
+            ["symbol", "bars_1m", "hourly", "triggers", "stretch_bars", "stretch", "params",
+             "atr_pct_3m"],
         )
 
 

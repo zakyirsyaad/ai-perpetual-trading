@@ -1,0 +1,20 @@
+mode:
+  L_cermin_live:
+    aktif: true
+    tf_pemicu: 3m
+    candle_jendela: 39
+    ema_periode: 21
+    atr_periode: 14
+    maks_jarak_ke_ema_kali_atr: 0.75
+    sl_minimal_persen: 0.28
+    sl_kali_atr: 1.5
+    sl_maksimal_persen: 0.40
+    tp_net_usdt: 56
+    fee_perkiraan_persen: 0.05      # the live bot's own estimate, used only for the TP level
+    batas_waktu_menit: 60
+    potong_rugi_persen: 0.10        # version (ii)
+    potong_rugi_setelah_menit: 10   # version (ii)
+biaya:
+  slippage_entry_bps: 0.3
+  slippage_exit_market_bps: 0.5
+  slippage_tp_bps: 0

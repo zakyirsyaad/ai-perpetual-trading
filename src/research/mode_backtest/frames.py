@@ -29,10 +29,11 @@ from types import MappingProxyType
 from typing import FrozenSet, List, Mapping, Optional, Tuple
 
 from bot.core.entry_window import WeeklyWindow
+from bot.strategy.indicators import atr as live_atr
 from bot.strategy.modes.config import ModesConfig, SelectorConfig
 from bot.strategy.modes.near_mean import stretch_from_window
 from bot.strategy.modes.position_rules import entry_window_open
-from bot.strategy.modes.regime import NAIK, pilih_mode
+from bot.strategy.modes.regime import NAIK, SIDEWAYS, TIDAK_ENTRY, TURUN, pilih_mode
 from bot.strategy.pine_indicators import atr, ema, rolling_median, sma
 from research.pine_gate.bars import Bars, aggregate, interval_to_ms, last_closed_index, wib_day
 from research.pine_gate.features import INTERVAL_1H, INTERVAL_1M, INTERVAL_3M, INTERVAL_4H, htf_bars
@@ -44,6 +45,7 @@ ATR_MEDIAN_HOURS = 720  # 30 days of closed hours, from the manager's document
 TRIGGER_TIMEFRAMES = ("15m", "5m")  # Mode A's trigger candles; 5m is the pre-registered switch
 
 Column = Tuple[Optional[float], ...]
+CONDITIONS = (NAIK, TURUN, SIDEWAYS, TIDAK_ENTRY)  # what ``pilih_mode`` answers
 
 
 @dataclass(frozen=True)
@@ -149,34 +151,51 @@ class HourlyFrame:
         window: Optional[WeeklyWindow],
         min_naik_hours: int,
     ) -> FrozenSet[date]:
-        """The WIB days with at least ``min_naik_hours`` hours in which Mode A could enter.
+        """The WIB days with at least ``min_naik_hours`` NAIK hours in which Mode A could enter.
+
+        It is ``condition_days(..., NAIK)``: see there for the hours, the range and the minimum.
+        ``min_naik_hours`` is the config's ``uji.hari_naik_minimal_jam_naik`` (1 in
+        ``config/modes.yaml``: one NAIK hour makes a NAIK day). It has no default, so no caller
+        can leave the config value out."""
+        return self.condition_days(start_ms, end_ms, window, min_naik_hours, NAIK)
+
+    def condition_days(
+        self,
+        start_ms: int,
+        end_ms: int,
+        window: Optional[WeeklyWindow],
+        min_hours: int,
+        kondisi: str,
+    ) -> FrozenSet[date]:
+        """The WIB days with at least ``min_hours`` hours of the condition ``kondisi``.
 
         An hour counts when its closed 1h candle's close lies in ``[start_ms, end_ms)`` (the
         start is included, the end is not), ``window`` is open at that close (read as a WIB time;
-        ``None`` means always open) and ``context_at(close).kondisi`` is NAIK. The hours are
-        counted for the WIB day of the close, so the candle ending at 00:00 WIB counts for the new
-        day, and a day is kept when it has at least ``min_naik_hours`` of them. Warm-up candles
+        ``None`` means always open) and ``context_at(close).kondisi`` is ``kondisi``. The hours
+        are counted for the WIB day of the close, so the candle ending at 00:00 WIB counts for the
+        new day, and a day is kept when it has at least ``min_hours`` of them. Warm-up candles
         count when the range reaches them.
 
-        ``min_naik_hours`` is the config's ``uji.hari_naik_minimal_jam_naik`` (1 in
-        ``config/modes.yaml``: one NAIK hour makes a NAIK day). It has no default, so no caller
-        can leave the config value out, and a value below 1 raises ``ValueError``. An empty range
-        gives no days and a reversed one raises ``ValueError``."""
+        ``min_hours`` has no default, and a value below 1 raises ``ValueError``; so does a
+        ``kondisi`` that ``pilih_mode`` never answers. An empty range gives no days and a reversed
+        one raises ``ValueError``."""
         if end_ms < start_ms:
             raise ValueError(f"end_ms {end_ms} is before start_ms {start_ms}")
-        if min_naik_hours < 1:
-            raise ValueError(f"min_naik_hours must be at least 1, got {min_naik_hours}")
+        if min_hours < 1:
+            raise ValueError(f"min_hours must be at least 1, got {min_hours}")
+        if kondisi not in CONDITIONS:
+            raise ValueError(f"kondisi must be one of {', '.join(CONDITIONS)}, got {kondisi!r}")
         opens = self._bars_1h.open_ms
         first = bisect_left(opens, start_ms - INTERVAL_1H)
         last = bisect_left(opens, end_ms - INTERVAL_1H)
-        naik_hours = Counter()
+        hours_of_condition = Counter()
         for i in range(first, last):
             close_ms = opens[i] + INTERVAL_1H
             if not entry_window_open(window, close_ms):
                 continue
-            if self.context_at(close_ms).kondisi == NAIK:
-                naik_hours[wib_day(close_ms)] += 1
-        return frozenset(day for day, hours in naik_hours.items() if hours >= min_naik_hours)
+            if self.context_at(close_ms).kondisi == kondisi:
+                hours_of_condition[wib_day(close_ms)] += 1
+        return frozenset(day for day, hours in hours_of_condition.items() if hours >= min_hours)
 
 
 def _require_1m(bars: Bars) -> None:
@@ -236,33 +255,67 @@ def _require_measurable(window: int, ema_period: int, atr_period: int) -> None:
         )
 
 
-def stretch_series(
+def _atr_pct_of_window(
+    highs: List[float], lows: List[float], closes: List[float], atr_period: int
+) -> Optional[float]:
+    """The live ATR of the window over its last close, in percent; ``None`` when the ATR is 0
+    (or not a number: ``not x > 0`` is also true for NaN)."""
+    window_atr = live_atr(highs, lows, closes, atr_period)
+    if not window_atr > 0 or not closes[-1] > 0:
+        return None
+    return window_atr / closes[-1] * 100
+
+
+def stretch_and_atr_series(
     bars_1m: Bars, window: int, ema_period: int, atr_period: int
-) -> Tuple[Bars, Column]:
-    """The 3m candles of the 1m bars and the stretch of each, as the live gate measures it.
+) -> Tuple[Bars, Column, Column]:
+    """The 3m candles of the 1m bars, the stretch of each and its ATR percent, in one pass.
 
     The stretch of candle ``i`` is ``near_mean.stretch_from_window`` over the ``window`` candles
     ending with candle ``i``, so it uses closes up to and including ``i`` and is known when the
     candle closes. It is ``None`` for the first ``window - 1`` candles and wherever the window has
     no ATR (a flat market). The loop is the one that builds ``stretch_3m`` in
-    ``research.pine_gate.features``, and a test holds the two equal on every candle. A window the
-    live maths cannot measure (see ``_require_measurable``) raises ``ValueError``."""
+    ``research.pine_gate.features``, and a test holds the two equal on every candle.
+
+    The ATR percent of candle ``i`` is the live ATR (``bot.strategy.indicators.atr``, the mean of
+    the last ``atr_period`` true ranges of the same window) divided by that candle's close, times
+    100. It is ``None`` wherever the stretch is, so a signal that has a stretch has an ATR percent.
+    A window the live maths cannot measure (see ``_require_measurable``) raises ``ValueError``."""
     _require_1m(bars_1m)
     _require_measurable(window, ema_period, atr_period)
     bars = aggregate(bars_1m, INTERVAL_3M)
     highs, lows, closes = list(bars.high), list(bars.low), list(bars.close)
-    out: List[Optional[float]] = []
+    stretch: List[Optional[float]] = []
+    atr_pct: List[Optional[float]] = []
     for end in range(1, len(closes) + 1):
         if end < window:
-            out.append(None)
+            stretch.append(None)
+            atr_pct.append(None)
             continue
         start = end - window
-        out.append(
-            stretch_from_window(
-                highs[start:end], lows[start:end], closes[start:end], ema_period, atr_period
+        value = stretch_from_window(
+            highs[start:end], lows[start:end], closes[start:end], ema_period, atr_period
+        )
+        stretch.append(value)
+        atr_pct.append(
+            None
+            if value is None
+            else _atr_pct_of_window(
+                highs[start:end], lows[start:end], closes[start:end], atr_period
             )
         )
-    return bars, tuple(out)
+    return bars, tuple(stretch), tuple(atr_pct)
+
+
+def stretch_series(
+    bars_1m: Bars, window: int, ema_period: int, atr_period: int
+) -> Tuple[Bars, Column]:
+    """The 3m candles of the 1m bars and the stretch of each, as the live gate measures it.
+
+    ``stretch_and_atr_series`` without the ATR percent: see there for the windows, the ``None``
+    values and the refusals."""
+    bars, stretch, _ = stretch_and_atr_series(bars_1m, window, ema_period, atr_period)
+    return bars, stretch
 
 
 @dataclass(frozen=True)
@@ -293,7 +346,10 @@ class PairFrames:
     ``hourly`` answers the market condition at any time. ``triggers`` maps ``"15m"`` and ``"5m"``
     to Mode A's candles with their EMA. ``stretch_bars`` are Mode D's 3m candles and ``stretch``
     holds the stretch of each, index for index. ``triggers`` is read-only. ``params`` are the
-    numbers the series were built with, so ``simulate_run`` refuses a config with others."""
+    numbers the series were built with, so ``simulate_run`` refuses a config with others.
+    ``atr_pct_3m`` is the ATR percent of each stretch candle, index for index and ``None`` where
+    the stretch is; it comes last, with an empty default, so a frame built by hand without it
+    still constructs."""
 
     symbol: str
     bars_1m: Bars
@@ -302,6 +358,7 @@ class PairFrames:
     stretch_bars: Bars
     stretch: Column
     params: FrameParams
+    atr_pct_3m: Column = ()
 
 
 def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
@@ -312,7 +369,7 @@ def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
     switch. The stretch takes Mode D's window and periods (``candle_jendela``, ``ema_periode``,
     ``atr_periode``)."""
     params = FrameParams.of(cfg)
-    stretch_bars, stretch = stretch_series(
+    stretch_bars, stretch, atr_pct_3m = stretch_and_atr_series(
         pair.bars_1m, params.candle_jendela, params.ema_periode, params.atr_periode
     )
     triggers = {
@@ -326,4 +383,5 @@ def build_pair_frames(pair: PairData, cfg: ModesConfig) -> PairFrames:
         stretch_bars,
         stretch,
         params,
+        atr_pct_3m,
     )

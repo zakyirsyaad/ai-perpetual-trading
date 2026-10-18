@@ -10,7 +10,7 @@ comparator trade. A check that must end in an exit code runs through ``cli.main`
 import ast
 import contextlib
 import csv
-import gzip
+import dataclasses
 import hashlib
 import io
 import json
@@ -36,6 +36,7 @@ from research.pine_gate.bars import wib_day_start_ms
 from tests.mode_backtest_helpers import MINUTE_MS, write_days, write_warmups
 from tests.mode_backtest_stages import (
     CLOCK,
+    FileReads,
     STAMP,
     SYMBOL,
     TEST_DAYS,
@@ -76,43 +77,6 @@ def flip_gzip_mtime(path):
     raw = bytearray(path.read_bytes())
     raw[4] ^= 0x01
     path.write_bytes(bytes(raw))
-
-
-class FileReads:
-    """Every path opened through ``gzip.open`` or read through ``Path.read_bytes`` while active.
-
-    ``events`` holds ``(path, probe())`` for each, so a test can ask what was true at that read."""
-
-    def __init__(self, probe=lambda: None):
-        self.probe = probe
-        self.events = []
-        self._patches = []
-
-    def __enter__(self):
-        real_open, real_read = gzip.open, Path.read_bytes
-
-        def opening(filename, *args, **kwargs):
-            self.events.append((Path(filename), self.probe()))
-            return real_open(filename, *args, **kwargs)
-
-        def reading(path):
-            self.events.append((Path(path), self.probe()))
-            return real_read(path)
-
-        self._patches = [
-            mock.patch.object(gzip, "open", opening),
-            mock.patch.object(Path, "read_bytes", reading),
-        ]
-        for patch in self._patches:
-            patch.start()
-        return self
-
-    def __exit__(self, *exc_info):
-        for patch in reversed(self._patches):
-            patch.stop()
-
-    def paths(self):
-        return [path for path, _probe in self.events]
 
 
 def blocked_none():
@@ -251,6 +215,27 @@ class LockFileTests(unittest.TestCase):
         for doc in ([], "lock", None):
             with self.subTest(doc=doc), self.assertRaises(lock.LockError):
                 lock.check_lock(doc, **self.bound())
+
+    def test_check_lock_holds_every_extra_binding_against_the_lock(self):
+        doc = {"config_sha256": "c" * 64, "code_sha256": "d" * 64,
+               "train_manifest_sha256": "e" * 64, "python": "3.10",
+               "live_config_sha256": "a" * 64}
+
+        self.assertIsNone(lock.check_lock(doc, **self.bound(),
+                                          extra={"live_config_sha256": "a" * 64}))
+        with self.assertRaises(lock.LockError) as changed:
+            lock.check_lock(doc, **self.bound(), extra={"live_config_sha256": "b" * 64})
+        with self.assertRaises(lock.LockError) as missing:
+            lock.check_lock(doc, **self.bound(), extra={"other_sha256": "b" * 64})
+        with self.assertRaises(lock.LockError) as both:
+            lock.check_lock({**doc, "python": "3.9"}, **self.bound(),
+                            extra={"live_config_sha256": "b" * 64})
+
+        (line,) = changed.exception.problems
+        self.assertTrue(line.startswith("live_config_sha256: locked " + "a" * 64), line)
+        self.assertIn("b" * 64, line)
+        self.assertEqual(missing.exception.problems, ("other_sha256: missing from the lock",))
+        self.assertEqual(len(both.exception.problems), 2, both.exception.problems)
 
     def test_read_lock_returns_the_document_and_the_sha256_of_its_bytes(self):
         path = self.root / "mode_A_BTC-USDT_lock.json"
@@ -871,6 +856,37 @@ class TestStageTests(StageCase):
         self.assertEqual(self.snapshot(), before)
 
 
+class LockedMetricsShapeTests(unittest.TestCase):
+    """The summary of a lock must hold exactly the fields of ``StageMetrics``."""
+
+    PHASE1_FIELDS = (
+        "posisi", "entry_per_hari_aktif", "menang_pct", "hasil_per_1_juta", "tp", "sl", "waktu",
+        "rata_lama_menit", "hasil_tanpa_teratas", "hari_naik",
+    )
+
+    def test_a_pre_mode_l_summary_with_ten_fields_is_refused(self):
+        # Deliberate: StageMetrics gained ``potong`` and ``entry_per_hari_kalender`` for mode L, so
+        # a summary written by Phase 1 code is no longer readable. It would fail the lock's code
+        # hash first, and Mode A's one-shot test is spent.
+        old = dict(zip(self.PHASE1_FIELDS, (40, 2.0, 50.0, -100.0, 20, 20, 0, 30.0, -200.0, 20)))
+
+        metrics, problem = stages.locked_metrics({"mode_a": old}, "mode_a")
+
+        self.assertIsNone(metrics)
+        self.assertEqual(problem, "summary.mode_a: not the metrics of a training run")
+
+    def test_a_summary_with_every_current_field_is_read(self):
+        m = StageMetrics(
+            posisi=40, entry_per_hari_aktif=2.0, menang_pct=50.0, hasil_per_1_juta=-100.0,
+            tp=20, sl=20, waktu=0, rata_lama_menit=30.0, hasil_tanpa_teratas=-200.0, hari_naik=20,
+        )
+
+        metrics, problem = stages.locked_metrics({"mode_a": dataclasses.asdict(m)}, "mode_a")
+
+        self.assertIsNone(problem)
+        self.assertEqual(metrics, m)
+
+
 class VerdictTests(StageCase):
     def staged(self, by_run, **uji):
         """Train and test on ``config/modes.yaml`` with ``uji`` replaced and ``by_run`` as runs."""
@@ -946,6 +962,8 @@ class VerdictTests(StageCase):
     def test_stage_metrics_has_one_call_site_and_it_passes_the_config_drop_top(self):
         calls = []
         for path in sorted(PACKAGE.glob("*.py")):
+            if path.name == "rescore.py":
+                continue  # a cost sensitivity, no verdict: pinned positively in the next test
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "stage_metrics":
@@ -957,6 +975,28 @@ class VerdictTests(StageCase):
             k.value for k in node.keywords if k.arg == "drop_top")
         self.assertTrue(ast.unparse(drop_top).endswith(".uji.lolos_buang_posisi_teratas"),
                         ast.unparse(drop_top))
+
+    def test_rescore_passes_the_config_drop_top_to_every_stage_metrics_call(self):
+        # rescore.py gives no verdict, so it may call stage_metrics for the trimmed result, but
+        # only with the drop_top rescore_stage reads from cfg.uji.lolos_buang_posisi_teratas.
+        tree = ast.parse((PACKAGE / "rescore.py").read_text(encoding="utf-8"))
+        metrics_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                         and getattr(n.func, "id", None) == "stage_metrics"]
+        self.assertTrue(metrics_calls)
+        for node in metrics_calls:
+            third = node.args[2] if len(node.args) > 2 else next(
+                k.value for k in node.keywords if k.arg == "drop_top")
+            self.assertEqual(ast.unparse(third), "drop_top")
+        stage = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == "rescore_stage")
+        reads = [ast.unparse(n.value) for n in ast.walk(stage) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["drop_top"]]
+        self.assertEqual(reads, ["cfg.uji.lolos_buang_posisi_teratas"])
+        log_calls = [n for n in ast.walk(stage) if isinstance(n, ast.Call)
+                     and getattr(n.func, "id", None) == "_log_doc"]
+        self.assertTrue(log_calls)
+        for node in log_calls:
+            self.assertEqual(ast.unparse(node.args[-1]), "drop_top")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ Research code; the bot never imports it. ``trade_log_text`` writes one row per `
 
 * ``trade_id`` is the 1-based row number inside this CSV, so every log starts again at 1.
 * ``sisi`` is ``LONG`` or ``SHORT`` (from the trade's ``side``), ``kondisi`` is the trade's own
-  condition and ``alasan_exit`` is ``TP``, ``SL`` or ``WAKTU``. ``sma20_1h``, ``sma50_1h``,
+  condition and ``alasan_exit`` is ``TP``, ``SL``, ``WAKTU`` or (mode L version ii) ``POTONG``.
+  ``sma20_1h``, ``sma50_1h``,
   ``ema50_4h`` and ``atr14_1h`` come from the hourly context the signal was read from.
 * ``harga_entry`` and ``harga_exit`` are the fills, slippage included; ``harga_tp`` and
   ``harga_sl`` are the levels set from the entry fill.
@@ -32,7 +33,7 @@ from research.pine_gate.spec import WIB
 
 from .simulate import Trade
 
-__all__ = ["COLUMNS", "trade_log_text", "wib_iso", "write_trade_log"]
+__all__ = ["COLUMNS", "LIVE_COLUMNS", "trade_log_text", "wib_iso", "write_trade_log"]
 
 # The columns of spec section 2.9, in the document's order.
 COLUMNS: Tuple[str, ...] = (
@@ -60,6 +61,9 @@ COLUMNS: Tuple[str, ...] = (
     "notional_usdt",
     "volume_usdt",
 )
+
+# Mode L and comparator S add the exit version, the stop distance and the cut price.
+LIVE_COLUMNS: Tuple[str, ...] = COLUMNS + ("versi", "sl_persen", "harga_potong")
 
 _SIDES = {LONG: "LONG", SHORT: "SHORT"}
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -115,26 +119,35 @@ def _cells(trade_id: int, t: Trade) -> Dict[str, str]:
         "pnl_usdt": _number(t.pnl_usdt),
         "notional_usdt": _number(t.notional_usdt),
         "volume_usdt": _number(t.volume_usdt),
+        "versi": t.versi,
+        "sl_persen": _number(t.sl_pct),
+        "harga_potong": _number(t.potong),
     }
 
 
-def trade_log_text(trades: Iterable[Trade]) -> str:
+def trade_log_text(trades: Iterable[Trade], live: bool = False) -> str:
     """The CSV of ``trades``: the header, then one row per trade in the order given.
+
+    ``live=False`` writes the 23 columns of Mode A; ``live=True`` writes ``LIVE_COLUMNS`` (the
+    same 23 plus ``versi``, ``sl_persen`` and ``harga_potong``, empty for a trade without them).
 
     Raises ``ValueError`` for a trade whose ``side`` is not ``LONG`` or ``SHORT`` or whose time is
     not a whole second (see ``wib_iso``)."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(COLUMNS)
+    columns = LIVE_COLUMNS if live else COLUMNS
+    writer.writerow(columns)
     for trade_id, t in enumerate(trades, start=1):
         cells = _cells(trade_id, t)
-        writer.writerow([cells[name] for name in COLUMNS])
+        writer.writerow([cells[name] for name in columns])
     return buffer.getvalue()
 
 
-def write_trade_log(path: Union[str, Path], trades: Iterable[Trade]) -> None:
-    """Write the log of ``trades`` to ``path``; ``FileExistsError`` if the file exists.
+def write_trade_log(path: Union[str, Path], trades: Iterable[Trade], live: bool = False) -> None:
+    """Write the log of ``trades`` to ``path`` (``live`` as in ``trade_log_text``).
+
+    ``FileExistsError`` if the file exists.
 
     The text is built before the file is touched, so a trade that cannot be written leaves no
     file behind."""
-    write_exclusive(Path(path), trade_log_text(trades), "trade log")
+    write_exclusive(Path(path), trade_log_text(trades, live), "trade log")

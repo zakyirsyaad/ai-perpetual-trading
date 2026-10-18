@@ -12,16 +12,19 @@ Tuesday at 16:00 WIB (160 candles after the first minute), and all three days fo
 the hourly frame reads NAIK, the 15m and 5m candles pull back to their EMA and Mode A trades, and
 the 3m candles come near their mean, so the comparator trades too. The warm-ups are built from the
 same minute prices (``write_minute_warmups``) and are just long enough for every hourly series to
-be warm at 00:00 WIB of the first training day.
+be warm at 00:00 WIB of the first training day. ``FileReads`` records every file a stage opens,
+so "never reads" is checked on the reads themselves.
 """
 
 from __future__ import annotations
 
+import gzip
 import math
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import List, Sequence
+from unittest import mock
 
 from tests.mode_backtest_helpers import write_days, write_minute_warmups
 
@@ -91,3 +94,40 @@ def write_stage_config(path: Path, **uji: object) -> Path:
     """Write ``stage_config_text(**uji)`` to ``path`` and return it."""
     path.write_text(stage_config_text(**uji), encoding="utf-8")
     return path
+
+
+class FileReads:
+    """Every path opened through ``gzip.open`` or read through ``Path.read_bytes`` while active.
+
+    ``events`` holds ``(path, probe())`` for each, so a test can ask what was true at that read."""
+
+    def __init__(self, probe=lambda: None):
+        self.probe = probe
+        self.events = []
+        self._patches = []
+
+    def __enter__(self):
+        real_open, real_read = gzip.open, Path.read_bytes
+
+        def opening(filename, *args, **kwargs):
+            self.events.append((Path(filename), self.probe()))
+            return real_open(filename, *args, **kwargs)
+
+        def reading(path):
+            self.events.append((Path(path), self.probe()))
+            return real_read(path)
+
+        self._patches = [
+            mock.patch.object(gzip, "open", opening),
+            mock.patch.object(Path, "read_bytes", reading),
+        ]
+        for patch in self._patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        for patch in reversed(self._patches):
+            patch.stop()
+
+    def paths(self):
+        return [path for path, _probe in self.events]

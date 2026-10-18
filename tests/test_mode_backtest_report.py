@@ -11,7 +11,19 @@ import dataclasses
 import unittest
 
 from research.mode_backtest.metrics import StageMetrics, stage_metrics
-from research.mode_backtest.report import NO_TRADING, ReportRow, mode_table
+from bot.strategy.modes.config import load_modes_config
+from pathlib import Path
+
+from research.mode_backtest.metrics import GAGAL
+from research.mode_backtest.report import (
+    NO_TRADING,
+    LiveRow,
+    ReportRow,
+    live_no_trading_row,
+    live_status_line,
+    live_table,
+    mode_table,
+)
 from research.mode_backtest.simulate import EXIT_SL, EXIT_TP, EXIT_WAKTU
 from tests.mode_backtest_helpers import MINUTE_MS
 from tests.mode_backtest_trades import FIRST_ENTRY_MS, make_trade, spec_table_header
@@ -267,6 +279,86 @@ class RealTradesTests(unittest.TestCase):
         self.assertEqual(
             table[2], "| A | BTC-USDT | Ujian | 3 | 1,50 | 50,0% | -200 | 1 / 1 / 1 | 60,0 menit |"
         )
+
+
+LIVE_HEADER = (
+    "| Mode | Versi | Pair | Tahap | Posisi | Entry per hari aktif | Entry per hari kalender | "
+    "Menang | Hasil per 1 juta | Keluar TP / SL / potong / waktu | Rata-rata lama posisi |"
+)
+UJI = load_modes_config(Path(__file__).resolve().parents[1] / "config" / "modes.yaml").uji
+
+
+def live_metrics(**fields):
+    base = dict(
+        posisi=123, entry_per_hari_aktif=2.345, menang_pct=47.61, hasil_per_1_juta=-1234.56,
+        tp=50, sl=40, waktu=13, rata_lama_menit=41.26, hasil_tanpa_teratas=-1500.0, hari_naik=52,
+        potong=20, entry_per_hari_kalender=1.005,
+    )
+    base.update(fields)
+    return StageMetrics(**base)
+
+
+class LiveTableTests(unittest.TestCase):
+    def test_live_table_rows_and_rounding(self):
+        table = live_table([
+            LiveRow("L", "ii", BTC, "Ujian", live_metrics()),
+            LiveRow("S", "i", BTC, "Ujian", live_metrics(entry_per_hari_kalender=None,
+                                                        menang_pct=None, rata_lama_menit=None)),
+        ]).splitlines()
+
+        self.assertEqual(table[0], LIVE_HEADER)
+        self.assertEqual(table[1], "|" + "---|" * 11)
+        self.assertEqual(
+            table[2],
+            "| L | ii | BTC-USDT | Ujian | 123 | 2,35 | 1,00 | 47,6% | -1.235 | "
+            "50 / 40 / 20 / 13 | 41,3 menit |",
+        )
+        self.assertEqual(
+            table[3],
+            "| S | i | BTC-USDT | Ujian | 123 | 2,35 | – | – | -1.235 | "
+            "50 / 40 / 20 / 13 | – |",
+        )
+        self.assertEqual(len(table), 4)
+
+    def test_the_no_trading_row_of_a_live_stage(self):
+        row = live_no_trading_row(BTC, "Ujian", 52, 70)
+
+        self.assertEqual((row.mode, row.versi, row.tahap), (NO_TRADING, "–", "Ujian"))
+        self.assertEqual((row.metrics.posisi, row.metrics.hasil_per_1_juta), (0, 0.0))
+        self.assertEqual(
+            live_table([row]).splitlines()[2],
+            "| Tidak trading | – | BTC-USDT | Ujian | 0 | 0,00 | 0,00 | – | 0 | 0 / 0 / 0 / 0 | – |",
+        )
+        none = live_no_trading_row(BTC, "Ujian", 0, 0).metrics
+        self.assertEqual((none.entry_per_hari_aktif, none.entry_per_hari_kalender), (None, None))
+
+    def test_an_empty_live_table_is_the_header_alone(self):
+        self.assertEqual(len(live_table([]).splitlines()), 2)
+
+    def test_the_mode_a_table_is_untouched(self):
+        self.assertEqual(lines([row()])[0], DOCUMENT_HEADER)
+
+
+class LiveStatusLineTests(unittest.TestCase):
+    def test_live_status_line_names_the_version(self):
+        m = live_metrics(posisi=37, hasil_per_1_juta=-190.5, hasil_tanpa_teratas=-260.0)
+
+        line = live_status_line("ii", m, UJI, "BTC-USDT")
+
+        self.assertEqual(
+            line,
+            "Ujian mode L versi ii BTC-USDT: BELUM CUKUP SAMPEL. Posisi 37 (minimal 40); "
+            "Hasil per 1 juta = -190.5 (lolos bila > -150.0); tanpa 3 posisi teratas = -260.0 "
+            "(lolos bila > -250.0).",
+        )
+
+    def test_a_failing_stage_and_the_comparator(self):
+        m = live_metrics(posisi=60, hasil_per_1_juta=-190.5, hasil_tanpa_teratas=-260.0)
+
+        line = live_status_line("i", m, UJI, "BTC-USDT", mode="S")
+
+        self.assertTrue(line.startswith("Ujian mode S versi i BTC-USDT: GAGAL. Posisi 60 (minimal 40);"))
+        self.assertIn(GAGAL, line)
 
 
 if __name__ == "__main__":

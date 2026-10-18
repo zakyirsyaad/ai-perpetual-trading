@@ -46,7 +46,7 @@ The event loop (spec section 9.1, decisions D2, D4, D5 and D10):
   candles at ``t`` (D2). Mode A sends every candle to a ``PullbackTracker`` with the candle's own
   EMA and the SMA20 and ATR14 (1h) of that context, also while a position is open and also before
   the EMA exists (D4). Mode D signals when the candle's stretch is near the mean
-  (``near_mean_short``). Mode A is LONG and Mode D SHORT.
+  (``near_mean``). Mode A is LONG and Mode D SHORT.
 * A signal meets the gates in this order, and the first that fails is counted under its key in
   ``RunResult.blocked``: ``window`` (the weekly window is closed at ``t``), ``segment_edge`` (D10:
   ``t`` plus the time limit is at or after the end, where the time-exit bar would open in the next
@@ -84,7 +84,7 @@ from bot.strategy.modes.checks import (
     require_positive,
 )
 from bot.strategy.modes.config import GeneralConfig, ModesConfig, PullbackConfig
-from bot.strategy.modes.near_mean import near_mean_short
+from bot.strategy.modes.near_mean import near_mean
 from bot.strategy.modes.position_rules import (
     LONG,
     SHORT,
@@ -105,16 +105,28 @@ from .frames import TRIGGER_TIMEFRAMES, FrameParams, HourlyContext, PairFrames, 
 
 __all__ = [
     "BLOCK_REASONS",
+    "Book",
+    "EXIT_POTONG",
     "EXIT_SL",
     "EXIT_TP",
     "EXIT_WAKTU",
     "MODE_A",
     "MODE_D",
     "ExitOutcome",
+    "Gates",
     "Money",
+    "NearMeanTrigger",
     "RunResult",
     "RunSpec",
     "Trade",
+    "candle_closes",
+    "check_column",
+    "check_inputs",
+    "check_walk",
+    "moment",
+    "outcome_exit_ms",
+    "reaches_sl",
+    "reaches_tp",
     "resolve_exit",
     "settle",
     "simulate_run",
@@ -123,6 +135,7 @@ __all__ = [
 EXIT_TP = "TP"
 EXIT_SL = "SL"
 EXIT_WAKTU = "WAKTU"
+EXIT_POTONG = "POTONG"  # Mode L version (ii): the loss cut, see ``live_sim``
 
 MODE_A = "A"  # the pullback LONG
 MODE_D = "D"  # the near-mean SHORT
@@ -149,12 +162,14 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 class ExitOutcome:
     """How a position ended.
 
-    ``reason`` is ``EXIT_TP``, ``EXIT_SL`` or ``EXIT_WAKTU``. ``exit_idx`` is the index, in the
+    ``reason`` is ``EXIT_TP``, ``EXIT_SL`` or ``EXIT_WAKTU`` (``EXIT_POTONG`` only from mode L's
+    ``live_sim`` walk). ``exit_idx`` is the index, in the
     walked bars, of the bar the exit happens in; a touch is only known to the minute. ``raw_price``
     is the exit price before its slippage: the level for a touch and the bar's open for a gap and
     for the time exit. ``gapped`` is True for an exit at the open of a bar that opened beyond a
-    level. ``both_touched`` is True for a stop-loss taken at the SL price from a bar whose range
-    also reached the take-profit: the one case the stop-first rule decided. A gap is not that case
+    level. ``both_touched`` is True for a stop-loss (or, in mode L's ``live_sim``
+    walk, a POTONG cut) taken at its price from a bar whose range also reached the take-profit:
+    the one case the stop-first rule decided. A gap is not that case
     (the open comes first, so the order is known) and neither is a time exit."""
 
     reason: str
@@ -183,21 +198,21 @@ class Money:
     volume_usdt: float
 
 
-def _reaches_sl(side: int, price: float, sl: float) -> bool:
+def reaches_sl(side: int, price: float, sl: float) -> bool:
     """Whether ``price`` is at or beyond the stop-loss.
 
     A LONG's stop is below its entry, so beyond it is at or below; a SHORT's is the mirror."""
     return price <= sl if side == LONG else price >= sl
 
 
-def _reaches_tp(side: int, price: float, tp: float) -> bool:
+def reaches_tp(side: int, price: float, tp: float) -> bool:
     """Whether ``price`` is at or beyond the take-profit.
 
     A LONG's target is above its entry, so beyond it is at or above; a SHORT's is the mirror."""
     return price >= tp if side == LONG else price <= tp
 
 
-def _check_walk(
+def check_walk(
     bars_1m: Bars, entry_idx: int, side: int, tp: float, sl: float, limit_min: int
 ) -> None:
     if bars_1m.interval_ms != INTERVAL_1M:
@@ -232,7 +247,7 @@ def resolve_exit(
     Raises ``ValueError`` for bars that are not 1m, a ``side`` that is not ``LONG`` or ``SHORT``,
     an ``entry_idx`` outside the bars, a ``limit_min`` that is not a whole number of at least 1,
     and levels that are not finite positive numbers or are on the wrong sides of each other."""
-    _check_walk(bars_1m, entry_idx, side, tp, sl, limit_min)
+    check_walk(bars_1m, entry_idx, side, tp, sl, limit_min)
     open_ms, opens, highs, lows = bars_1m.open_ms, bars_1m.open, bars_1m.high, bars_1m.low
     limit_idx = entry_idx + limit_min
     for i in range(entry_idx, min(limit_idx, len(bars_1m) - 1) + 1):
@@ -241,14 +256,14 @@ def resolve_exit(
         bar_open = opens[i]
         if i == limit_idx:
             return ExitOutcome(EXIT_WAKTU, i, bar_open, False, False)
-        if _reaches_sl(side, bar_open, sl):
+        if reaches_sl(side, bar_open, sl):
             return ExitOutcome(EXIT_SL, i, bar_open, True, False)
-        if _reaches_tp(side, bar_open, tp):
+        if reaches_tp(side, bar_open, tp):
             return ExitOutcome(EXIT_TP, i, bar_open, True, False)
         worst, best = (lows[i], highs[i]) if side == LONG else (highs[i], lows[i])
-        if _reaches_sl(side, worst, sl):
-            return ExitOutcome(EXIT_SL, i, float(sl), False, _reaches_tp(side, best, tp))
-        if _reaches_tp(side, best, tp):
+        if reaches_sl(side, worst, sl):
+            return ExitOutcome(EXIT_SL, i, float(sl), False, reaches_tp(side, best, tp))
+        if reaches_tp(side, best, tp):
             return ExitOutcome(EXIT_TP, i, float(tp), False, False)
     return None
 
@@ -343,7 +358,9 @@ class Trade:
     ``EXIT_TP``, ``EXIT_SL`` or ``EXIT_WAKTU``. ``gapped`` and ``both_touched`` are those of the
     walk's ``ExitOutcome``; the two fills, ``qty``, the fee, the slippage, ``pnl_usdt`` and
     ``volume_usdt`` are those of ``settle``'s ``Money``, and ``notional_usdt`` is the configured
-    size the position opened with."""
+    size the position opened with. The last three belong to mode L and comparator S and stay
+    unset for Mode A and Mode D: ``versi`` is the exit version ("i" or "ii"), ``sl_pct`` the stop
+    distance in percent of the entry fill and ``potong`` the cut price (version ii only)."""
 
     mode: str
     pair: str
@@ -367,6 +384,9 @@ class Trade:
     slippage_usdt: float
     pnl_usdt: float
     volume_usdt: float
+    versi: str = ""
+    sl_pct: Optional[float] = None
+    potong: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -398,13 +418,13 @@ class _Terms:
     faktor_k: float
 
 
-def _moment(t_ms: int) -> str:
+def moment(t_ms: int) -> str:
     """``t_ms`` as a WIB time and in milliseconds, for a message."""
     wib = (_EPOCH + timedelta(milliseconds=t_ms)).astimezone(WIB)
     return f"{wib.isoformat()} ({t_ms} ms)"
 
 
-def _check_column(bars: Bars, column: Tuple, interval_ms: int, what: str, name: str) -> None:
+def check_column(bars: Bars, column: Tuple, interval_ms: int, what: str, name: str) -> None:
     """The candles of a signal source must be of the run's interval, one value of ``name`` each."""
     if bars.interval_ms != interval_ms:
         raise ValueError(f"the {what} are {bars.interval_ms} ms candles, expected {interval_ms} ms")
@@ -412,12 +432,13 @@ def _check_column(bars: Bars, column: Tuple, interval_ms: int, what: str, name: 
         raise ValueError(f"the {what} have {len(bars)} candles but {len(column)} {name} values")
 
 
-def _check_inputs(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> None:
-    """The frames and the config must be those of the run, and the loop holds one position."""
-    if run.pair != frames.symbol:
-        raise ValueError(f"the run is for {run.pair!r} but the frames are of {frames.symbol!r}")
-    if run.pair not in cfg.pair:
-        raise ValueError(f"{run.pair!r} is not a pair of the config ({', '.join(cfg.pair)})")
+def check_inputs(frames: PairFrames, cfg: ModesConfig, pair: str) -> None:
+    """The frames and the config must be those of the run on ``pair``, and the loop holds one
+    position."""
+    if pair != frames.symbol:
+        raise ValueError(f"the run is for {pair!r} but the frames are of {frames.symbol!r}")
+    if pair not in cfg.pair:
+        raise ValueError(f"{pair!r} is not a pair of the config ({', '.join(cfg.pair)})")
     if cfg.umum.maks_posisi_per_pair != 1:
         raise ValueError(
             "the loop holds one position per pair at a time, but umum.maks_posisi_per_pair is "
@@ -474,8 +495,9 @@ class _PullbackTrigger:
         self._tracker.consume()
 
 
-class _NearMeanTrigger:
-    """Mode D's signals: a candle whose stretch is within the band. It keeps no state."""
+class NearMeanTrigger:
+    """The signals of Mode D and of mode L: a candle whose stretch is within the band, whatever
+    the side. It keeps no state."""
 
     def __init__(self, bars: Bars, stretch: Tuple, hourly: _Conditions, max_abs: float) -> None:
         self.bars = bars
@@ -485,7 +507,7 @@ class _NearMeanTrigger:
 
     def signal_at(self, i: int, t_ms: int) -> Optional[HourlyContext]:
         """The context at ``t_ms`` when candle ``i``, closing then, signals; else None."""
-        if not near_mean_short(self._stretch[i], self._max_abs):
+        if not near_mean(self._stretch[i], self._max_abs):
             return None
         return self._hourly.context_at(t_ms)
 
@@ -495,22 +517,22 @@ class _NearMeanTrigger:
 
 def _trigger(
     frames: PairFrames, cfg: ModesConfig, run: RunSpec
-) -> Union[_PullbackTrigger, _NearMeanTrigger]:
+) -> Union[_PullbackTrigger, NearMeanTrigger]:
     """The signal source of the run's mode, after checking its candles and their column."""
     interval_ms = interval_to_ms(run.tf)
     if run.mode == MODE_A:
         series = frames.triggers.get(run.tf)
         if series is None:
             raise ValueError(f"the frames hold no {run.tf} trigger candles")
-        _check_column(series.bars, series.ema, interval_ms, f"{run.tf} trigger candles", "EMA")
+        check_column(series.bars, series.ema, interval_ms, f"{run.tf} trigger candles", "EMA")
         return _PullbackTrigger(series, frames.hourly, cfg.mode_a)
-    _check_column(frames.stretch_bars, frames.stretch, interval_ms, "3m candles", "stretch")
-    return _NearMeanTrigger(
+    check_column(frames.stretch_bars, frames.stretch, interval_ms, "3m candles", "stretch")
+    return NearMeanTrigger(
         frames.stretch_bars, frames.stretch, frames.hourly, cfg.mode_d.maks_jarak_ke_ema_kali_atr
     )
 
 
-def _closes(bars: Bars, start_ms: int, end_ms: int) -> Iterator[Tuple[int, int]]:
+def candle_closes(bars: Bars, start_ms: int, end_ms: int) -> Iterator[Tuple[int, int]]:
     """``(index, close)`` of every candle closing in ``[start_ms, end_ms)``, in time order.
 
     A candle missing between two of them raises ``RuntimeError``: the Mode A window counts the
@@ -522,13 +544,13 @@ def _closes(bars: Bars, start_ms: int, end_ms: int) -> Iterator[Tuple[int, int]]
     for i in range(first, last):
         if i > first and opens[i] != opens[i - 1] + step:
             raise RuntimeError(
-                f"no trigger candle closes at {_moment(opens[i - 1] + 2 * step)}: the candles of "
+                f"no trigger candle closes at {moment(opens[i - 1] + 2 * step)}: the candles of "
                 "the run have a hole"
             )
         yield i, opens[i] + step
 
 
-class _Book:
+class Book:
     """What the run has done so far: its trades, the last exit, the entries per WIB day and the
     blocked signals per reason."""
 
@@ -558,20 +580,21 @@ class _Book:
         return RunResult(tuple(self._trades), MappingProxyType(blocked))
 
 
-class _Gates:
-    """The gates of a signal (spec section 9.1) with the numbers of the config and the run."""
+class Gates:
+    """The gates of a signal (spec section 9.1) with the numbers of the config and the run: the
+    condition the run needs, the end of its segment and the time limit of its positions."""
 
-    def __init__(self, umum: GeneralConfig, run: RunSpec, limit_min: int) -> None:
+    def __init__(self, umum: GeneralConfig, kondisi_gate: str, end_ms: int, limit_min: int) -> None:
         self._window = parse_weekly_window(umum.jendela_entry_mingguan)
         self._limit_ms = limit_min * INTERVAL_1M
-        self._end_ms = run.end_ms
-        self._kondisi = run.kondisi_gate
+        self._end_ms = end_ms
+        self._kondisi = kondisi_gate
         self._pause_min = umum.jeda_menit
         self._max_pair = umum.maks_entry_per_hari_per_pair
         self._max_total = umum.maks_entry_per_hari_total
         self._volatility_mult = umum.penjaga_volatilitas_kali_median_atr
 
-    def first_failure(self, t_ms: int, context: HourlyContext, book: _Book) -> Optional[str]:
+    def first_failure(self, t_ms: int, context: HourlyContext, book: Book) -> Optional[str]:
         """The key of the first gate the signal at ``t_ms`` fails, or None when it passes all."""
         if not entry_window_open(self._window, t_ms):
             return _WINDOW
@@ -591,7 +614,7 @@ class _Gates:
         return None
 
 
-def _exit_ms(bars_1m: Bars, outcome: ExitOutcome) -> int:
+def outcome_exit_ms(bars_1m: Bars, outcome: ExitOutcome) -> int:
     """The open of the exit bar for a time exit and a gap; the end of its minute for a touch."""
     at_open = outcome.reason == EXIT_WAKTU or outcome.gapped
     return bars_1m.open_ms[outcome.exit_idx] + (0 if at_open else INTERVAL_1M)
@@ -608,7 +631,7 @@ def _open_position(
     """The trade of a signal at ``t_ms`` that passed every gate; it never comes back empty."""
     idx = entry_index_for(bars_1m, t_ms)
     if idx is None or bars_1m.open_ms[idx] != t_ms:
-        raise RuntimeError(f"no 1m bar opens at the signal at {_moment(t_ms)}")
+        raise RuntimeError(f"no 1m bar opens at the signal at {moment(t_ms)}")
     entry_open = bars_1m.open[idx]
     side, slippage = terms.side, umum.slippage_persen
     bracket = bracket_prices(
@@ -617,7 +640,7 @@ def _open_position(
     outcome = resolve_exit(bars_1m, idx, side, bracket.tp, bracket.sl, terms.limit_min)
     if outcome is None:
         raise RuntimeError(
-            f"the position of the signal at {_moment(t_ms)} does not end inside the 1m bars: a "
+            f"the position of the signal at {moment(t_ms)} does not end inside the 1m bars: a "
             "minute is missing or the data ends before its exit"
         )
     money = settle(
@@ -635,7 +658,7 @@ def _open_position(
         entry_fill=money.entry_fill,
         tp=bracket.tp,
         sl=bracket.sl,
-        exit_ms=_exit_ms(bars_1m, outcome),
+        exit_ms=outcome_exit_ms(bars_1m, outcome),
         exit_fill=money.exit_fill,
         exit_reason=outcome.reason,
         gapped=outcome.gapped,
@@ -663,12 +686,12 @@ def simulate_run(frames: PairFrames, cfg: ModesConfig, run: RunSpec) -> RunResul
     (EMA, stretch) that does not match its candles. Raises
     ``RuntimeError`` for a hole in the data the run needs: a missing trigger candle, no 1m bar
     opening at a signal that passed every gate, or a walk that cannot end."""
-    _check_inputs(frames, cfg, run)
+    check_inputs(frames, cfg, run.pair)
     terms = _terms(cfg, run)
     trigger = _trigger(frames, cfg, run)
-    gates = _Gates(cfg.umum, run, terms.limit_min)
-    book = _Book()
-    for i, t_ms in _closes(trigger.bars, run.start_ms, run.end_ms):
+    gates = Gates(cfg.umum, run.kondisi_gate, run.end_ms, terms.limit_min)
+    book = Book()
+    for i, t_ms in candle_closes(trigger.bars, run.start_ms, run.end_ms):
         context = trigger.signal_at(i, t_ms)
         if context is None:
             continue
