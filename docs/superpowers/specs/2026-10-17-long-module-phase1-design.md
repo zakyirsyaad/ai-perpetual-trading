@@ -168,8 +168,11 @@ alasan_exit,fee_usdt,slippage_usdt,pnl_usdt,notional_usdt,volume_usdt
   the bot's own `_resolve_trade_targets` bracket (SL ≈ 0.28 %, TP ≈ 0.60 %, ATR-scaled) with a
   60-minute stop; 0.2 % / 0.2 % was the Pine test's bracket.
 - The document's breakeven figures (49 %, and 45 % for −150 at TP 0.40 / SL 0.25) leave out its own
-  0.01 % slippage. With it a round trip costs 9 bps: breakeven ≈ 52.3 %, the −150 target ≈ 47.7 %
-  (binary TP/SL outcomes; time exits shift both).
+  0.01 % slippage. With it a round trip costs 9 bps. Because D6 sets TP and SL from the entry fill,
+  a TP nets +32 bps and an SL −33 bps (the Mode A trade logs show exactly that), so breakeven ≈
+  50.8 % and the −150 target ≈ 46.2 % (binary TP/SL outcomes; time exits shift both). Corrected
+  2026-10-18: this note first said 52.3 % / 47.7 %, which charged the entry slippage against both
+  levels.
 
 ## 5. Defaults for what the document leaves open (approved 2026-10-17)
 
