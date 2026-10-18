@@ -4,6 +4,17 @@ Offline backtest of a LONG mirror of the live SHORT bot, with the live bot's exi
 harness. Spec: `docs/superpowers/specs/2026-10-18-long-mirror-live-exit-design.md`. Each task below
 records its RED output and GREEN result.
 
+## User journey
+
+The manager asked whether the live SHORT bot's edge has a LONG twin. Mode A (pullback LONG in an
+up-trend) already failed its one-shot test, so this plan does not retune it: it mirrors the live
+bot's near-mean 3m entry to LONG in NAIK days, with the live bot's exits (ATR-scaled SL, a TP at the
+net +56 USDT level, a 60-minute time exit, and a cut at 0.10 % adverse from minute 10 in version ii),
+and runs the SHORT original in TURUN days as comparator S. The operator runs `train --mode L`, then,
+on their go-ahead, `verify-copy` and the one-shot `test --mode L`, and reads an Indonesian table with
+a pass or fail line for L(i) and L(ii). `rescore` is a side tool: it reprices Mode A's Phase 1 logs
+with the same costs, as a cost sensitivity and never a verdict. Nothing here touches the live bot.
+
 ## Task 1: Live-exit config file and loader
 
 Files: `config/modes_live_exit.yaml` (spec section 7, verbatim), `src/bot/strategy/modes/config.py`
@@ -391,3 +402,75 @@ One existing test changed: `test_stage_metrics_has_one_call_site_and_it_passes_t
 (`tests/test_mode_backtest_lock.py`) now skips `rescore.py`, which calls the same helper but gives
 no verdict; the guard on the verdict path (`stages.py`, config `drop_top`) is unchanged.
 `compileall` and `git diff --check` are clean; the structure test passes.
+
+## Verification
+
+Run on branch `feat/long-mirror-live-exit` with the local `.venv` (Python 3.10), `PYTHONPATH=src`,
+before the commit of this task.
+
+```
+$ PYTHONPATH=src .venv/bin/python -m compileall -q src tests
+(no output, exit 0)
+```
+
+Coverage: Python 3.10 cannot read `pyproject.toml` without tomli, so an rcfile outside the repo
+carries the same settings (`source = src`, `branch = False`, omit `src/tradingview_relay.py`,
+`fail_under = 80`, the same `exclude_lines`).
+
+```
+$ PYTHONPATH=src .venv/bin/python -m coverage run --rcfile=<rc> -m unittest discover -s tests
+Ran 2462 tests in 136.197s
+OK
+$ PYTHONPATH=src .venv/bin/python -m coverage report --rcfile=<rc>
+TOTAL                                      15641   1396    91%
+(exit 0, fail_under 80)
+```
+
+```
+$ git diff --check 1717d94..HEAD            -> no output, exit 0
+$ git diff --check                          -> no output, exit 0
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_secret_hygiene
+Ran 1 test in 0.023s
+OK
+$ git diff --quiet config/modes.yaml        -> unchanged
+```
+
+`config/modes.yaml` is unchanged, Mode A's golden log sha test passes, and no live module imports the
+rule core (`tests/test_mode_backtest_structure.py`).
+
+## Commit trail
+
+Since `1717d94`:
+
+```
+457c5c5 feat: config file and loader for mode L
+73caf23 feat: live exit levels for mode L
+0f2e1d0 feat: 3m ATR percent and condition days for mode L
+a4dffcc feat: live exit walk and per-kind fills
+a7d8aa5 feat: event loop for mode L and comparator S
+175acd7 feat: metrics, trade log and table for mode L
+e34e683 test: pin that pre-mode-L lock summaries are refused
+b82caa2 feat: train and one-shot test stages for mode L
+0d59f25 feat: CLI for mode L
+dcf5325 feat: rescore stage for the cost sensitivity
+this commit: docs: mode L commands, notes and TDD evidence
+```
+
+## Deployment gate
+
+Nothing is deployed. The live bot, `.env`, pm2 and the VPS are untouched, and nothing in `src/bot`
+imports mode L. The mode L records do not exist yet: `train` and `test` have not run.
+
+Task 11 runs `train --mode L` and then the one-shot `test --mode L`, after merge and only on the
+user's go-ahead, with the Phase 1 operator notes:
+
+- Run `verify-copy` right before `test`: `test` only `stat`s the test-period days, so their content is
+  `verify-copy`'s job.
+- Use the Python 3.10 `.venv` for both stages (the lock binds the Python minor version).
+- Do not pull or merge `main` between `train` and `test`: the lock binds `code_sha256`, and any change
+  to the package makes `test` exit 2.
+- One `--out-dir`/`--data-dir` pair for both stages; never reuse a rehearsal's out-dir.
+- Never rehearse against `~/replay/mode_backtest/data`: a rehearsal `test` reads the real test days
+  and leaves a marker in `holdout_runs/` that refuses the real run. Rehearse on synthetic data only.
+- Once `test` has claimed its start record, the shot is spent; never delete the start record or the
+  marker.
