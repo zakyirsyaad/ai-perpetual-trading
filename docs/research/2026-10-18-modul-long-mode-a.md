@@ -13,11 +13,12 @@ Tanggal: 18 Oktober 2026 · Untuk: dokumen "Modul LONG — Spesifikasi & Rencana
   2,64 entry per hari NAIK (batasnya 3). Ini satu-satunya penyesuaian yang diizinkan, dan
   keputusannya diambil dari jumlah entry saja, bukan dari hasil.
 - **Latihan juga rugi, di setiap periode.** Agustus 2025 – 4 Agustus 2026: −472 per 1 juta dari
-  479 posisi. Tidak ada kuartal latihan atau bulan ujian yang mendekati −150; yang terbaik −258
-  (1–13 Oktober 2026, 17 posisi).
+  479 posisi. Tidak ada kuartal latihan yang mendekati −150 (terbaik −327, 110 posisi). Bulan
+  ujian terbaik −258, tapi hanya 17 posisi (ketidakpastian sekitar ±315), jadi angka per bulan
+  belum bermakna.
 - **Tidak ada keunggulan sebelum biaya.** Sebelum fee dan slippage, rata-rata per posisi −0,4 bps
   di latihan dan −1,9 bps di ujian, sedangkan biayanya 9 bps per posisi (450 per 1 juta). Menang
-  30–33%, padahal titik impas dengan TP 0,40%, SL 0,25% dan biaya itu sekitar 52%.
+  30–33%, padahal titik impas dengan TP 0,40%, SL 0,25% dan biaya itu sekitar 51%.
 - **Pembanding juga rugi.** Aturan SHORT sekarang yang dijalankan di jam NAIK yang sama: −483 per
   1 juta di ujian (150 posisi). Tidak trading = 0.
 - **Mode A di BTC tidak lanjut ke forward test.** Menurut tahapan dokumen, forward test hanya untuk
@@ -97,10 +98,12 @@ Ujian Mode A BTC-USDT (5m): GAGAL. Posisi 94 (minimal 40); Hasil per 1 juta = -5
 - **Kerugiannya merata, bukan karena beberapa posisi.** Membuang 3 posisi paling untung menggeser
   ujian dari −546 ke −617. Kelima kuartal latihan di bawah −300 (terbaik −327, Januari – Maret
   2026), dan ketiga bulan ujian di bawah −250.
-- **Menang yang rendah bukan masalah utamanya.** Dengan TP 0,40% dan SL 0,25%, harga yang bergerak
+- **Menang yang rendah bukan masalah utamanya.** TP dan SL dihitung dari harga fill, yang sudah
+  0,01% di atas open, jadi harga mulai 0,41% di bawah TP dan 0,24% di atas SL. Harga yang bergerak
   tanpa arah menyentuh SL lebih dulu kira-kira 6 dari 10 kali, jadi mode tanpa keunggulan menang
-  sekitar 38%. Mode A menang 30–33%, sedikit di bawah itu, sesuai hasil kotornya yang sedikit
-  negatif. Impas setelah biaya butuh sekitar 52%, dan −150 butuh sekitar 48%.
+  sekitar 37%. Mode A menang 30–33%, sedikit di bawah itu, sesuai hasil kotornya yang sedikit
+  negatif. Setelah biaya, posisi TP bersih +32 bps dan posisi SL −33 bps (sama di setiap posisi di
+  log), jadi impas butuh sekitar 51%, dan −150 butuh sekitar 46%.
 - **Pindah ke 5m tidak mengubah gambaran.** Di latihan 5m lebih baik dari 15m (−472 lawan −567),
   tapi keduanya jauh dari −150, dan hasil kotor keduanya di bawah nol.
 - **Yang dibutuhkan untuk −150.** Biayanya 450 per 1 juta, jadi sebuah mode perlu hasil kotor
