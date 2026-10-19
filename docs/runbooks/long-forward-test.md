@@ -51,39 +51,65 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
 3. **`VOLUME_CYCLE_STARTED_AT` must be the forward start** (this `--cycle-start`). The forward guard counts closed trades
    since that instant in the configured schema; an earlier cutoff would pool older trades into the 60 and 150 counts.
    Never edit it afterwards.
-4. Review the key names that came over from the live `.env` and were not forced (names only, e.g.
-   `grep -o '^[A-Za-z_]*=' .env | sort`). Values the second account needs to differ on are the operator's call.
+4. Review the key names that came over from the live `.env` and were not forced. Names only, every key (digits in names and
+   `export KEY=` lines included; it never prints a value). `[[:space:]]` keeps it working with both GNU and BSD `sed`:
+   ```bash
+   grep -vE '^[[:space:]]*(#|$)' /home/ubuntu/ai-perp-long/.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*=.*//' | sort
+   ```
+   Values the second account needs to differ on are the operator's call.
 5. The account owner types `BINGX_API_KEY`, `BINGX_SECRET_KEY` and `XAI_API_KEY` into `/home/ubuntu/ai-perp-long/.env`
    with an editor. `chmod 600 .env` stays.
 6. **Process environment overrides `.env`** (pydantic-settings reads the environment first). The pm2 app must not export
    any forced key (`SUPABASE_SCHEMA`, `BINGX_*`, `XAI_*`, `ENTRY_*`, `COOLDOWN_*`, `FORWARD_*`, `VOLUME_*`, `TRADE_*`,
-   `MAX_*`, `TELEMETRY_*`, ...). Read-only check that prints names only, never values; run it in the shell you will start
-   pm2 from (it must print `[]`), and again against the running app:
-   ```bash
-   env | cut -d= -f1 | grep -iE '^(SUPABASE_|BINGX_|XAI_|ENTRY_|COOLDOWN_|FORWARD_|VOLUME_|TRADE_|MAX_|REGIME_|TELEMETRY_|LEVERAGE$|SYMBOLS$)'
-   pm2 jlist | python3 -c 'import json,re,sys
-   app=[p for p in json.load(sys.stdin) if p["name"]=="ai-perp-long"][0]["pm2_env"]
-   print(sorted(k for k in app if re.match(r"(SUPABASE_|BINGX_|XAI_|ENTRY_|COOLDOWN_|FORWARD_|VOLUME_|TRADE_|MAX_|REGIME_|TELEMETRY_|LEVERAGE$|SYMBOLS$)", k, re.I)))'
-   ```
-   The first command prints nothing when clean. If any name shows up, unset it in that shell (`unset NAME`) before
-   starting, and restart the app only while flat.
-7. **First start in the foreground**, to read the startup checks (isolated margin, hedge mode, leverage read back, the
-   fee log, the first `Regime gate ...` line, a reachable `long_forward` schema):
+   `MAX_*`, `TELEMETRY_*`, ...). Two read-only checks that print names only, never values:
+   - **Before the first start**, in the shell you will start the bot from (foreground or pm2). It must print nothing. If a
+     name shows up, `unset NAME` first.
+     ```bash
+     env | cut -d= -f1 | grep -iE '^(SUPABASE_|BINGX_|XAI_|ENTRY_|COOLDOWN_|FORWARD_|VOLUME_|TRADE_|MAX_|REGIME_|TELEMETRY_|LEVERAGE$|SYMBOLS$)'
+     ```
+   - **After `pm2 start`** (it fails with an IndexError before the app exists). It must print `[]`:
+     ```bash
+     pm2 jlist | python3 -c 'import json,re,sys
+     app=[p for p in json.load(sys.stdin) if p["name"]=="ai-perp-long"][0]["pm2_env"]
+     print(sorted(k for k in app if re.match(r"(SUPABASE_|BINGX_|XAI_|ENTRY_|COOLDOWN_|FORWARD_|VOLUME_|TRADE_|MAX_|REGIME_|TELEMETRY_|LEVERAGE$|SYMBOLS$)", k, re.I)))'
+     ```
+7. **First start, outside the entry window, in the foreground.** The entry window is `mon 07:00-sat 00:00` in
+   `TRADING_TIMEZONE` (default `Asia/Jakarta`, WIB). Start only between **Saturday 00:00 and Monday 07:00 WIB**, and finish
+   steps 7 and 8 before Monday 07:00.
+
+   Why outside the window, and why it is safe: `run_forever` runs the startup checks, then ticks at once, and a tick that
+   opens a position blocks until it closes. In `_tick` the window gate comes right after the entries latch and the forward
+   guard and before the risk guard, the cooldowns, the regime gate and the strategy, so while the window is closed no AI call
+   and no order can happen. Inside the window a NAIK hour could open a real position within minutes, and the handover to
+   pm2 would then be a restart with an open position (`104103` crash loop, section 4). The alternative of skipping the
+   foreground run and starting under pm2 straight away is less safe: with autorestart a bad key or a wrong `.env` becomes a
+   crash loop that hammers the venue, while a foreground run just exits.
    ```bash
    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/main.py
    ```
-   `main.py` refuses to boot with `ENTRY_REGIME_GATE=naik` and more than one symbol in `SYMBOLS` (the forward bot is one
-   symbol). Trust the fee log over the config default. Inside the entry window (`mon 07:00-sat 00:00`) this run can
-   already open a position; stop it with Ctrl-C only while flat (section 4).
-8. **Then pm2.** The plan's command is kept, with three changes: the interpreter and cwd are absolute, `PYTHONPATH=src`
-   is set (the repo has no `sys.path` fix, so `src/main.py` fails to import `bot` without it; `ecosystem.config.js` sets
-   it the same way for `ai-perp-volume`), and `--restart-delay 10000` mirrors that file's `restart_delay`.
+   What you will see: isolated margin, hedge mode, leverage read back, the fee log (trust it over the config default),
+   `VST trade engine started`, the schema being reachable (no PostgREST error), and `Entry window closed (mon 07:00-sat
+   00:00): no new entries until it opens again.` (that line confirms the forced window parsed and that the timezone puts you
+   outside it). If it does not appear, the window is open: Ctrl-C at once and check the venue for a position or order before doing anything else.
+   What you will not see: the regime gate sits after the window gate, so its first verdict (`Regime gate ...`) is not
+   logged until the window opens. `main.py` refuses `ENTRY_REGIME_GATE=naik` with more than one symbol in `SYMBOLS` (the
+   forward bot is one symbol); that refusal is visible now. Read the first verdict in the pm2 error log on Monday after
+   07:00 and the guard state from the first report.
+
+   Stop it with Ctrl-C after reading the lines. Before stopping, confirm on the venue that the account is flat (the BingX VST
+   app shows no position or open order; with the window closed there can be none).
+8. **Then pm2, still outside the window.** The foreground to pm2 handover is itself a restart, so the same rule applies:
+   flat on the venue first (confirmed in step 7), then start. The plan's command is kept, with three changes: the
+   interpreter and cwd are absolute, `PYTHONPATH=src` is set (the repo has no `sys.path` fix, so `src/main.py` fails to
+   import `bot` without it; `ecosystem.config.js` sets it the same way for `ai-perp-volume`), and `--restart-delay
+   10000` mirrors that file's `restart_delay`.
    ```bash
    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src pm2 start src/main.py --name ai-perp-long \
      --interpreter /home/ubuntu/ai-perp-long/.venv/bin/python --cwd /home/ubuntu/ai-perp-long --restart-delay 10000
    pm2 status    # ai-perp-volume must still be online and unrestarted
    ```
-   Logs go to stderr, so they are in `~/.pm2/logs/ai-perp-long-error.log`.
+   Then run the "after `pm2 start`" check of step 6. Logs go to stderr, so they are in
+   `~/.pm2/logs/ai-perp-long-error.log`; the same startup lines should be there.
 9. Record the cycle start and the first Monday in `CLAUDE.md` and in memory (plan Task 9).
 
 Never touch `ai-perp-volume`. Never run `pm2 restart all`, `pm2 delete all` or `pm2 stop all`.
@@ -108,6 +134,7 @@ Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates
 
    With `D1 = FROM - 1 day` and `D2 = TO - 1 day`:
    ```bash
+   cd /home/ubuntu/ai-perp-long   # the repo, for PYTHONPATH=src and config/
    W=~/replay/forward_week_FROM
    # 1m production days D1 .. D2 inclusive (public endpoints, at most 1 request per second; D2 must be over in WIB)
    PYTHONPATH=src nice -n 19 .venv/bin/python -m research.pine_gate.cli --data-dir $W \
@@ -122,13 +149,20 @@ Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates
    reach the first loaded day".
 3. **The earliest allowed `FROM` is 2026-10-15** (its day before, `D1`, is 2026-10-14, the first day after mode L's test
    period). `compare-forward` refuses an earlier one (exit 2) without opening a day file.
-4. **Warm-up hours overlap mode L's test period (ruling R3).** For the first weeks the 1h/4h warm-up bars (about 35 days
-   back from `D1`) reach into mode L's test period (5 Aug to 13 Oct 2026). They are indicator history only (SMA50, the
+4. **Warm-up hours overlap mode L's test period (ruling R3).** The fetched warm-up reaches 80 days back from `D1`, and
+   mode L's test period ends at 2026-10-14 00:00 WIB (5 Aug to 13 Oct). Those bars are indicator history only (SMA50, the
    4h EMA50, the 720-hour ATR median) and are never simulated or reported: no mode L outcome over the test period is
-   computed. The manager should know this before counting those hours as "seen". Mode L's one-shot `test` is not
-   affected: `compare-forward` reads no lock, start record or marker and writes none.
+   computed. The overlap is long-lived because the 4h EMA50 needs about 401 bars (about 67 days) before it is defined, and
+   the fetched file holds 80 days:
+   - the file contains test-period bars while `D1` is before 2027-01-02 (2026-10-14 plus 80 days);
+   - the 4h EMA50 at the window start still rests on them while `D1` is before about 2026-12-20 (plus 67 days);
+   - the 720-hour ATR median (about 831 hourly bars, about 35 days) stops resting on them from about 2026-11-18.
+
+   The manager should know this before counting those hours as "seen". Mode L's one-shot `test` is not affected:
+   `compare-forward` reads no lock, start record or marker and writes none.
 5. **Compare:**
    ```bash
+   cd /home/ubuntu/ai-perp-long   # the repo: the config paths below are relative to it
    PYTHONPATH=src nice -n 19 .venv/bin/python -m research.mode_backtest compare-forward --pair BTC-USDT \
      --config config/modes.yaml --live-config config/modes_live_exit.yaml --data-dir $W \
      --forward-trades ~/forward_weeks/<the CSV from step 1> --from FROM --to TO --out-dir ~/forward_weeks
@@ -160,7 +194,8 @@ The guard recomputes from Supabase on every tick (stateless across restarts), lo
   `crossed`, exits, and pm2's autorestart turns it into a crash loop that hammers the venue auth endpoint. Recovery:
   `pm2 stop ai-perp-long`, close the position on the venue, then start. Flip the position flat before any redeploy or
   `.env` change, and confirm flat on the venue (the BingX VST app, or the bot's `Position ...` status lines having
-  stopped) before `pm2 restart ai-perp-long --update-env`.
+  stopped) before `pm2 restart ai-perp-long --update-env`. Rerun the clean-shell check of section 2 step 6 in the
+  shell you restart from first: `--update-env` copies that shell's environment into the app, and it overrides `.env`.
 - Do not start a second process on the same account, schema or directory. `ai-perp-long` on the second account, schema
   `long_forward` and its own directory is the only sanctioned second live instance.
 

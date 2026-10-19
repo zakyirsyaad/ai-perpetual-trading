@@ -218,6 +218,9 @@ Not deployed. Task 9 starts only on the user's go-ahead and on merged `main`:
 2. Merge needs a green CI (read the checks; never `--auto`). Mode L's `train` and `test` run on one code version, so either
    merge before `train`, or run both before merging, never between.
 3. Build the `.env` with `--cycle-start` set to the forward start; run the names-only env check so that no forced key is
-   exported to pm2; the first start in the foreground to read isolated margin, hedge mode, leverage, the fee log and the
-   first regime verdict; then `pm2 start` and confirm `ai-perp-volume` is online and untouched.
+   exported to pm2; the first start in the foreground, only between Saturday 00:00 and Monday 07:00 WIB (the entry window is
+   closed, so no order can happen), to read isolated margin, hedge mode, leverage, the fee log and the `Entry window closed`
+   line (the regime gate sits after the window gate, so its first verdict is read in the pm2 log on Monday after 07:00);
+   confirm flat on the venue, stop it, then `pm2 start` in the same closed window and confirm `ai-perp-volume` is online
+   and untouched.
 4. Never restart either app with an open position (`104103` crash loop).
