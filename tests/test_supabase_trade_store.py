@@ -336,6 +336,23 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         for request in http.gets:
             self.assertIn(("exchange", "eq.bingx"), request["params"])
 
+    async def test_closed_trades_since_cycle_parses_rows_and_sorts_oldest_first(self) -> None:
+        def row(closed_at: str, pnl: float) -> dict:
+            return {
+                "symbol": "BTC/USDT", "direction": "long", "entry_price": 100.0, "exit_price": 101.0,
+                "quantity": 2.0, "pnl_usdt": pnl, "reason": "time_stop", "entry_reason": "ai_volume",
+                "opened_at": "2026-10-12T00:00:00+00:00", "closed_at": closed_at,
+            }
+
+        http = _FakeHTTP(rows=[row("2026-10-13T00:00:00+00:00", 2.0), row("2026-10-12T01:00:00+00:00", 1.0), {"symbol": "x"}])
+        trades = await _store(http).closed_trades_since_cycle()
+
+        self.assertEqual([t.pnl_usdt for t in trades], [1.0, 2.0])
+        self.assertEqual(trades[0].direction, PositionDirection.LONG)
+        self.assertEqual(len(http.gets), 1)
+        self.assertEqual(http.posts, [])
+        self.assertIn(("exchange", "eq.bingx"), http.gets[0]["params"])
+
     async def test_learning_note_is_a_no_op(self) -> None:
         http = _FakeHTTP()
         await _store(http).save_learning_note(note_type="entry_decision", symbol="BTC/USDT", payload={})

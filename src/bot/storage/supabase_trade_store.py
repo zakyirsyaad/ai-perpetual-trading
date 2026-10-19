@@ -46,6 +46,13 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+_CLOSED_TRADE_COLUMNS = (
+    "symbol,direction,entry_price,exit_price,quantity,pnl_usdt,reason,entry_reason,"
+    "opened_at,closed_at,exchange_entry_order_id,exchange_exit_order_id,confidence,"
+    "factor_metadata,trigger_metadata"
+)
+
+
 class SupabaseTradeStore:
     """Primary trade store backed by Supabase REST.
 
@@ -373,12 +380,7 @@ class SupabaseTradeStore:
         return await self._get_rows(
             self._trades_table,
             [
-                (
-                    "select",
-                    "symbol,direction,entry_price,exit_price,quantity,pnl_usdt,reason,entry_reason,"
-                    "opened_at,closed_at,exchange_entry_order_id,exchange_exit_order_id,confidence,"
-                    "factor_metadata,trigger_metadata",
-                ),
+                ("select", _CLOSED_TRADE_COLUMNS),
                 ("exchange", f"eq.{self._exchange}"),
                 ("order", "closed_at.desc"),
                 ("limit", str(limit)),
@@ -401,8 +403,24 @@ class SupabaseTradeStore:
 
     async def recent_closed_trades(self, limit: int = 100) -> list[ClosedTrade]:
         """The newest `limit` closed trades, oldest first, for seeding the dashboard history."""
+        trades = self._parse_closed_trades(await self.recent_closed_trade_records(limit))
+        # The dashboard starts where the volume cycle starts, so older trades are not shown.
+        if self._volume_cycle_started_at is not None:
+            cutoff = self._volume_cycle_started_at.astimezone(timezone.utc)
+            trades = [trade for trade in trades if trade.closed_at >= cutoff]
+        trades.sort(key=lambda trade: trade.closed_at)
+        return trades
+
+    async def closed_trades_since_cycle(self) -> list[ClosedTrade]:
+        """Every closed trade since the cycle start, oldest first, paged past the 1000-row cap (GET only)."""
+        rows = await self._all_closed_trade_rows(_CLOSED_TRADE_COLUMNS)
+        trades = self._parse_closed_trades(rows)
+        trades.sort(key=lambda trade: trade.closed_at)
+        return trades
+
+    def _parse_closed_trades(self, rows: list[dict[str, Any]]) -> list[ClosedTrade]:
         trades: list[ClosedTrade] = []
-        for row in await self.recent_closed_trade_records(limit):
+        for row in rows:
             try:
                 opened = _parse_timestamp(row.get("opened_at"))
                 closed = _parse_timestamp(row.get("closed_at"))
@@ -427,11 +445,6 @@ class SupabaseTradeStore:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self._logger.warning("Skipping unreadable closed trade row: %s", exc)
-        # The dashboard starts where the volume cycle starts, so older trades are not shown.
-        if self._volume_cycle_started_at is not None:
-            cutoff = self._volume_cycle_started_at.astimezone(timezone.utc)
-            trades = [trade for trade in trades if trade.closed_at >= cutoff]
-        trades.sort(key=lambda trade: trade.closed_at)
         return trades
 
     async def _closed_trade_rows_for_day(
