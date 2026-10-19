@@ -133,6 +133,58 @@ class BuildForwardEnvTests(unittest.TestCase):
         for key in BLANKED_KEYS:  # the file keeps SUPABASE_*, but never the second account's secrets
             self.assertNotIn(FAKE_VALUES[key], text)
 
+    def test_case_variants_of_a_forced_key_are_dropped_and_cannot_win(self) -> None:
+        self.write_source(
+            f"SUPABASE_URL={FAKE_VALUES['SUPABASE_URL']}\n"
+            "SUPABASE_SCHEMA=public\n"
+            "supabase_schema=public\n"
+            "Supabase_Schema=public\n"
+            f"BINGX_API_KEY={FAKE_VALUES['BINGX_API_KEY']}\n"
+            f"bingx_api_key={FAKE_VALUES['BINGX_API_KEY']}\n"
+            f"Bingx_Secret_Key={FAKE_VALUES['BINGX_SECRET_KEY']}\n"
+            f"xai_api_key={FAKE_VALUES['XAI_API_KEY']}\n"
+            "entry_gate_direction=short\n"
+            "Volume_Cycle_Started_At=2020-01-01T00:00:00+00:00\n"
+        )
+        text = self.built()
+        keys = [k.upper() for k, _ in parse(text)]
+        for key in (*FORWARD_OVERRIDES, CYCLE_KEY, *BLANKED_KEYS):
+            self.assertEqual(keys.count(key), 1, key)
+        for name in ("SUPABASE_SCHEMA", "BINGX_API_KEY", "BINGX_SECRET_KEY", "XAI_API_KEY"):
+            self.assertIn(name + "=", text)
+        for key in BLANKED_KEYS:
+            self.assertNotIn(FAKE_VALUES[key], text)
+        settings = Settings(_env_file=str(self.target), BINGX_API_KEY="x", BINGX_SECRET_KEY="y", XAI_API_KEY="z")
+        self.assertEqual(settings.supabase_schema, "long_forward")
+        self.assertEqual(settings.entry_gate_direction, "long")
+        self.assertEqual(settings.volume_cycle_started_at, datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc))
+        # the blanked keys must really be empty in the file itself
+        self.assertEqual({k: v for k, v in effective(text).items() if k.upper() in BLANKED_KEYS},
+                         {k: "" for k in BLANKED_KEYS})
+
+    def test_quoted_keys_count_as_occurrences(self) -> None:
+        self.write_source(
+            f"SUPABASE_URL={FAKE_VALUES['SUPABASE_URL']}\n"
+            f"'BINGX_API_KEY'={FAKE_VALUES['BINGX_API_KEY']}\n"
+            f"export 'bingx_secret_key'={FAKE_VALUES['BINGX_SECRET_KEY']}\n"
+            f'"XAI_API_KEY"={FAKE_VALUES["XAI_API_KEY"]}\n'
+            "'supabase_schema'=public\n"
+        )
+        text = self.built()
+        for key in BLANKED_KEYS:
+            self.assertNotIn(FAKE_VALUES[key], text)
+        self.assertEqual([k for k, _ in parse(text)].count("SUPABASE_SCHEMA"), 1)
+        from dotenv import dotenv_values
+
+        parsed = dotenv_values(self.target)
+        self.assertEqual(parsed["SUPABASE_SCHEMA"], "long_forward")
+        self.assertEqual({k.upper() for k in parsed if k.upper() in BLANKED_KEYS}, set(BLANKED_KEYS))
+        self.assertTrue(all(parsed[k] == "" for k in BLANKED_KEYS))
+
+    def test_lowercase_supabase_url_satisfies_the_source_check(self) -> None:
+        self.write_source(f"supabase_url={FAKE_VALUES['SUPABASE_URL']}\n")
+        build(self.source, self.target, CYCLE)  # Settings would read it, so the source is the live env
+
     def test_secrets_are_blanked_and_never_printed(self) -> None:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

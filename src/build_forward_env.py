@@ -65,8 +65,18 @@ class BuildReport:
 
 
 def _key_of(line: str) -> str | None:
-    """Key of an env line, also when it starts with `export `."""
-    return _key_from_line(_EXPORT_PATTERN.sub("", line.strip(), count=1))
+    """Canonical (upper-case) key of an env line, or None.
+
+    Handles a leading `export `, and quotes around the key (python-dotenv reads `'KEY'=v` as KEY).
+    Case is folded because Settings matches names case-insensitively, so `supabase_schema=public`
+    is the same setting as `SUPABASE_SCHEMA` and, coming later, would win.
+    """
+    key = _key_from_line(_EXPORT_PATTERN.sub("", line.strip(), count=1))
+    if key is None:
+        return None
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "'\"":
+        key = key[1:-1].strip()
+    return key.upper() or None
 
 
 def _has_value(line: str) -> bool:
