@@ -33,6 +33,8 @@ from bot.core.forward_summary import (
     ForwardSummary,
     classify_exit,
     export_csv,
+    format_number,
+    format_percent,
     non_long_warning,
     summarize,
     trade_volume,
@@ -41,8 +43,6 @@ from bot.core.forward_summary import (
 )
 from bot.logger import setup_logging
 from bot.storage.supabase_trade_store import SupabaseTradeStore
-# One notation with the compare report the manager reads beside it (Indonesian decimals, "–" when missing).
-from research.mode_backtest.report import format_number, format_percent
 
 # The summary, the exit buckets and the CSV live in bot.core.forward_summary, so the offline mode
 # backtest can read the same CSV and reuse the same maths without importing the store; they are

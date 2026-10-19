@@ -188,5 +188,19 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "[]")
 
 
+class FormatTests(unittest.TestCase):
+    def test_the_copy_prints_exactly_what_the_compare_report_prints(self) -> None:
+        from research.mode_backtest import report as research_report
+
+        values = [None, 0.0, -0.0, -0.004, 0.5, 12.345, -546.4, 1234567.891, float("nan"), float("inf"), True]
+        for value in values:
+            for decimals in (0, 1, 2):
+                with self.subTest(value=value, decimals=decimals):
+                    self.assertEqual(fs.format_number(value, decimals),
+                                     research_report.format_number(value, decimals))
+                    self.assertEqual(fs.format_percent(value, decimals),
+                                     research_report.format_percent(value, decimals))
+
+
 if __name__ == "__main__":
     unittest.main()

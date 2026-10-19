@@ -99,6 +99,30 @@ def direction_name(trade: object) -> str:
     return str(getattr(direction, "value", direction))
 
 
+MISSING = "–"  # research.pine_gate.report_format.NA, so the weekly CLI and the compare .md agree
+_INDONESIAN = str.maketrans({",": ".", ".": ","})
+
+
+def format_number(value: Optional[float], decimals: int) -> str:
+    """``value`` in Indonesian notation (``1.234,5``), or "–" when missing or not finite.
+
+    The same text as ``research.mode_backtest.report.format_number`` (a test pins it), so the
+    weekly report prints each figure as the compare report beside it does; ``bot`` may not
+    import ``research``, hence the copy."""
+    if value is None or isinstance(value, bool) or not math.isfinite(value):
+        return MISSING
+    text = f"{float(value):,.{decimals}f}"
+    if text.startswith("-") and float(text[1:].replace(",", "")) == 0:
+        text = text[1:]  # never "-0" or "-0,00"
+    return text.translate(_INDONESIAN)
+
+
+def format_percent(value: Optional[float], decimals: int = 1) -> str:
+    """A percentage such as "48,1%"; "–" when missing."""
+    text = format_number(value, decimals)
+    return text if text == MISSING else f"{text}%"
+
+
 def non_long_warning(count: int) -> Optional[str]:
     """The line that must accompany any summary holding a position that is not LONG, or None."""
     if count <= 0:
