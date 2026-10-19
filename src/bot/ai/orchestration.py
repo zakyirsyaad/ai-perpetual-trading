@@ -62,6 +62,13 @@ class AIOrchestrator:
         self._compact_context = CompactDecisionContextBuilder(settings)
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
+        self._gate_context: dict[str, Any] | None = None
+
+    def set_gate_context(self, context: dict[str, Any]) -> None:
+        """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
+
+        Replaced, never mutated, so a stale verdict cannot leak into a later decision."""
+        self._gate_context = dict(context)
 
     async def close(self) -> None:
         await self._brain.close()
@@ -184,7 +191,7 @@ class AIOrchestrator:
 
         if gate_verdict and gate_verdict.get("verdict") == "block" and gate_verdict.get("reason") == "direction":
             allowed = gate_verdict.get("allowed_direction")
-            if gate_verdict.get("mode") == "enforce":
+            if gate_verdict.get("mode") == "enforce" or gate_verdict.get("forced_by") == "regime_gate":
                 self._logger.info(
                     "Entry candidate %s rejected: the gate lets through %s entries only.", decision.symbol, allowed
                 )
@@ -552,13 +559,19 @@ class AIOrchestrator:
             "behind_schedule": False,
             "entries_needed_per_hour": None,
         }
-        if mode == "off" or decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+        if decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
             return verdict
-
+        allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
+        other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
+        if other_side and self._settings.entry_regime_gate != "off":
+            # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
+            # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
+            verdict["forced_by"] = "regime_gate"
+        elif mode == "off":
+            return verdict
         # The side filter comes before the schedule relaxation on purpose: being behind
         # on volume may excuse a stretched entry, never the side that has no edge.
-        allowed_side = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
-        if allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}":
+        if other_side:
             verdict["verdict"] = "block"
             verdict["reason"] = "direction"
             verdict["allowed_direction"] = allowed_side
@@ -659,6 +672,8 @@ class AIOrchestrator:
         # spend can be attributed to individual decisions.
         call_metrics = getattr(self._brain, "last_call_metrics", None)
         ai_call_id = getattr(call_metrics, "call_id", None)
+        if self._gate_context:
+            gate = {**(gate or {}), "regime": self._gate_context}
         payload_json = {
             "decision": decision.model_dump(),
             "request": request_payload,

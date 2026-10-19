@@ -16,6 +16,10 @@ class GrokStrategy(BaseStrategy):
     def set_daily_state(self, state: DailyRiskState) -> None:
         self._daily_state = state
 
+    def set_gate_context(self, context: dict) -> None:
+        """Hand the orchestrator the regime verdict to record beside the next entry decisions."""
+        self._orchestrator.set_gate_context(context)
+
     async def next_trade_plan(self) -> TradePlan | None:
         if self._daily_state is None:
             raise RuntimeError("Daily risk state must be set before requesting a Grok trade plan.")

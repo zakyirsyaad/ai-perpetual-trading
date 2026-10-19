@@ -117,6 +117,7 @@ __all__ = [
     "RUN_KEYS",
     "StageError",
     "calendar_days",
+    "check_mode_l",
     "measured_days",
     "test_live_stage",
     "train_live_stage",
@@ -167,10 +168,16 @@ def _load_configs(config_path: PathLike, live_config_path: PathLike,
         raise StageError(f"mode L runs on {LIVE_PAIR} only, got pair {pair!r}")
     cfg, config_sha = load_modes_config_with_sha256(Path(config_path))
     live, live_sha = load_live_exit_config_with_sha256(Path(live_config_path))
+    check_mode_l(live, cfg)
+    return cfg, config_sha, live, live_sha
+
+
+def check_mode_l(live: LiveExitConfig, cfg: ModesConfig) -> None:
+    """Mode L can run as pre-registered: switched on (``StageError`` otherwise) and with a live
+    trigger equal to Mode D's (``ModesConfigError`` otherwise)."""
     if not live.mode_l.aktif:
         raise StageError("mode.L_cermin_live.aktif is false: mode L is switched off")
     check_live_trigger_matches(live, cfg)
-    return cfg, config_sha, live, live_sha
 
 
 def calendar_days(period: Period) -> int:

@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
+    # Regime gate of the LONG forward bot (bot/core/regime_gate.py). "off" makes no venue call and
+    # changes nothing; "naik" lets an entry through only while the hourly mode selector reads NAIK.
+    entry_regime_gate: str = Field(default="off", alias="ENTRY_REGIME_GATE")
+    # Volatility guard: skip entries while ATR14 (1h) exceeds this multiple of its 720-hour median,
+    # and while that median is not yet known. 0 turns the guard off. Read only with the regime gate on.
+    entry_volatility_guard_mult: float = Field(default=0.0, ge=0.0, alias="ENTRY_VOLATILITY_GUARD_MULT")
+    # The selector's sideways band, in ATR (config/modes.yaml pemilih_mode.sideways_jarak_kali_atr).
+    regime_sideways_atr_mult: float = Field(default=0.2, gt=0.0, alias="REGIME_SIDEWAYS_ATR_MULT")
     # Live dashboard feed (src/bot/telemetry). Read-only and off by default. The
     # listener refuses any non-loopback host: reach it through an SSH tunnel.
     telemetry_enabled: bool = Field(default=False, alias="TELEMETRY_ENABLED")
@@ -181,6 +189,14 @@ class Settings(BaseSettings):
     entry_guard_short_rsi_min: float = Field(default=24.0, ge=0.0, le=100.0, alias="ENTRY_GUARD_SHORT_RSI_MIN")
     cooldown_minutes_after_entry: int = Field(default=10, alias="COOLDOWN_MINUTES_AFTER_ENTRY")
     cooldown_minutes_after_stop: int = Field(default=20, alias="COOLDOWN_MINUTES_AFTER_STOP")
+    # Pause after a close of any reason (stop, neutral exit, AI exit, time stop). 0 = off.
+    cooldown_minutes_after_exit: int = Field(default=0, ge=0, alias="COOLDOWN_MINUTES_AFTER_EXIT")
+    # LONG forward bot self-stop (0 = off). From FORWARD_KILL_AFTER_POSITIONS closed positions, entries latch
+    # off while the pooled result is below FORWARD_KILL_BELOW_PER_1M per 1M; FORWARD_REVIEW_AT_POSITIONS
+    # latches them whatever the result, so the manager decides.
+    forward_kill_after_positions: int = Field(default=0, ge=0, alias="FORWARD_KILL_AFTER_POSITIONS")
+    forward_kill_below_per_1m: float = Field(default=-500.0, alias="FORWARD_KILL_BELOW_PER_1M")
+    forward_review_at_positions: int = Field(default=0, ge=0, alias="FORWARD_REVIEW_AT_POSITIONS")
     max_daily_drawdown_usdt: float = Field(default=100.0, alias="MAX_DAILY_DRAWDOWN_USDT")
     max_consecutive_losses: int = Field(default=3, alias="MAX_CONSECUTIVE_LOSSES")
     prevent_new_entries_if_exchange_position_open: bool = Field(
@@ -404,6 +420,14 @@ class Settings(BaseSettings):
         if direction not in {"any", "long", "short"}:
             raise ValueError("ENTRY_GATE_DIRECTION must be one of: any, long, short.")
         return direction
+
+    @field_validator("entry_regime_gate")
+    @classmethod
+    def normalize_entry_regime_gate(cls, value: str) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode not in {"off", "naik"}:
+            raise ValueError("ENTRY_REGIME_GATE must be one of: off, naik.")
+        return mode
 
     @field_validator("telemetry_host")
     @classmethod
@@ -631,7 +655,31 @@ class Settings(BaseSettings):
             raise ValueError("LEVERAGE cannot exceed VENUE_MAX_LEVERAGE.")
         if self.volume_execution_mode == "maker_only" and self.execution_post_only_fallback_to_market:
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
+        self._require_long_only_companions()
         return self
+
+    def _require_long_only_companions(self) -> None:
+        """The regime gate means a LONG-only forward bot; the side filter lives elsewhere, so demand it.
+
+        Only AIOrchestrator enforces ENTRY_GATE_DIRECTION, and only inside the stretch gate when its
+        mode is `enforce`; the deterministic `volume` strategy never reaches it. A gate-on .env that
+        inherited another mode would trade SHORTs. A gate-off Settings is not checked at all.
+        """
+        if self.entry_regime_gate == "off":
+            return
+        problems = []
+        if self.entry_gate_direction != "long":
+            problems.append("ENTRY_GATE_DIRECTION=long")
+        if self.entry_stretch_gate_mode != "enforce":
+            problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
+        if self.strategy_mode not in {"grok", "ai_volume"}:
+            problems.append("STRATEGY_MODE=grok or ai_volume")
+        if problems:
+            raise ValueError(
+                "ENTRY_REGIME_GATE is on, which makes this a LONG-only bot; it needs "
+                + ", ".join(problems)
+                + " (the direction filter only runs in an AI strategy with the stretch gate enforcing)."
+            )
 
     @property
     def exchange_name(self) -> str:
