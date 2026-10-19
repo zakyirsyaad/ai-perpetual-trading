@@ -14,141 +14,58 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import sys
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date
 from pathlib import Path
-from typing import Any, Optional, Sequence
-from zoneinfo import ZoneInfo
+from typing import Any, Optional
 
 from bot.config import Settings
 from bot.core.forward_guard import CycleTotals, forward_guard_reason
+from bot.core.forward_summary import (
+    CSV_COLUMNS,
+    DROPPED_TOP_TRADES,
+    EXIT_AI,
+    EXIT_OTHER,
+    EXIT_SL,
+    EXIT_TIME,
+    EXIT_TP,
+    WIB,
+    ForwardSummary,
+    classify_exit,
+    export_csv,
+    summarize,
+    trade_volume,
+    trades_in_window,
+    window_bounds,
+)
 from bot.logger import setup_logging
-from bot.models import ClosedTrade
 from bot.storage.supabase_trade_store import SupabaseTradeStore
 
-WIB = ZoneInfo("Asia/Jakarta")
-PER_MILLION = 1_000_000.0
-DROPPED_TOP_TRADES = 3
-
-CSV_COLUMNS = (
-    "opened_at",
-    "closed_at",
-    "direction",
-    "entry_price",
-    "exit_price",
-    "quantity",
-    "pnl_usdt",
-    "reason",
-    "volume_usdt",
-)
-
-EXIT_TP = "tp"
-EXIT_SL = "sl"
-EXIT_TIME = "waktu"
-EXIT_AI = "ai"
-EXIT_OTHER = "lain"
-# The reason strings TradeEngine._monitor_position returns and stores; strategy exits carry a suffix
-# ("strategy_exit:<model reason>"), so they match by prefix.
-_EXACT_EXIT_BUCKETS = {
-    "neutral_exit": EXIT_TP,
-    "take_profit": EXIT_TP,
-    "stop_loss": EXIT_SL,
-    "time_stop": EXIT_TIME,
-}
-_STRATEGY_EXIT_PREFIX = "strategy_exit"
-
-
-@dataclass(frozen=True, slots=True)
-class ForwardSummary:
-    posisi: int
-    entry_per_hari_kalender: float
-    untung_pct: float
-    exits: dict[str, int]
-    hasil_per_1_juta: Optional[float]
-    hasil_tanpa_teratas: Optional[float]
-    pnl_usdt: float
-    volume_usdt: float
-
-
-def classify_exit(reason: str) -> str:
-    """Bucket of a stored exit reason; anything unknown counts under `lain` rather than being dropped."""
-    text = (reason or "").strip()
-    if text in _EXACT_EXIT_BUCKETS:
-        return _EXACT_EXIT_BUCKETS[text]
-    if text == _STRATEGY_EXIT_PREFIX or text.startswith(_STRATEGY_EXIT_PREFIX + ":"):
-        return EXIT_AI
-    return EXIT_OTHER
-
-
-def trade_volume(trade: ClosedTrade) -> float:
-    """Traded volume of a position, both legs; the definition SupabaseTradeStore._sum_trade_volume uses."""
-    return (trade.entry_price + trade.exit_price) * trade.quantity
-
-
-def window_bounds(first_day: date, last_day: date) -> tuple[datetime, datetime]:
-    """[first_day 00:00, last_day 00:00) in WIB. Refuses an empty or reversed window."""
-    if last_day <= first_day:
-        raise ValueError(f"empty or reversed window: from {first_day} to {last_day} (to is exclusive)")
-    return (
-        datetime.combine(first_day, time.min, tzinfo=WIB),
-        datetime.combine(last_day, time.min, tzinfo=WIB),
-    )
-
-
-def trades_in_window(trades: Sequence[ClosedTrade], first_day: date, last_day: date) -> list[ClosedTrade]:
-    start, end = window_bounds(first_day, last_day)
-    return [trade for trade in trades if start <= trade.closed_at < end]
-
-
-def _pooled_per_1m(trades: Sequence[ClosedTrade]) -> Optional[float]:
-    volume = sum(trade_volume(trade) for trade in trades)
-    if volume <= 0:
-        return None
-    return PER_MILLION * sum(trade.pnl_usdt for trade in trades) / volume
-
-
-def summarize(trades: Sequence[ClosedTrade], first_day: date, last_day: date) -> ForwardSummary:
-    """Summary of the trades closed inside the WIB window [first_day, last_day)."""
-    window = trades_in_window(trades, first_day, last_day)
-    days = (last_day - first_day).days
-    exits = {EXIT_TP: 0, EXIT_SL: 0, EXIT_TIME: 0, EXIT_AI: 0, EXIT_OTHER: 0}
-    for trade in window:
-        exits[classify_exit(trade.reason)] += 1
-    ranked = sorted(window, key=lambda trade: trade.pnl_usdt, reverse=True)
-    wins = sum(1 for trade in window if trade.pnl_usdt > 0)
-    return ForwardSummary(
-        posisi=len(window),
-        entry_per_hari_kalender=len(window) / days,
-        untung_pct=(100.0 * wins / len(window)) if window else 0.0,
-        exits=exits,
-        hasil_per_1_juta=_pooled_per_1m(window),
-        hasil_tanpa_teratas=_pooled_per_1m(ranked[DROPPED_TOP_TRADES:]),
-        pnl_usdt=sum(trade.pnl_usdt for trade in window),
-        volume_usdt=sum(trade_volume(trade) for trade in window),
-    )
-
-
-def export_csv(trades: Sequence[ClosedTrade], path: Path) -> None:
-    """Write the trades to `path`, refusing (FileExistsError) to overwrite. Columns are an interface."""
-    with open(path, "x", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(CSV_COLUMNS)
-        for trade in trades:
-            writer.writerow(
-                [
-                    trade.opened_at.astimezone(timezone.utc).isoformat(),
-                    trade.closed_at.astimezone(timezone.utc).isoformat(),
-                    trade.direction.value,
-                    trade.entry_price,
-                    trade.exit_price,
-                    trade.quantity,
-                    trade.pnl_usdt,
-                    trade.reason,
-                    trade_volume(trade),
-                ]
-            )
+# The summary, the exit buckets and the CSV live in bot.core.forward_summary, so the offline mode
+# backtest can read the same CSV and reuse the same maths without importing the store; they are
+# re-exported here under their old names.
+__all__ = [
+    "CSV_COLUMNS",
+    "DROPPED_TOP_TRADES",
+    "EXIT_AI",
+    "EXIT_OTHER",
+    "EXIT_SL",
+    "EXIT_TIME",
+    "EXIT_TP",
+    "WIB",
+    "ForwardSummary",
+    "build_parser",
+    "classify_exit",
+    "execute",
+    "export_csv",
+    "main",
+    "render_guard",
+    "render_summary",
+    "summarize",
+    "trade_volume",
+    "trades_in_window",
+    "window_bounds",
+]
 
 
 def _fmt(value: Optional[float], digits: int = 1) -> str:

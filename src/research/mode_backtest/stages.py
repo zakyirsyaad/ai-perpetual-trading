@@ -326,7 +326,7 @@ def require_warm(frames: PairFrames, period: Period) -> None:
     cold = [name for name in _HOURLY_SERIES if getattr(context, name) is None]
     if cold:
         raise StageError(
-            f"{', '.join(cold)} still None at {period.start.isoformat()}, the start of training: "
+            f"{', '.join(cold)} still None at {period.start.isoformat()}, the start of the stage: "
             "the warm-up files are too short for the hourly series"
         )
 
