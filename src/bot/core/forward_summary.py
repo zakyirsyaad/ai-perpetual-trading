@@ -175,7 +175,9 @@ def summarize(
 
 
 def export_csv(trades: Sequence, path: Path) -> None:
-    """Write ``ClosedTrade`` rows to `path`, refusing (FileExistsError) to overwrite. Columns are an interface."""
+    """Write ``ClosedTrade`` or ``ForwardTrade`` rows to `path`, refusing (FileExistsError) to overwrite.
+
+    Columns are an interface."""
     with open(path, "x", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(CSV_COLUMNS)
@@ -184,7 +186,7 @@ def export_csv(trades: Sequence, path: Path) -> None:
                 [
                     trade.opened_at.astimezone(timezone.utc).isoformat(),
                     trade.closed_at.astimezone(timezone.utc).isoformat(),
-                    trade.direction.value,
+                    direction_name(trade),
                     trade.entry_price,
                     trade.exit_price,
                     trade.quantity,

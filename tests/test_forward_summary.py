@@ -113,6 +113,14 @@ class ReadTradesCsvTests(unittest.TestCase):
         # the summary takes the rows read back as it takes the store's trades
         self.assertEqual(fs.summarize(read, FROM, TO), fs.summarize(trades, FROM, TO))
 
+    def test_rows_read_back_export_again_unchanged(self):
+        fs.export_csv([closed_trade(pnl=10.0, reason="neutral_exit")], self.path)
+        again = self.path.with_name("again.csv")
+
+        fs.export_csv(fs.read_trades_csv(self.path), again)
+
+        self.assertEqual(again.read_text(encoding="utf-8"), self.path.read_text(encoding="utf-8"))
+
     def test_an_empty_export_reads_as_no_trades(self):
         fs.export_csv([], self.path)
         self.assertEqual(fs.read_trades_csv(self.path), [])
