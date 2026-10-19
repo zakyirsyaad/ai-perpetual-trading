@@ -361,12 +361,24 @@ class VerdictTests(unittest.TestCase):
             make_gate(FakeClient([]), mode="long")
 
 
+# What a gate-on Settings must carry besides the gate: the LONG-only invariant is enforced by the
+# direction gate in AIOrchestrator, which only runs for an AI strategy with the stretch gate enforcing.
+LONG_ONLY_COMPANIONS = {
+    "ENTRY_GATE_DIRECTION": "long",
+    "ENTRY_STRETCH_GATE_MODE": "enforce",
+    "STRATEGY_MODE": "ai_volume",
+    "XAI_API_KEY": "test-xai",
+}
+
+
 class ConfigTests(unittest.TestCase):
     def settings(self, **env):
-        return Settings(
-            _env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret",
-            STRATEGY_MODE="volume", **env,
-        )
+        env.setdefault("STRATEGY_MODE", "volume")
+        return Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", **env)
+
+    def gated(self, **override):
+        env = {**LONG_ONLY_COMPANIONS, "ENTRY_REGIME_GATE": "naik", **override}
+        return self.settings(**env)
 
     def test_defaults_leave_the_gate_off(self):
         settings = self.settings()
@@ -375,7 +387,46 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.entry_volatility_guard_mult, 0.0)
 
     def test_naik_is_accepted_and_normalised(self):
-        self.assertEqual(self.settings(ENTRY_REGIME_GATE=" NAIK ").entry_regime_gate, "naik")
+        self.assertEqual(self.gated(ENTRY_REGIME_GATE=" NAIK ").entry_regime_gate, "naik")
+
+    def test_the_gate_with_all_its_companions_boots(self):
+        settings = self.gated()
+
+        self.assertEqual(settings.entry_gate_direction, "long")
+        self.assertEqual(settings.entry_stretch_gate_mode, "enforce")
+
+    def test_the_gate_refuses_to_boot_without_a_long_only_direction(self):
+        for direction in ("any", "short"):
+            with self.subTest(direction=direction):
+                with self.assertRaises(ValueError) as caught:
+                    self.gated(ENTRY_GATE_DIRECTION=direction)
+                self.assertIn("ENTRY_GATE_DIRECTION", str(caught.exception))
+
+    def test_the_gate_refuses_to_boot_unless_the_stretch_gate_enforces(self):
+        for mode in ("off", "shadow"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError) as caught:
+                    self.gated(ENTRY_STRETCH_GATE_MODE=mode)
+                self.assertIn("ENTRY_STRETCH_GATE_MODE", str(caught.exception))
+
+    def test_the_gate_refuses_to_boot_with_the_deterministic_strategy(self):
+        with self.assertRaises(ValueError) as caught:
+            self.gated(STRATEGY_MODE="volume")
+        self.assertIn("STRATEGY_MODE", str(caught.exception))
+
+    def test_the_gate_accepts_either_ai_strategy(self):
+        self.assertEqual(self.gated(STRATEGY_MODE="grok").strategy_mode, "grok")
+
+    def test_the_live_style_settings_with_the_gate_off_still_construct(self):
+        for direction in ("any", "short", "long"):
+            for mode in ("off", "shadow", "enforce"):
+                for strategy in ("volume", "grok", "ai_volume"):
+                    with self.subTest(direction=direction, mode=mode, strategy=strategy):
+                        settings = self.settings(
+                            ENTRY_GATE_DIRECTION=direction, ENTRY_STRETCH_GATE_MODE=mode,
+                            STRATEGY_MODE=strategy, XAI_API_KEY="test-xai",
+                        )
+                        self.assertEqual(settings.entry_regime_gate, "off")
 
     def test_config_refuses_an_unknown_regime_gate_value(self):
         with self.assertRaises(ValueError):

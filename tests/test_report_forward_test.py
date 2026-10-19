@@ -24,11 +24,12 @@ def _trade(
     entry: float = 100.0,
     exit_: float = 101.0,
     qty: float = 10.0,
+    direction: PositionDirection = PositionDirection.LONG,
 ) -> ClosedTrade:
     closed = closed or datetime(2026, 10, 12, 12, 0, tzinfo=WIB)
     return ClosedTrade(
         symbol="BTC/USDT",
-        direction=PositionDirection.LONG,
+        direction=direction,
         entry_price=entry,
         exit_price=exit_,
         quantity=qty,
@@ -194,6 +195,53 @@ class CliTests(unittest.TestCase):
             code, out, _ = self._run(["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store)
         self.assertEqual(code, 0)
         self.assertIn("forward_review", out)
+
+    def test_a_short_row_is_flagged_in_the_summary_and_still_exported(self) -> None:
+        store = _FakeStore(
+            [_trade(pnl=5.0), _trade(pnl=-2.0, direction=PositionDirection.SHORT)],
+            CycleTotals(count=2, pnl_usdt=3.0, volume_usdt=4000.0),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err = self._run(["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store)
+            rows = list(csv.DictReader(io.StringIO((Path(tmp) / "forward_trades_2026-10-12_2026-10-19.csv").read_text())))
+        self.assertEqual(code, 0, err)
+        self.assertIn("PERINGATAN: 1 posisi bukan LONG", out)
+        self.assertEqual(len(rows), 2)
+
+    def test_an_all_long_week_prints_no_warning(self) -> None:
+        store = _FakeStore([_trade()], CycleTotals(count=1, pnl_usdt=1.0, volume_usdt=2000.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out, _ = self._run(["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store)
+        self.assertNotIn("PERINGATAN", out)
+
+    def test_prints_the_cycle_start_and_warns_when_the_window_begins_before_it(self) -> None:
+        cycle = datetime(2026, 10, 14, 7, 0, tzinfo=WIB)
+        store = _FakeStore([_trade()], CycleTotals(count=1, pnl_usdt=1.0, volume_usdt=2000.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out, _ = self._run(
+                ["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store,
+                _settings(volume_cycle_started_at=cycle),
+            )
+        self.assertIn("2026-10-14", out)  # VOLUME_CYCLE_STARTED_AT is printed
+        self.assertIn("PERINGATAN: --from 2026-10-12 lebih awal dari VOLUME_CYCLE_STARTED_AT", out)
+
+    def test_no_cycle_warning_when_the_window_begins_at_or_after_it(self) -> None:
+        cycle = datetime(2026, 10, 12, 0, 0, tzinfo=WIB)
+        store = _FakeStore([_trade()], CycleTotals(count=1, pnl_usdt=1.0, volume_usdt=2000.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out, _ = self._run(
+                ["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store,
+                _settings(volume_cycle_started_at=cycle),
+            )
+        self.assertIn("VOLUME_CYCLE_STARTED_AT", out)
+        self.assertNotIn("PERINGATAN", out)
+
+    def test_a_settings_without_a_cycle_start_prints_tidak_diatur(self) -> None:
+        store = _FakeStore([], CycleTotals(0, 0.0, 0.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out, _ = self._run(["--from", "2026-10-12", "--to", "2026-10-19", "--out-dir", tmp], store)
+        self.assertIn("VOLUME_CYCLE_STARTED_AT", out)
+        self.assertIn("tidak diatur", out)
 
     def test_reversed_window_exits_2_with_one_error_line(self) -> None:
         store = _FakeStore([], CycleTotals(0, 0.0, 0.0))

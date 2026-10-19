@@ -245,6 +245,30 @@ class RunTests(ForwardCompareCase):
                      "Tanpa 3 teratas", "2026-10-20", "2026-10-23", "hari kalender"):
             self.assertIn(text, report)
 
+    def test_the_report_states_the_edge_asymmetry(self):
+        self.run_stage()
+
+        report = (self.out / f"{STEM}.md").read_text(encoding="utf-8")
+        self.assertIn("60 menit terakhir", report)  # mode L takes no entry in the window's last 60 minutes
+        self.assertIn("closed_at", report)  # the forward side counts a position by when it closed
+        self.assertNotIn("PERINGATAN", report)
+
+    def test_a_short_forward_row_in_the_window_is_flagged_in_the_report_and_the_result(self):
+        rows = forward_rows()
+        rows[1][2] = "SHORT"  # the first row closed inside the window
+        with self.trades.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(fs.CSV_COLUMNS)
+            writer.writerows(rows)
+
+        path = self.run_stage()
+
+        report = (self.out / f"{STEM}.md").read_text(encoding="utf-8")
+        self.assertIn("PERINGATAN: 1 posisi bukan LONG", report)
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["forward"]["non_long"], 1)
+        self.assertIn("PERINGATAN: 1 posisi bukan LONG", doc["status_line"])
+
     def test_never_writes_a_marker_or_lock(self):
         self.run_stage()
 

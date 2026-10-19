@@ -33,6 +33,7 @@ from bot.core.forward_summary import (
     ForwardSummary,
     classify_exit,
     export_csv,
+    non_long_warning,
     summarize,
     trade_volume,
     trades_in_window,
@@ -59,6 +60,7 @@ __all__ = [
     "execute",
     "export_csv",
     "main",
+    "render_cycle",
     "render_guard",
     "render_summary",
     "summarize",
@@ -86,6 +88,9 @@ def render_summary(summary: ForwardSummary, first_day: date, last_day: date) -> 
         f"hasil per 1 juta          : {_fmt(summary.hasil_per_1_juta)}",
         f"hasil tanpa {DROPPED_TOP_TRADES} teratas     : {_fmt(summary.hasil_tanpa_teratas)}",
     ]
+    warning = non_long_warning(summary.non_long)
+    if warning:
+        lines.append(warning)
     return "\n".join(lines)
 
 
@@ -103,6 +108,24 @@ def render_guard(totals: CycleTotals, settings: Any) -> str:
             f"status                    : {reason if reason else 'aktif'}",
         ]
     )
+
+
+def render_cycle(settings: Any, first_day: date) -> str:
+    """The cycle start the store filters on, and a warning when the window begins before it.
+
+    The store reads only trades closed since VOLUME_CYCLE_STARTED_AT, so an earlier day of the
+    window would silently come back empty or short.
+    """
+    cycle_start = getattr(settings, "volume_cycle_started_at", None)
+    if cycle_start is None:
+        return "VOLUME_CYCLE_STARTED_AT    : tidak diatur (semua posisi di skema ini dihitung)"
+    lines = [f"VOLUME_CYCLE_STARTED_AT    : {cycle_start.astimezone(WIB).isoformat()} (WIB)"]
+    if first_day < cycle_start.astimezone(WIB).date():
+        lines.append(
+            f"PERINGATAN: --from {first_day} lebih awal dari VOLUME_CYCLE_STARTED_AT; posisi yang "
+            "ditutup sebelum awal siklus tidak dibaca, jadi hari-hari awal jendela tampak kosong atau kurang."
+        )
+    return "\n".join(lines)
 
 
 def _parse_day(text: str) -> date:
@@ -145,6 +168,8 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
     trades = await store.closed_trades_since_cycle()
     totals = await store.cycle_trade_totals()
     window = trades_in_window(trades, args.first_day, args.last_day)
+    print(render_cycle(settings, args.first_day))
+    print()
     print(render_summary(summarize(trades, args.first_day, args.last_day), args.first_day, args.last_day))
     print()
     print(render_guard(totals, settings))

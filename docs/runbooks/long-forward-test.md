@@ -34,11 +34,21 @@ Ground rules:
 
 Starts only on the user's go-ahead (plan Task 9), on merged `main`.
 
-1. Clone into its own directory and give it its own venv:
+1. **Pin the code with a tag** (spec section 5: the live bot's code at a tagged release). After this branch is merged
+   to `main`, the operator creates the tag on the merge commit from a machine with push rights (nobody creates it
+   automatically):
+   ```bash
+   git fetch origin && git tag -a long-forward-v1 -m "LONG AI forward test, first deployment" origin/main
+   git push origin long-forward-v1
+   ```
+   Then clone into its own directory at that tag and give it its own venv:
    ```bash
    git clone <repo url> /home/ubuntu/ai-perp-long && cd /home/ubuntu/ai-perp-long
+   git checkout long-forward-v1   # detached HEAD on purpose: the forward bot runs exactly this release
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
    ```
+   A later code change reaches the forward bot only as a new tag (`long-forward-v2`, ...), checked out while the account
+   is flat (section 4) and recorded with the report of the week it starts in.
 2. Build the `.env` from the live one. The source is only read; the target must not exist; the file is created with mode
    600. Pick the cycle start now (a timezone-aware ISO-8601 instant, not more than 5 minutes in the future):
    ```bash
@@ -47,16 +57,25 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
      --target /home/ubuntu/ai-perp-long/.env \
      --cycle-start "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
    ```
-   It prints the key names it set and the three it blanked. Show that output to the user.
+   It prints the key names it set and the three it blanked. Show that output to the user. Among the keys it forces are
+   `ENTRY_STRETCH_GATE_MODE=enforce` and `STRATEGY_MODE=ai_volume`: the LONG-only filter (`ENTRY_GATE_DIRECTION=long`) runs
+   only inside the enforcing stretch gate of an AI strategy, so `Settings` refuses to boot with `ENTRY_REGIME_GATE=naik`
+   unless all three hold (the error names the keys).
 3. **`VOLUME_CYCLE_STARTED_AT` must be the forward start** (this `--cycle-start`). The forward guard counts closed trades
    since that instant in the configured schema; an earlier cutoff would pool older trades into the 60 and 150 counts.
    Never edit it afterwards.
-4. Review the key names that came over from the live `.env` and were not forced. Names only, every key (digits in names and
-   `export KEY=` lines included; it never prints a value). `[[:space:]]` keeps it working with both GNU and BSD `sed`:
+4. Review the key names that came over from the live `.env` and were not forced. Names only: the `grep` keeps just the
+   lines that start a `NAME=` assignment (an `export NAME=` line, spaces around `=` and digits in names included), so a
+   continuation line of a multi-line quoted value or a stray token never reaches the terminal; the `sed` then cuts
+   everything from the first `=`. `[[:space:]]` keeps it working with both GNU and BSD `sed`:
    ```bash
-   grep -vE '^[[:space:]]*(#|$)' /home/ubuntu/ai-perp-long/.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*=.*//' | sort
+   grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' /home/ubuntu/ai-perp-long/.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*=.*//' | sort
    ```
-   Values the second account needs to differ on are the operator's call.
+   Values the second account needs to differ on are the operator's call. **Decide on the external-provider keys here:**
+   the builder copies `COINMARKETCAP_API_KEY` and `DUNE_API_KEY` from the live `.env` when it has them, so both bots then
+   call those providers on the same quota (external calls double, and an exhausted quota prunes the provider from the live
+   bot's payload too). Choose one on purpose: keep them (accept the shared quota), give the forward bot its own keys, or
+   blank them in the forward `.env` (the provider is then absent from its payload).
 5. The account owner types `BINGX_API_KEY`, `BINGX_SECRET_KEY` and `XAI_API_KEY` into `/home/ubuntu/ai-perp-long/.env`
    with an editor. `chmod 600 .env` stays.
 6. **Process environment overrides `.env`** (pydantic-settings reads the environment first). The pm2 app must not export
@@ -124,7 +143,11 @@ Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates
    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/report_forward_test.py \
      --from FROM --to TO --out-dir ~/forward_weeks
    ```
-   It prints the week's summary and the guard state (whole cycle) and writes the trades CSV (never overwritten).
+   It prints `VOLUME_CYCLE_STARTED_AT`, the week's summary and the guard state (whole cycle) and writes the trades CSV
+   (never overwritten). Two `PERINGATAN` lines can appear and each needs an answer before the numbers go to the manager:
+   `--from` earlier than the cycle start (the store reads only trades closed since the cycle start, so the early days
+   are silently missing: use `--from` on or after it), and `N posisi bukan LONG` (the forward bot is LONG-only, so a
+   SHORT row means the side filter failed: stop and look).
 2. **A separate forward data dir, one per week.** `compare-forward` refuses a `--data-dir` that holds `holdout_runs/`
    (that is the Phase 1 one-shot data dir, exit 2), so never point it at `~/replay/mode_backtest/data` or
    `~/replay/pine_gate/data`. `fetch` and `warmup` skip a file that already exists, so reuse of last week's dir would keep
@@ -168,7 +191,7 @@ Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates
      --forward-trades ~/forward_weeks/<the CSV from step 1> --from FROM --to TO --out-dir ~/forward_weeks
    ```
    Output: a JSON and the Indonesian `.md` (outputs are never overwritten; a rerun for the same window exits 1).
-6. **Edge asymmetry to state in the report.** Mode L takes no entry in the last 60 minutes of the simulated window (the
+6. **Edge asymmetry** (the `.md` now states it itself; kept here for reference). Mode L takes no entry in the last 60 minutes of the simulated window (the
    live gates' segment edge), so every mode L position opens and closes inside `[FROM 00:00, TO 00:00)`. The forward side
    counts a position in the window by its `closed_at`. The Saturday-to-Monday gap of the entry window makes the two
    agree in practice; they could differ for a position near an edge.

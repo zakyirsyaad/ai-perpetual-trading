@@ -45,6 +45,7 @@ from bot.core.forward_summary import (
     EXIT_TIME,
     EXIT_TP,
     ForwardSummary,
+    non_long_warning,
     read_trades_csv,
     summarize,
     trades_in_window,
@@ -265,8 +266,15 @@ def _status_line(c: _Comparison, first_day: date, end_day: date) -> str:
              f"posisi {run.metrics.posisi}" for run in c.runs]
     s = c.forward.summary
     parts.append(f"uji maju hasil per 1 juta = {exact(s.hasil_per_1_juta)}, posisi {s.posisi}")
-    return (f"Banding uji maju {c.pair} {first_day.isoformat()} s/d {end_day.isoformat()} "
+    line = (f"Banding uji maju {c.pair} {first_day.isoformat()} s/d {end_day.isoformat()} "
             f"(WIB, akhir tidak termasuk): {'; '.join(parts)}.")
+    warning = non_long_warning(s.non_long)
+    return f"{line} {warning}" if warning else line
+
+
+def _warning_block(summary: ForwardSummary) -> Sequence[str]:
+    warning = non_long_warning(summary.non_long)
+    return [warning, ""] if warning else []
 
 
 def _report(c: _Comparison, cfg: ModesConfig, live: LiveExitConfig, first_day: date,
@@ -288,6 +296,7 @@ def _report(c: _Comparison, cfg: ModesConfig, live: LiveExitConfig, first_day: d
         "",
         _table(c.runs, c.forward.summary, c.drop_top),
         "",
+        *_warning_block(c.forward.summary),
         "Hasil per 1 juta = 1.000.000 × jumlah PnL bersih / jumlah volume (kedua kaki); tanpa "
         f"{c.drop_top} teratas membuang {c.drop_top} posisi dengan PnL terbesar. Mode L memakai "
         f"fee {format_number(cfg.umum.fee_taker_persen, 3)}% per kaki dan slippage dari "
@@ -302,6 +311,13 @@ def _report(c: _Comparison, cfg: ModesConfig, live: LiveExitConfig, first_day: d
         "ATR 720 jam) memakai bar pemanasan bertanggal sebelum jendela, sebagian sebelum "
         f"{c.test_end_day.isoformat()} (akhir masa ujian Fase 1), hanya sebagai riwayat "
         f"indikator: tidak ada posisi atau angka dari sebelum {first_day.isoformat()} 00:00 WIB.",
+        "",
+        "Ujung jendela tidak simetris: mode L tidak membuka entry di "
+        f"{rules.batas_waktu_menit} menit terakhir jendela (posisinya harus selesai di dalam jendela), "
+        "sedangkan uji maju menghitung posisi menurut closed_at, sehingga posisi yang dibuka di "
+        "ujung jendela dan ditutup setelahnya jatuh ke minggu berikutnya dan posisi dari minggu "
+        "sebelumnya yang ditutup di awal jendela ikut terhitung. Selisih jumlah posisi di kedua "
+        "ujung bukan sinyal.",
         "",
         f"Data: klines produksi, manifest sha256 `{loaded_sha}`; file posisi uji maju "
         f"`{c.forward.path.name}` (sha256 `{c.forward.sha256}`, {c.forward.rows} baris, "

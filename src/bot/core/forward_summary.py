@@ -90,6 +90,23 @@ class ForwardSummary:
     hasil_tanpa_teratas: Optional[float]
     pnl_usdt: float
     volume_usdt: float
+    non_long: int = 0  # positions in the window whose direction is not LONG; the forward bot is LONG-only
+
+
+def direction_name(trade: object) -> str:
+    """`LONG`/`SHORT` of a ``ClosedTrade`` (enum) or a ``ForwardTrade`` (text)."""
+    direction = getattr(trade, "direction", None)
+    return str(getattr(direction, "value", direction))
+
+
+def non_long_warning(count: int) -> Optional[str]:
+    """The line that must accompany any summary holding a position that is not LONG, or None."""
+    if count <= 0:
+        return None
+    return (
+        f"PERINGATAN: {count} posisi bukan LONG di dalam jendela. Bot uji maju hanya boleh LONG, jadi "
+        "hasil gabungan di bawah memuat sisi lain: periksa penyaring arah sebelum memakai angkanya."
+    )
 
 
 def classify_exit(reason: str) -> str:
@@ -153,6 +170,7 @@ def summarize(
         hasil_tanpa_teratas=_pooled_per_1m(ranked[drop_top:]),
         pnl_usdt=sum(trade.pnl_usdt for trade in window),
         volume_usdt=sum(trade_volume(trade) for trade in window),
+        non_long=sum(1 for trade in window if direction_name(trade) != "LONG"),
     )
 
 

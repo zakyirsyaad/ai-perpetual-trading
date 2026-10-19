@@ -172,6 +172,69 @@ three changes. `PYTHONPATH=src` is added (the plan's form has none, `src/main.py
 `ecosystem.config.js` sets it for `ai-perp-volume`); the interpreter is an absolute path; and `--restart-delay 10000` mirrors
 that file's `restart_delay`.
 
+## Final review fix wave
+
+The whole-branch review (`638bd24..8943951`) found one invariant resting on an inherited setting and a handful of cheap
+gaps. Findings, in the review's numbering:
+
+1. **LONG-only depended on an inherited `ENTRY_STRETCH_GATE_MODE=enforce`.** `ENTRY_GATE_DIRECTION` is read only inside
+   `_stretch_gate_verdict`, which returns `allow` when the mode is `off`, and a direction block is enforced only when the mode
+   is `enforce`; `STRATEGY_MODE=volume` never reaches the orchestrator at all. Fixed in three places: (a)
+   `Settings.validate_cross_field_settings` refuses `ENTRY_REGIME_GATE` on unless `ENTRY_GATE_DIRECTION=long`,
+   `ENTRY_STRETCH_GATE_MODE=enforce` and `STRATEGY_MODE` is `grok`/`ai_volume` (the gate-off live Settings is untouched, a test
+   builds 27 live-style combinations); (b) the builder forces `ENTRY_STRETCH_GATE_MODE=enforce` and `STRATEGY_MODE=ai_volume`;
+   (c) `report_forward_test` and `compare-forward` count rows that are not LONG (`ForwardSummary.non_long`, shared in
+   `bot/core/forward_summary.py`) and print or write `PERINGATAN: N posisi bukan LONG ...`.
+2. **The runbook's names-only check could print a value** (a continuation line of a multi-line quoted value has no `=`).
+   Now `grep -E` keeps only `NAME=` lines before the `sed`; checked on a temp file with fake values (a multi-line quoted
+   value, a bare token, an `export` line, spaces around `=`): the old pipeline printed `bare-continuation-token-...` and
+   `final line"`, the new one printed the five key names only.
+3. The compare `.md` states the edge asymmetry itself (no entry in the window's last `batas_waktu_menit` = 60 minutes; the
+   forward side counts by `closed_at`).
+4. `report_forward_test` prints `VOLUME_CYCLE_STARTED_AT` (or `tidak diatur`) and warns when `--from` precedes it.
+5. Runbook: the forward bot inherits `COINMARKETCAP_API_KEY`/`DUNE_API_KEY`; an explicit keep/separate/blank decision.
+6. Runbook and CLAUDE.md: the code is pinned by a tag, `long-forward-v1`, which the operator creates on merged `main` (the
+   runbook gives the command; no tag was created or pushed here); the clone checks it out.
+7. CLAUDE.md "The tick loop and its gates" lists the real order (ten gates) so it agrees with the forward section.
+8. `test_every_new_setting_defaults_off` also asserts `forward_kill_after_positions == 0`, `forward_review_at_positions == 0`
+   and `entry_volatility_guard_mult == 0`.
+9. The tests that parse the built file into `Settings` run under `mock.patch.dict(os.environ, {}, clear=True)`.
+
+### RED
+
+Tests for 1a, 1b, 1c, 3 and 4 were written first (`.superpowers/sdd/2026-10-19-long-ai-forward-test/final-fix-red.txt`):
+
+```
+$ PYTHONPATH=src .venv/bin/python -m unittest tests.test_regime_gate.ConfigTests tests.test_build_forward_env \
+    tests.test_trade_engine_forward_gates tests.test_forward_summary tests.test_report_forward_test \
+    tests.test_mode_backtest_forward_compare
+ERROR: test_the_overrides_carry_what_the_long_only_invariant_needs   (KeyError ENTRY_STRETCH_GATE_MODE)
+ERROR: test_counts_rows_of_either_shape_inside_the_window / test_all_long_has_none / test_the_warning_names_the_count (AttributeError: non_long / non_long_warning)
+FAIL: test_the_gate_refuses_to_boot_without_a_long_only_direction (direction='any'), (direction='short')
+FAIL: test_the_gate_refuses_to_boot_unless_the_stretch_gate_enforces (mode='off'), (mode='shadow')
+FAIL: test_the_gate_refuses_to_boot_with_the_deterministic_strategy
+FAIL: test_a_live_env_with_the_wrong_mode_is_forced_to_the_long_only_one, test_built_file_parses_into_the_forward_settings
+FAIL: test_a_short_row_is_flagged_in_the_summary_and_still_exported, test_prints_the_cycle_start_and_warns_..., test_no_cycle_warning_..., test_a_settings_without_a_cycle_start_prints_tidak_diatur
+FAIL: test_the_report_states_the_edge_asymmetry, test_a_short_forward_row_in_the_window_is_flagged_in_the_report_and_the_result
+Ran 110 tests ... FAILED (failures=13, errors=4)
+```
+
+Item 8 only strengthens assertions that already hold (defaults are 0), so it has no RED. Item 9's flakiness was shown
+instead: with `SUPABASE_SCHEMA=public` exported and the new tests stashed, `tests.test_build_forward_env` fails 2 tests; with
+the fix it passes under `SUPABASE_SCHEMA=public ENTRY_GATE_DIRECTION=short STRATEGY_MODE=volume`.
+
+### GREEN
+
+Same command: Ran 132 tests, OK. Existing fixtures that turned the gate on (`tests/test_regime_gate.py`,
+`tests/test_trade_engine_forward_gates.py`, the parsed-Settings test) now carry the three companions; the rule was not bent.
+
+### Verification
+
+Full suite under coverage (rcfile with pyproject's settings; Python 3.10 cannot read pyproject): 2640 tests, OK, 91 % line
+coverage (gate 80 %); `compileall -q src tests` clean; `git diff --check` clean; `tests.test_secret_hygiene` passes.
+Mode L's code sha changed again (`bot/core/forward_summary.py`, `forward_compare.py`); mode L's `train` has not run, so
+nothing is invalidated.
+
 ## Verification
 
 ```text

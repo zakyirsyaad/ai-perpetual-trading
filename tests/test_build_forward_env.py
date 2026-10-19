@@ -6,6 +6,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,6 +50,14 @@ SOURCE_LINES = [
     "#SUPABASE_SCHEMA=commented-out-stays",
     "TELEMETRY_ENABLED=true",
 ]
+
+
+@contextlib.contextmanager
+def clean_environment():
+    """Settings reads process env over a dotenv file; a shell that exports SUPABASE_SCHEMA or
+    STRATEGY_MODE must not decide what these tests see. Only the file counts."""
+    with mock.patch.dict(os.environ, {}, clear=True):
+        yield
 
 
 def parse(text: str) -> list[tuple[str, str]]:
@@ -154,7 +163,8 @@ class BuildForwardEnvTests(unittest.TestCase):
             self.assertIn(name + "=", text)
         for key in BLANKED_KEYS:
             self.assertNotIn(FAKE_VALUES[key], text)
-        settings = Settings(_env_file=str(self.target), BINGX_API_KEY="x", BINGX_SECRET_KEY="y", XAI_API_KEY="z")
+        with clean_environment():
+            settings = Settings(_env_file=str(self.target), BINGX_API_KEY="x", BINGX_SECRET_KEY="y", XAI_API_KEY="z")
         self.assertEqual(settings.supabase_schema, "long_forward")
         self.assertEqual(settings.entry_gate_direction, "long")
         self.assertEqual(settings.volume_cycle_started_at, datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc))
@@ -336,6 +346,30 @@ class ForwardOverridesAreRealSettingsTests(unittest.TestCase):
         for key in (*FORWARD_OVERRIDES, CYCLE_KEY, *BLANKED_KEYS):
             self.assertIn(key, aliases, f"{key} is not a Settings alias")
 
+    def test_the_overrides_carry_what_the_long_only_invariant_needs(self) -> None:
+        # Settings refuses ENTRY_REGIME_GATE=naik without these; a live .env that lacks them must not
+        # leave the forward bot to inherit a mode under which the direction gate never runs.
+        self.assertEqual(FORWARD_OVERRIDES["ENTRY_STRETCH_GATE_MODE"], "enforce")
+        self.assertEqual(FORWARD_OVERRIDES["STRATEGY_MODE"], "ai_volume")
+        self.assertEqual(FORWARD_OVERRIDES["ENTRY_GATE_DIRECTION"], "long")
+
+    def test_a_live_env_with_the_wrong_mode_is_forced_to_the_long_only_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, target = root / "live.env", root / "forward.env"
+            source.write_text(
+                "\n".join([*SOURCE_LINES, "ENTRY_STRETCH_GATE_MODE=off", "STRATEGY_MODE=volume"]) + "\n",
+                encoding="utf-8",
+            )
+            build(source, target, CYCLE)
+            with clean_environment():
+                settings = Settings(
+                    _env_file=str(target), BINGX_API_KEY="x-test-hand-typed-1",
+                    BINGX_SECRET_KEY="x-test-hand-typed-2", XAI_API_KEY="x-test-hand-typed-3",
+                )
+        self.assertEqual(settings.entry_stretch_gate_mode, "enforce")
+        self.assertEqual(settings.strategy_mode, "ai_volume")
+
     def test_the_builder_reuses_clean_envs_line_parser(self) -> None:
         import clean_env
 
@@ -348,15 +382,18 @@ class ForwardOverridesAreRealSettingsTests(unittest.TestCase):
             source.write_text("\n".join(SOURCE_LINES) + "\n", encoding="utf-8")
             build(source, target, CYCLE)
             # the blanked keys are typed by hand later; supply stand-ins the way a test does
-            settings = Settings(
-                _env_file=str(target),
-                BINGX_API_KEY="x-test-hand-typed-1",
-                BINGX_SECRET_KEY="x-test-hand-typed-2",
-                XAI_API_KEY="x-test-hand-typed-3",
-            )
+            with clean_environment():
+                settings = Settings(
+                    _env_file=str(target),
+                    BINGX_API_KEY="x-test-hand-typed-1",
+                    BINGX_SECRET_KEY="x-test-hand-typed-2",
+                    XAI_API_KEY="x-test-hand-typed-3",
+                )
         self.assertEqual(settings.supabase_schema, "long_forward")
         self.assertEqual(settings.entry_gate_direction, "long")
         self.assertEqual(settings.entry_regime_gate, "naik")
+        self.assertEqual(settings.entry_stretch_gate_mode, "enforce")
+        self.assertEqual(settings.strategy_mode, "ai_volume")
         self.assertEqual(settings.entry_volatility_guard_mult, 2.0)
         self.assertEqual(settings.cooldown_minutes_after_exit, 15)
         self.assertEqual(settings.cooldown_minutes_after_entry, 0)
@@ -385,7 +422,7 @@ class ForwardOverridesAreRealSettingsTests(unittest.TestCase):
             source.write_text("\n".join(SOURCE_LINES) + "\n", encoding="utf-8")
             build(source, target, CYCLE)
             self.assertNotIn(FAKE_VALUES["XAI_API_KEY"], target.read_text(encoding="utf-8"))
-            with self.assertRaises(Exception):
+            with clean_environment(), self.assertRaises(Exception):
                 Settings(_env_file=str(target))  # no key typed in: the bot must refuse to boot
 
 

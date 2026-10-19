@@ -80,6 +80,9 @@ class DefaultsTests(unittest.IsolatedAsyncioTestCase):
         settings = Settings(_env_file=None, BINGX_API_KEY="test-key", BINGX_SECRET_KEY="test-secret", STRATEGY_MODE="volume")
         self.assertEqual(settings.cooldown_minutes_after_exit, 0)
         self.assertEqual(settings.entry_regime_gate, "off")
+        self.assertEqual(settings.forward_kill_after_positions, 0)
+        self.assertEqual(settings.forward_review_at_positions, 0)
+        self.assertEqual(settings.entry_volatility_guard_mult, 0.0)
         self.assertIsNone(build_regime_gate(settings, FakeClient(), logging.getLogger(LOG_NAME)))
 
     def test_negative_pause_after_exit_is_refused(self) -> None:
@@ -361,7 +364,11 @@ class DecisionPayloadTests(unittest.IsolatedAsyncioTestCase):
 
 class BuildRegimeGateTests(unittest.TestCase):
     def _settings(self, **env):
-        return Settings(_env_file=None, BINGX_API_KEY="k", BINGX_SECRET_KEY="s", STRATEGY_MODE="volume", **env)
+        if env.get("ENTRY_REGIME_GATE", "off") != "off":  # the companions Settings demands with the gate on
+            env = {"ENTRY_GATE_DIRECTION": "long", "ENTRY_STRETCH_GATE_MODE": "enforce",
+                   "STRATEGY_MODE": "ai_volume", "XAI_API_KEY": "test-xai", **env}
+        env.setdefault("STRATEGY_MODE", "volume")
+        return Settings(_env_file=None, BINGX_API_KEY="k", BINGX_SECRET_KEY="s", **env)
 
     def test_the_gate_is_built_for_the_single_symbol(self) -> None:
         settings = self._settings(ENTRY_REGIME_GATE="naik", SYMBOLS="BTC/USDT", ENTRY_VOLATILITY_GUARD_MULT="2.0")

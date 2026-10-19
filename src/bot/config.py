@@ -655,7 +655,31 @@ class Settings(BaseSettings):
             raise ValueError("LEVERAGE cannot exceed VENUE_MAX_LEVERAGE.")
         if self.volume_execution_mode == "maker_only" and self.execution_post_only_fallback_to_market:
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
+        self._require_long_only_companions()
         return self
+
+    def _require_long_only_companions(self) -> None:
+        """The regime gate means a LONG-only forward bot; the side filter lives elsewhere, so demand it.
+
+        Only AIOrchestrator enforces ENTRY_GATE_DIRECTION, and only inside the stretch gate when its
+        mode is `enforce`; the deterministic `volume` strategy never reaches it. A gate-on .env that
+        inherited another mode would trade SHORTs. A gate-off Settings is not checked at all.
+        """
+        if self.entry_regime_gate == "off":
+            return
+        problems = []
+        if self.entry_gate_direction != "long":
+            problems.append("ENTRY_GATE_DIRECTION=long")
+        if self.entry_stretch_gate_mode != "enforce":
+            problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
+        if self.strategy_mode not in {"grok", "ai_volume"}:
+            problems.append("STRATEGY_MODE=grok or ai_volume")
+        if problems:
+            raise ValueError(
+                "ENTRY_REGIME_GATE is on, which makes this a LONG-only bot; it needs "
+                + ", ".join(problems)
+                + " (the direction filter only runs in an AI strategy with the stretch gate enforcing)."
+            )
 
     @property
     def exchange_name(self) -> str:

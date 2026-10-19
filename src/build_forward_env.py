@@ -22,6 +22,10 @@ from clean_env import _key_from_line
 FORWARD_OVERRIDES: dict[str, str] = {
     "SUPABASE_SCHEMA": "long_forward",
     "ENTRY_GATE_DIRECTION": "long",
+    # The direction filter runs only inside the enforcing stretch gate of an AI strategy; Settings
+    # refuses ENTRY_REGIME_GATE=naik without these, so a live .env cannot leave them inherited.
+    "ENTRY_STRETCH_GATE_MODE": "enforce",
+    "STRATEGY_MODE": "ai_volume",
     "ENTRY_REGIME_GATE": "naik",
     "ENTRY_VOLATILITY_GUARD_MULT": "2.0",
     "COOLDOWN_MINUTES_AFTER_EXIT": "15",

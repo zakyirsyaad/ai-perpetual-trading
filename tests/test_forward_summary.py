@@ -34,6 +34,34 @@ def closed_trade(pnl=1.0, reason="neutral_exit", closed=None, entry=100.0, exit_
     )
 
 
+class NonLongTests(unittest.TestCase):
+    """The forward bot is LONG-only; a row of another side must be counted and named, never pooled silently."""
+
+    def test_counts_rows_of_either_shape_inside_the_window(self):
+        in_window = datetime(2026, 10, 21, 12, 0, tzinfo=WIB)
+        trades = [
+            closed_trade(),
+            closed_trade(direction=PositionDirection.SHORT),
+            closed_trade(direction=PositionDirection.SHORT, closed=datetime(2026, 10, 30, tzinfo=WIB)),
+            fs.ForwardTrade(in_window - timedelta(minutes=5), in_window, "SHORT", 100.0, 99.0, 1.0,
+                            1.0, "stop_loss", 199.0),
+        ]
+
+        summary = fs.summarize(trades, FROM, TO)
+
+        self.assertEqual(summary.posisi, 3)
+        self.assertEqual(summary.non_long, 2)  # the one closed after the window is not counted
+
+    def test_all_long_has_none(self):
+        self.assertEqual(fs.summarize([closed_trade()], FROM, TO).non_long, 0)
+        self.assertIsNone(fs.non_long_warning(0))
+
+    def test_the_warning_names_the_count(self):
+        text = fs.non_long_warning(2)
+
+        self.assertTrue(text.startswith("PERINGATAN: 2 posisi bukan LONG"), text)
+
+
 class ReadTradesCsvTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
