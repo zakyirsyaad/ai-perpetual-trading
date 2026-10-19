@@ -228,12 +228,16 @@ class RunTests(ForwardCompareCase):
                              expected.entry_per_hari_kalender)
             self.assertTrue(all(wib_day_start_ms(FIRST) <= t.entry_ms
                                 and t.exit_ms <= wib_day_start_ms(END) for t in result.trades))
+            # one definition on both sides: the share of positions with a booked pnl above zero
+            wins = sum(1 for t in result.trades if t.pnl_usdt > 0)
+            self.assertAlmostEqual(run["untung_pct"], 100.0 * wins / len(result.trades))
         forward = doc["forward"]
         self.assertEqual(forward["posisi"], 2)  # the one closed on Monday is outside the window
         self.assertEqual(forward["exits"], {"tp": 1, "sl": 0, "waktu": 0, "ai": 1, "lain": 0})
         volume = (100.0 + 100.2) * 180.0 + (100.0 + 99.9) * 180.0
         self.assertAlmostEqual(forward["hasil_per_1_juta"], 1_000_000 * -7.5 / volume)
         self.assertAlmostEqual(forward["entry_per_hari_kalender"], 2 / 3)
+        self.assertEqual(forward["untung_pct"], 50.0)  # +12.5 and -20.0
         self.assertIsNone(forward["hasil_tanpa_teratas"])  # 2 positions, the top 3 dropped
         self.assertEqual(doc["forward_trades"]["rows"], 3)
         self.assertEqual(doc["forward_trades"]["rows_in_window"], 2)
@@ -242,8 +246,11 @@ class RunTests(ForwardCompareCase):
 
         report = (self.out / f"{STEM}.md").read_text(encoding="utf-8")
         for text in ("Mode L (i)", "Mode L (ii)", "Uji maju", "Hasil per 1 juta",
-                     "Tanpa 3 teratas", "2026-10-20", "2026-10-23", "hari kalender"):
+                     "Tanpa 3 teratas", "untung (pnl > 0)", "2026-10-20", "2026-10-23",
+                     "hari kalender"):
             self.assertIn(text, report)
+        header = next(line for line in report.splitlines() if line.startswith("| Baris"))
+        self.assertNotIn("menang", header.lower())  # TP share is a different measure: not in the table
 
     def test_the_report_states_the_edge_asymmetry(self):
         self.run_stage()

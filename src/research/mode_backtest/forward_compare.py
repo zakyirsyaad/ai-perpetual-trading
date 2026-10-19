@@ -5,7 +5,8 @@ positions (``report_forward_test.py``, the CSV of ``bot.core.forward_summary``) 
 on the same dates. It backtests mode L, versions (i) and (ii), over ``[first_day 00:00, end_day
 00:00)`` WIB on BTC-USDT and writes, exclusively, ``forward_compare_<first_day>_<end_day>.json`` and
 an Indonesian ``.md`` for the manager: the two versions beside the forward summary (positions,
-entries per calendar day, result per 1M, the result without the top positions and the exit mix).
+entries per calendar day, result per 1M, the result without the top positions, the share of
+positions with a pnl above zero and the exit mix).
 It is a comparison, not a test: no pass status, and no lock, start record or marker is read or
 written.
 
@@ -158,6 +159,7 @@ class _VersionRun:
     spec: LiveRunSpec
     metrics: StageMetrics
     blocked: Dict[str, int]
+    untung_pct: float  # share of positions with a booked pnl above zero, as the forward side counts it
 
     @property
     def key(self) -> str:
@@ -165,7 +167,8 @@ class _VersionRun:
 
     def record(self) -> Dict[str, Any]:
         return {"mode": MODE_L, "versi": self.versi, "sisi": "LONG", "kondisi_gate": NAIK,
-                "metrics": asdict(self.metrics), "blocked": dict(self.blocked)}
+                "metrics": asdict(self.metrics), "untung_pct": self.untung_pct,
+                "blocked": dict(self.blocked)}
 
 
 def _run_versions(frames: PairFrames, cfg: ModesConfig, live: LiveExitConfig, pair: str,
@@ -176,7 +179,9 @@ def _run_versions(frames: PairFrames, cfg: ModesConfig, live: LiveExitConfig, pa
         spec = LiveRunSpec(pair, LONG, NAIK, versi, period.start_ms, period.end_ms)
         result = simulate_live_run(frames, cfg, live, spec)
         metrics = run_metrics(result, hari_naik, cfg, calendar_days(period))
-        runs.append(_VersionRun(versi, spec, metrics, dict(result.blocked)))
+        wins = sum(1 for trade in result.trades if trade.pnl_usdt > 0)
+        untung_pct = 100.0 * wins / len(result.trades) if result.trades else 0.0
+        runs.append(_VersionRun(versi, spec, metrics, dict(result.blocked), untung_pct))
     return tuple(runs)
 
 
@@ -207,7 +212,7 @@ def _forward(path: PathLike, first_day: date, end_day: date, drop_top: int) -> _
 
 
 _TABLE_HEADER = ("Baris", "Posisi", "Entry per hari kalender", "Hasil per 1 juta",
-                 "Tanpa {top} teratas", "TP", "SL", "Potong", "Waktu", "AI", "Lain")
+                 "Tanpa {top} teratas", "untung (pnl > 0)", "TP", "SL", "Potong", "Waktu", "AI", "Lain")
 
 
 def _line(cells: Sequence[str]) -> str:
@@ -223,7 +228,7 @@ def _mode_l_line(run: _VersionRun) -> str:
     return _line((f"Mode L ({run.versi})", _count(m.posisi),
                   format_number(m.entry_per_hari_kalender, 2),
                   format_number(m.hasil_per_1_juta, 0), format_number(m.hasil_tanpa_teratas, 0),
-                  _count(m.tp), _count(m.sl), _count(m.potong), _count(m.waktu), NA, NA))
+                  f"{format_number(run.untung_pct, 1)}%", _count(m.tp), _count(m.sl), _count(m.potong), _count(m.waktu), NA, NA))
 
 
 def _forward_line(s: ForwardSummary) -> str:
@@ -231,7 +236,7 @@ def _forward_line(s: ForwardSummary) -> str:
     return _line(("Uji maju (bot AI LONG)", _count(s.posisi),
                   format_number(s.entry_per_hari_kalender, 2),
                   format_number(s.hasil_per_1_juta, 0), format_number(s.hasil_tanpa_teratas, 0),
-                  _count(e[EXIT_TP]), _count(e[EXIT_SL]), NA, _count(e[EXIT_TIME]),
+                  f"{format_number(s.untung_pct, 1)}%", _count(e[EXIT_TP]), _count(e[EXIT_SL]), NA, _count(e[EXIT_TIME]),
                   _count(e[EXIT_AI]), _count(e[EXIT_OTHER])))
 
 
@@ -297,7 +302,8 @@ def _report(c: _Comparison, cfg: ModesConfig, live: LiveExitConfig, first_day: d
         _table(c.runs, c.forward.summary, c.drop_top),
         "",
         *_warning_block(c.forward.summary),
-        "Hasil per 1 juta = 1.000.000 × jumlah PnL bersih / jumlah volume (kedua kaki); tanpa "
+        "Untung (pnl > 0) = bagian posisi dengan PnL tercatat di atas nol, sama di kedua sisi "
+        "(bukan porsi TP). Hasil per 1 juta = 1.000.000 × jumlah PnL bersih / jumlah volume (kedua kaki); tanpa "
         f"{c.drop_top} teratas membuang {c.drop_top} posisi dengan PnL terbesar. Mode L memakai "
         f"fee {format_number(cfg.umum.fee_taker_persen, 3)}% per kaki dan slippage dari "
         f"`modes_live_exit.yaml` (entry {format_number(costs.slippage_entry_bps, 1)} bps, exit "

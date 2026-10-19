@@ -506,6 +506,7 @@ class EntryPacingRecordTests(unittest.IsolatedAsyncioTestCase):
         store = FakeTradeStore()
         brain = FakeBrain()
         orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._gate_context = None
         orchestrator._settings = SimpleNamespace(
             strategy_mode="ai_volume",
             symbols=["BTC/USDT"],
@@ -747,6 +748,51 @@ class EntryDirectionFilterTests(EntryStretchGateTests):
             self._decision("OPEN_LONG"), self._context(ema_21=self.NEAR_MEAN), None
         )
         self.assertEqual(verdict["verdict"], "allow")
+
+
+class RegimeGateSideDefenceTests(unittest.TestCase):
+    """With the regime gate on, only the configured side may become a candidate, whatever the stretch mode.
+
+    The LONG forward bot's invariant used to rest on the stretch gate enforcing; a misconfigured
+    ENTRY_STRETCH_GATE_MODE must not let a SHORT through. Gate off: nothing changes.
+    """
+
+    _settings = EntryStretchGateTests._settings
+    _orchestrator = EntryStretchGateTests._orchestrator
+    _decision = EntryStretchGateTests._decision
+    _context = EntryStretchGateTests._context
+    NEAR_MEAN = EntryStretchGateTests.NEAR_MEAN
+
+    def test_a_short_is_rejected_with_the_gate_on_even_when_the_stretch_gate_is_off(self) -> None:
+        orchestrator = self._orchestrator(
+            entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off"
+        )
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_SHORT")
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+        self.assertEqual(verdict["verdict"], "allow")  # the stretch gate alone would not have stopped it
+
+        with self.assertLogs("test.stretch_gate", level="INFO") as logs:
+            candidate = orchestrator._build_entry_candidate(decision, context, verdict)
+
+        self.assertIsNone(candidate)
+        self.assertIn("regime gate", "\n".join(logs.output).lower())
+
+    def test_the_configured_side_still_passes_with_the_gate_on(self) -> None:
+        orchestrator = self._orchestrator(
+            entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off"
+        )
+        context = self._context(ema_21=self.NEAR_MEAN)
+
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision("OPEN_LONG"), context, None))
+
+    def test_with_the_gate_off_a_short_still_passes(self) -> None:
+        orchestrator = self._orchestrator(
+            entry_regime_gate="off", entry_gate_direction="long", entry_stretch_gate_mode="off"
+        )
+        context = self._context(ema_21=self.NEAR_MEAN)
+
+        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision("OPEN_SHORT"), context, None))
 
 
 class EntryGateDirectionSettingTests(unittest.TestCase):

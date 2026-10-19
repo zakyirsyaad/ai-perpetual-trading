@@ -98,7 +98,7 @@
 - Consumes: Task 1 `RegimeGate`, `RegimeVerdict`.
 - Produces:
   - `TradeEngine.__init__(..., regime_gate: RegimeGate | None = None)`.
-  - `_tick` order: entries latch → forward guard (Task 3) → window → risk → stop cooldown → entry cooldown → **pause after exit** → volume pause → daily cap → **regime gate** → strategy.
+  - `_tick` order: entries latch → window → forward guard (Task 3) → risk → stop cooldown → entry cooldown → **pause after exit** → volume pause → daily cap → **regime gate** → strategy.
   - Each blocking gate logs once per state change, the same way the window gate does.
 
 - [ ] **Step 1: Write the failing tests:**

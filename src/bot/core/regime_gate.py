@@ -17,8 +17,9 @@ The gate answers one question per closed hour: may an entry go through now?
   unknown median (fewer than 720 ATR values) blocks while the guard is on.
 
 The verdict is cached until the next 1h close, so the venue is read once per closed hour. A venue
-error, a gap or a non-finite price in the candles blocks with reason ``data_error`` and is retried on
-the next call. A blocked verdict for a data reason is logged at WARNING once per state change.
+error, a gap, a non-finite price, or candles older than the last closed hour (plus slack) block with
+reason ``data_error``; that verdict is kept for ``DATA_ERROR_RETRY_MS`` and then the venue is asked
+again. A blocked verdict for a data reason is logged at WARNING once per state change.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from bot.strategy.modes.regime import NAIK, pilih_mode
@@ -44,6 +46,8 @@ KLINES_4H = 500  # the 4h EMA50 needs 400 candles to settle
 
 HOUR_MS = 3_600_000
 FOUR_HOUR_MS = 4 * HOUR_MS
+STALE_SLACK_MS = 5 * 60_000  # how late the venue may be in serving the newest closed 1h candle
+DATA_ERROR_RETRY_MS = 60_000  # a data_error verdict is kept this long before the venue is asked again
 
 MODE_OFF = "off"
 MODE_NAIK = "naik"
@@ -127,19 +131,19 @@ class RegimeGate:
         self._logger = logger
         self._clock_ms = clock_ms
         self._cached: Optional[RegimeVerdict] = None
+        self._cached_until_ms = 0
         self._last_logged_reason: Optional[str] = None
         self._last_verdict: Optional[RegimeVerdict] = None
-        self._detail = ""
 
     async def verdict(self) -> RegimeVerdict:
         if self._mode == MODE_OFF:
             return RegimeVerdict("", True, REASON_OFF, None, None, None)
-        if self._cached is not None and self._cache_is_current(self._cached):
+        if self._cached is not None and self._clock_ms() < self._cached_until_ms:
             return self._cached
-        verdict = await self._evaluate()
-        self._note(verdict)
-        # a data error is not cached: the next call asks the venue again
-        self._cached = None if verdict.reason == REASON_DATA_ERROR else verdict
+        verdict, detail = await self._evaluate()
+        self._note(verdict, detail)
+        self._cached = verdict
+        self._cached_until_ms = self._cache_deadline_ms(verdict)
         self._last_verdict = verdict
         return verdict
 
@@ -147,22 +151,32 @@ class RegimeGate:
         """The last verdict as a plain dict for the decision payload; ``{}`` before the first."""
         return dataclasses.asdict(self._last_verdict) if self._last_verdict is not None else {}
 
-    def _cache_is_current(self, cached: RegimeVerdict) -> bool:
-        return cached.hour_close_ms is not None and self._clock_ms() < cached.hour_close_ms + HOUR_MS
+    def _cache_deadline_ms(self, verdict: RegimeVerdict) -> int:
+        """Until when ``verdict`` stands: the next 1h close, or a short retry window after a data error.
+        A verdict resting on no candle (``hour_close_ms`` unknown) is not kept."""
+        if verdict.reason == REASON_DATA_ERROR:
+            return self._clock_ms() + DATA_ERROR_RETRY_MS
+        if verdict.hour_close_ms is None:
+            return 0
+        return verdict.hour_close_ms + HOUR_MS
 
-    async def _evaluate(self) -> RegimeVerdict:
+    async def _evaluate(self) -> tuple[RegimeVerdict, str]:
+        """The verdict and, for a data error, what went wrong (``""`` otherwise)."""
         try:
             rows_1h = _checked(await self._client.get_klines(self._symbol, "1h", KLINES_1H), HOUR_MS)
             rows_4h = _checked(await self._client.get_klines(self._symbol, "4h", KLINES_4H), FOUR_HOUR_MS)
         except Exception as exc:  # noqa: BLE001 - the gate fails closed on any read problem
-            self._detail = f"{type(exc).__name__}: {exc}"
-            return RegimeVerdict("", False, REASON_DATA_ERROR, None, None, None)
+            return RegimeVerdict("", False, REASON_DATA_ERROR, None, None, None), f"{type(exc).__name__}: {exc}"
         if not rows_1h:
-            return RegimeVerdict("", False, REASON_HISTORY_SHORT, None, None, None)
+            return RegimeVerdict("", False, REASON_HISTORY_SHORT, None, None, None), ""
         hour_close_ms = int(rows_1h[-1]["timestamp"]) + HOUR_MS
+        if self._clock_ms() > hour_close_ms + HOUR_MS + STALE_SLACK_MS:
+            # a venue that serves old candles must not keep a stale NAIK verdict alive
+            stamp = datetime.fromtimestamp(hour_close_ms / 1000, tz=timezone.utc).isoformat()
+            return RegimeVerdict("", False, REASON_DATA_ERROR, None, None, None), f"stale candles: last 1h close {stamp}"
         # the last 4h candle closed at or before that hour close, as the backtest reads it
         closed_4h = [r for r in rows_4h if int(r["timestamp"]) + FOUR_HOUR_MS <= hour_close_ms]
-        return self._classify(rows_1h, closed_4h, hour_close_ms)
+        return self._classify(rows_1h, closed_4h, hour_close_ms), ""
 
     def _classify(self, rows_1h: Candles, rows_4h: Candles, hour_close_ms: int) -> RegimeVerdict:
         highs = [float(r["high"]) for r in rows_1h]
@@ -192,7 +206,7 @@ class RegimeGate:
                 return verdict(False, REASON_VOLATILITY)
         return verdict(True, REASON_NAIK)
 
-    def _note(self, verdict: RegimeVerdict) -> None:
+    def _note(self, verdict: RegimeVerdict, detail: str) -> None:
         """Log a change of state once: WARNING for a data reason, INFO for the rest."""
         if verdict.reason == self._last_logged_reason:
             return
@@ -203,7 +217,7 @@ class RegimeGate:
             "Regime gate %s: %s | allowed=%s kondisi=%s atr14_1h=%s atr_median=%s%s",
             self._symbol, verdict.reason, verdict.allowed, verdict.kondisi or "-",
             verdict.atr14_1h, verdict.atr_median,
-            f" | {self._detail}" if verdict.reason == REASON_DATA_ERROR else "",
+            f" | {detail}" if verdict.reason == REASON_DATA_ERROR else "",
         )
 
 

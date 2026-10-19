@@ -165,12 +165,15 @@ class EngineGuardTests(unittest.IsolatedAsyncioTestCase):
         await engine._tick()
         self.assertEqual(strategy.next_calls, 1)
 
-    async def test_the_guard_runs_before_the_window_gate(self) -> None:
+    async def test_the_guard_runs_after_the_window_gate(self) -> None:
+        # a closed window already blocks entries: no store read and no ERROR line per tick outside it
         store = GuardStore(_totals(60, -501.0))
-        engine, _ = _engine(store, entry_weekly_window="Mon 00:00-00:01", **GUARD_ON)
-        with self.assertLogs(LOG_NAME, level="ERROR"):
+        engine, strategy = _engine(store, **GUARD_ON)
+        engine._entry_window_is_open = lambda: False  # type: ignore[method-assign]
+        with self.assertNoLogs(LOG_NAME, level="ERROR"):
             await engine._tick()
-        self.assertEqual(store.total_calls, 1)
+        self.assertEqual(store.total_calls, 0)
+        self.assertEqual(strategy.next_calls, 0)
 
     async def test_guard_is_recomputed_after_a_restart(self) -> None:
         store = GuardStore(_totals(60, -501.0))

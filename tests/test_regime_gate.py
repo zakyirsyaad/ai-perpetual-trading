@@ -16,6 +16,8 @@ from pathlib import Path
 from bot.config import Settings
 from bot.core.regime_gate import (
     ATR_MEDIAN_HOURS,
+    DATA_ERROR_RETRY_MS,
+    STALE_SLACK_MS,
     ATR_PERIOD_1H,
     EMA_PERIOD_4H,
     SMA_FAST_PERIOD_1H,
@@ -110,6 +112,7 @@ QUIET.propagate = False
 
 
 def make_gate(client, mode="naik", volatility_mult=2.0, sideways_mult=0.2, logger=None):
+    """A gate whose clock is the fake venue's ``now_ms``, so a test moves time by moving the client's."""
     return RegimeGate(
         client,
         SYMBOL,
@@ -117,6 +120,7 @@ def make_gate(client, mode="naik", volatility_mult=2.0, sideways_mult=0.2, logge
         volatility_mult,
         sideways_mult,
         logger or QUIET,
+        clock_ms=lambda: client.now_ms,
     )
 
 
@@ -249,7 +253,8 @@ class ShortHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("test.regime_gate", level="WARNING") as logs:
             first = await gate.verdict()
-            second = await gate.verdict()  # the clock is far past the data: a fresh evaluation
+            client.now_ms += HOUR_MS  # the next hour has closed: a fresh evaluation
+            second = await gate.verdict()
 
         self.assertEqual(len(client.calls), 4)
         self.assertFalse(first.allowed)
@@ -288,10 +293,50 @@ class DataErrorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("test.regime_gate", level="WARNING"):
             failed = await gate.verdict()
         client.fail = False
+        client.now_ms += DATA_ERROR_RETRY_MS
         recovered = await gate.verdict()
 
         self.assertEqual((failed.allowed, failed.reason), (False, "data_error"))
         self.assertEqual((recovered.allowed, recovered.reason), (True, "naik"))
+
+    async def test_a_data_error_is_cached_for_the_retry_window_then_refetched(self):
+        client = FakeClient(hourly_rows(MARKETS["NAIK"]), fail=True)
+        gate = make_gate(client)
+
+        with self.assertLogs("test.regime_gate", level="WARNING"):
+            first = await gate.verdict()
+            client.now_ms += DATA_ERROR_RETRY_MS - 1
+            second = await gate.verdict()
+        self.assertEqual(len(client.calls), 1)  # the venue is not hammered once per tick
+        self.assertEqual(second, first)
+
+        client.now_ms += 1
+        await gate.verdict()
+
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_candles_older_than_an_hour_plus_slack_block_as_stale(self):
+        client = FakeClient(hourly_rows(MARKETS["NAIK"]), now_ms=hour_close(HISTORY_HOURS - 1) + 3 * HOUR_MS)
+        gate = make_gate(client)
+
+        with self.assertLogs("test.regime_gate", level="WARNING") as logs:
+            verdict = await gate.verdict()
+
+        self.assertEqual((verdict.allowed, verdict.reason), (False, "data_error"))
+        self.assertIn("stale candles: last 1h close", logs.output[0])
+
+    async def test_candles_within_the_hour_and_slack_are_not_stale(self):
+        last_close = hour_close(HISTORY_HOURS - 1)
+        for age_ms in (30 * 60_000, HOUR_MS + STALE_SLACK_MS):
+            with self.subTest(age_ms=age_ms):
+                client = FakeClient(hourly_rows(MARKETS["NAIK"]), now_ms=last_close + age_ms)
+
+                verdict = await make_gate(client).verdict()
+
+                self.assertEqual((verdict.allowed, verdict.reason), (True, "naik"))
+        client = FakeClient(hourly_rows(MARKETS["NAIK"]), now_ms=last_close + HOUR_MS + STALE_SLACK_MS + 1)
+        with self.assertLogs("test.regime_gate", level="WARNING"):
+            self.assertEqual((await make_gate(client).verdict()).reason, "data_error")
 
     async def test_a_hole_in_the_candles_blocks(self):
         rows = hourly_rows(MARKETS["NAIK"])

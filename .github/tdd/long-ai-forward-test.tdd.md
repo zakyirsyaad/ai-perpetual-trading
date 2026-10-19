@@ -264,13 +264,41 @@ to any tracked file, and no `.env` was read.
 
 ## Deferred notes (from the task reviews, none blocking)
 
-- A close that fails after the fill and is then found flat (`_manage_open_position_guarded`) does not set `_last_exit_ts`, so
-  the 15-minute pause is skipped for that one exit.
 - `build_regime_gate`'s refusal in `main.py` sits outside the `try/except`, so it is a raw traceback.
 - `ENTRY_VOLATILITY_GUARD_MULT` alone does nothing when `ENTRY_REGIME_GATE=off`.
 - `FORWARD_KILL_AFTER_POSITIONS` and `FORWARD_REVIEW_AT_POSITIONS` are not cross-validated.
-- `compare-forward`'s JSON records the CSV's absolute local path; the `.md` has no win-rate column.
+- `compare-forward`'s JSON records the CSV's absolute local path.
 - `_has_value` in the builder treats `SUPABASE_URL= # note` as non-empty.
+
+## PR #42 review fixes
+
+Ten review findings, each with a test written first (items 3 and 4 are docs). RED output is the failing run before the
+fix; GREEN is the same command after. The live SHORT bot (all new settings off) is unchanged: the only change on its
+path is that `AIOrchestrator` sets `_gate_context = None` in `__init__` (it was a class default) and the new side check
+in `_build_entry_candidate` is behind `entry_regime_gate != "off"`.
+
+| # | Change | RED | GREEN |
+|---|--------|-----|-------|
+| 1 | `RegimeGate._evaluate`: newest 1h candle older than one hour plus `STALE_SLACK_MS` (5 min) blocks as `data_error` ("stale candles: last 1h close <iso>") | `python -m unittest tests.test_regime_gate`: `test_candles_older_than_an_hour_plus_slack_block_as_stale` (no WARNING logged), `test_candles_within_the_hour_and_slack_are_not_stale` (`'naik' != 'data_error'` at one ms past the slack) | 36 tests OK |
+| 2 | `_manage_open_position_guarded`, flat branch, sets `_last_exit_ts` | `tests.test_trade_engine_forward_gates.PauseAfterFailedManagementTests`: `AssertionError: unexpectedly None` | 27 tests OK |
+| 3 | Runbook section 2 step 9: supervisor cron for `ai-perp-long` (cwd, `--app`, `--log`, five-minute cadence, a `--dry-run` first); CLAUDE.md one clause | docs | docs |
+| 4 | Runbook section 2 step 4: names-only check via `dotenv_values` | docs; checked on a temp file with fake values (multi-line quoted value ending in `=`, a continuation line with `==`, bare token, `export`, spaces around `=`, comment line): printed names only, the bare token and every value were absent | same |
+| 5 | `_build_entry_candidate`: with `entry_regime_gate != "off"` any side but `entry_gate_direction` is rejected before the stretch gate, with its own log line | `tests.test_ai_orchestration.RegimeGateSideDefenceTests`: OPEN_SHORT returned an `EntryCandidate` with gate on, direction long and stretch mode off | 3 tests OK (gate off: a SHORT still passes) |
+| 6 | `data_error` verdict kept `DATA_ERROR_RETRY_MS` (60 s) then refetched | `test_a_data_error_is_cached_for_the_retry_window_then_refetched`: `AssertionError: 2 != 1` | 36 tests OK |
+| 7 | Forward guard moved right after the window gate (entries latch, window, forward guard, risk, ...); order updated in CLAUDE.md (both lists), the runbook and the plan | `tests.test_forward_guard.EngineGuardTests.test_the_guard_runs_after_the_window_gate`: guard logged ERROR with the window closed | 19 tests OK |
+| 8 | `_gate_context` set in `__init__`, class default removed; `object.__new__` test helpers set it | `test_the_gate_context_is_set_by_init_and_not_by_a_class_default`: `'_gate_context' unexpectedly found` in the class; removing the default alone broke 14 `test_orchestration_pipeline` tests (`AttributeError`) until the helpers set it | OK |
+| 9 | `RegimeGate._detail` removed: `_evaluate` returns `(verdict, detail)`, `_note` takes the detail | covered by the item 1 and 6 tests (log text unchanged) | OK |
+| 10 | `compare-forward` table and JSON: `untung (pnl > 0)` (share of positions with pnl > 0) for both sides; mode L's `menang_pct` is not in the table | `tests.test_mode_backtest_forward_compare`: `KeyError: 'untung_pct'` | 16 tests OK |
+
+Notes. Item 7's old test (`test_the_guard_runs_before_the_window_gate`) used a window string the parser rejects and passed
+only because the guard returned first; the new test stubs the window as closed. Item 1 and 6 needed the gate's clock to
+follow the fake venue in `tests/test_regime_gate.py` (`make_gate` passes `clock_ms=lambda: client.now_ms`); the old tests
+ran on the real clock against 2023 candles, which the staleness check would rightly block. Item 10 changes mode L's
+code sha, which is fine because its `train` has not run.
+
+Verification after the ten fixes: full suite 2649 tests OK (was 2641; +8 new), coverage 91 % total with the temp-rcfile
+approach (`regime_gate.py` 99 %, `forward_compare.py` 100 %, `orchestration.py` 95 %, `trade_engine.py` 87 %), `compileall`
+clean, `git diff --check` clean, `tests.test_secret_hygiene` OK.
 
 ## Deployment gate
 

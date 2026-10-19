@@ -64,12 +64,12 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
 3. **`VOLUME_CYCLE_STARTED_AT` must be the forward start** (this `--cycle-start`). The forward guard counts closed trades
    since that instant in the configured schema; an earlier cutoff would pool older trades into the 60 and 150 counts.
    Never edit it afterwards.
-4. Review the key names that came over from the live `.env` and were not forced. Names only: the `grep` keeps just the
-   lines that start a `NAME=` assignment (an `export NAME=` line, spaces around `=` and digits in names included), so a
-   continuation line of a multi-line quoted value or a stray token never reaches the terminal; the `sed` then cuts
-   everything from the first `=`. `[[:space:]]` keeps it working with both GNU and BSD `sed`:
+4. Review the key names that came over from the live `.env` and were not forced. Names only: python-dotenv parses the file
+   the way the bot does (quoted multi-line values, `export NAME=...`, comments) and only the names are printed, so no value
+   and no continuation line of a quoted value ever reaches the terminal. A bare token with no `=` has no value and is
+   skipped. Run it from `/home/ubuntu/ai-perp-long`:
    ```bash
-   grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' /home/ubuntu/ai-perp-long/.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*=.*//' | sort
+   .venv/bin/python -I -c "import sys; from dotenv import dotenv_values; print('\n'.join(sorted(k for k, v in dotenv_values(sys.argv[1]).items() if v is not None)))" /home/ubuntu/ai-perp-long/.env
    ```
    Values the second account needs to differ on are the operator's call. **Decide on the external-provider keys here:**
    the builder copies `COINMARKETCAP_API_KEY` and `DUNE_API_KEY` from the live `.env` when it has them, so both bots then
@@ -97,8 +97,8 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
    steps 7 and 8 before Monday 07:00.
 
    Why outside the window, and why it is safe: `run_forever` runs the startup checks, then ticks at once, and a tick that
-   opens a position blocks until it closes. In `_tick` the window gate comes right after the entries latch and the forward
-   guard and before the risk guard, the cooldowns, the regime gate and the strategy, so while the window is closed no AI call
+   opens a position blocks until it closes. In `_tick` the window gate comes right after the entries latch and before the forward
+   guard, the risk guard, the cooldowns, the regime gate and the strategy, so while the window is closed no AI call
    and no order can happen. Inside the window a NAIK hour could open a real position within minutes, and the handover to
    pm2 would then be a restart with an open position (`104103` crash loop, section 4). The alternative of skipping the
    foreground run and starting under pm2 straight away is less safe: with autorestart a bad key or a wrong `.env` becomes a
@@ -129,7 +129,22 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
    ```
    Then run the "after `pm2 start`" check of step 6. Logs go to stderr, so they are in
    `~/.pm2/logs/ai-perp-long-error.log`; the same startup lines should be there.
-9. Record the cycle start and the first Monday in `CLAUDE.md` and in memory (plan Task 9).
+9. **Supervisor cron** (the watchdog for the entries latch, `src/supervisor.py`; the same five-minute cadence the live bot's
+   cron uses, see the script's docstring). It must run with the forward bot's directory as cwd, because the default state
+   file `logs/supervisor_state.json` is relative, and it needs `--app` and `--log` for this bot (the defaults point at
+   `ai-perp-volume`). First once by hand, `--dry-run` (decides and reports, never restarts), and read the output:
+   ```bash
+   cd /home/ubuntu/ai-perp-long && mkdir -p logs && PYTHONPATH=src .venv/bin/python src/supervisor.py \
+     --app ai-perp-long --log /home/ubuntu/.pm2/logs/ai-perp-long-error.log --dry-run
+   ```
+   Then add this line with `crontab -e` (cron does not expand `~`, so the log path is absolute; do not touch the live bot's
+   line):
+   ```
+   */5 * * * * cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/supervisor.py --app ai-perp-long --log /home/ubuntu/.pm2/logs/ai-perp-long-error.log >> logs/supervisor.log 2>&1
+   ```
+   It restarts `ai-perp-long` only when the venue shows no position and the order lookup finds nothing, and at most once per
+   order id; every other case it leaves for a person. It reads the forward bot's `.env` (cwd) for the account-2 keys.
+10. Record the cycle start and the first Monday in `CLAUDE.md` and in memory (plan Task 9).
 
 Never touch `ai-perp-volume`. Never run `pm2 restart all`, `pm2 delete all` or `pm2 stop all`.
 
@@ -201,7 +216,8 @@ Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates
 
 ## 4. Stop rules
 
-The guard recomputes from Supabase on every tick (stateless across restarts), logs `Forward guard stops new entries:
+The guard sits right after the entry window gate in `_tick`, so it only runs (and logs) while the window is open. It
+recomputes from Supabase on every such tick (stateless across restarts), logs `Forward guard stops new entries:
 <reason>` at ERROR on every blocked tick, never sets the supervisor's `_entries_blocked_reason` latch, and fails closed
 (entries paused, ERROR with traceback) when the store cannot be read. Open positions keep being managed.
 

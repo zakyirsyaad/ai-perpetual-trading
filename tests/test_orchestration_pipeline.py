@@ -166,6 +166,7 @@ def _orchestrator(brain, store, settings=None) -> AIOrchestrator:
     orchestrator._compact_context = CompactDecisionContextBuilder(settings)
     orchestrator._exit_policy = AIExitPolicy(settings)
     orchestrator._active_exit_symbol = None
+    orchestrator._gate_context = None
     return orchestrator
 
 

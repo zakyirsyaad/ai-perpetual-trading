@@ -42,9 +42,6 @@ class EntryCandidate:
 class AIOrchestrator:
     """Layer 2: coordinate brain decisions, risk state, market context, and learning memory."""
 
-    # Class-level default so an orchestrator built without __init__ (as several tests do) records no regime.
-    _gate_context: dict[str, Any] | None = None
-
     def __init__(
         self,
         settings: Settings,
@@ -65,6 +62,7 @@ class AIOrchestrator:
         self._compact_context = CompactDecisionContextBuilder(settings)
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
+        self._gate_context: dict[str, Any] | None = None
 
     def set_gate_context(self, context: dict[str, Any]) -> None:
         """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
@@ -190,6 +188,18 @@ class AIOrchestrator:
             review.confirmations,
             review.invalidation_trigger,
         )
+
+        # Defence in depth for the LONG-only forward bot: with the regime gate on, the side filter does not
+        # depend on the stretch gate's mode (the direction check in `_stretch_gate_verdict` is skipped when off).
+        if getattr(self._settings, "entry_regime_gate", "off") != "off":
+            only_side = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
+            if only_side != "any" and decision.action != f"OPEN_{only_side.upper()}":
+                self._logger.info(
+                    "Entry candidate %s rejected: the regime gate is on and lets through %s entries only.",
+                    decision.symbol,
+                    only_side,
+                )
+                return None
 
         if gate_verdict and gate_verdict.get("verdict") == "block" and gate_verdict.get("reason") == "direction":
             allowed = gate_verdict.get("allowed_direction")

@@ -224,9 +224,9 @@ class TradeEngine:
         if self._entries_blocked_reason is not None:
             self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
             return
-        if await self._forward_guard_blocks_entries():
-            return
         if not self._entry_window_is_open():
+            return
+        if await self._forward_guard_blocks_entries():
             return
         state = await self._risk_manager.get_daily_state()
         if isinstance(self._strategy, GrokStrategy):
@@ -611,6 +611,8 @@ class TradeEngine:
                     "but this trade may be missing from the trade record.",
                     open_position.symbol,
                 )
+                # a close happened, so the pause after any exit must run from now
+                self._last_exit_ts = datetime.now(timezone.utc).timestamp()
                 return
             state = "still open" if still_open else "unreadable"
             self._entries_blocked_reason = (

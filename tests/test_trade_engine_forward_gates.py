@@ -14,7 +14,7 @@ from bot.ai.orchestration import AIOrchestrator
 from bot.config import Settings
 from bot.core.regime_gate import RegimeGate, RegimeVerdict, build_regime_gate
 from bot.core.trade_engine import TradeEngine
-from bot.models import ClosedTrade, PositionDirection
+from bot.models import ClosedTrade, OpenPosition, PositionDirection
 from bot.strategy.grok_strategy import GrokStrategy
 
 try:  # `python -m unittest tests.x` (package) and `discover -s tests` (top-level) both work
@@ -223,6 +223,41 @@ class PauseAfterExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gate.calls, 0)
 
 
+class PauseAfterFailedManagementTests(unittest.IsolatedAsyncioTestCase):
+    """A close that raised but left the venue flat is still a close: the pause must start."""
+
+    async def test_a_flat_venue_after_a_management_failure_starts_the_pause(self) -> None:
+        strategy = ContextStrategy(_plan())
+        client = FakeClient()
+        client.position_size = 0.0
+        engine = TradeEngine(
+            _settings(cooldown_minutes_after_exit=15), logging.getLogger(LOG_NAME), client, strategy,
+            FakeRisk(), FakeStore(),
+        )
+
+        async def failing_manage(position, plan, **kwargs):
+            raise RuntimeError("Supabase request failed for table trades: 504")
+
+        engine._manage_open_position = failing_manage  # type: ignore[method-assign]
+        position = OpenPosition(
+            symbol="BTC/USDT", direction=PositionDirection.LONG, entry_price=100.0, quantity=1.0,
+            exchange_size=1.0, exchange_order_id="1", opened_at=datetime.now(timezone.utc),
+            stop_loss_pct=0.3, take_profit_pct=0.5,
+        )
+
+        with self.assertLogs(LOG_NAME, level="WARNING"):
+            await engine._manage_open_position_guarded(
+                position, _plan(), entry_order_id="1", entry_fill=None, entry_fee_usdt=0.0,
+                record_entry_cooldown=False,
+            )
+        self.assertIsNone(engine._entries_blocked_reason)
+        self.assertIsNotNone(engine._last_exit_ts)
+
+        await engine._tick()
+
+        self.assertEqual(strategy.next_calls, 0)  # paused
+
+
 class PauseSeedTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _trade(closed_at: datetime) -> ClosedTrade:
@@ -316,7 +351,16 @@ class DecisionPayloadTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._brain = SimpleNamespace(last_call_metrics=None)
         orchestrator._trade_store = store
         orchestrator._supabase_journal = None
+        orchestrator._gate_context = None
         return orchestrator
+
+    def test_the_gate_context_is_set_by_init_and_not_by_a_class_default(self) -> None:
+        orchestrator = AIOrchestrator(
+            SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), _RecordingStore(), logging.getLogger(LOG_NAME)
+        )
+
+        self.assertIsNone(orchestrator._gate_context)
+        self.assertNotIn("_gate_context", vars(AIOrchestrator))
 
     async def test_ai_decision_payload_carries_the_regime_verdict(self) -> None:
         store = _RecordingStore()
