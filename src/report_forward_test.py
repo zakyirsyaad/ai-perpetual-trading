@@ -17,7 +17,7 @@ import asyncio
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from bot.config import Settings
 from bot.core.forward_guard import CycleTotals, forward_guard_reason
@@ -41,6 +41,8 @@ from bot.core.forward_summary import (
 )
 from bot.logger import setup_logging
 from bot.storage.supabase_trade_store import SupabaseTradeStore
+# One notation with the compare report the manager reads beside it (Indonesian decimals, "–" when missing).
+from research.mode_backtest.report import format_number, format_percent
 
 # The summary, the exit buckets and the CSV live in bot.core.forward_summary, so the offline mode
 # backtest can read the same CSV and reuse the same maths without importing the store; they are
@@ -70,27 +72,19 @@ __all__ = [
 ]
 
 
-def _fmt(value: Optional[float], digits: int = 1) -> str:
-    return "-" if value is None else f"{value:.{digits}f}"
-
-
-def _fmt_percent(value: Optional[float]) -> str:
-    return "-" if value is None else f"{value:.1f}%"
-
-
 def render_summary(summary: ForwardSummary, first_day: date, last_day: date) -> str:
     exits = summary.exits
     lines = [
         f"=== Uji maju LONG, {first_day} s/d {last_day} (WIB, akhir tidak termasuk) ===",
         f"posisi                    : {summary.posisi}",
-        f"entry per hari kalender   : {summary.entry_per_hari_kalender:.2f}",
-        f"untung (pnl > 0)          : {_fmt_percent(summary.untung_pct)}",
+        f"entry per hari kalender   : {format_number(summary.entry_per_hari_kalender, 2)}",
+        f"untung (pnl > 0)          : {format_percent(summary.untung_pct, 1)}",
         f"keluar                    : tp={exits[EXIT_TP]} sl={exits[EXIT_SL]} "
         f"waktu={exits[EXIT_TIME]} ai={exits[EXIT_AI]} lain={exits[EXIT_OTHER]}",
-        f"pnl bersih (USDT)         : {summary.pnl_usdt:.2f}",
-        f"volume (USDT)             : {summary.volume_usdt:.0f}",
-        f"hasil per 1 juta          : {_fmt(summary.hasil_per_1_juta)}",
-        f"hasil tanpa {DROPPED_TOP_TRADES} teratas     : {_fmt(summary.hasil_tanpa_teratas)}",
+        f"pnl bersih (USDT)         : {format_number(summary.pnl_usdt, 2)}",
+        f"volume (USDT)             : {format_number(summary.volume_usdt, 0)}",
+        f"hasil per 1 juta          : {format_number(summary.hasil_per_1_juta, 0)}",
+        f"hasil tanpa {DROPPED_TOP_TRADES} teratas     : {format_number(summary.hasil_tanpa_teratas, 0)}",
     ]
     warning = non_long_warning(summary.non_long)
     if warning:
@@ -108,7 +102,7 @@ def render_guard(totals: CycleTotals, settings: Any) -> str:
         [
             "--- Penjaga uji maju (seluruh siklus) ---",
             f"posisi tertutup           : {totals.count} (kill dari {kill_after}, tinjau di {review_at})",
-            f"hasil gabungan per 1 juta : {_fmt(totals.pnl_per_1m())}",
+            f"hasil gabungan per 1 juta : {format_number(totals.pnl_per_1m(), 0)}",
             f"status                    : {reason if reason else 'aktif'}",
         ]
     )

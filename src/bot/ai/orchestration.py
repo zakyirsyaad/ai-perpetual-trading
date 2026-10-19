@@ -191,7 +191,7 @@ class AIOrchestrator:
 
         if gate_verdict and gate_verdict.get("verdict") == "block" and gate_verdict.get("reason") == "direction":
             allowed = gate_verdict.get("allowed_direction")
-            if gate_verdict.get("mode") == "enforce":
+            if gate_verdict.get("mode") == "enforce" or gate_verdict.get("forced_by") == "regime_gate":
                 self._logger.info(
                     "Entry candidate %s rejected: the gate lets through %s entries only.", decision.symbol, allowed
                 )
@@ -565,8 +565,8 @@ class AIOrchestrator:
         other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
         if other_side and self._settings.entry_regime_gate != "off":
             # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
-            # ENTRY_STRETCH_GATE_MODE says, so the stored verdict and the outcome agree.
-            verdict["mode"] = "enforce"
+            # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
+            verdict["forced_by"] = "regime_gate"
         elif mode == "off":
             return verdict
         # The side filter comes before the schedule relaxation on purpose: being behind

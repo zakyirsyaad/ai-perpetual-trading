@@ -69,9 +69,22 @@ class SummaryTests(unittest.TestCase):
     def test_empty_window_renders_a_dash_for_the_win_rate(self) -> None:
         text = report.render_summary(report.summarize([], FROM, TO), FROM, TO)
         line = next(row for row in text.splitlines() if row.startswith("untung"))
-        self.assertEqual(line.split(":", 1)[1].strip(), "-")
-        self.assertIn("33.3%", report.render_summary(
+        self.assertEqual(line.split(":", 1)[1].strip(), "–")
+        self.assertIn("33,3%", report.render_summary(
             report.summarize([_trade(pnl=1.0), _trade(pnl=-1.0), _trade(pnl=-2.0)], FROM, TO), FROM, TO))
+
+    def test_figures_are_printed_as_the_compare_report_prints_them(self) -> None:
+        # One notation for the manager: the weekly CLI and the compare .md format each figure alike.
+        from research.mode_backtest.report import format_number, format_percent
+
+        s = report.summarize([_trade(pnl=12.5), _trade(pnl=-4.0), _trade(pnl=-1.0)], FROM, TO)
+        lines = dict(row.split(":", 1) for row in report.render_summary(s, FROM, TO).splitlines()[1:]
+                     if ":" in row and not row.startswith("PERINGATAN"))
+        figures = {key.strip(): value.strip() for key, value in lines.items()}
+        self.assertEqual(figures["untung (pnl > 0)"], format_percent(s.untung_pct, 1))
+        self.assertEqual(figures["entry per hari kalender"], format_number(s.entry_per_hari_kalender, 2))
+        self.assertEqual(figures["hasil per 1 juta"], format_number(s.hasil_per_1_juta, 0))
+        self.assertEqual(figures["pnl bersih (USDT)"], format_number(s.pnl_usdt, 2))
 
     def test_zero_volume_gives_none(self) -> None:
         s = report.summarize([_trade(pnl=3.0, qty=0.0)], FROM, TO)

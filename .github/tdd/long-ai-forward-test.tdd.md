@@ -339,3 +339,9 @@ Not deployed. Task 9 starts only on the user's go-ahead and on merged `main`:
    confirm flat on the venue, stop it, then `pm2 start` in the same closed window and confirm `ai-perp-volume` is online
    and untouched.
 4. Never restart either app with an open position (`104103` crash loop).
+
+## PR #42 third review fixes
+
+1. `CLAUDE.md` no longer asserts what the live `.env` lists (nobody read it); `SYMBOLS` is forced because the live file *may* list several.
+2. With the regime gate on, `_stretch_gate_verdict` keeps `mode` as configured and records `forced_by: regime_gate` on the direction block; `_build_entry_candidate` enforces a block that is either `mode == enforce` or forced by the regime gate. RED: `RegimeGateSideDefenceTests` failed (`'enforce' != 'off'`, `KeyError: 'forced_by'`); GREEN: `tests.test_ai_orchestration` 42 OK.
+3. `report_forward_test` prints every figure with `research.mode_backtest.report.format_number`/`format_percent`, the notation of the compare `.md` (Indonesian decimals, `–` when missing). RED: `test_figures_are_printed_as_the_compare_report_prints_them` and the dash test failed; GREEN: `tests.test_report_forward_test` 20 OK.

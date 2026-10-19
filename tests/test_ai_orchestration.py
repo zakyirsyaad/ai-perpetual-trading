@@ -780,13 +780,15 @@ class RegimeGateSideDefenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(verdict["verdict"], "block")
         self.assertEqual(verdict["reason"], "direction")
-        self.assertEqual(verdict["mode"], "enforce")
+        # the record keeps the configured stretch mode and names what enforced the side
+        self.assertEqual(verdict["mode"], "off")
+        self.assertEqual(verdict["forced_by"], "regime_gate")
         self.assertEqual(verdict["allowed_direction"], "long")
-        # same keys as the block the enforcing stretch gate returns
+        # otherwise the same block the enforcing stretch gate returns
         reference = self._orchestrator(entry_stretch_gate_mode="enforce", entry_gate_direction="long")
         expected = reference._stretch_gate_verdict(decision, context, None)
-        self.assertEqual(set(verdict), set(expected))
-        self.assertEqual(verdict, expected)
+        self.assertNotIn("forced_by", expected)
+        self.assertEqual(verdict, {**expected, "mode": "off", "forced_by": "regime_gate"})
 
         with self.assertLogs("test.stretch_gate", level="INFO") as logs:
             candidate = orchestrator._build_entry_candidate(decision, context, verdict)
@@ -812,7 +814,10 @@ class RegimeGateSideDefenceTests(unittest.IsolatedAsyncioTestCase):
         await orchestrator._record_ai_decision(decision, {}, None, verdict)
 
         gate = saved[0]["payload"]["gate"]
-        self.assertEqual((gate["verdict"], gate["reason"], gate["mode"]), ("block", "direction", "enforce"))
+        self.assertEqual(
+            (gate["verdict"], gate["reason"], gate["mode"], gate["forced_by"]),
+            ("block", "direction", "off", "regime_gate"),
+        )
         self.assertIsNone(orchestrator._build_entry_candidate(decision, context, verdict))
 
     def test_the_configured_side_still_passes_with_the_gate_on(self) -> None:
