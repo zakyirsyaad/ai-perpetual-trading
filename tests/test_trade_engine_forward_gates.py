@@ -136,16 +136,19 @@ class RegimeGateTickTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(gate.calls, 0)
 
-    async def test_the_block_is_logged_once_per_state_change(self) -> None:
-        gate = SpyRegimeGate(BLOCKED_VERDICT, BLOCKED_VERDICT, BLOCKED_VERDICT, NAIK_VERDICT)
-        engine = _engine(ContextStrategy(None), regime_gate=gate)
+    async def test_the_engine_leaves_the_regime_log_to_the_gate(self) -> None:
+        # RegimeGate._note logs every change with the numbers; the engine adding its own line would
+        # say the same thing twice with less detail. The block itself still happens, every tick.
+        strategy = ContextStrategy(None)
+        gate = SpyRegimeGate(BLOCKED_VERDICT, BLOCKED_VERDICT, NAIK_VERDICT)
+        engine = _engine(strategy, regime_gate=gate)
         with self.assertLogs(LOG_NAME, level="INFO") as captured:
-            for _ in range(4):
-                await engine._tick()
-        blocked = [line for line in captured.output if "regime gate" in line.lower() and "blocks" in line.lower()]
-        resumed = [line for line in captured.output if "regime gate" in line.lower() and "allows" in line.lower()]
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(len(resumed), 1)
+            await engine._tick()
+            await engine._tick()
+            self.assertEqual(strategy.next_calls, 0)
+            await engine._tick()
+        self.assertEqual(strategy.next_calls, 1)
+        self.assertEqual([line for line in captured.output if "regime gate" in line.lower()], [])
 
     async def test_the_gate_context_reaches_the_grok_strategy(self) -> None:
         received: list[dict] = []

@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from bot.core.forward_summary import (
     EXIT_AI,
@@ -70,7 +70,7 @@ from .data import load_pair, manifest, manifest_sha256, stage_files
 from .frames import PairFrames, build_pair_frames
 from .live_sim import MODE_L, VERSION_I, VERSION_II, LiveRunSpec, simulate_live_run
 from .metrics import StageMetrics
-from .report import exact, format_number
+from .report import exact, format_number, format_percent
 from .stages import NA, Period, StageError, refuse_existing, require_warm, run_metrics, stamp
 from .stages_live import LIVE_PAIR, calendar_days, check_mode_l, measured_days
 
@@ -159,7 +159,7 @@ class _VersionRun:
     spec: LiveRunSpec
     metrics: StageMetrics
     blocked: Dict[str, int]
-    untung_pct: float  # share of positions with a booked pnl above zero, as the forward side counts it
+    untung_pct: Optional[float]  # None without positions; share of positions with a booked pnl above zero, as the forward side counts it
 
     @property
     def key(self) -> str:
@@ -180,7 +180,7 @@ def _run_versions(frames: PairFrames, cfg: ModesConfig, live: LiveExitConfig, pa
         result = simulate_live_run(frames, cfg, live, spec)
         metrics = run_metrics(result, hari_naik, cfg, calendar_days(period))
         wins = sum(1 for trade in result.trades if trade.pnl_usdt > 0)
-        untung_pct = 100.0 * wins / len(result.trades) if result.trades else 0.0
+        untung_pct = 100.0 * wins / len(result.trades) if result.trades else None
         runs.append(_VersionRun(versi, spec, metrics, dict(result.blocked), untung_pct))
     return tuple(runs)
 
@@ -228,7 +228,7 @@ def _mode_l_line(run: _VersionRun) -> str:
     return _line((f"Mode L ({run.versi})", _count(m.posisi),
                   format_number(m.entry_per_hari_kalender, 2),
                   format_number(m.hasil_per_1_juta, 0), format_number(m.hasil_tanpa_teratas, 0),
-                  f"{format_number(run.untung_pct, 1)}%", _count(m.tp), _count(m.sl), _count(m.potong), _count(m.waktu), NA, NA))
+                  format_percent(run.untung_pct, 1), _count(m.tp), _count(m.sl), _count(m.potong), _count(m.waktu), NA, NA))
 
 
 def _forward_line(s: ForwardSummary) -> str:
@@ -236,7 +236,7 @@ def _forward_line(s: ForwardSummary) -> str:
     return _line(("Uji maju (bot AI LONG)", _count(s.posisi),
                   format_number(s.entry_per_hari_kalender, 2),
                   format_number(s.hasil_per_1_juta, 0), format_number(s.hasil_tanpa_teratas, 0),
-                  f"{format_number(s.untung_pct, 1)}%", _count(e[EXIT_TP]), _count(e[EXIT_SL]), NA, _count(e[EXIT_TIME]),
+                  format_percent(s.untung_pct, 1), _count(e[EXIT_TP]), _count(e[EXIT_SL]), NA, _count(e[EXIT_TIME]),
                   _count(e[EXIT_AI]), _count(e[EXIT_OTHER])))
 
 

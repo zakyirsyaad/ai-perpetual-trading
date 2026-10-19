@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from bot.core import forward_summary as fs
@@ -251,6 +252,42 @@ class RunTests(ForwardCompareCase):
             self.assertIn(text, report)
         header = next(line for line in report.splitlines() if line.startswith("| Baris"))
         self.assertNotIn("menang", header.lower())  # TP share is a different measure: not in the table
+
+    def _untung_cells(self, report):
+        """The 'untung' cell of the Mode L and forward rows of the report table."""
+        header = next(line for line in report.splitlines() if line.startswith("| Baris"))
+        index = [cell.strip() for cell in header.strip("|").split("|")].index("untung (pnl > 0)")
+        return {line.strip("|").split("|")[0].strip(): line.strip("|").split("|")[index].strip()
+                for line in report.splitlines() if line.startswith(("| Mode L", "| Uji maju"))}
+
+    def test_no_forward_positions_leave_the_win_rate_unmeasured(self):
+        with self.trades.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(fs.CSV_COLUMNS)
+            writer.writerow(forward_rows()[0])  # closed before the window: none inside it
+
+        path = self.run_stage()
+
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["forward"]["posisi"], 0)
+        self.assertIsNone(doc["forward"]["untung_pct"])
+        cells = self._untung_cells((self.out / f"{STEM}.md").read_text(encoding="utf-8"))
+        self.assertEqual(cells["Uji maju (bot AI LONG)"], forward_compare.NA)
+        self.assertRegex(cells["Mode L (i)"], r"%$")  # a measured rate keeps its percent sign
+
+    def test_a_mode_l_run_without_positions_leaves_the_win_rate_unmeasured(self):
+        empty = SimpleNamespace(trades=(), blocked={})
+        with mock.patch.object(forward_compare, "simulate_live_run", return_value=empty):
+            path = self.run_stage()
+
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        for key in RUN_KEYS:
+            self.assertEqual(doc["runs"][key]["metrics"]["posisi"], 0)
+            self.assertIsNone(doc["runs"][key]["untung_pct"])
+        cells = self._untung_cells((self.out / f"{STEM}.md").read_text(encoding="utf-8"))
+        self.assertEqual(cells["Mode L (i)"], forward_compare.NA)
+        self.assertEqual(cells["Mode L (ii)"], forward_compare.NA)
+        self.assertEqual(cells["Uji maju (bot AI LONG)"], "50,0%")
 
     def test_the_report_states_the_edge_asymmetry(self):
         self.run_stage()

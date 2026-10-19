@@ -39,6 +39,7 @@ def _settings(**overrides) -> SimpleNamespace:
         volume_profile=SimpleNamespace(as_log_fields=lambda: {}),
         venue_max_leverage=100,
         telemetry_enabled=False,
+        entry_regime_gate="off",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -139,6 +140,36 @@ class CompositionRootTests(unittest.IsolatedAsyncioTestCase):
         settings = _settings()
         await self._run(settings)
         self.assertEqual(settings.venue_max_leverage, 100)
+
+
+class RegimeGateRefusalTests(unittest.IsolatedAsyncioTestCase):
+    """A bad gate configuration ends in one error line and a closed client, not a traceback."""
+
+    async def test_a_refused_gate_logs_one_line_closes_the_client_and_exits_1(self) -> None:
+        closed: list[bool] = []
+        _Engine.instances.clear()
+
+        class ClosingClient(_Recorder):
+            async def close(self) -> None:
+                closed.append(True)
+
+        settings = _settings(entry_regime_gate="naik", symbols=("BTC/USDT", "ETH/USDT"))
+        patches = _patched(settings) + [patch.object(main_module, "BingXFuturesClient", ClosingClient)]
+        for item in patches:
+            item.start()
+        try:
+            with self.assertLogs(level="ERROR") as logs, self.assertRaises(SystemExit) as raised:
+                await main_module.run()
+        finally:
+            for item in patches:
+                item.stop()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(closed, [True])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("exactly one symbol", logs.records[0].getMessage())
+        self.assertIsNone(logs.records[0].exc_info)
+        self.assertEqual(_Engine.instances, [])  # no engine was built
 
 
 class TelemetryWiringTests(unittest.IsolatedAsyncioTestCase):

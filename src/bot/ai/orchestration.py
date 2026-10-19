@@ -189,18 +189,6 @@ class AIOrchestrator:
             review.invalidation_trigger,
         )
 
-        # Defence in depth for the LONG-only forward bot: with the regime gate on, the side filter does not
-        # depend on the stretch gate's mode (the direction check in `_stretch_gate_verdict` is skipped when off).
-        if getattr(self._settings, "entry_regime_gate", "off") != "off":
-            only_side = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
-            if only_side != "any" and decision.action != f"OPEN_{only_side.upper()}":
-                self._logger.info(
-                    "Entry candidate %s rejected: the regime gate is on and lets through %s entries only.",
-                    decision.symbol,
-                    only_side,
-                )
-                return None
-
         if gate_verdict and gate_verdict.get("verdict") == "block" and gate_verdict.get("reason") == "direction":
             allowed = gate_verdict.get("allowed_direction")
             if gate_verdict.get("mode") == "enforce":
@@ -571,13 +559,19 @@ class AIOrchestrator:
             "behind_schedule": False,
             "entries_needed_per_hour": None,
         }
-        if mode == "off" or decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+        if decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
             return verdict
-
+        allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
+        other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
+        if other_side and self._settings.entry_regime_gate != "off":
+            # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
+            # ENTRY_STRETCH_GATE_MODE says, so the stored verdict and the outcome agree.
+            verdict["mode"] = "enforce"
+        elif mode == "off":
+            return verdict
         # The side filter comes before the schedule relaxation on purpose: being behind
         # on volume may excuse a stretched entry, never the side that has no edge.
-        allowed_side = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
-        if allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}":
+        if other_side:
             verdict["verdict"] = "block"
             verdict["reason"] = "direction"
             verdict["allowed_direction"] = allowed_side

@@ -54,7 +54,12 @@ async def run() -> None:
         debug_http=settings.bingx_debug_http,
     )
     # None while ENTRY_REGIME_GATE=off; refuses to boot on the gate with more than one symbol.
-    regime_gate = build_regime_gate(settings, client, logger)
+    try:
+        regime_gate = build_regime_gate(settings, client, logger)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        await client.close()
+        raise SystemExit(1) from None
     resolution = await resolve_venue_leverage(
         client,
         symbols=settings.symbols,

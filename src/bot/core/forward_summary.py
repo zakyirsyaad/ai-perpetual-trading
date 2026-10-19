@@ -84,7 +84,7 @@ class ForwardTrade:
 class ForwardSummary:
     posisi: int
     entry_per_hari_kalender: float
-    untung_pct: float
+    untung_pct: Optional[float]  # None when the window holds no position
     exits: dict[str, int]
     hasil_per_1_juta: Optional[float]
     hasil_tanpa_teratas: Optional[float]
@@ -164,7 +164,7 @@ def summarize(
     return ForwardSummary(
         posisi=len(window),
         entry_per_hari_kalender=len(window) / days,
-        untung_pct=(100.0 * wins / len(window)) if window else 0.0,
+        untung_pct=(100.0 * wins / len(window)) if window else None,
         exits=exits,
         hasil_per_1_juta=_pooled_per_1m(window),
         hasil_tanpa_teratas=_pooled_per_1m(ranked[drop_top:]),

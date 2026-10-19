@@ -74,13 +74,17 @@ def _fmt(value: Optional[float], digits: int = 1) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+def _fmt_percent(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.1f}%"
+
+
 def render_summary(summary: ForwardSummary, first_day: date, last_day: date) -> str:
     exits = summary.exits
     lines = [
         f"=== Uji maju LONG, {first_day} s/d {last_day} (WIB, akhir tidak termasuk) ===",
         f"posisi                    : {summary.posisi}",
         f"entry per hari kalender   : {summary.entry_per_hari_kalender:.2f}",
-        f"untung (pnl > 0)          : {summary.untung_pct:.1f}%",
+        f"untung (pnl > 0)          : {_fmt_percent(summary.untung_pct)}",
         f"keluar                    : tp={exits[EXIT_TP]} sl={exits[EXIT_SL]} "
         f"waktu={exits[EXIT_TIME]} ai={exits[EXIT_AI]} lain={exits[EXIT_OTHER]}",
         f"pnl bersih (USDT)         : {summary.pnl_usdt:.2f}",

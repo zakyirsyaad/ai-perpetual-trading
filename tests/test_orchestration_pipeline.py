@@ -16,6 +16,8 @@ from bot.risk.risk_manager import DailyRiskState
 
 def _settings(**overrides) -> SimpleNamespace:
     base = dict(
+        entry_regime_gate="off",
+        entry_gate_direction="any",
         strategy_mode="ai_volume",
         symbols=("BTC/USDT", "ETH/USDT"),
         exchange_name="bingx",

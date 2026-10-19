@@ -112,7 +112,7 @@ Starts only on the user's go-ahead (plan Task 9), on merged `main`.
    outside it). If it does not appear, the window is open: Ctrl-C at once and check the venue for a position or order before doing anything else.
    What you will not see: the regime gate sits after the window gate, so its first verdict (`Regime gate ...`) is not
    logged until the window opens. `main.py` refuses `ENTRY_REGIME_GATE=naik` with more than one symbol in `SYMBOLS` (the
-   forward bot is one symbol); that refusal is visible now. Read the first verdict in the pm2 error log on Monday after
+   forward bot is one symbol; `build_forward_env.py` forces `SYMBOLS=BTC/USDT`); a refusal is one error line and exit 1, visible now. Read the first verdict in the pm2 error log on Monday after
    07:00 and the guard state from the first report.
 
    Stop it with Ctrl-C after reading the lines. Before stopping, confirm on the venue that the account is flat (the BingX VST

@@ -49,6 +49,7 @@ SOURCE_LINES = [
     f"COINMARKETCAP_API_KEY={FAKE_VALUES['COINMARKETCAP_API_KEY']}",
     "#SUPABASE_SCHEMA=commented-out-stays",
     "TELEMETRY_ENABLED=true",
+    "SYMBOLS=BTC/USDT,ETH/USDT",
 ]
 
 
@@ -391,6 +392,7 @@ class ForwardOverridesAreRealSettingsTests(unittest.TestCase):
                 )
         self.assertEqual(settings.supabase_schema, "long_forward")
         self.assertEqual(settings.entry_gate_direction, "long")
+        self.assertEqual(settings.symbols, ("BTC/USDT",))  # the source lists ETH too; the gate is BTC-only
         self.assertEqual(settings.entry_regime_gate, "naik")
         self.assertEqual(settings.entry_stretch_gate_mode, "enforce")
         self.assertEqual(settings.strategy_mode, "ai_volume")

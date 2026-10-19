@@ -25,6 +25,8 @@ def _volume_run_settings() -> SimpleNamespace:
     gates are removed (confidence/systemic/RR floors no longer veto)."""
     return SimpleNamespace(
         strategy_mode="ai_volume",
+        entry_regime_gate="off",
+        entry_gate_direction="any",
         symbols=["BTC/USDT", "ETH/USDT"],
         stop_loss_pct=0.08,
         take_profit_pct=0.12,
@@ -750,11 +752,12 @@ class EntryDirectionFilterTests(EntryStretchGateTests):
         self.assertEqual(verdict["verdict"], "allow")
 
 
-class RegimeGateSideDefenceTests(unittest.TestCase):
+class RegimeGateSideDefenceTests(unittest.IsolatedAsyncioTestCase):
     """With the regime gate on, only the configured side may become a candidate, whatever the stretch mode.
 
     The LONG forward bot's invariant used to rest on the stretch gate enforcing; a misconfigured
-    ENTRY_STRETCH_GATE_MODE must not let a SHORT through. Gate off: nothing changes.
+    ENTRY_STRETCH_GATE_MODE must not let a SHORT through. The defence lives in the verdict, so the
+    stored decision and the outcome agree. Gate off: nothing changes.
     """
 
     _settings = EntryStretchGateTests._settings
@@ -763,36 +766,75 @@ class RegimeGateSideDefenceTests(unittest.TestCase):
     _context = EntryStretchGateTests._context
     NEAR_MEAN = EntryStretchGateTests.NEAR_MEAN
 
-    def test_a_short_is_rejected_with_the_gate_on_even_when_the_stretch_gate_is_off(self) -> None:
-        orchestrator = self._orchestrator(
-            entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off"
-        )
+    def _gated(self, **overrides) -> AIOrchestrator:
+        options = dict(entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off")
+        options.update(overrides)
+        return self._orchestrator(**options)
+
+    def test_a_short_gets_a_direction_block_even_when_the_stretch_gate_is_off(self) -> None:
+        orchestrator = self._gated()
         context = self._context(ema_21=self.NEAR_MEAN)
         decision = self._decision("OPEN_SHORT")
+
         verdict = orchestrator._stretch_gate_verdict(decision, context, None)
-        self.assertEqual(verdict["verdict"], "allow")  # the stretch gate alone would not have stopped it
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "direction")
+        self.assertEqual(verdict["mode"], "enforce")
+        self.assertEqual(verdict["allowed_direction"], "long")
+        # same keys as the block the enforcing stretch gate returns
+        reference = self._orchestrator(entry_stretch_gate_mode="enforce", entry_gate_direction="long")
+        expected = reference._stretch_gate_verdict(decision, context, None)
+        self.assertEqual(set(verdict), set(expected))
+        self.assertEqual(verdict, expected)
 
         with self.assertLogs("test.stretch_gate", level="INFO") as logs:
             candidate = orchestrator._build_entry_candidate(decision, context, verdict)
-
         self.assertIsNone(candidate)
-        self.assertIn("regime gate", "\n".join(logs.output).lower())
+        self.assertIn("lets through long entries only", "\n".join(logs.output))
+
+    async def test_the_stored_decision_shows_the_block_the_outcome_follows(self) -> None:
+        saved: list[dict] = []
+
+        class Store:
+            async def save_ai_decision(self, **kwargs) -> None:
+                saved.append(kwargs)
+
+        orchestrator = self._gated()
+        orchestrator._trade_store = Store()
+        orchestrator._brain = SimpleNamespace()
+        orchestrator._supabase_journal = None
+        orchestrator._gate_context = None
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_SHORT")
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        await orchestrator._record_ai_decision(decision, {}, None, verdict)
+
+        gate = saved[0]["payload"]["gate"]
+        self.assertEqual((gate["verdict"], gate["reason"], gate["mode"]), ("block", "direction", "enforce"))
+        self.assertIsNone(orchestrator._build_entry_candidate(decision, context, verdict))
 
     def test_the_configured_side_still_passes_with_the_gate_on(self) -> None:
-        orchestrator = self._orchestrator(
-            entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off"
-        )
+        orchestrator = self._gated()
         context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_LONG")
 
-        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision("OPEN_LONG"), context, None))
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(decision, context, verdict))
 
     def test_with_the_gate_off_a_short_still_passes(self) -> None:
-        orchestrator = self._orchestrator(
-            entry_regime_gate="off", entry_gate_direction="long", entry_stretch_gate_mode="off"
-        )
+        orchestrator = self._gated(entry_regime_gate="off")
         context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_SHORT")
 
-        self.assertIsNotNone(orchestrator._build_entry_candidate(self._decision("OPEN_SHORT"), context, None))
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertEqual(verdict["mode"], "off")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(decision, context, verdict))
 
 
 class EntryGateDirectionSettingTests(unittest.TestCase):

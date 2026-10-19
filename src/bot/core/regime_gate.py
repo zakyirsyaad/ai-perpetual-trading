@@ -226,7 +226,7 @@ def build_regime_gate(settings: Any, client: Any, logger: logging.Logger) -> Opt
 
     The gate reads one symbol's candles, so a bot that trades several symbols could not tell which
     one a verdict is about: with the gate on, anything but a single symbol refuses to boot."""
-    mode = getattr(settings, "entry_regime_gate", MODE_OFF)
+    mode = settings.entry_regime_gate
     if mode == MODE_OFF:
         return None
     symbols = tuple(settings.symbols)

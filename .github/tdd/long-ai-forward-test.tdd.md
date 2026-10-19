@@ -300,6 +300,30 @@ Verification after the ten fixes: full suite 2649 tests OK (was 2641; +8 new), c
 approach (`regime_gate.py` 99 %, `forward_compare.py` 100 %, `orchestration.py` 95 %, `trade_engine.py` 87 %), `compileall`
 clean, `git diff --check` clean, `tests.test_secret_hygiene` OK.
 
+## PR #42 second review fixes
+
+Six code items, each with a test written first (RED = the failing run before the fix). With every new setting off the live
+SHORT bot is unchanged: the only path it touches is `_stretch_gate_verdict`, which for `entry_regime_gate == "off"` returns
+exactly what it did (an added test pins gate off, stretch mode off, OPEN_SHORT: verdict `allow`, mode `off`).
+
+| # | Change | RED | GREEN |
+|---|--------|-----|-------|
+| 1 | `FORWARD_OVERRIDES["SYMBOLS"] = "BTC/USDT"` (Settings stores the tuple `("BTC/USDT",)`) | `tests.test_build_forward_env` with the source listing `SYMBOLS=BTC/USDT,ETH/USDT`: `Tuples differ: ('BTC/USDT', 'ETH/USDT') != ('BTC/USDT',)` | 28 tests OK |
+| 2 | `ForwardSummary.untung_pct` and mode L's `untung_pct` are `None` without positions; every renderer prints a dash, JSON carries null, a number keeps its `%` | `0.0 is not None` (forward summary, report and compare, both sides), `'0.0%' != '-'` | 37 tests OK |
+| 3 | `main.py`: `build_regime_gate`'s `ValueError` logs one error line, closes the client and exits 1 (no traceback) | `tests.test_main_composition.RegimeGateRefusalTests`: raw `ValueError: ENTRY_REGIME_GATE=naik needs exactly one symbol in SYMBOLS, got 2` out of `run()` | 12 tests OK |
+| 4 | The LONG-only defence moved into `_stretch_gate_verdict`: gate on and a decision on the other side returns the `direction` block with mode `enforce`, whatever the stretch mode; the separate block in `_build_entry_candidate` is gone | `tests.test_ai_orchestration.RegimeGateSideDefenceTests`: `'allow' != 'block'` (verdict) and `KeyError: 'reason'` (the stored `gate` of the decision) | OK (4 tests; the enforce path drops the candidate) |
+| 5 | `entry_regime_gate` / `entry_gate_direction` are read by plain attribute access in `orchestration.py` and `regime_gate.py`; the fake settings in `test_ai_orchestration`, `test_orchestration_pipeline` and `test_main_composition` carry both fields | the first full run after the plain access: 28 `AttributeError: ... no attribute 'entry_gate_direction'` errors until the fakes were updated | full suite OK |
+| 6 | The engine no longer logs the regime gate (`RegimeGate._note` already logs each change with the numbers); the pause-after-exit note stays | `test_the_engine_leaves_the_regime_log_to_the_gate`: two engine lines (`Regime gate blocks entries ...`, `Regime gate allows entries ...`) where none are expected | 28 tests OK |
+
+Notes. Item 4 keeps one behaviour on purpose: gate on, the configured side, stretch mode off still skips the stretch check
+(only the other side is promoted to `enforce`), so a misconfigured stretch mode cannot start rejecting LONGs either.
+Item 7 needs no change: `_publish_volume` returns early when telemetry is off and the forward bot forces
+`TELEMETRY_ENABLED=false`, so it already reads the cycle rows once per tick.
+
+Verification: full suite 2654 tests OK (was 2649), coverage 91 % total with the temp-rcfile approach (`orchestration.py`
+95 %, `main.py` 100 %, `forward_summary.py` 100 %, `forward_compare.py` 100 %, `regime_gate.py` 99 %, `trade_engine.py` 87 %),
+`compileall` clean, `git diff --check` clean, `tests.test_secret_hygiene` OK.
+
 ## Deployment gate
 
 Not deployed. Task 9 starts only on the user's go-ahead and on merged `main`:

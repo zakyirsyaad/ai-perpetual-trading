@@ -292,12 +292,7 @@ class TradeEngine:
 
         if self._regime_gate is not None:
             regime = await self._regime_gate.verdict()
-            self._note_gate(
-                "regime",
-                not regime.allowed,
-                f"Regime gate blocks entries ({regime.reason}); the model is not called.",
-                f"Regime gate allows entries ({regime.reason}).",
-            )
+            # RegimeGate logs every change of its verdict itself, with the numbers.
             if not regime.allowed:
                 return
             set_gate_context = getattr(self._strategy, "set_gate_context", None)
