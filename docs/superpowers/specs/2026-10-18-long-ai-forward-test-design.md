@@ -72,7 +72,7 @@ logged once, and the condition goes into each AI decision's `gate` payload.
 
 Skips an entry when ATR14 (1h) exceeds the multiple times the median of the last 720 closed-hour
 ATR14 values, the latest included, and while fewer than 720 exist (the Phase 1 definition). It needs
-at least 735 closed 1h bars per check, read once per closed hour. Its verdict joins the `gate`
+about 831 closed 1h bars per check (112 for the ATR14 warm-up plus 720), read once per closed hour. Its verdict joins the `gate`
 payload.
 
 ### 4.3 Pause after any exit `COOLDOWN_MINUTES_AFTER_EXIT`
