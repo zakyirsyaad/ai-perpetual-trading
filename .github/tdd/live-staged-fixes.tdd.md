@@ -264,9 +264,8 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
 
 ## Known limits (deferred review notes, none blocking)
 
-- `ENTRY_STRETCH_GATE_MAX_ATR=inf` passes the lean guard: the one remaining way to make the rule
-  sentence false.
-- `SETUP_LEDGER_HURDLE_BPS` accepts `nan`/`inf` (`nan` silently disables `enforce`);
+- ~~`ENTRY_STRETCH_GATE_MAX_ATR=inf` passes the lean guard~~ (fixed in the final review fix wave).
+- ~~`SETUP_LEDGER_HURDLE_BPS` accepts `nan`/`inf`~~ (fixed in the final review fix wave);
   `SETUP_LEDGER_SINCE` has no future-time guard (a year typo leaves the ledger `learning`).
 - `complete_shadow_entry` is not guarded by `evaluated_at is null`; harmless with the single
   evaluator. `shadow_outcomes_since` returns `expired`/`invalid` rows with NULL `gross_bps`; every
@@ -279,6 +278,153 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   maths on the same candles.
 - `build_forward_env.py` forces none of the new keys; this matters only if the forward bot moves to
   a newer tag.
+
+## Final review fix wave
+
+The whole-branch review found four important and four minor issues; the controller's rulings are
+binding and were implemented as written. Every default (`ENTRY_REGIME_GATE=off`,
+`AI_ENTRY_PAYLOAD=legacy`, `SETUP_LEDGER_MODE=off`) is untouched, `tests/fixtures/legacy_entry_payload.json`
+is unchanged, and the entry system prompt and `COMPACT_PROMPT_VERSION` are untouched.
+
+### 1. Lean showed ledger statuses the code did not enforce (`3da90ff`)
+
+Under `SETUP_LEDGER_MODE=shadow` the lean `setup_ledger` lines said `blocked` while the bot still
+traded the bucket. Ruling: the lean payload carries `setup_ledger` only under `enforce`.
+
+RED (`test_lean_omits_the_ledger_block_unless_enforcing`):
+
+```
+FAIL: test_lean_omits_the_ledger_block_unless_enforcing (tests.test_ai_orchestration.LeanEntryPayloadTests) (mode='shadow')
+AssertionError: True != False
+```
+
+GREEN: `_ledger_lines` returns `[]` unless the mode is `enforce`; the builder already omits the key
+for no lines. `test_lean_ledger_lines_reuse_the_one_ledger_read` now pins the `enforce` output (and
+that the shown `blocked` status really drops the candidate into a `ledger_block` row). `shadow` still
+records the verdict at `payload_json.gate.ledger`.
+
+### 2. Shadow rows had no spacing (`85186fb`)
+
+A row was written on every tick the model answered OPEN on a shadow side (and for every
+enforce-blocked candidate), so 60-minute walks overlapped, inflating n and understating the SE.
+Ruling: no new row for the same (symbol, side, source) while the last written one was decided less
+than `POSITION_HOLD_MINUTES + COOLDOWN_MINUTES_AFTER_ENTRY` minutes earlier.
+
+RED:
+
+```
+ERROR: test_a_fresh_orchestrator_starts_with_no_spacing_state (tests.test_ai_orchestration.LedgerAndShadowTests)
+AttributeError: 'AIOrchestrator' object has no attribute '_shadow_rows_written_at'
+FAIL: test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [date[58 chars].utc), datetime.datetime(2026, 10, 21, 3, 30, [25 chars]utc)] != [date[58 chars].utc)]
+FAIL: test_spacing_is_per_symbol_side_and_source (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('BT[139 chars]ide'), ('BTC/USDT', 'long', 'shadow_side'), ('[29 chars]de')] != [('BT[139 chars]ide')]
+```
+
+`test_a_failed_write_does_not_start_the_spacing` passed before the change (there was no spacing to
+start) and pins the failure path of the new code.
+
+GREEN: `AIOrchestrator.__init__` sets `_shadow_rows_written_at = {}`; `_record_shadow_entry` reads the
+clock once (`_utc_now`, the one seam the tests move), skips a row inside the spacing with one INFO
+line giving the minutes remaining, and replaces (never mutates) the map only after a successful
+write. The candidate is dropped in every case. A restart forgets the map (documented in CLAUDE.md).
+
+### 3. `reopened` never expired (`7ab059a`)
+
+Once reopened a bucket wrote no more `ledger_block` rows, so its old shadow sample kept it reopened
+forever. Ruling: a bucket the real rule blocks and the shadow rule reopens is judged again on its
+real trades opened after its latest `ledger_block` row's `decided_at`; `min_samples` of them with
+mean + 1.28 x SE below the hurdle make it `blocked` again.
+
+RED (behaviour, then the pure API):
+
+```
+FAIL: test_ledger_enforce_blocks_a_reopened_bucket_that_loses_again (tests.test_ai_orchestration.LedgerAndShadowTests) (new_trades=3)
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_a_reopened_bucket_that_loses_again_reads_blocked (tests.test_report_live_stages.CliTests) (status='blocked')
+AssertionError: 'reopened' != 'blocked'
+ImportError: cannot import name 'EMPTY_BUCKET_LEDGER' from 'bot.core.setup_ledger'
+```
+
+GREEN: `ledger_table` returns a frozen `BucketLedger(real, shadow, real_since_block)` per bucket.
+`real_since_block` holds the counted trades whose `opened_at` is strictly after the bucket's latest
+`ledger_block` `decided_at` (every block row with a readable time sets it, an expired one included;
+times are parsed by `shadow_eval._parse_utc`, offset required, so an unreadable or naive time never
+counts). `ledger_status(bucket, min_samples, hurdle_bps)` stays pure. The orchestrator reads a
+missing bucket as `EMPTY_BUCKET_LEDGER`; the report adds `n sejak blok` and its bound. Named tests:
+`test_a_reopened_bucket_that_loses_again_is_blocked_again`,
+`test_a_reopened_bucket_with_too_few_new_trades_stays_reopened` (`tests/test_setup_ledger.py`).
+
+### 4. The shadow walk models the floor neutral exit (`5b6b9eb`)
+
+Ruling: `Settings` refuses `ENTRY_REGIME_GATE=map` or `SETUP_LEDGER_MODE` other than `off` unless
+`VOLUME_NEUTRAL_EXIT_ENABLED=true` and `VOLUME_NEUTRAL_EXIT_MODE=floor`, one ValueError naming what is
+missing; `naik` with the ledger off is not checked. Account 1 already runs the floor exit, enabled
+(verified read-only by the controller).
+
+RED:
+
+```
+FAIL: test_map_refuses_without_the_floor_neutral_exit (...) (override={'VOLUME_NEUTRAL_EXIT_ENABLED': 'false'})
+AssertionError: ValueError not raised
+FAIL: test_one_error_names_both_missing_keys (...)
+AssertionError: ValueError not raised
+FAIL: test_the_ledger_on_refuses_without_the_floor_neutral_exit_even_under_naik (...) (mode='shadow')
+AssertionError: ValueError not raised
+```
+
+GREEN: `_require_shadow_walk_companions`, after the regime and ledger checks. The map and lean test
+Settings now set both keys (`FLOOR_EXIT` in `tests/test_live_staged_settings.py`); the other
+real-`Settings` tests (`test_regime_gate.py`, `test_trade_engine_forward_gates.py`) build only `naik`
+with the ledger off, which is not checked, and every other map or ledger bot in the tests is a
+`SimpleNamespace`, which the validator never sees.
+
+### 5-8. Minor (`5b6b9eb`, `0a8f592`)
+
+- **5. Non-finite hurdle.** `SETUP_LEDGER_HURDLE_BPS` has `allow_inf_nan=False`. RED:
+  `test_a_non_finite_hurdle_is_refused` (`nan`, `inf`, `-inf`) `AssertionError: ValueError not raised`.
+- **6. Infinite stretch limit.** The lean guard requires `math.isfinite(ENTRY_STRETCH_GATE_MAX_ATR)`
+  ("a finite ENTRY_STRETCH_GATE_MAX_ATR above 0"); the field is unchanged, so a legacy `.env` with
+  `inf` still boots (`test_legacy_keeps_accepting_an_infinite_stretch_limit`). RED:
+  `test_lean_refuses_an_infinite_stretch_limit` `AssertionError: ValueError not raised`.
+- **7. Comments.** `config.py` and `.env.example` now say ledger `shadow` only records the verdict at
+  `payload_json.gate.ledger` and writes no rows, the regime gate comment names `map`, and the
+  `.env.example` header no longer calls the block "LONG forward bot" only.
+- **8. One source per ledger read.** `shadow_outcomes_since(since, source=None)` adds
+  `source=eq.<value>` when given; the orchestrator passes `ledger_block`, the report reads both. RED:
+  `TypeError: SupabaseTradeStore.shadow_outcomes_since() got an unexpected keyword argument 'source'`,
+  and the orchestrator's `ledger_reads` assertion (`None != 'ledger_block'`).
+
+### Known limit of the ruling in item 3
+
+The reopening sample is every `ledger_block` outcome since `SETUP_LEDGER_SINCE`. When a re-blocked
+bucket writes its next `ledger_block` row and that row is evaluated (hold + 1 minutes later), the
+latest block time moves past every real trade, `real_since_block` restarts empty, and the old good
+shadow sample reads the bucket `reopened` again. So a re-block lasts about an hour, then another
+`min_samples` real trades must fail. Implemented as ruled; flagged for the controller.
+
+### Verification (final wave)
+
+Run on `feat/live-staged-fixes` at `7ab059a` plus this documentation, Python 3.10.20 from `.venv`,
+2026-10-21.
+
+```
+PYTHONPATH=src python -m compileall -q src tests                                   # exit 0
+PYTHONPATH=src python -m unittest discover -s tests                                # Ran 2923 tests, OK
+PYTHONPATH=src python -m coverage run --rcfile=<rc> -m unittest discover -s tests  # Ran 2923 tests, OK
+python -m coverage report --rcfile=<rc>                                            # TOTAL 17296 1405 92%   (fail_under 80)
+git diff --check origin/main...HEAD                                                # exit 0, no output (origin/main = 95e61b7)
+uv pip check --python .venv/bin/python                                             # All installed packages are compatible
+```
+
+- 2,923 tests (2,899 before the wave: +24). `<rc>` mirrors `pyproject.toml`'s `[tool.coverage]`
+  (`source`, `omit`, `exclude_lines`, `fail_under`), as above.
+- Modules: `setup_ledger.py` 100 %, `shadow_eval.py` 100 %, `orchestration.py` 96 %, `config.py`
+  96 %, `supabase_trade_store.py` 95 %, `report_live_stages.py` 98 %. Every line the wave changed
+  under `src/` is covered.
+- The secret-hygiene, dashboard-contract, forward-schema and import-structure tests pass unchanged;
+  `setup_ledger.py` now imports `bot.core.shadow_eval` (for `_parse_utc`), which imports only
+  `bot.telemetry.ws`, so neither module reaches `pine_indicators` or `bot/strategy/modes/`.
 
 ## Verification
 
@@ -339,6 +485,12 @@ f8a2e23 feat: setup ledger statistics and status                                
 1249c89 fix: lean payload only with an enforcing stretch gate                   Task 9 review
 81e4230 feat: live stage report                                                 Task 10
         docs: live staged fixes in CLAUDE.md and TDD evidence                   Task 11
+5b6b9eb fix: settings guards for the shadow walk exit, a finite hurdle and a finite stretch limit   final review 4-7
+0a8f592 perf: read only ledger_block shadow outcomes for the setup ledger       final review 8
+3da90ff fix: lean payload shows ledger statuses only while the ledger enforces  final review 1
+85186fb fix: space shadow rows by the hold plus the entry cooldown              final review 2
+7ab059a fix: judge a reopened ledger bucket again on its new real trades        final review 3
+        docs: final review fix wave in CLAUDE.md, the spec and TDD evidence     final review
 ```
 
 ## Deployment gate

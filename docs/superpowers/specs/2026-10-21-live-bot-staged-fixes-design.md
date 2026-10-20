@@ -98,7 +98,8 @@ today's payload. `lean` changes the entry request only (the exit AI is off and o
   `change_pct_20_bars` with a `bar_interval` field (15 and 60 minutes on 3m candles), ATR14 in %.
 - **Confidence.** `risk_constraints.min_confidence` is removed from the payload; the code still
   enforces `AI_MIN_CONFIDENCE`.
-- **Ledger status** (Part C on): the bucket status of each allowed side, one line each.
+- **Ledger status** (Part C enforcing): the bucket status of each allowed side, one line each. Absent
+  while the ledger is `off` or `shadow`, because `shadow` still trades a `blocked` bucket (final review).
 
 The arena still runs and is still recorded; only what reaches the model changes. Every decision
 records `payload_json.payload_profile` = `legacy` or `lean`.
@@ -150,18 +151,30 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   minute on and walks them like the live exit rules (stop first when a candle touches both, stop
   filled 1 bp worse, time exit at the last close). A read failure leaves the row for the next tick
   and is logged at WARNING; it never blocks trading.
+  - *Final review:* the walk models the floor neutral exit, so `Settings` refuses
+    `ENTRY_REGIME_GATE=map` or a ledger mode other than `off` unless `VOLUME_NEUTRAL_EXIT_ENABLED=true`
+    and `VOLUME_NEUTRAL_EXIT_MODE=floor` (`naik` with the ledger off is not checked).
+  - *Final review:* rows are spaced at write time. No new row is written for the same (symbol, side,
+    source) while the last one written for it was decided less than `POSITION_HOLD_MINUTES` +
+    `COOLDOWN_MINUTES_AFTER_ENTRY` minutes earlier, so walks do not overlap and n is not inflated. A
+    skipped candidate is still dropped (one INFO line); a failed write does not start the spacing; the
+    times are kept in memory, so a restart forgets them.
 - **Verdict per bucket** (pre-registered):
   - `blocked` when real n ≥ `MIN_SAMPLES` and mean + 1.28 × SE < `HURDLE_BPS` (90 % one-sided:
     the bucket cannot reach the bar);
   - a blocked bucket is `reopened` when its shadow outcomes since the block reach n ≥ `MIN_SAMPLES`
     and mean + 1.28 × SE ≥ `HURDLE_BPS`;
+  - *final review:* a reopened bucket is judged again on its real trades opened (`opened_at`) after
+    its latest `ledger_block` row's `decided_at`: once those reach n ≥ `MIN_SAMPLES` with
+    mean + 1.28 × SE < `HURDLE_BPS` it is `blocked` again, otherwise it stays `reopened`;
   - otherwise `open`, with `learning` while n < `MIN_SAMPLES`.
 - **Mode.** `shadow`: the verdict is recorded at `payload_json.gate.ledger` and changes nothing.
   `enforce`: the candidate of an entry in a `blocked` bucket is dropped in code (the tick holds; the
   decision row keeps the model's action, with `gate.ledger.status=blocked`), logged, and written to
   `shadow_entries` with source `ledger_block`, so the bucket can earn its way back.
-- **What the model sees** (lean payload): per allowed side, `bucket`, `n`, mean gross bps and
-  status. Facts about the setup in front of it, not a list of old lessons.
+- **What the model sees** (lean payload, `enforce` only): per allowed side, `bucket`, `n`, mean gross
+  bps and status. Facts about the setup in front of it, not a list of old lessons. Under `shadow` the
+  block is absent, so the model is never shown a status the code does not apply.
 - `learned_trade_memory` stays in the legacy payload; the lean payload drops it (§4).
 
 ## 7. Report
