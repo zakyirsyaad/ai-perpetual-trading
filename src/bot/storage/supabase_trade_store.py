@@ -52,6 +52,16 @@ _CLOSED_TRADE_COLUMNS = (
     "factor_metadata,trigger_metadata"
 )
 
+_SHADOW_ENTRIES_TABLE = "shadow_entries"
+_PAGE_SIZE = 1000  # PostgREST serves at most this many rows per request
+
+
+def _utc_iso(moment: datetime) -> str:
+    """A UTC ISO-8601 string for a PostgREST filter or column; a naive datetime is refused, not guessed."""
+    if moment.tzinfo is None:
+        raise ValueError(f"timestamp must be timezone-aware, got {moment.isoformat()}")
+    return moment.astimezone(timezone.utc).isoformat()
+
 
 class SupabaseTradeStore:
     """Primary trade store backed by Supabase REST.
@@ -263,6 +273,69 @@ class SupabaseTradeStore:
         if since:
             params.append(("created_at", f"gte.{since}"))
         return await self._get_rows(self._ai_call_metrics_table, params)
+
+    async def save_shadow_entry(self, row: dict[str, Any]) -> None:
+        """Persist one hypothetical entry; the exchange defaults to this store's. A failed write raises."""
+        payload = {key: _utc_iso(value) if isinstance(value, datetime) else value for key, value in row.items()}
+        payload["exchange"] = row.get("exchange") or self._exchange
+        await self._insert(_SHADOW_ENTRIES_TABLE, payload)
+
+    async def pending_shadow_entries(self, decided_before: datetime, limit: int) -> list[dict[str, Any]]:
+        """Up to `limit` unevaluated shadow rows decided before the cutoff, oldest first."""
+        return await self._get_rows(
+            _SHADOW_ENTRIES_TABLE,
+            [
+                ("select", "*"),
+                ("exchange", f"eq.{self._exchange}"),
+                ("evaluated_at", "is.null"),
+                ("decided_at", f"lt.{_utc_iso(decided_before)}"),
+                ("order", "decided_at.asc"),
+                ("limit", str(limit)),
+            ],
+        )
+
+    async def complete_shadow_entry(self, entry_id: int, gross_bps: float | None, exit_reason: str) -> None:
+        """Close one shadow row. `gross_bps=None` (an expired row) still stamps `evaluated_at`, so it never pends again."""
+        await self._patch(
+            _SHADOW_ENTRIES_TABLE,
+            [("id", f"eq.{entry_id}"), ("exchange", f"eq.{self._exchange}")],
+            {
+                "gross_bps": gross_bps,
+                "exit_reason": exit_reason,
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    async def shadow_outcomes_since(self, since: datetime) -> list[dict[str, Any]]:
+        """Evaluated shadow rows decided at or after `since`, oldest first, paged. Expired rows carry a null `gross_bps`.
+
+        Scoped by `since` alone: the volume-cycle cutoff does not apply.
+        """
+        return await self._page_all(
+            _SHADOW_ENTRIES_TABLE,
+            [
+                ("select", "*"),
+                ("exchange", f"eq.{self._exchange}"),
+                ("evaluated_at", "not.is.null"),
+                ("decided_at", f"gte.{_utc_iso(since)}"),
+                ("order", "decided_at.asc,id.asc"),
+            ],
+        )
+
+    async def closed_trade_rows_since(self, since: datetime) -> list[dict[str, Any]]:
+        """Closed-trade records closed at or after `since`, oldest first, paged past the 1000-row cap.
+
+        Scoped by `since` alone: the volume-cycle cutoff does not apply.
+        """
+        return await self._page_all(
+            self._trades_table,
+            [
+                ("select", _CLOSED_TRADE_COLUMNS),
+                ("exchange", f"eq.{self._exchange}"),
+                ("closed_at", f"gte.{_utc_iso(since)}"),
+                ("order", "closed_at.asc,id.asc"),
+            ],
+        )
 
     async def save_learning_note(
         self,
@@ -479,25 +552,26 @@ class SupabaseTradeStore:
 
     async def _all_cycle_rows(self, table: str, select: str, time_column: str) -> list[dict[str, Any]]:
         """Every row of `table` since the cycle start, oldest first, paged past PostgREST's 1000-row cap."""
+        params = [
+            ("select", select),
+            ("exchange", f"eq.{self._exchange}"),
+            ("order", f"{time_column}.asc"),
+        ]
+        if self._volume_cycle_started_at is not None:
+            cycle_start = self._volume_cycle_started_at.astimezone(timezone.utc).isoformat()
+            params.insert(2, (time_column, f"gte.{cycle_start}"))
+        return await self._page_all(table, params)
+
+    async def _page_all(self, table: str, params: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        """Every row matching `params`, fetched `_PAGE_SIZE` at a time until a short page ends the scan."""
         rows: list[dict[str, Any]] = []
-        page_size = 1000
         offset = 0
         while True:
-            params = [
-                ("select", select),
-                ("exchange", f"eq.{self._exchange}"),
-                ("order", f"{time_column}.asc"),
-                ("limit", str(page_size)),
-                ("offset", str(offset)),
-            ]
-            if self._volume_cycle_started_at is not None:
-                cycle_start = self._volume_cycle_started_at.astimezone(timezone.utc).isoformat()
-                params.insert(2, (time_column, f"gte.{cycle_start}"))
-            page = await self._get_rows(table, params)
+            page = await self._get_rows(table, [*params, ("limit", str(_PAGE_SIZE)), ("offset", str(offset))])
             rows.extend(page)
-            if len(page) < page_size:
+            if len(page) < _PAGE_SIZE:
                 return rows
-            offset += page_size
+            offset += _PAGE_SIZE
 
     async def _insert(self, table: str, payload: dict[str, Any]) -> None:
         response = await self._client.post(
@@ -532,6 +606,21 @@ class SupabaseTradeStore:
             f"{self._url}/rest/v1/{table}",
             params=params,
             headers={**self._headers(), "Prefer": "return=minimal", "Content-Profile": self._schema},
+        )
+        self._raise_for_status(response, table)
+
+    async def _patch(self, table: str, params: list[tuple[str, str]], payload: dict[str, Any]) -> None:
+        response = await self._client.request(
+            "PATCH",
+            f"{self._url}/rest/v1/{table}",
+            params=params,
+            json=payload,
+            headers={
+                **self._headers(),
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+                "Content-Profile": self._schema,
+            },
         )
         self._raise_for_status(response, table)
 
