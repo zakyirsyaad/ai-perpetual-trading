@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from bot.ai.compact_context import (
@@ -11,6 +13,8 @@ from bot.ai.compact_context import (
     compact_json,
     payload_hash,
 )
+
+LEGACY_ENTRY_GOLDEN = Path(__file__).parent / "fixtures" / "legacy_entry_payload.json"
 
 
 def _settings() -> SimpleNamespace:
@@ -49,6 +53,16 @@ class ParityPayloadTests(unittest.TestCase):
         self.assertNotIn("factor_intelligence", payload["market_context"]["intelligence"])
         self.assertNotIn("market_flow_signals", payload["market_context"]["intelligence"])
         self.assertTrue(payload["output_rules"]["open_requires_final_stop_strictly_before_estimated_liquidation_or_hold"])
+
+    def test_legacy_payload_matches_the_golden(self) -> None:
+        # The legacy entry payload is pinned byte for byte: a change here is a change
+        # to what account 1 sends the model. Regenerate the fixture only on purpose.
+        performance = {"total_trades": 12, "records": [{"reason": "complete record", "pnl": 1.2}]}
+        memory = {"lessons": ["one", "two", "three", "four"], "patterns": [{"raw": "all fields"}]}
+        objective = {"mode": "ai_volume", "primary_goal": "full objective", "nested": {"keep": True}}
+        payload = self.builder.build_entry_payload(market_context=self.context, daily_state=_daily(), recent_performance=performance, trade_memory=memory, strategy_objective=objective, arena_reviews=[{"role": "MarketAnalyzer", "payload": {"all": "values"}}])
+        golden = json.loads(LEGACY_ENTRY_GOLDEN.read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), golden)
 
     def test_exit_payload_keeps_full_position_constraints_and_one_symbol_context(self) -> None:
         payload = self.builder.build_exit_payload(position={"symbol": "BTC/USDT", "direction": "LONG", "exchange_size": 0.012345678, "entry_price": 60000.0}, market_context=self.context)
