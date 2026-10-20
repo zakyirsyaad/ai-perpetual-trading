@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Sequence
 
@@ -42,6 +42,11 @@ _SIDES = frozenset({"long", "short"})
 _OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
 # `shadow_entries.source` of a mapped side that ENTRY_GATE_DIRECTION does not make live.
 SHADOW_SIDE_SOURCE = "shadow_side"
+
+
+def _utc_now() -> datetime:
+    """The wall clock that stamps a shadow row's `decided_at` (one seam, so tests can move it)."""
+    return datetime.now(timezone.utc)
 
 
 @dataclass(slots=True)
@@ -85,6 +90,8 @@ class AIOrchestrator:
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
         self._gate_context: dict[str, Any] | None = None
+        # `decided_at` of the last shadow row written per (symbol, side, source); in memory only.
+        self._shadow_rows_written_at: dict[tuple[str, str, str], datetime] = {}
 
     def _current_gate_context(self) -> dict[str, Any] | None:
         # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
@@ -146,7 +153,8 @@ class AIOrchestrator:
                 continue
             shadow_source = self._shadow_source(decision, gate_verdict)
             if shadow_source:
-                # Recorded for the shadow evaluator and never traded, even when the row cannot be saved.
+                # Recorded for the shadow evaluator and never traded, even when the row is skipped by the
+                # spacing or cannot be saved.
                 await self._record_shadow_entry(decision, candidate, shadow_source, context_dict)
                 continue
             candidates.append(candidate)
@@ -885,11 +893,13 @@ class AIOrchestrator:
         candidate: EntryCandidate,
         source: str,
         market_context: dict[str, Any],
+        decided_at: datetime | None = None,
     ) -> dict[str, Any]:
         """One `shadow_entries` row for a candidate that is recorded, not traded (the store adds `exchange`).
 
         The floor is the live neutral-exit level, `100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional` plus
-        the round-trip fee, capped at the candidate's take-profit. Raises `ValueError` without a 3m price."""
+        the round-trip fee, capped at the candidate's take-profit. `decided_at` defaults to now. Raises
+        `ValueError` without a 3m price."""
         features = self._features_for_symbol(market_context, decision.symbol) or {}
         ref_price = float(features.get("last_price") or 0.0)
         if not math.isfinite(ref_price) or ref_price <= 0:
@@ -902,7 +912,7 @@ class AIOrchestrator:
             + candidate.target.round_trip_fee_pct,
         )
         return {
-            "decided_at": datetime.now(timezone.utc),
+            "decided_at": decided_at if decided_at is not None else _utc_now(),
             "symbol": decision.symbol,
             "side": side.lower(),
             "bucket_key": self._ledger_bucket(side, features),
@@ -913,6 +923,20 @@ class AIOrchestrator:
             "hold_minutes": int(self._settings.position_hold_minutes),
         }
 
+    def _shadow_spacing(self) -> timedelta:
+        """The least time between two shadow rows of one (symbol, side, source).
+
+        A shadow row stands for a trade that was not taken; a real trade holds up to
+        `POSITION_HOLD_MINUTES` and is followed by `COOLDOWN_MINUTES_AFTER_ENTRY`, so rows closer than that
+        would overlap their walk windows, count one move several times and understate the SE."""
+        hold = int(getattr(self._settings, "position_hold_minutes", 0) or 0)
+        cooldown = int(getattr(self._settings, "cooldown_minutes_after_entry", 0) or 0)
+        return timedelta(minutes=hold + cooldown)
+
+    def _last_shadow_rows(self) -> dict[tuple[str, str, str], datetime]:
+        # `getattr`: an orchestrator built without `__init__` (tests) has written no row yet.
+        return getattr(self, "_shadow_rows_written_at", None) or {}
+
     async def _record_shadow_entry(
         self,
         decision: EntryDecision,
@@ -920,9 +944,29 @@ class AIOrchestrator:
         source: str,
         market_context: dict[str, Any],
     ) -> None:
-        """Write the candidate's shadow row. A failure is logged; the caller drops the candidate either way."""
+        """Write the candidate's shadow row, at most one per (symbol, side, source) per spacing.
+
+        A row inside the spacing is skipped (one INFO line) and a failed write is logged; the caller drops
+        the candidate in every case. Only a written row starts the spacing. The last write times live in
+        memory, so a restart forgets them and its first row is always written."""
+        key = (decision.symbol, candidate.direction.value, source)
+        now = _utc_now()
+        last = self._last_shadow_rows().get(key)
+        spacing = self._shadow_spacing()
+        if last is not None and now - last < spacing:
+            self._logger.info(
+                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for it was decided at %s, "
+                "%.1f min of the %.0f-minute spacing remain.",
+                decision.symbol,
+                candidate.direction.value,
+                source,
+                last.isoformat(timespec="seconds"),
+                (spacing - (now - last)).total_seconds() / 60.0,
+                spacing.total_seconds() / 60.0,
+            )
+            return
         try:
-            row = self._shadow_row(decision, candidate, source, market_context)
+            row = self._shadow_row(decision, candidate, source, market_context, decided_at=now)
             await self._trade_store.save_shadow_entry(row)
         except Exception as exc:  # noqa: BLE001 - the candidate is not traded whether or not the row is saved
             self._logger.warning(
@@ -934,6 +978,8 @@ class AIOrchestrator:
                 exc,
             )
             return
+        # Replaced, never mutated.
+        self._shadow_rows_written_at = {**self._last_shadow_rows(), key: row["decided_at"]}
         self._logger.info(
             "Entry candidate %s %s is not traded (%s): shadow row for bucket %s, stop %.3f%%, floor %.3f%%.",
             decision.symbol,
