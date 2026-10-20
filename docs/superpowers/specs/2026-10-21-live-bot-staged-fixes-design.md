@@ -80,7 +80,11 @@ today's payload. `lean` changes the entry request only (the exit AI is off and o
   the regime gate off, the side `ENTRY_GATE_DIRECTION` allows (both for `any`).
 - **Entry rules block** (`entry_rules`): the current `stretch_atr` computed in code before the call
   (`build_setup_profile`, the same number the stretch gate uses), the limit
-  `ENTRY_STRETCH_GATE_MAX_ATR`, and the sentence "an entry beyond this limit is rejected in code".
+  `ENTRY_STRETCH_GATE_MAX_ATR`, and the sentence "an entry with |stretch_atr| above this limit is
+  rejected in code".
+- **Boot guard.** `lean` refuses to boot unless `ENTRY_STRETCH_GATE_MODE=enforce`,
+  `ENTRY_STRETCH_GATE_MAX_ATR` > 0 and `ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0`, so
+  the sentence above and the narrowed `allowed_actions` describe what the running bot enforces.
 - **Regime block** (`market_regime`): the regime gate's verdict with its numbers — condition, 1h
   SMA20 and SMA50, 1h ATR14 and its 720-hour median, 4h close and EMA50, and the distance of price
   from the 1h SMA20 in 1h ATR. `RegimeVerdict` gains the fields it lacks (`sma20_1h`, `sma50_1h`,
