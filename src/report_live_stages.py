@@ -256,17 +256,24 @@ def render_ledger(
     lines = [
         f"=== Ledger (minimum {min_samples} sampel, ambang {format_number(hurdle, 2)} bps) ===",
         f"{'kelompok':<34}{'n nyata':>8}{'rata-rata':>11}{'batas atas':>12}"
-        f"{'n shadow':>10}{'rata-rata':>11}{'batas atas':>12}  status",
+        f"{'n shadow':>10}{'rata-rata':>11}{'batas atas':>12}"
+        f"{'n sejak blok':>14}{'batas atas':>12}  status",
     ]
-    for bucket, (real, shadow) in sorted(table.items()):
+    for bucket, entry in sorted(table.items()):
+        real, shadow, since = entry.real, entry.shadow, entry.real_since_block
         lines.append(
             f"{bucket:<34}{real.n:>8}{_bps(real.mean_bps):>11}{_bps(real.upper_bps):>12}"
             f"{shadow.n:>10}{_bps(shadow.mean_bps):>11}{_bps(shadow.upper_bps):>12}"
-            f"  {ledger_status(real, shadow, min_samples, hurdle)}"
+            f"{since.n:>14}{_bps(since.upper_bps):>12}"
+            f"  {ledger_status(entry, min_samples, hurdle)}"
         )
     if not table:
         lines.append("belum ada posisi atau baris shadow berkelompok")
-    grouped = sum(real.n for real, _ in table.values())
+    lines.append(
+        "n sejak blok: posisi nyata yang dibuka setelah baris ledger_block terakhir kelompok itu; "
+        "kelompok reopened diblok lagi bila jumlahnya mencapai minimum dan batas atasnya di bawah ambang"
+    )
+    grouped = sum(entry.real.n for entry in table.values())
     lines.append(f"posisi berkelompok: {grouped} dari {len(trades)} posisi")
     return "\n".join(lines)
 

@@ -5,7 +5,8 @@ the volatility regime of its setup (`bucket_key`). The ledger folds the realized
 every closed trade in a bucket (in basis points of the entry price) into a mean, a standard error
 and a one-sided 90 % upper bound, and compares that bound with a hurdle. A bucket whose upper bound
 sits below the hurdle with enough samples is `blocked`; shadow outcomes of the blocked entries can
-`reopen` it. Everything here is pure maths over rows already fetched: no I/O, no clock.
+`reopen` it, and the real trades opened after its latest `ledger_block` row can block it again.
+Everything here is pure maths over rows already fetched: no I/O, no clock.
 
 This module imports neither `bot.strategy.pine_indicators` nor `bot.strategy.modes`; only
 `bot/core/regime_gate.py` may.
@@ -17,7 +18,11 @@ import math
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+
+# Store timestamps are read the way the shadow evaluator reads `decided_at`: offset required, UTC out.
+from bot.core.shadow_eval import _parse_utc
 
 # One-sided 90 % normal quantile: the bound is mean + Z * SE.
 Z_ONE_SIDED_90 = 1.28
@@ -49,6 +54,28 @@ class BucketStats:
     upper_bps: float | None
 
 
+EMPTY_STATS = BucketStats(0, None, None, None)
+
+
+@dataclass(frozen=True)
+class BucketLedger:
+    """One bucket's three samples.
+
+    - `real`: every counted closed trade;
+    - `shadow`: the `ledger_block` shadow outcomes (the entries the ledger refused);
+    - `real_since_block`: the real trades opened after the bucket's latest `ledger_block` row
+      (empty while it has none), on which a reopened bucket is judged again.
+    """
+
+    real: BucketStats
+    shadow: BucketStats
+    real_since_block: BucketStats
+
+
+# What a bucket with no counted row reads: `learning`.
+EMPTY_BUCKET_LEDGER = BucketLedger(EMPTY_STATS, EMPTY_STATS, EMPTY_STATS)
+
+
 def gross_bps(direction: str, entry_price: float, exit_price: float) -> float:
     """Gross result in basis points of the entry price: positive when the position gained."""
     side = str(direction).strip().upper()
@@ -77,57 +104,103 @@ def bucket_stats(values: Sequence[float]) -> BucketStats:
     return BucketStats(n, mean, se, mean + Z_ONE_SIDED_90 * se)
 
 
-def ledger_status(real: BucketStats, shadow: BucketStats, min_samples: int, hurdle_bps: float) -> str:
+def ledger_status(bucket: BucketLedger, min_samples: int, hurdle_bps: float) -> str:
     """`learning`, `open`, `blocked` or `reopened` for one bucket.
 
     - `learning`: fewer than `min_samples` real outcomes (or no upper bound yet);
     - `open`: the real upper bound reaches the hurdle;
+    - `blocked`: the real bound is below the hurdle and the shadow evidence does not clear it;
     - `reopened`: the real bound is below the hurdle, but at least `min_samples` shadow outcomes of
-      the blocked entries have an upper bound at or above it;
-    - `blocked`: the real bound is below the hurdle and the shadow evidence does not clear it.
+      the blocked entries have an upper bound at or above it, and the real trades opened since the
+      latest block row have not failed again: once those reach `min_samples` with an upper bound below
+      the hurdle, the bucket is `blocked` again.
     """
+    real = bucket.real
     if real.n < min_samples or real.upper_bps is None:
         return STATUS_LEARNING
     if real.upper_bps >= hurdle_bps:
         return STATUS_OPEN
-    if shadow.n >= min_samples and shadow.upper_bps is not None and shadow.upper_bps >= hurdle_bps:
-        return STATUS_REOPENED
-    return STATUS_BLOCKED
+    if not _clears(bucket.shadow, min_samples, hurdle_bps):
+        return STATUS_BLOCKED
+    if _fails(bucket.real_since_block, min_samples, hurdle_bps):
+        return STATUS_BLOCKED
+    return STATUS_REOPENED
+
+
+def _clears(stats: BucketStats, min_samples: int, hurdle_bps: float) -> bool:
+    return stats.n >= min_samples and stats.upper_bps is not None and stats.upper_bps >= hurdle_bps
+
+
+def _fails(stats: BucketStats, min_samples: int, hurdle_bps: float) -> bool:
+    return stats.n >= min_samples and stats.upper_bps is not None and stats.upper_bps < hurdle_bps
 
 
 def ledger_table(
     trade_rows: Iterable[Mapping[str, Any]],
     shadow_rows: Iterable[Mapping[str, Any]],
-) -> dict[str, tuple[BucketStats, BucketStats]]:
-    """`{bucket_key: (real_stats, shadow_stats)}` for every bucket with at least one counted row.
+) -> dict[str, BucketLedger]:
+    """`{bucket_key: BucketLedger}` for every bucket with at least one counted row.
 
     A trade row counts when `factor_metadata.setup.bucket_key` is set and its prices give a gross
     result. A shadow row counts only with `source == "ledger_block"` and a finite `gross_bps`
     (expired and invalid rows carry none). A bucket seen in only one source gets empty stats
-    (`n == 0`) for the other.
+    (`n == 0`) for the other; readers take `EMPTY_BUCKET_LEDGER` for a bucket that is not a key.
+
+    `real_since_block` holds the counted trades whose `opened_at` is strictly after the bucket's latest
+    `ledger_block` row's `decided_at`. Every `ledger_block` row with a readable `decided_at` sets that
+    time, an expired one included; times need an offset (`opened_at` and `decided_at` as the store
+    writes them), and a trade without a readable `opened_at` never counts there.
     """
-    real_values: dict[str, list[float]] = {}
+    trades: list[tuple[str, float, datetime | None]] = []
     for row in trade_rows:
         key = _trade_bucket_key(row)
         value = _trade_gross_bps(row) if key else None
         if key and value is not None:
-            real_values.setdefault(key, []).append(value)
+            trades.append((key, value, _moment(row.get("opened_at"))))
 
     shadow_values: dict[str, list[float]] = {}
+    last_block: dict[str, datetime] = {}
     for row in shadow_rows:
         key = _text(row.get("bucket_key"))
-        value = _finite(row.get("gross_bps")) if row.get("source") == SHADOW_BLOCK_SOURCE else None
-        if key and value is not None:
+        if not key or row.get("source") != SHADOW_BLOCK_SOURCE:
+            continue
+        decided_at = _moment(row.get("decided_at"))
+        if decided_at is not None and (key not in last_block or decided_at > last_block[key]):
+            last_block[key] = decided_at
+        value = _finite(row.get("gross_bps"))
+        if value is not None:
             shadow_values.setdefault(key, []).append(value)
 
+    real_values: dict[str, list[float]] = {}
+    since_block_values: dict[str, list[float]] = {}
+    for key, value, opened_at in trades:
+        real_values.setdefault(key, []).append(value)
+        block_at = last_block.get(key)
+        if block_at is not None and opened_at is not None and opened_at > block_at:
+            since_block_values.setdefault(key, []).append(value)
+
     return {
-        key: (bucket_stats(real_values.get(key, [])), bucket_stats(shadow_values.get(key, [])))
+        key: BucketLedger(
+            real=bucket_stats(real_values.get(key, [])),
+            shadow=bucket_stats(shadow_values.get(key, [])),
+            real_since_block=bucket_stats(since_block_values.get(key, [])),
+        )
         for key in (*real_values, *(k for k in shadow_values if k not in real_values))
     }
 
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _moment(value: Any) -> datetime | None:
+    """A UTC time from a store timestamp, or `None` when it is missing, unreadable or has no offset."""
+    if value is None or value == "":
+        return None
+    try:
+        return _parse_utc(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _finite(value: Any) -> float | None:

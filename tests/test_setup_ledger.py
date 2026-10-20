@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import math
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from bot.core.setup_ledger import (
+    EMPTY_BUCKET_LEDGER,
     Z_ONE_SIDED_90,
+    BucketLedger,
     BucketStats,
     bucket_key,
     bucket_stats,
@@ -15,20 +18,36 @@ from bot.core.setup_ledger import (
 
 MIN_SAMPLES = 60
 HURDLE_BPS = 4.0
+EMPTY = BucketStats(0, None, None, None)
+BLOCK_AT = datetime(2026, 10, 22, 5, 0, tzinfo=timezone.utc)
 
 
-def _trade(bucket: str | None, direction: str, entry: float, exit_: float) -> dict:
+def _trade(
+    bucket: str | None, direction: str, entry: float, exit_: float, opened_at: object = None
+) -> dict:
     setup = {} if bucket is None else {"bucket_key": bucket}
-    return {
+    row = {
         "direction": direction,
         "entry_price": entry,
         "exit_price": exit_,
         "factor_metadata": {"setup": setup},
     }
+    return row if opened_at is None else {**row, "opened_at": opened_at}
 
 
-def _shadow(bucket: str, gross: float | None, source: str = "ledger_block", side: str = "LONG") -> dict:
-    return {"bucket_key": bucket, "source": source, "gross_bps": gross, "side": side}
+def _shadow(
+    bucket: str,
+    gross: float | None,
+    source: str = "ledger_block",
+    side: str = "LONG",
+    decided_at: object = None,
+) -> dict:
+    row = {"bucket_key": bucket, "source": source, "gross_bps": gross, "side": side}
+    return row if decided_at is None else {**row, "decided_at": decided_at}
+
+
+def _status(real: BucketStats, shadow: BucketStats, since_block: BucketStats = EMPTY) -> str:
+    return ledger_status(BucketLedger(real, shadow, since_block), MIN_SAMPLES, HURDLE_BPS)
 
 
 class BucketKeyTests(unittest.TestCase):
@@ -80,50 +99,50 @@ class LedgerStatusTests(unittest.TestCase):
     def test_identical_values_have_zero_se_and_still_decide(self) -> None:
         low = bucket_stats([1.0] * 60)
         self.assertEqual(low.se_bps, 0.0)
-        self.assertEqual(ledger_status(low, BucketStats(0, None, None, None), MIN_SAMPLES, HURDLE_BPS), "blocked")
+        self.assertEqual(_status(low, BucketStats(0, None, None, None)), "blocked")
         high = bucket_stats([4.0] * 60)
-        self.assertEqual(ledger_status(high, BucketStats(0, None, None, None), MIN_SAMPLES, HURDLE_BPS), "open")
+        self.assertEqual(_status(high, BucketStats(0, None, None, None)), "open")
 
     def test_learning_below_min_samples(self) -> None:
         empty = BucketStats(0, None, None, None)
-        self.assertEqual(ledger_status(empty, empty, MIN_SAMPLES, HURDLE_BPS), "learning")
+        self.assertEqual(_status(empty, empty), "learning")
         one = bucket_stats([-50.0])
-        self.assertEqual(ledger_status(one, empty, MIN_SAMPLES, HURDLE_BPS), "learning")
+        self.assertEqual(_status(one, empty), "learning")
         short = bucket_stats([-50.0] * 59)
-        self.assertEqual(ledger_status(short, empty, MIN_SAMPLES, HURDLE_BPS), "learning")
+        self.assertEqual(_status(short, empty), "learning")
         full = bucket_stats([-50.0] * 60)
-        self.assertEqual(ledger_status(full, empty, MIN_SAMPLES, HURDLE_BPS), "blocked")
+        self.assertEqual(_status(full, empty), "blocked")
 
     def test_blocked_when_the_upper_bound_is_below_the_hurdle(self) -> None:
         real = BucketStats(60, 1.0, 1.5, 1.0 + Z_ONE_SIDED_90 * 1.5)
         self.assertAlmostEqual(real.upper_bps, 2.92)
         empty = BucketStats(0, None, None, None)
-        self.assertEqual(ledger_status(real, empty, MIN_SAMPLES, HURDLE_BPS), "blocked")
+        self.assertEqual(_status(real, empty), "blocked")
 
     def test_open_when_the_upper_bound_reaches_the_hurdle(self) -> None:
         empty = BucketStats(0, None, None, None)
         at_hurdle = BucketStats(60, 2.0, 1.5625, 4.0)
-        self.assertEqual(ledger_status(at_hurdle, empty, MIN_SAMPLES, HURDLE_BPS), "open")
+        self.assertEqual(_status(at_hurdle, empty), "open")
         above = BucketStats(60, 3.0, 1.5, 3.0 + Z_ONE_SIDED_90 * 1.5)
-        self.assertEqual(ledger_status(above, empty, MIN_SAMPLES, HURDLE_BPS), "open")
+        self.assertEqual(_status(above, empty), "open")
 
     def test_reopened_needs_min_samples_of_shadow_at_or_above_the_hurdle(self) -> None:
         real = bucket_stats([1.0] * 60)
         good_shadow = bucket_stats([5.0] * 60)
-        self.assertEqual(ledger_status(real, good_shadow, MIN_SAMPLES, HURDLE_BPS), "reopened")
+        self.assertEqual(_status(real, good_shadow), "reopened")
         at_hurdle = bucket_stats([4.0] * 60)
-        self.assertEqual(ledger_status(real, at_hurdle, MIN_SAMPLES, HURDLE_BPS), "reopened")
+        self.assertEqual(_status(real, at_hurdle), "reopened")
         too_few = bucket_stats([5.0] * 59)
-        self.assertEqual(ledger_status(real, too_few, MIN_SAMPLES, HURDLE_BPS), "blocked")
+        self.assertEqual(_status(real, too_few), "blocked")
         below = bucket_stats([3.0] * 60)
-        self.assertEqual(ledger_status(real, below, MIN_SAMPLES, HURDLE_BPS), "blocked")
+        self.assertEqual(_status(real, below), "blocked")
 
     def test_shadow_cannot_reopen_a_bucket_that_is_still_learning_or_open(self) -> None:
         good_shadow = bucket_stats([5.0] * 60)
         learning = bucket_stats([1.0] * 10)
-        self.assertEqual(ledger_status(learning, good_shadow, MIN_SAMPLES, HURDLE_BPS), "learning")
+        self.assertEqual(_status(learning, good_shadow), "learning")
         open_ = bucket_stats([6.0] * 60)
-        self.assertEqual(ledger_status(open_, good_shadow, MIN_SAMPLES, HURDLE_BPS), "open")
+        self.assertEqual(_status(open_, good_shadow), "open")
 
 
 class LedgerTableTests(unittest.TestCase):
@@ -147,7 +166,7 @@ class LedgerTableTests(unittest.TestCase):
         ]
         table = ledger_table(trades, shadows)
         self.assertEqual(set(table), {bucket})
-        real, shadow = table[bucket]
+        real, shadow = table[bucket].real, table[bucket].shadow
         self.assertEqual(real.n, 2)
         self.assertAlmostEqual(real.mean_bps, (100.0 - 50.0) / 2)
         self.assertEqual(shadow, BucketStats(1, 7.0, None, None))
@@ -155,7 +174,7 @@ class LedgerTableTests(unittest.TestCase):
     def test_a_shadow_only_bucket_has_empty_real_stats(self) -> None:
         bucket = "LONG|NAIK|atr_high"
         table = ledger_table([], [_shadow(bucket, 2.0), _shadow(bucket, 4.0)])
-        real, shadow = table[bucket]
+        real, shadow = table[bucket].real, table[bucket].shadow
         self.assertEqual(real, BucketStats(0, None, None, None))
         self.assertEqual(shadow.n, 2)
         self.assertAlmostEqual(shadow.mean_bps, 3.0)
@@ -164,7 +183,7 @@ class LedgerTableTests(unittest.TestCase):
     def test_a_trade_only_bucket_has_empty_shadow_stats(self) -> None:
         bucket = "LONG|NAIK|atr_high"
         table = ledger_table([_trade(bucket, "LONG", 100.0, 100.1)], [])
-        real, shadow = table[bucket]
+        real, shadow = table[bucket].real, table[bucket].shadow
         self.assertEqual(real.n, 1)
         self.assertAlmostEqual(real.mean_bps, 10.0)
         self.assertIsNone(real.upper_bps)
@@ -186,22 +205,114 @@ class LedgerTableTests(unittest.TestCase):
             _trade(bucket, "SHORT", 100.0, 99.0),
         ]
         table = ledger_table(trades, [])
-        real, _ = table[bucket]
+        real = table[bucket].real
         self.assertEqual(real.n, 1)
         self.assertAlmostEqual(real.mean_bps, 100.0)
 
     def test_non_finite_shadow_values_are_skipped(self) -> None:
         bucket = "SHORT|TURUN|atr_mid"
         table = ledger_table([], [_shadow(bucket, float("nan")), _shadow(bucket, float("inf")), _shadow(bucket, 1.0)])
-        self.assertEqual(table[bucket][1], BucketStats(1, 1.0, None, None))
+        self.assertEqual(table[bucket].shadow, BucketStats(1, 1.0, None, None))
 
     def test_table_feeds_the_status_end_to_end(self) -> None:
         bucket = "SHORT|TURUN|atr_mid"
         trades = [_trade(bucket, "SHORT", 100.0, 100.01) for _ in range(60)]
         shadows = [_shadow(bucket, 6.0) for _ in range(60)]
-        real, shadow = ledger_table(trades, shadows)[bucket]
-        self.assertAlmostEqual(real.mean_bps, -1.0)
-        self.assertEqual(ledger_status(real, shadow, MIN_SAMPLES, HURDLE_BPS), "reopened")
+        entry = ledger_table(trades, shadows)[bucket]
+        self.assertAlmostEqual(entry.real.mean_bps, -1.0)
+        self.assertEqual(ledger_status(entry, MIN_SAMPLES, HURDLE_BPS), "reopened")
+
+
+class ReopenedBucketTests(unittest.TestCase):
+    """A bucket the real rule blocks and the shadow rule reopens is judged again on its real trades opened
+    after its latest `ledger_block` row: `min_samples` of them with an upper bound below the hurdle block it
+    again; fewer, or a bound at or above the hurdle, keep it `reopened`."""
+
+    BUCKET = "SHORT|TURUN|atr_mid"
+
+    def _rows(self, new_exits: list[float]) -> tuple[list[dict], list[dict]]:
+        # 60 SHORTs at -1 bps before the block, 60 good ledger_block outcomes up to BLOCK_AT, then the new trades.
+        before = [
+            _trade(self.BUCKET, "SHORT", 100.0, 100.01, (BLOCK_AT - timedelta(days=2)).isoformat())
+            for _ in range(60)
+        ]
+        shadows = [
+            _shadow(self.BUCKET, 6.0, decided_at=(BLOCK_AT - timedelta(minutes=70 * i)).isoformat())
+            for i in range(60)
+        ]
+        after = [
+            _trade(self.BUCKET, "SHORT", 100.0, exit_, (BLOCK_AT + timedelta(minutes=10 * (i + 1))).isoformat())
+            for i, exit_ in enumerate(new_exits)
+        ]
+        return before + after, shadows
+
+    def _status_of(self, new_exits: list[float]) -> str:
+        trades, shadows = self._rows(new_exits)
+        return ledger_status(ledger_table(trades, shadows)[self.BUCKET], MIN_SAMPLES, HURDLE_BPS)
+
+    def test_a_reopened_bucket_that_loses_again_is_blocked_again(self) -> None:
+        self.assertEqual(self._status_of([]), "reopened")
+        self.assertEqual(self._status_of([100.01] * 60), "blocked")   # 60 new trades at -1 bps
+
+    def test_a_reopened_bucket_with_too_few_new_trades_stays_reopened(self) -> None:
+        self.assertEqual(self._status_of([100.01] * 59), "reopened")
+
+    def test_a_reopened_bucket_whose_new_trades_clear_the_hurdle_stays_reopened(self) -> None:
+        # 60 new trades at +5 bps: the whole sample (120, mean 2.0) is still below the hurdle, the new ones are not.
+        trades, shadows = self._rows([99.95] * 60)
+        entry = ledger_table(trades, shadows)[self.BUCKET]
+        self.assertLess(entry.real.upper_bps, HURDLE_BPS)
+        self.assertAlmostEqual(entry.real_since_block.upper_bps, 5.0)
+        self.assertEqual(ledger_status(entry, MIN_SAMPLES, HURDLE_BPS), "reopened")
+
+    def test_the_status_rule_reads_the_new_trades_only_after_a_shadow_reopening(self) -> None:
+        losing_new = bucket_stats([-1.0] * 60)
+        blocked_real = bucket_stats([-1.0] * 60)
+        good_shadow = bucket_stats([6.0] * 60)
+        poor_shadow = bucket_stats([3.0] * 60)
+        self.assertEqual(_status(blocked_real, good_shadow, losing_new), "blocked")
+        self.assertEqual(_status(blocked_real, good_shadow, bucket_stats([-1.0] * 59)), "reopened")
+        self.assertEqual(_status(blocked_real, good_shadow, bucket_stats([4.0] * 60)), "reopened")
+        # without a shadow reopening the new trades change nothing
+        self.assertEqual(_status(blocked_real, poor_shadow, bucket_stats([9.0] * 60)), "blocked")
+        self.assertEqual(_status(bucket_stats([1.0] * 10), good_shadow, losing_new), "learning")
+        self.assertEqual(_status(bucket_stats([6.0] * 60), good_shadow, losing_new), "open")
+
+    def test_only_trades_opened_strictly_after_the_latest_block_row_count(self) -> None:
+        bucket = self.BUCKET
+        later = BLOCK_AT + timedelta(hours=1)
+        trades = [
+            _trade(bucket, "SHORT", 100.0, 99.9, (BLOCK_AT - timedelta(minutes=1)).isoformat()),   # before
+            _trade(bucket, "SHORT", 100.0, 99.8, BLOCK_AT.isoformat()),                           # at the first row
+            _trade(bucket, "SHORT", 100.0, 99.7, later.isoformat()),                              # at the latest row
+            _trade(bucket, "SHORT", 100.0, 99.6, (later + timedelta(seconds=1)).isoformat()),    # after: counts
+            _trade(bucket, "SHORT", 100.0, 99.5, later + timedelta(minutes=5)),                   # a datetime: counts
+            _trade(bucket, "SHORT", 100.0, 99.4),                                                 # no opened_at
+            _trade(bucket, "SHORT", 100.0, 99.3, "not a time"),                                   # unreadable
+            _trade(bucket, "SHORT", 100.0, 99.2, "2026-10-22T09:00:00"),                          # naive: refused
+        ]
+        shadows = [
+            _shadow(bucket, 5.0, decided_at=BLOCK_AT.isoformat()),
+            _shadow(bucket, None, decided_at=later.isoformat().replace("+00:00", "Z")),   # expired, still a block row
+            _shadow(bucket, 5.0, source="shadow_side", decided_at=(later + timedelta(hours=1)).isoformat()),
+            _shadow("LONG|NAIK|atr_mid", 5.0, decided_at=(later + timedelta(hours=1)).isoformat()),
+            _shadow(bucket, 5.0, decided_at="garbage"),
+        ]
+        entry = ledger_table(trades, shadows)[bucket]
+        self.assertEqual(entry.real.n, 8)
+        self.assertEqual(entry.real_since_block.n, 2)
+        self.assertAlmostEqual(entry.real_since_block.mean_bps, (40.0 + 50.0) / 2)
+
+    def test_a_bucket_without_a_readable_block_row_has_no_new_trades(self) -> None:
+        trades = [_trade(self.BUCKET, "SHORT", 100.0, 99.0, BLOCK_AT.isoformat())]
+        for shadows in ([], [_shadow(self.BUCKET, 5.0)], [_shadow(self.BUCKET, 5.0, decided_at="")]):
+            with self.subTest(shadows=shadows):
+                self.assertEqual(ledger_table(trades, shadows)[self.BUCKET].real_since_block, EMPTY)
+
+    def test_the_empty_ledger_reads_learning(self) -> None:
+        self.assertEqual(EMPTY_BUCKET_LEDGER, BucketLedger(EMPTY, EMPTY, EMPTY))
+        self.assertEqual(ledger_status(EMPTY_BUCKET_LEDGER, MIN_SAMPLES, HURDLE_BPS), "learning")
+
 
 
 if __name__ == "__main__":

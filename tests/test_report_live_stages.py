@@ -27,9 +27,10 @@ def _row(
     exit_: float = 99.0,
     qty: float = 10.0,
     bucket: str | None = None,
+    opened: datetime | None = None,
 ) -> dict[str, Any]:
     setup = {"setup": {"bucket_key": bucket}} if bucket else {}
-    return {
+    row = {
         "symbol": "BTC/USDT",
         "direction": direction,
         "entry_price": entry,
@@ -40,6 +41,7 @@ def _row(
         "closed_at": closed.isoformat(),
         "factor_metadata": setup,
     }
+    return row if opened is None else {**row, "opened_at": opened.isoformat()}
 
 
 def _shadow(
@@ -408,6 +410,27 @@ class CliTests(unittest.TestCase):
         line = next(row for row in ledger_part.splitlines() if row.startswith(BUCKET))
         self.assertIn("reopened", line)  # real bound far below 4 bps, shadow bound far above it
         self.assertIn("posisi berkelompok: 2 dari 3", ledger_part)
+
+    def test_a_reopened_bucket_that_loses_again_reads_blocked(self) -> None:
+        # min samples 2: two losers block the bucket, two good ledger_block outcomes (decided at DAY0) reopen
+        # it, and two more losers opened after DAY0 block it again.
+        losers = [
+            _row(DAY0 - timedelta(hours=2), entry=100.0, exit_=100.5, bucket=BUCKET, opened=DAY0 - timedelta(hours=3)),
+            _row(DAY0 - timedelta(hours=1), entry=100.0, exit_=100.6, bucket=BUCKET, opened=DAY0 - timedelta(hours=2)),
+        ]
+        again = [
+            _row(DAY0 + timedelta(hours=2), entry=100.0, exit_=100.4, bucket=BUCKET, opened=DAY0 + timedelta(hours=1)),
+            _row(DAY0 + timedelta(hours=4), entry=100.0, exit_=100.7, bucket=BUCKET, opened=DAY0 + timedelta(hours=3)),
+        ]
+        shadows = [_shadow("short", BUCKET, 20.0, "ledger_block"), _shadow("short", BUCKET, 22.0, "ledger_block")]
+        start = DAY0 - timedelta(days=1)
+        for trades, status in ((losers, "reopened"), (losers + again, "blocked")):
+            with self.subTest(status=status):
+                _, out, _ = self._run(
+                    ["--stage-start", start.isoformat(), "--until", DAY1.isoformat()], _FakeStore(trades, shadows)
+                )
+                line = next(row for row in out.split("Ledger", 1)[1].splitlines() if row.startswith(BUCKET))
+                self.assertEqual(line.split()[-1], status)
 
     def test_an_empty_run_still_prints_all_sections(self) -> None:
         code, out, err = self._run(

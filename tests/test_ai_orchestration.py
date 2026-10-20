@@ -1380,6 +1380,34 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.shadow_rows, [])
         self.assertEqual(self._gate(store)["ledger"]["status"], "reopened")
 
+    async def test_ledger_enforce_blocks_a_reopened_bucket_that_loses_again(self) -> None:
+        # Blocked on three losing SHORTs, reopened by three good ledger_block outcomes decided at 05:00; the
+        # SHORTs opened after that last block row are judged again, and three more losers block it again.
+        block_at = datetime(2026, 10, 21, 5, 0, tzinfo=timezone.utc)
+        before = [dict(row, opened_at="2026-10-21T01:00:00+00:00") for row in self._losing_shorts()]
+        shadows = [
+            {"source": "ledger_block", "bucket_key": self.BUCKET, "gross_bps": value, "decided_at": block_at.isoformat()}
+            for value in (20.0, 25.0, 30.0)
+        ]
+        for new_trades, status in ((3, "blocked"), (2, "reopened")):
+            with self.subTest(new_trades=new_trades):
+                after = [
+                    dict(row, opened_at=(block_at + timedelta(minutes=10 * (i + 1))).isoformat())
+                    for i, row in enumerate(self._losing_shorts()[:new_trades])
+                ]
+                store = _LedgerStore(before + after, shadows)
+                orchestrator = self._orchestrator(
+                    store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+                )
+
+                plan = await orchestrator.next_trade_plan(self._state())
+
+                self.assertEqual(self._gate(store)["ledger"]["status"], status)
+                self.assertEqual(plan is None, status == "blocked")
+                self.assertEqual(
+                    [row["source"] for row in store.shadow_rows], ["ledger_block"] if status == "blocked" else []
+                )
+
     async def test_a_ledger_read_failure_is_logged_and_treated_as_learning(self) -> None:
         store = _LedgerStore(self._losing_shorts(), read_error=RuntimeError("supabase down"))
         orchestrator = self._orchestrator(

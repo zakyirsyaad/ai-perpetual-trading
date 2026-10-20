@@ -23,11 +23,11 @@ from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
 from bot.core.setup_ledger import (
+    EMPTY_BUCKET_LEDGER,
     SHADOW_BLOCK_SOURCE,
     STATUS_BLOCKED,
-    BucketStats,
+    BucketLedger,
     bucket_key,
-    bucket_stats,
     ledger_status,
     ledger_table,
 )
@@ -202,7 +202,7 @@ class AIOrchestrator:
         context_dict: dict[str, Any],
         daily_state: DailyRiskState,
         sides: Sequence[str],
-        ledger: dict[str, tuple[BucketStats, BucketStats]],
+        ledger: dict[str, BucketLedger],
     ) -> dict[str, Any]:
         """The lean request. The regime distance and the ledger lines read the first configured
         symbol, which is the only one whenever the regime gate (and so the ledger) is on."""
@@ -245,7 +245,7 @@ class AIOrchestrator:
         self,
         sides: Sequence[str],
         features: dict[str, Any] | None,
-        ledger: dict[str, tuple[BucketStats, BucketStats]],
+        ledger: dict[str, BucketLedger],
     ) -> list[dict[str, Any]]:
         """One line per offered side, from the tick's one ledger snapshot; `[]` unless the ledger enforces.
 
@@ -800,7 +800,7 @@ class AIOrchestrator:
     def _ledger_mode(self) -> str:
         return str(getattr(self._settings, "setup_ledger_mode", "off") or "off").strip().lower()
 
-    async def _ledger_snapshot(self) -> dict[str, tuple[BucketStats, BucketStats]]:
+    async def _ledger_snapshot(self) -> dict[str, BucketLedger]:
         """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
 
         Only `ledger_block` shadow rows count, so only those are read. A failed read is logged and also
@@ -831,20 +831,19 @@ class AIOrchestrator:
         self,
         side: str,
         features: dict[str, Any] | None,
-        ledger: dict[str, tuple[BucketStats, BucketStats]],
+        ledger: dict[str, BucketLedger],
     ) -> dict[str, Any]:
         bucket = self._ledger_bucket(side, features)
         # `ledger_table` keys only buckets with a counted row; any other bucket has no outcomes yet.
-        real, shadow = ledger.get(bucket, (bucket_stats([]), bucket_stats([])))
+        entry = ledger.get(bucket, EMPTY_BUCKET_LEDGER)
         return {
             "mode": self._ledger_mode(),
             "bucket": bucket,
-            "n": real.n,
-            "mean_bps": real.mean_bps,
-            "upper_bps": real.upper_bps,
+            "n": entry.real.n,
+            "mean_bps": entry.real.mean_bps,
+            "upper_bps": entry.real.upper_bps,
             "status": ledger_status(
-                real,
-                shadow,
+                entry,
                 int(self._settings.setup_ledger_min_samples),
                 float(self._settings.setup_ledger_hurdle_bps),
             ),
@@ -855,7 +854,7 @@ class AIOrchestrator:
         gate_verdict: dict[str, Any],
         decision: EntryDecision,
         market_context: dict[str, Any],
-        ledger: dict[str, tuple[BucketStats, BucketStats]],
+        ledger: dict[str, BucketLedger],
     ) -> dict[str, Any]:
         """The gate verdict plus `ledger` for an OPEN decision while the ledger is on; otherwise unchanged.
 
