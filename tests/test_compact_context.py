@@ -32,6 +32,19 @@ def _daily() -> SimpleNamespace:
     return SimpleNamespace(closed_trades=3, stop_losses=1, consecutive_losses=1, total_pnl_usdt=-2.0)
 
 
+def serialized_payload(payload: dict) -> str:
+    """The text form the golden was captured in. Comparing text, not parsed objects, keeps
+    an int that turned into a float (100 vs 100.0) from passing: parsed equality treats
+    them as equal, but the bytes sent to the model, and payload_hash, change."""
+    return json.dumps(payload, sort_keys=True, indent=2)
+
+
+def legacy_golden_text() -> str:
+    """The fixture's exact text, less the single newline the capture script appended."""
+    text = LEGACY_ENTRY_GOLDEN.read_bytes().decode("utf-8")
+    return text[:-1] if text.endswith("\n") else text
+
+
 def legacy_entry_payload(builder: CompactDecisionContextBuilder, context: dict) -> dict:
     """The entry payload the golden fixture was captured from, for the given context."""
     performance = {"total_trades": 12, "records": [{"reason": "complete record", "pnl": 1.2}]}
@@ -66,8 +79,7 @@ class ParityPayloadTests(unittest.TestCase):
         # The legacy entry payload is pinned byte for byte: a change here is a change
         # to what account 1 sends the model. Regenerate the fixture only on purpose.
         payload = legacy_entry_payload(self.builder, self.context)
-        golden = json.loads(LEGACY_ENTRY_GOLDEN.read_text(encoding="utf-8"))
-        self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), golden)
+        self.assertEqual(serialized_payload(payload), legacy_golden_text())
 
     def test_exit_payload_keeps_full_position_constraints_and_one_symbol_context(self) -> None:
         payload = self.builder.build_exit_payload(position={"symbol": "BTC/USDT", "direction": "LONG", "exchange_size": 0.012345678, "entry_price": 60000.0}, market_context=self.context)

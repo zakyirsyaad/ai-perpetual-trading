@@ -13,7 +13,7 @@ import unittest
 from bot.ai.compact_context import CompactDecisionContextBuilder, compact_json
 from bot.data.market_signals import ExternalMarketSignals, MarketContext, TechnicalFeatures
 from bot.intelligence.market_intelligence import lean_features_from_candles
-from tests.test_compact_context import LEGACY_ENTRY_GOLDEN, _context, _daily, legacy_entry_payload
+from tests.test_compact_context import _context, _daily, legacy_entry_payload, legacy_golden_text, serialized_payload
 from tests.test_compact_context import _settings as _builder_settings
 from tests.test_market_intelligence import _FakeClient, _intelligence, _settings
 
@@ -110,6 +110,8 @@ class LeanFeatureValueTests(unittest.TestCase):
 
         for key in ATR_SCALED_KEYS:
             self.assertIsNone(lean[key], key)
+        # The shared indicator reads a window with no losses as fully overbought.
+        self.assertEqual(lean["rsi_14"], 100.0)
         self.assertAlmostEqual(lean["change_pct_5_bars"], 0.0, delta=1e-12)
         self.assertAlmostEqual(lean["change_pct_20_bars"], 0.0, delta=1e-12)
 
@@ -205,8 +207,7 @@ class LegacyAndExitPayloadTests(unittest.TestCase):
     def test_the_golden_holds_with_lean_features_in_the_context(self) -> None:
         payload = legacy_entry_payload(self.builder, self.with_lean)
 
-        golden = json.loads(LEGACY_ENTRY_GOLDEN.read_text(encoding="utf-8"))
-        self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), golden)
+        self.assertEqual(serialized_payload(payload), legacy_golden_text())
 
     def test_the_dedupe_does_not_mutate_the_callers_context(self) -> None:
         self._entry(self.with_lean)
