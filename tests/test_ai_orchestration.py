@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import unittest
 from datetime import date
@@ -855,3 +856,197 @@ class EntryGateDirectionSettingTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             Settings.normalize_entry_gate_direction("both")
+
+
+class MapSideTests(EntryStretchGateTests):
+    """Under `ENTRY_REGIME_GATE=map` the hourly regime picks the one side an entry may take.
+
+    NAIK maps to LONG and TURUN to SHORT. The mapped side is judged by the stretch check like any
+    other entry; a side that `ENTRY_GATE_DIRECTION` does not make live is a shadow side (marked, not
+    traded, evaluated later). Every other side, and every hour without a mapped side, is a direction
+    block. Inherits the helpers; the parent's tests re-run with the gate off, which doubles as the
+    regression check that the default path is unchanged.
+    """
+
+    def _mapped(self, kondisi: str, allowed_direction: str, **overrides) -> AIOrchestrator:
+        options = dict(entry_regime_gate="map", entry_stretch_gate_mode="enforce", entry_gate_direction="any")
+        options.update(overrides)
+        orchestrator = self._orchestrator(**options)
+        orchestrator.set_gate_context(
+            {
+                "kondisi": kondisi,
+                "allowed": bool(allowed_direction),
+                "reason": kondisi.lower(),
+                "allowed_direction": allowed_direction,
+            }
+        )
+        return orchestrator
+
+    def test_map_mapped_side_live_passes_to_the_stretch_check(self) -> None:
+        orchestrator = self._mapped("TURUN", "short", entry_gate_direction="short")
+        context = self._context(ema_21=100.02)   # price 0.2 ATR below the mean
+        decision = self._decision("OPEN_SHORT")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIs(verdict["shadow_side"], False)
+        self.assertEqual(verdict["mapped_side"], "short")
+        self.assertIsNotNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_map_mapped_side_not_live_is_shadow(self) -> None:
+        orchestrator = self._mapped("NAIK", "long", entry_gate_direction="short")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertIs(verdict["shadow_side"], True)
+        self.assertEqual(verdict["mapped_side"], "long")
+
+    def test_map_shadow_side_still_gets_the_stretch_check(self) -> None:
+        orchestrator = self._mapped("NAIK", "long", entry_gate_direction="short")
+        context = self._context(ema_21=self.STRETCHED)
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "stretch")
+        self.assertIs(verdict["shadow_side"], True)
+
+    def test_map_wrong_side_is_a_direction_block(self) -> None:
+        orchestrator = self._mapped("TURUN", "short", entry_gate_direction="short")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        decision = self._decision("OPEN_LONG")
+
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "direction")
+        self.assertEqual(verdict["forced_by"], "regime_gate")
+        self.assertEqual(verdict["allowed_direction"], "short")
+        self.assertIsNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_map_without_context_blocks_every_side(self) -> None:
+        orchestrator = self._orchestrator(
+            entry_regime_gate="map", entry_stretch_gate_mode="enforce", entry_gate_direction="any"
+        )
+        context = self._context(ema_21=self.NEAR_MEAN)
+        for action in ("OPEN_LONG", "OPEN_SHORT"):
+            with self.subTest(action=action):
+                decision = self._decision(action)
+
+                verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+
+                self.assertEqual(verdict["verdict"], "block")
+                self.assertEqual(verdict["reason"], "direction")
+                self.assertEqual(verdict["allowed_direction"], "")
+                self.assertEqual(verdict["forced_by"], "regime_gate")
+                self.assertIsNone(orchestrator._build_entry_candidate(decision, context, verdict))
+
+    def test_map_a_hold_hour_blocks_both_sides(self) -> None:
+        orchestrator = self._mapped("SIDEWAYS", "")
+        context = self._context(ema_21=self.NEAR_MEAN)
+        for action in ("OPEN_LONG", "OPEN_SHORT"):
+            verdict = orchestrator._stretch_gate_verdict(self._decision(action), context, None)
+            self.assertEqual((verdict["verdict"], verdict["reason"]), ("block", "direction"))
+
+    def test_map_mapped_side_runs_the_stretch_check_whatever_the_stretch_mode(self) -> None:
+        orchestrator = self._mapped("TURUN", "short", entry_stretch_gate_mode="off")
+        context = self._context(ema_21=100.14)   # price 1.4 ATR below the mean
+        verdict = orchestrator._stretch_gate_verdict(self._decision("OPEN_SHORT"), context, None)
+
+        self.assertEqual(verdict["verdict"], "block")
+        self.assertEqual(verdict["reason"], "stretch")
+
+    def test_map_a_day_behind_schedule_cannot_bypass_the_mapped_side(self) -> None:
+        orchestrator = self._mapped(
+            "TURUN", "short", entry_stretch_gate_behind_schedule_entries_per_hour=2.0
+        )
+        pacing = {"volume_today_usdt": 0.0, "target_volume_per_day_usdt": 1_008_000.0,
+                  "hours_remaining_in_trading_day": 6.0}
+        verdict = orchestrator._stretch_gate_verdict(
+            self._decision("OPEN_LONG"), self._context(ema_21=self.NEAR_MEAN), pacing
+        )
+
+        self.assertEqual((verdict["verdict"], verdict["reason"]), ("block", "direction"))
+
+    def test_naik_and_off_verdicts_are_unchanged(self) -> None:
+        # The side maps are ignored outside `map`, even with a TURUN context lying around.
+        naik = self._orchestrator(
+            entry_regime_gate="naik", entry_gate_direction="long", entry_stretch_gate_mode="off"
+        )
+        naik.set_gate_context({"kondisi": "TURUN", "allowed_direction": "short"})
+        context = self._context(ema_21=self.NEAR_MEAN)
+
+        blocked = naik._stretch_gate_verdict(self._decision("OPEN_SHORT"), context, None)
+        passed = naik._stretch_gate_verdict(self._decision("OPEN_LONG"), context, None)
+
+        self.assertEqual((blocked["verdict"], blocked["reason"]), ("block", "direction"))
+        self.assertEqual(blocked["allowed_direction"], "long")
+        self.assertEqual(blocked["forced_by"], "regime_gate")
+        self.assertEqual(passed["verdict"], "allow")
+        for verdict in (blocked, passed):
+            self.assertNotIn("mapped_side", verdict)
+            self.assertNotIn("shadow_side", verdict)
+
+        off = self._orchestrator(entry_regime_gate="off", entry_gate_direction="any")
+        off.set_gate_context({"kondisi": "TURUN", "allowed_direction": "short"})
+        self.assertEqual(off._stretch_gate_verdict(self._decision("OPEN_LONG"), context, None)["verdict"], "allow")
+
+    def test_mapped_side_and_live_sides_follow_the_configured_direction(self) -> None:
+        cases = [
+            # (regime_gate, direction, allowed_direction, expected mapped side, expected live sides)
+            ("map", "any", "short", "short", {"short"}),
+            ("map", "short", "short", "short", {"short"}),
+            ("map", "short", "long", "long", set()),
+            ("map", "long", "long", "long", {"long"}),
+            ("map", "any", "", "", set()),
+            ("naik", "long", "long", "", {"long"}),
+            ("off", "any", "short", "", {"long", "short"}),
+            ("off", "short", "", "", {"short"}),
+        ]
+        for gate, direction, allowed, mapped, live in cases:
+            with self.subTest(gate=gate, direction=direction, allowed=allowed):
+                orchestrator = self._orchestrator(entry_regime_gate=gate, entry_gate_direction=direction)
+                orchestrator.set_gate_context({"kondisi": "X", "allowed_direction": allowed})
+
+                self.assertEqual(orchestrator._mapped_side(), mapped)
+                self.assertEqual(orchestrator._live_sides(), frozenset(live))
+
+    def test_bucket_and_side_use_the_same_gate_context(self) -> None:
+        orchestrator = self._mapped("TURUN", "short", entry_gate_direction="short")
+        context = {
+            "technicals": [
+                {"symbol": "BTC/USDT", "last_price": 100.0, "ema_21": 100.02, "atr_14": 0.25, "rsi_14": 40.0}
+            ],
+            "factor_snapshots": [],
+            "liquidation_constraints": {"BTC/USDT": {"status": "available", "max_long_stop_loss_pct": 0.5,
+                                                     "max_short_stop_loss_pct": 0.5}},
+        }
+        decision = self._decision("OPEN_SHORT")
+        verdict = orchestrator._stretch_gate_verdict(decision, context, None)
+        candidate = orchestrator._build_entry_candidate(decision, context, verdict)
+        self.assertIsNotNone(candidate)
+
+        plan = asyncio.run(orchestrator._candidate_to_trade_plan(candidate, context))
+
+        setup = plan.factor_metadata["setup"]
+        self.assertEqual(verdict["mapped_side"], "short")
+        self.assertEqual(setup["kondisi"], "TURUN")
+        self.assertEqual(setup["atr_regime"], "atr_mid")
+        self.assertEqual(setup["bucket_key"], "SHORT|TURUN|atr_mid")
+
+    def test_setup_has_no_bucket_without_a_gate_context(self) -> None:
+        meta = AIOrchestrator._factor_metadata_for_symbol(
+            {"technicals": [{"symbol": "BTC/USDT", "last_price": 100.4, "ema_21": 100.0, "atr_14": 0.25}],
+             "factor_snapshots": []},
+            "BTC/USDT",
+            "LONG",
+        )
+        self.assertEqual(meta["setup"]["kondisi"], "")
+        self.assertEqual(meta["setup"]["bucket_key"], "")
+        # the pre-existing keys are untouched
+        self.assertEqual(meta["setup"]["setup_key"], "LONG|stretch_up|atr_mid")

@@ -14,12 +14,15 @@ from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
+from bot.core.setup_ledger import bucket_key
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
 from bot.storage.supabase_journal import SupabaseJournal
 from bot.storage.interfaces import TradeStoreProtocol
 from bot.strategy.base import ExitSignal
+
+_SIDES = frozenset({"long", "short"})
 
 
 @dataclass(slots=True)
@@ -63,6 +66,10 @@ class AIOrchestrator:
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
         self._gate_context: dict[str, Any] | None = None
+
+    def _current_gate_context(self) -> dict[str, Any] | None:
+        # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
+        return getattr(self, "_gate_context", None)
 
     def set_gate_context(self, context: dict[str, Any]) -> None:
         """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
@@ -267,7 +274,7 @@ class AIOrchestrator:
             decision_payload=decision.model_dump(),
             confidence=decision.confidence,
             factor_metadata=self._factor_metadata_for_symbol(
-                market_context, decision.symbol, direction.value
+                market_context, decision.symbol, direction.value, self._current_gate_context()
             ),
             trigger_metadata=self._trigger_metadata_for_symbol(market_context, decision.symbol),
         )
@@ -559,16 +566,34 @@ class AIOrchestrator:
             "behind_schedule": False,
             "entries_needed_per_hour": None,
         }
+        # Under `map` the regime picks the side. The gate context is read once, here, so the side
+        # and the decision's record come from the same hour.
+        mapped_gate = self._regime_gate_mode() == "map"
+        mapped_side = self._mapped_side() if mapped_gate else ""
+        if mapped_gate:
+            verdict["mapped_side"] = mapped_side
+            verdict["shadow_side"] = False
         if decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
             return verdict
-        allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
-        other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
-        if other_side and self._settings.entry_regime_gate != "off":
-            # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
-            # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
-            verdict["forced_by"] = "regime_gate"
-        elif mode == "off":
-            return verdict
+        if mapped_gate:
+            # The mapped side goes on to the stretch check whatever ENTRY_STRETCH_GATE_MODE says; every
+            # other side, and an hour with no mapped side, is a direction block. A mapped side that
+            # ENTRY_GATE_DIRECTION does not make live is a shadow side: marked here, never traded.
+            allowed_side = mapped_side
+            other_side = decision.action != f"OPEN_{mapped_side.upper()}"
+            if other_side:
+                verdict["forced_by"] = "regime_gate"
+            else:
+                verdict["shadow_side"] = mapped_side not in self._live_sides(mapped_side)
+        else:
+            allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
+            other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
+            if other_side and self._settings.entry_regime_gate != "off":
+                # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
+                # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
+                verdict["forced_by"] = "regime_gate"
+            elif mode == "off":
+                return verdict
         # The side filter comes before the schedule relaxation on purpose: being behind
         # on volume may excuse a stretched entry, never the side that has no edge.
         if other_side:
@@ -601,6 +626,33 @@ class AIOrchestrator:
             verdict["verdict"] = "block"
             verdict["reason"] = "stretch"
         return verdict
+
+    def _regime_gate_mode(self) -> str:
+        return str(getattr(self._settings, "entry_regime_gate", "off") or "off").strip().lower()
+
+    def _mapped_side(self) -> str:
+        """The one side the regime maps to this hour: `"long"`, `"short"`, or `""`.
+
+        Only under `ENTRY_REGIME_GATE=map`; it is the gate context's `allowed_direction`, so a missing
+        context, an hour with no mapped condition and every other gate mode give `""`."""
+        if self._regime_gate_mode() != "map":
+            return ""
+        context = self._current_gate_context() or {}
+        side = str(context.get("allowed_direction") or "").strip().lower()
+        return side if side in _SIDES else ""
+
+    def _live_sides(self, mapped: str | None = None) -> frozenset[str]:
+        """The sides this bot may trade now; a mapped side outside this set is a shadow side.
+
+        `ENTRY_GATE_DIRECTION` names the sides the account trades (`any` is both). Under `map` the
+        regime narrows that to the mapped side, or to nothing when the hour maps no side that the
+        account trades. Pass `mapped` to reuse a side already read from the gate context."""
+        configured = str(getattr(self._settings, "entry_gate_direction", "any") or "any").strip().lower()
+        configured_sides = frozenset({configured}) if configured in _SIDES else _SIDES
+        if self._regime_gate_mode() != "map":
+            return configured_sides
+        side = self._mapped_side() if mapped is None else mapped
+        return frozenset({side}) & configured_sides
 
     def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
         if not isinstance(pacing, dict):
@@ -758,7 +810,10 @@ class AIOrchestrator:
 
     @staticmethod
     def _factor_metadata_for_symbol(
-        market_context: dict[str, Any], symbol: str, direction: str = ""
+        market_context: dict[str, Any],
+        symbol: str,
+        direction: str = "",
+        gate_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         snapshots = [
             item
@@ -766,14 +821,22 @@ class AIOrchestrator:
             if isinstance(item, dict) and item.get("symbol") == symbol
         ]
         top = sorted(snapshots, key=lambda item: abs(float(item.get("score") or 0.0)), reverse=True)[:5]
+        setup = build_setup_profile(AIOrchestrator._features_for_symbol(market_context, symbol), direction, top)
+        # The regime condition the gate read for this entry's hour, and the ledger bucket it files the
+        # entry under; both are "" when no gate context was set.
+        kondisi = str((gate_context or {}).get("kondisi") or "")
         return {
             "top_factors": [str(item.get("name")) for item in top if item.get("name")],
             "snapshots": top,
             # Persisted so attribution can bucket by the *shape* of the entry,
             # not just its symbol/direction/factors.
-            "setup": build_setup_profile(
-                AIOrchestrator._features_for_symbol(market_context, symbol), direction, top
-            ),
+            "setup": {
+                **setup,
+                "kondisi": kondisi,
+                "bucket_key": (
+                    bucket_key(setup["direction"], kondisi, setup["atr_regime"]) if kondisi else ""
+                ),
+            },
         }
 
     @staticmethod
