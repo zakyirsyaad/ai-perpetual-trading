@@ -13,6 +13,61 @@ from bot.exchange.contracts import FuturesExchangeProtocol, MaintenanceMarginTie
 from bot.exchange.liquidation import estimate_isolated_liquidation_constraint, select_maintenance_margin_tier
 from bot.strategy.indicators import atr, ema, macd, pct_change, rsi
 
+LEAN_EMA_PERIOD = 21
+LEAN_ATR_PERIOD = 14
+LEAN_RSI_PERIOD = 14
+LEAN_SLOPE_BARS = 5
+LEAN_SHORT_CHANGE_BARS = 5
+LEAN_LONG_CHANGE_BARS = 20
+# 21 closes make a real EMA21, and the slope compares it with the EMA21 of the series
+# five bars earlier. The three ATR-scaled values share this warm-up.
+LEAN_MIN_CLOSES = LEAN_EMA_PERIOD + LEAN_SLOPE_BARS
+
+
+def _change_pct_or_none(closes: list[float], lookback: int) -> float | None:
+    """`pct_change`, but None instead of its 0.0 fallback when the history is missing."""
+    if len(closes) <= lookback or closes[-1 - lookback] == 0:
+        return None
+    return pct_change(closes, lookback)
+
+
+def lean_features_from_candles(
+    *,
+    bar_interval: str,
+    closes: list[float],
+    highs: list[float],
+    lows: list[float],
+) -> dict[str, Any]:
+    """The lean entry payload's numbers, from closed candles (oldest first).
+
+    Every value is None when its input is missing, never a placeholder. The ATR-scaled
+    values (`stretch_atr`, `ema21_slope_atr_5_bars`, `atr_pct`) need 26 closes and a
+    non-zero ATR14. `rsi_14` and the two changes need only their own look-back
+    (15, 6 and 21 closes), because `rsi` and `pct_change` would otherwise answer 50.0
+    or 0.0 for a series too short to measure.
+    """
+    lean: dict[str, Any] = {
+        "bar_interval": bar_interval,
+        "stretch_atr": None,
+        "ema21_slope_atr_5_bars": None,
+        "rsi_14": rsi(closes, LEAN_RSI_PERIOD) if len(closes) > LEAN_RSI_PERIOD else None,
+        "change_pct_5_bars": _change_pct_or_none(closes, LEAN_SHORT_CHANGE_BARS),
+        "change_pct_20_bars": _change_pct_or_none(closes, LEAN_LONG_CHANGE_BARS),
+        "atr_pct": None,
+    }
+    if len(closes) < LEAN_MIN_CLOSES:
+        return lean
+    atr_value = atr(highs, lows, closes, LEAN_ATR_PERIOD)
+    last = closes[-1]
+    if atr_value <= 0 or last <= 0:
+        return lean
+    ema_now = ema(closes, LEAN_EMA_PERIOD)
+    ema_before = ema(closes[:-LEAN_SLOPE_BARS], LEAN_EMA_PERIOD)
+    lean["stretch_atr"] = (last - ema_now) / atr_value
+    lean["ema21_slope_atr_5_bars"] = (ema_now - ema_before) / atr_value
+    lean["atr_pct"] = 100.0 * atr_value / last
+    return lean
+
 
 class MarketIntelligence:
     """Layer 4: convert raw market data and external signals into AI-ready context.
@@ -43,10 +98,13 @@ class MarketIntelligence:
     async def build_context(self, symbols: tuple[str, ...] | None = None) -> MarketContext:
         pairs = symbols or self._settings.symbols
         technicals: list[TechnicalFeatures] = []
+        lean_features: dict[str, dict[str, Any]] = {}
         for symbol in pairs:
-            features = await self._build_symbol_features(symbol)
-            if features is not None:
+            built = await self._build_symbol_features(symbol)
+            if built is not None:
+                features, lean = built
                 technicals.append(features)
+                lean_features[symbol] = lean
 
         external = await self._external_signals.fetch()
         factor_payload: dict[str, Any] = {"snapshots": [], "top_factors": []}
@@ -70,12 +128,14 @@ class MarketIntelligence:
             active_flow_signals=flow_payload.get("active") or [],
             new_flow_signals=flow_payload.get("new_triggers") or [],
             liquidation_constraints=liquidation_constraints,
+            lean_features=lean_features,
         )
 
     async def close(self) -> None:
         await self._external_signals.close()
 
-    async def _build_symbol_features(self, symbol: str) -> TechnicalFeatures | None:
+    async def _build_symbol_features(self, symbol: str) -> tuple[TechnicalFeatures, dict[str, Any]] | None:
+        """The symbol's technicals and its lean features, or None when no candles came back."""
         klines = await self._client.get_klines(
             symbol=symbol,
             interval=self._settings.ai_kline_interval,
@@ -119,7 +179,13 @@ class MarketIntelligence:
             except Exception as exc:
                 self._logger.debug("Order book enrichment failed for %s: %s", symbol, exc)
 
-        return TechnicalFeatures(
+        lean = lean_features_from_candles(
+            bar_interval=self._settings.ai_kline_interval,
+            closes=closes,
+            highs=highs,
+            lows=lows,
+        )
+        features = TechnicalFeatures(
             symbol=symbol,
             last_price=closes[-1],
             ema_fast=ema(closes, 9),
@@ -141,6 +207,7 @@ class MarketIntelligence:
             bid_depth_notional=bid_depth_notional,
             ask_depth_notional=ask_depth_notional,
         )
+        return features, lean
 
     async def _build_liquidation_constraints(
         self,

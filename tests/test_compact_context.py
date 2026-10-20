@@ -32,6 +32,14 @@ def _daily() -> SimpleNamespace:
     return SimpleNamespace(closed_trades=3, stop_losses=1, consecutive_losses=1, total_pnl_usdt=-2.0)
 
 
+def legacy_entry_payload(builder: CompactDecisionContextBuilder, context: dict) -> dict:
+    """The entry payload the golden fixture was captured from, for the given context."""
+    performance = {"total_trades": 12, "records": [{"reason": "complete record", "pnl": 1.2}]}
+    memory = {"lessons": ["one", "two", "three", "four"], "patterns": [{"raw": "all fields"}]}
+    objective = {"mode": "ai_volume", "primary_goal": "full objective", "nested": {"keep": True}}
+    return builder.build_entry_payload(market_context=context, daily_state=_daily(), recent_performance=performance, trade_memory=memory, strategy_objective=objective, arena_reviews=[{"role": "MarketAnalyzer", "payload": {"all": "values"}}])
+
+
 class ParityPayloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.builder = CompactDecisionContextBuilder(_settings())
@@ -57,10 +65,7 @@ class ParityPayloadTests(unittest.TestCase):
     def test_legacy_payload_matches_the_golden(self) -> None:
         # The legacy entry payload is pinned byte for byte: a change here is a change
         # to what account 1 sends the model. Regenerate the fixture only on purpose.
-        performance = {"total_trades": 12, "records": [{"reason": "complete record", "pnl": 1.2}]}
-        memory = {"lessons": ["one", "two", "three", "four"], "patterns": [{"raw": "all fields"}]}
-        objective = {"mode": "ai_volume", "primary_goal": "full objective", "nested": {"keep": True}}
-        payload = self.builder.build_entry_payload(market_context=self.context, daily_state=_daily(), recent_performance=performance, trade_memory=memory, strategy_objective=objective, arena_reviews=[{"role": "MarketAnalyzer", "payload": {"all": "values"}}])
+        payload = legacy_entry_payload(self.builder, self.context)
         golden = json.loads(LEGACY_ENTRY_GOLDEN.read_text(encoding="utf-8"))
         self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), golden)
 

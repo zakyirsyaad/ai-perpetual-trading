@@ -141,6 +141,9 @@ class CompactDecisionContextBuilder:
     def _deduplicated_market_context(self, market_context: dict[str, Any], symbol: str | None = None) -> dict[str, Any]:
         """Keep complete values once, removing only mirrored factor/flow arrays."""
         context = deepcopy(_as_dict(market_context))
+        # Lean features belong to the lean entry payload alone. Dropping them here keeps
+        # the legacy entry payload and the exit payload exactly as they were.
+        context.pop("lean_features", None)
         # A provider whose sub-requests all failed still returns a skeleton (Dune)
         # or an empty dict (TradingView). Forwarding those verbatim shows the model
         # a provider that is present but carries nothing, which the entry prompt
