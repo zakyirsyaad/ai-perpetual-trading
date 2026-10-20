@@ -11,6 +11,7 @@ from bot.config import Settings
 from bot.core.entry_window import parse_weekly_window, window_is_open
 from bot.core.forward_guard import forward_guard_reason
 from bot.core.regime_gate import RegimeGate
+from bot.core.shadow_eval import DEFAULT_MAX_HOLD_MINUTES, evaluate_pending
 from bot.exchange.contracts import (
     ExchangeAPIError,
     FreshOrderBookProvider,
@@ -194,6 +195,34 @@ class TradeEngine:
         except Exception:  # noqa: BLE001 - a dashboard figure must never stop the trading loop
             self._logger.warning("Could not publish token usage to the dashboard.", exc_info=True)
 
+    def _shadow_evaluation_enabled(self) -> bool:
+        """Shadow rows exist only under the regime map or a running setup ledger; otherwise nothing to evaluate."""
+        return (
+            getattr(self._settings, "entry_regime_gate", "off") == "map"
+            or getattr(self._settings, "setup_ledger_mode", "off") != "off"
+        )
+
+    async def _evaluate_shadow_entries(self) -> None:
+        """Complete due shadow rows (hypothetical entries) with the live exit rules; never raises.
+
+        Runs on every tick that gets past the entries latch, the weekly window included: the rows are
+        history, not entries. Any failure is logged at WARNING and the tick goes on.
+        """
+        if not self._shadow_evaluation_enabled():
+            return
+        try:
+            await evaluate_pending(
+                self._trade_store,
+                self._client,
+                now=datetime.now(timezone.utc),
+                logger=self._logger,
+                max_hold_minutes=int(
+                    getattr(self._settings, "position_hold_minutes", DEFAULT_MAX_HOLD_MINUTES)
+                ),
+            )
+        except Exception:  # noqa: BLE001 - shadow bookkeeping must never stop the trading loop
+            self._logger.warning("Shadow evaluation failed; trading continues.", exc_info=True)
+
     async def _forward_guard_blocks_entries(self) -> bool:
         """The LONG forward bot's kill and review stop, recomputed from the store on every tick.
 
@@ -224,6 +253,7 @@ class TradeEngine:
         if self._entries_blocked_reason is not None:
             self._logger.error("Entries blocked: %s", self._entries_blocked_reason)
             return
+        await self._evaluate_shadow_entries()
         if not self._entry_window_is_open():
             return
         if await self._forward_guard_blocks_entries():

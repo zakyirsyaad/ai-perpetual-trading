@@ -9,6 +9,7 @@ import logging
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest import mock
 
 from bot.ai.orchestration import AIOrchestrator
 from bot.config import Settings
@@ -326,6 +327,113 @@ class PauseSeedTests(unittest.IsolatedAsyncioTestCase):
         await engine._seed_last_exit()
         self.assertEqual(store.requested, [])
         self.assertIsNone(engine._last_exit_ts)
+
+
+class ShadowTickTests(unittest.IsolatedAsyncioTestCase):
+    """The shadow evaluation runs once per tick, right after the entries latch and before every other gate."""
+
+    WINDOW = "mon 07:00-sat 00:00"
+    SATURDAY_NOON = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _store(error: Exception | None = None):
+        class Store(FakeStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pending_calls: list[tuple[datetime, int]] = []
+
+            async def pending_shadow_entries(self, decided_before: datetime, limit: int) -> list:
+                self.pending_calls.append((decided_before, limit))
+                if error is not None:
+                    raise error
+                return []
+
+        return Store()
+
+    def _engine_for(self, strategy, store, **settings):
+        engine = _engine(strategy, _settings(**settings), store=store)
+        engine._now_in_trading_tz = lambda: self.SATURDAY_NOON
+        return engine
+
+    async def test_engine_evaluates_after_the_entries_latch_and_before_the_window(self) -> None:
+        store = self._store()
+        strategy = ContextStrategy(_plan())
+        engine = self._engine_for(
+            strategy, store, entry_regime_gate="map", entry_weekly_window=self.WINDOW, position_hold_minutes=60
+        )
+
+        await engine._tick()  # Saturday noon: the window is closed, the evaluation still runs
+
+        self.assertEqual(len(store.pending_calls), 1)
+        self.assertEqual(strategy.next_calls, 0)
+        cutoff, limit = store.pending_calls[0]
+        self.assertEqual(limit, 3)
+        self.assertEqual(cutoff.utcoffset(), timedelta(0))
+        self.assertAlmostEqual(
+            (datetime.now(timezone.utc) - cutoff).total_seconds(), 61 * 60, delta=5
+        )  # hold (the setting) + 1 minute
+
+        engine._entries_blocked_reason = "unmatched exposure"
+        with self.assertLogs(LOG_NAME, level="ERROR"):
+            await engine._tick()
+
+        self.assertEqual(len(store.pending_calls), 1)  # a latched bot does not evaluate
+
+    async def test_engine_skips_evaluation_with_map_and_ledger_off(self) -> None:
+        for settings in (
+            {},
+            {"entry_regime_gate": "off", "setup_ledger_mode": "off"},
+            {"entry_regime_gate": "naik", "setup_ledger_mode": "off"},
+        ):
+            with self.subTest(settings=settings):
+                store = self._store()
+                strategy = ContextStrategy(_plan())
+
+                await self._engine_for(strategy, store, **settings)._tick()
+
+                self.assertEqual(store.pending_calls, [])
+                self.assertEqual(strategy.next_calls, 1)
+
+    async def test_engine_evaluates_when_either_the_map_gate_or_the_ledger_is_on(self) -> None:
+        for settings in (
+            {"entry_regime_gate": "map", "setup_ledger_mode": "off"},
+            {"entry_regime_gate": "off", "setup_ledger_mode": "shadow"},
+            {"entry_regime_gate": "off", "setup_ledger_mode": "enforce"},
+        ):
+            with self.subTest(settings=settings):
+                store = self._store()
+
+                await self._engine_for(ContextStrategy(_plan()), store, **settings)._tick()
+
+                self.assertEqual(len(store.pending_calls), 1)
+
+    async def test_an_evaluator_exception_never_stops_the_tick(self) -> None:
+        store = self._store(error=RuntimeError("Supabase request failed for table shadow_entries: 500"))
+        strategy = ContextStrategy(_plan())
+        engine = self._engine_for(strategy, store, entry_regime_gate="map")
+
+        with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+            await engine._tick()
+
+        self.assertEqual(strategy.next_calls, 1)
+        self.assertTrue(any("shadow" in line.lower() for line in captured.output))
+
+    async def test_the_evaluation_gets_the_engine_client_store_and_hold_setting(self) -> None:
+        store = self._store()
+        engine = self._engine_for(
+            ContextStrategy(None), store, entry_regime_gate="map", position_hold_minutes=45
+        )
+
+        with mock.patch("bot.core.trade_engine.evaluate_pending", new=mock.AsyncMock(return_value=0)) as spy:
+            await engine._tick()
+
+        spy.assert_awaited_once()
+        args, kwargs = spy.await_args
+        self.assertIs(args[0], store)
+        self.assertIs(args[1], engine._client)
+        self.assertEqual(kwargs["max_hold_minutes"], 45)
+        self.assertIs(kwargs["logger"], engine._logger)
+        self.assertEqual(kwargs["now"].utcoffset(), timedelta(0))
 
 
 class _RecordingStore:
