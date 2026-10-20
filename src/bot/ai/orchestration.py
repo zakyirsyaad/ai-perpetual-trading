@@ -5,11 +5,19 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any
+from typing import Any, Sequence
 
 from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, GrokBrain
-from bot.ai.compact_context import CompactDecisionContextBuilder, payload_hash
+from bot.ai.compact_context import (
+    LEAN_PRIMARY_GOAL,
+    PAYLOAD_PROFILE_LEAN,
+    PAYLOAD_PROFILE_LEGACY,
+    STRETCH_RULE_TEXT,
+    CompactDecisionContextBuilder,
+    lean_market_regime,
+    payload_hash,
+)
 from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
@@ -93,30 +101,28 @@ class AIOrchestrator:
         await self._intelligence.close()
 
     async def next_trade_plan(self, daily_state: DailyRiskState) -> TradePlan | None:
+        lean = self._payload_profile() == PAYLOAD_PROFILE_LEAN
+        # The sides the lean request offers come from the gate context set before the strategy ran,
+        # the same one the stretch gate and the ledger bucket read below.
+        lean_sides = self._lean_allowed_sides() if lean else []
+        if lean and not lean_sides:
+            context = self._current_gate_context() or {}
+            self._logger.info(
+                "Lean entry payload has no side to offer (regime gate %s, reason %s); holding without an AI call.",
+                self._regime_gate_mode(),
+                context.get("reason") or "no gate context",
+            )
+            return None
         market_context = await self._intelligence.build_context()
-        recent_performance = await self._trade_store.recent_performance_summary(
-            limit=self._settings.ai_recent_performance_limit,
-        )
-        recent_trade_records = await self._trade_store.recent_closed_trade_records(
-            limit=self._settings.ai_trade_memory_limit,
-        )
-        learned_trade_memory = build_trade_decision_memory(recent_trade_records)
         context_dict = market_context.to_dict()
         # Read once per tick, and only while the ledger is on; `{}` otherwise.
         ledger = await self._ledger_snapshot()
         # The full context still feeds deterministic execution, attribution, and the
         # audit record below; only the AI representation is compacted.
-        payload = self._compact_context.build_entry_payload(
-            market_context=context_dict,
-            daily_state=daily_state,
-            recent_performance=recent_performance,
-            trade_memory=learned_trade_memory,
-            strategy_objective=self._strategy_objective_payload(),
-            arena_reviews=[
-                self._market_analyzer.review(context_dict).to_dict(),
-                self._signal_designer.review(context_dict).to_dict(),
-            ],
-        )
+        if lean:
+            payload = self._lean_entry_payload(context_dict, daily_state, lean_sides, ledger)
+        else:
+            payload = await self._legacy_entry_payload(context_dict, daily_state)
         decisions = await self._brain.entry_decisions(payload)
         if decisions is None:
             return None
@@ -157,6 +163,100 @@ class AIOrchestrator:
             len(candidates),
         )
         return await self._candidate_to_trade_plan(candidate, context_dict)
+
+    def _payload_profile(self) -> str:
+        """`AI_ENTRY_PAYLOAD`: `lean`, or `legacy` for anything else (an unset setting included)."""
+        profile = str(getattr(self._settings, "ai_entry_payload", PAYLOAD_PROFILE_LEGACY) or "").strip().lower()
+        return PAYLOAD_PROFILE_LEAN if profile == PAYLOAD_PROFILE_LEAN else PAYLOAD_PROFILE_LEGACY
+
+    async def _legacy_entry_payload(self, context_dict: dict[str, Any], daily_state: DailyRiskState) -> dict[str, Any]:
+        """Today's request. Its trade history and arena reviews feed this request and nothing else."""
+        recent_performance = await self._trade_store.recent_performance_summary(
+            limit=self._settings.ai_recent_performance_limit,
+        )
+        recent_trade_records = await self._trade_store.recent_closed_trade_records(
+            limit=self._settings.ai_trade_memory_limit,
+        )
+        return self._compact_context.build_entry_payload(
+            market_context=context_dict,
+            daily_state=daily_state,
+            recent_performance=recent_performance,
+            trade_memory=build_trade_decision_memory(recent_trade_records),
+            strategy_objective=self._strategy_objective_payload(),
+            arena_reviews=[
+                self._market_analyzer.review(context_dict).to_dict(),
+                self._signal_designer.review(context_dict).to_dict(),
+            ],
+        )
+
+    def _lean_entry_payload(
+        self,
+        context_dict: dict[str, Any],
+        daily_state: DailyRiskState,
+        sides: Sequence[str],
+        ledger: dict[str, tuple[BucketStats, BucketStats]],
+    ) -> dict[str, Any]:
+        """The lean request. The regime distance and the ledger lines read the first configured
+        symbol, which is the only one whenever the regime gate (and so the ledger) is on."""
+        features = self._features_for_symbol(context_dict, self._primary_symbol())
+        return self._compact_context.build_lean_entry_payload(
+            market_context=context_dict,
+            daily_state=daily_state,
+            strategy_objective=self._lean_strategy_objective_payload(),
+            allowed_sides=sides,
+            entry_rules=self._lean_entry_rules(context_dict),
+            market_regime=lean_market_regime(self._current_gate_context(), (features or {}).get("last_price")),
+            ledger_lines=self._ledger_lines(sides, features, ledger),
+        )
+
+    def _lean_allowed_sides(self) -> list[str]:
+        """The sides the lean request offers: the mapped side under `map` (a shadow side included, so
+        its calls are measured), none in an hour that maps no side; otherwise the live sides, sorted."""
+        if self._regime_gate_mode() == "map":
+            mapped = self._mapped_side()
+            return [mapped] if mapped else []
+        return sorted(self._live_sides())
+
+    def _lean_entry_rules(self, context_dict: dict[str, Any]) -> dict[str, Any]:
+        """The stretch rule the gate applies after the call, with the stretch it will measure.
+
+        `stretch_atr` is the signed (price - EMA21) / ATR14 of `build_setup_profile`, the stretch
+        gate's own number. One configured symbol gives one number; several give one per symbol."""
+        symbols = [str(symbol) for symbol in self._settings.symbols]
+        stretches = {
+            symbol: build_setup_profile(self._features_for_symbol(context_dict, symbol), "")["stretch_atr"]
+            for symbol in symbols
+        }
+        return {
+            "stretch_atr": stretches[symbols[0]] if len(symbols) == 1 else stretches,
+            "max_stretch_atr": float(getattr(self._settings, "entry_stretch_gate_max_atr", 0.0) or 0.0),
+            "rule": STRETCH_RULE_TEXT,
+        }
+
+    def _ledger_lines(
+        self,
+        sides: Sequence[str],
+        features: dict[str, Any] | None,
+        ledger: dict[str, tuple[BucketStats, BucketStats]],
+    ) -> list[dict[str, Any]]:
+        """One line per offered side, from the tick's one ledger snapshot; `[]` while the ledger is off."""
+        if self._ledger_mode() == "off":
+            return []
+        verdicts = [(side, self._ledger_verdict(side, features, ledger)) for side in sides]
+        return [
+            {
+                "side": side,
+                "bucket": verdict["bucket"],
+                "n": verdict["n"],
+                "mean_bps": round(verdict["mean_bps"], 2) if verdict["mean_bps"] is not None else None,
+                "status": verdict["status"],
+            }
+            for side, verdict in verdicts
+        ]
+
+    def _primary_symbol(self) -> str:
+        symbols = list(getattr(self._settings, "symbols", ()) or ())
+        return str(symbols[0]) if symbols else ""
 
     def _dedupe_entry_decisions(self, decisions: list[EntryDecision]) -> list[EntryDecision]:
         result: list[EntryDecision] = []
@@ -335,6 +435,17 @@ class AIOrchestrator:
                 "ai_responsibility": "select the best symbol and direction every tick; do not sit out",
                 "fee_warning": "Entries/exits pay fees; prefer the side with cleaner directional lean.",
             },
+        }
+
+    def _lean_strategy_objective_payload(self) -> dict[str, Any]:
+        """The lean objective: an entry needs an edge beyond the fee, HOLD is the usual answer. The
+        "every tick" and "do not sit out" notes are gone; the volume profile stays as information."""
+        if self._strategy_mode != "ai_volume":
+            return {"mode": "directional_ai", "primary_goal": LEAN_PRIMARY_GOAL}
+        return {
+            "mode": "ai_volume",
+            "primary_goal": LEAN_PRIMARY_GOAL,
+            "volume_profile": self._settings.volume_profile.as_log_fields(),
         }
 
     @property
@@ -907,6 +1018,8 @@ class AIOrchestrator:
             "ai_call_id": ai_call_id,
             "pacing": pacing,
             "gate": gate,
+            # Beside the request, never inside it: the legacy request stays byte for byte today's.
+            "payload_profile": self._payload_profile(),
         }
         await self._trade_store.save_ai_decision(
             symbol=decision.symbol,

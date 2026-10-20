@@ -1523,3 +1523,306 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(floor, 100.0 * 200.0 / 18_000.0 + 0.07)
         with self.assertRaises(ValueError):
             orchestrator._shadow_row(candidate.decision, candidate, "shadow_side", {"technicals": []})
+
+
+class _PayloadStore(_LedgerStore):
+    """`_LedgerStore` that also records the trade-history reads only the legacy payload needs."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.memory_reads: list[str] = []
+
+    async def recent_performance_summary(self, limit: int = 50) -> dict:
+        self.memory_reads.append("performance")
+        return {"sample_size": 0}
+
+    async def recent_closed_trade_records(self, limit: int = 100) -> list[dict]:
+        self.memory_reads.append("records")
+        return []
+
+
+class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
+    """`AI_ENTRY_PAYLOAD=lean` changes what the model is sent, never what the code enforces.
+
+    The request offers only the sides that may be decided this tick (the mapped side under `map`,
+    shadow included; the live sides otherwise), states the stretch rule with the stretch the gate
+    will measure, shows the regime verdict and, with the ledger on, each side's bucket status. With
+    no side to offer there is no AI call at all. Every stored decision names its payload profile.
+    """
+
+    SINCE = LedgerAndShadowTests.SINCE
+    BUCKET = LedgerAndShadowTests.BUCKET
+    # The ledger tests' settings (map, SHORT live, enforce, max 0.75 ATR, ledger off) and losing SHORTs.
+    _settings = LedgerAndShadowTests._settings
+    _losing_shorts = LedgerAndShadowTests._losing_shorts
+    LEAN_GOAL = (
+        "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
+        "HOLD is the expected answer most ticks."
+    )
+
+    @staticmethod
+    def _context(*, ema_21: float = 100.0) -> dict:
+        context = LedgerAndShadowTests._context(ema_21=ema_21)
+        context["lean_features"] = {
+            "BTC/USDT": {"bar_interval": "3m", "stretch_atr": 0.4, "rsi_14": 50.0, "atr_pct": 0.25},
+        }
+        return context
+
+    def _orchestrator(
+        self,
+        store: _LedgerStore,
+        decisions: list[EntryDecision],
+        *,
+        gate_context: dict | None = None,
+        context: dict | None = None,
+        **overrides,
+    ) -> tuple[AIOrchestrator, list[dict], list[str]]:
+        """The orchestrator, the payloads its brain was sent, and its context builds."""
+        settings = self._settings(**overrides)
+        context = context if context is not None else self._context()
+        payloads: list[dict] = []
+        builds: list[str] = []
+
+        class Brain:
+            last_call_metrics = None
+
+            async def entry_decisions(self, payload: dict):
+                payloads.append(payload)
+                return decisions
+
+        class Intelligence:
+            async def build_context(self) -> SimpleNamespace:
+                builds.append("context")
+                return SimpleNamespace(to_dict=lambda: context)
+
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._gate_context = None
+        orchestrator._settings = settings
+        orchestrator._logger = logging.getLogger("test.lean")
+        orchestrator._brain = Brain()
+        orchestrator._trade_store = store
+        orchestrator._supabase_journal = None
+        orchestrator._intelligence = Intelligence()
+        orchestrator._market_analyzer = SimpleNamespace(review=lambda ctx: SimpleNamespace(to_dict=lambda: {"role": "MarketAnalyzer"}))
+        orchestrator._signal_designer = SimpleNamespace(review=lambda ctx: SimpleNamespace(to_dict=lambda: {"role": "SignalDesigner"}))
+        orchestrator._compact_context = CompactDecisionContextBuilder(settings)
+        if gate_context is not None:
+            orchestrator.set_gate_context(gate_context)
+        return orchestrator, payloads, builds
+
+    @staticmethod
+    def _turun(**numbers) -> dict:
+        return {**LedgerAndShadowTests._turun(), **numbers}
+
+    async def test_lean_profile_is_recorded_and_legacy_is_default(self) -> None:
+        for name, overrides in (("unset", {}), ("legacy", {"ai_entry_payload": "legacy"})):
+            with self.subTest(name):
+                store = _PayloadStore()
+                orchestrator, payloads, _ = self._orchestrator(
+                    store, [LedgerAndShadowTests._decision("OPEN_SHORT")], gate_context=self._turun(), **overrides
+                )
+                plan = await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+                self.assertIsNotNone(plan)
+                self.assertEqual(store.decisions[0]["payload"]["payload_profile"], "legacy")
+                request = payloads[0]
+                self.assertIs(store.decisions[0]["payload"]["request"], request)
+                self.assertEqual([review["role"] for review in request["arena_reviews"]], ["MarketAnalyzer", "SignalDesigner"])
+                self.assertIn("learned_trade_memory", request)
+                self.assertEqual(request["risk_constraints"]["min_confidence"], 0.75)
+                self.assertEqual(request["output_rules"]["allowed_actions"], ["OPEN_LONG", "OPEN_SHORT", "HOLD"])
+                self.assertNotIn("features", request)
+                self.assertNotIn("payload_profile", request)
+                self.assertEqual(store.memory_reads, ["performance", "records"])
+
+        store = _PayloadStore()
+        orchestrator, payloads, _ = self._orchestrator(
+            store, [LedgerAndShadowTests._decision("OPEN_SHORT")], gate_context=self._turun(), ai_entry_payload="lean"
+        )
+        plan = await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        # lean changes the request, not the outcome: the same SHORT still trades
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.direction, PositionDirection.SHORT)
+        self.assertEqual(store.decisions[0]["payload"]["payload_profile"], "lean")
+        request = payloads[0]
+        self.assertIs(store.decisions[0]["payload"]["request"], request)
+        for key in ("arena_reviews", "learned_trade_memory", "recent_executed_trade_performance", "payload_profile"):
+            self.assertNotIn(key, request)
+        self.assertNotIn("min_confidence", request["risk_constraints"])
+        self.assertEqual(request["features"], self._context()["lean_features"])
+        # the trade history fed only the legacy payload, so lean does not read it
+        self.assertEqual(store.memory_reads, [])
+
+    async def test_no_mapped_side_under_lean_makes_no_ai_call(self) -> None:
+        sideways = {"kondisi": "SIDEWAYS", "allowed": False, "reason": "not_mapped:SIDEWAYS", "allowed_direction": ""}
+        for name, gate_context in (("sideways hour", sideways), ("no gate context", None)):
+            with self.subTest(name):
+                store = _PayloadStore(self._losing_shorts())
+                orchestrator, payloads, builds = self._orchestrator(
+                    store,
+                    [LedgerAndShadowTests._decision("OPEN_SHORT")],
+                    gate_context=gate_context,
+                    ai_entry_payload="lean",
+                    setup_ledger_mode="shadow",
+                )
+
+                with self.assertLogs("test.lean", level="INFO") as logs:
+                    plan = await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+                self.assertIsNone(plan)
+                self.assertEqual(payloads, [])
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn("no side to offer", logs.output[0])
+                # nothing read, nothing recorded
+                self.assertEqual(builds, [])
+                self.assertEqual(store.decisions, [])
+                self.assertEqual(store.shadow_rows, [])
+                self.assertEqual(store.ledger_reads, [])
+                self.assertEqual(store.memory_reads, [])
+
+    async def test_lean_allowed_actions_follow_the_mapped_or_live_sides(self) -> None:
+        naik = LedgerAndShadowTests._naik()
+        for name, gate_context, overrides, actions in (
+            ("map, NAIK, shadow LONG offered", naik, {}, ["OPEN_LONG", "HOLD"]),
+            ("map, TURUN", self._turun(), {}, ["OPEN_SHORT", "HOLD"]),
+            ("map, TURUN, any live", self._turun(), {"entry_gate_direction": "any"}, ["OPEN_SHORT", "HOLD"]),
+            ("naik gate, LONG bot", naik, {"entry_regime_gate": "naik", "entry_gate_direction": "long"}, ["OPEN_LONG", "HOLD"]),
+            ("gate off, any", None, {"entry_regime_gate": "off", "entry_gate_direction": "any"}, ["OPEN_LONG", "OPEN_SHORT", "HOLD"]),
+            ("gate off, short", None, {"entry_regime_gate": "off", "entry_gate_direction": "short"}, ["OPEN_SHORT", "HOLD"]),
+        ):
+            with self.subTest(name):
+                orchestrator, payloads, _ = self._orchestrator(
+                    _PayloadStore(),
+                    [LedgerAndShadowTests._decision("HOLD")],
+                    gate_context=gate_context,
+                    ai_entry_payload="lean",
+                    **overrides,
+                )
+                await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+                self.assertEqual(payloads[0]["output_rules"]["allowed_actions"], actions)
+
+    async def test_lean_entry_rules_carry_the_stretch_the_gate_measures(self) -> None:
+        store = _PayloadStore()
+        orchestrator, payloads, _ = self._orchestrator(
+            store,
+            [LedgerAndShadowTests._decision("OPEN_SHORT")],
+            gate_context=self._turun(),
+            context=self._context(ema_21=99.9),   # (100 - 99.9) / 0.25 = 0.4 ATR above the mean
+            ai_entry_payload="lean",
+            symbols=["BTC/USDT"],
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        self.assertEqual(
+            payloads[0]["entry_rules"],
+            {"stretch_atr": 0.4, "max_stretch_atr": 0.75, "rule": "an entry beyond this limit is rejected in code"},
+        )
+        self.assertEqual(store.decisions[0]["payload"]["gate"]["stretch_atr"], payloads[0]["entry_rules"]["stretch_atr"])
+
+    async def test_lean_entry_rules_hold_one_stretch_per_symbol_with_several_symbols(self) -> None:
+        orchestrator, payloads, _ = self._orchestrator(
+            _PayloadStore(),
+            [LedgerAndShadowTests._decision("HOLD")],
+            context=self._context(ema_21=99.9),
+            ai_entry_payload="lean",
+            entry_regime_gate="off",
+            entry_gate_direction="any",
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        self.assertEqual(payloads[0]["entry_rules"]["stretch_atr"], {"BTC/USDT": 0.4, "ETH/USDT": 0.0})
+
+    async def test_lean_market_regime_comes_from_the_gate_context(self) -> None:
+        numbers = {"atr14_1h": 0.5, "atr_median": 0.4, "hour_close_ms": 1_792_000_000_000, "sma20_1h": 101.0,
+                   "sma50_1h": 102.0, "close_4h": 100.5, "ema50_4h": 101.5}
+        orchestrator, payloads, _ = self._orchestrator(
+            _PayloadStore(),
+            [LedgerAndShadowTests._decision("HOLD")],
+            gate_context=self._turun(**numbers),
+            ai_entry_payload="lean",
+            symbols=["BTC/USDT"],
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        self.assertEqual(
+            payloads[0]["market_regime"],
+            {"kondisi": "TURUN", "reason": "turun", "allowed_direction": "short", **numbers,
+             "price_vs_sma20_1h_atr": -2.0},   # (100 - 101) / 0.5, from the 3m last price
+        )
+
+        orchestrator, payloads, _ = self._orchestrator(
+            _PayloadStore(), [LedgerAndShadowTests._decision("HOLD")], ai_entry_payload="lean",
+            entry_regime_gate="off", entry_gate_direction="any",
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+        self.assertNotIn("market_regime", payloads[0])
+
+    async def test_lean_ledger_lines_reuse_the_one_ledger_read(self) -> None:
+        store = _PayloadStore(self._losing_shorts())
+        orchestrator, payloads, _ = self._orchestrator(
+            store,
+            [LedgerAndShadowTests._decision("OPEN_SHORT")],
+            gate_context=self._turun(),
+            ai_entry_payload="lean",
+            setup_ledger_mode="shadow",
+            symbols=["BTC/USDT"],
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        self.assertEqual(
+            payloads[0]["setup_ledger"],
+            [{"side": "short", "bucket": self.BUCKET, "n": 3, "mean_bps": -15.0, "status": "blocked"}],
+        )
+        # the decision's ledger verdict and the payload line come from one read of each table
+        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE)])
+        self.assertEqual(store.decisions[0]["payload"]["gate"]["ledger"]["status"], "blocked")
+
+    async def test_lean_ledger_lines_cover_a_shadow_side_and_are_absent_while_the_ledger_is_off(self) -> None:
+        store = _PayloadStore()
+        orchestrator, payloads, _ = self._orchestrator(
+            store, [LedgerAndShadowTests._decision("HOLD")], gate_context=LedgerAndShadowTests._naik(),
+            ai_entry_payload="lean", setup_ledger_mode="enforce", symbols=["BTC/USDT"],
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+        self.assertEqual(
+            payloads[0]["setup_ledger"],
+            [{"side": "long", "bucket": "LONG|NAIK|atr_mid", "n": 0, "mean_bps": None, "status": "learning"}],
+        )
+
+        orchestrator, payloads, _ = self._orchestrator(
+            _PayloadStore(), [LedgerAndShadowTests._decision("HOLD")], gate_context=self._turun(),
+            ai_entry_payload="lean", symbols=["BTC/USDT"],
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+        self.assertNotIn("setup_ledger", payloads[0])
+
+    async def test_lean_objective_drops_the_every_tick_mandate_and_keeps_the_volume_profile(self) -> None:
+        orchestrator, payloads, _ = self._orchestrator(
+            _PayloadStore(), [LedgerAndShadowTests._decision("HOLD")], gate_context=self._turun(),
+            ai_entry_payload="lean",
+        )
+        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+        lean = {"mode": "ai_volume", "primary_goal": self.LEAN_GOAL, "volume_profile": {"margin_per_entry_usdt": 180.0}}
+        self.assertEqual(orchestrator._lean_strategy_objective_payload(), lean)
+        self.assertEqual(payloads[0]["strategy_objective"], lean)
+        # the legacy objective is today's, word for word
+        self.assertEqual(
+            orchestrator._strategy_objective_payload(),
+            {
+                "mode": "ai_volume",
+                "primary_goal": "Build exchange volume by opening a directional trade every tick.",
+                "volume_profile": {"margin_per_entry_usdt": 180.0},
+                "execution_notes": {
+                    "sizing_source": "volume_profile",
+                    "ai_responsibility": "select the best symbol and direction every tick; do not sit out",
+                    "fee_warning": "Entries/exits pay fees; prefer the side with cleaner directional lean.",
+                },
+            },
+        )
+
+        grok, _, _ = self._orchestrator(_PayloadStore(), [], strategy_mode="grok")
+        self.assertEqual(
+            grok._lean_strategy_objective_payload(), {"mode": "directional_ai", "primary_goal": self.LEAN_GOAL}
+        )
