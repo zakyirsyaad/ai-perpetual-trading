@@ -14,7 +14,15 @@ from bot.ai.exit_policy import AIExitPolicy
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
-from bot.core.setup_ledger import bucket_key
+from bot.core.setup_ledger import (
+    SHADOW_BLOCK_SOURCE,
+    STATUS_BLOCKED,
+    BucketStats,
+    bucket_key,
+    bucket_stats,
+    ledger_status,
+    ledger_table,
+)
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
@@ -23,6 +31,9 @@ from bot.storage.interfaces import TradeStoreProtocol
 from bot.strategy.base import ExitSignal
 
 _SIDES = frozenset({"long", "short"})
+_OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
+# `shadow_entries.source` of a mapped side that ENTRY_GATE_DIRECTION does not make live.
+SHADOW_SIDE_SOURCE = "shadow_side"
 
 
 @dataclass(slots=True)
@@ -91,6 +102,8 @@ class AIOrchestrator:
         )
         learned_trade_memory = build_trade_decision_memory(recent_trade_records)
         context_dict = market_context.to_dict()
+        # Read once per tick, and only while the ledger is on; `{}` otherwise.
+        ledger = await self._ledger_snapshot()
         # The full context still feeds deterministic execution, attribution, and the
         # audit record below; only the AI representation is compacted.
         payload = self._compact_context.build_entry_payload(
@@ -118,11 +131,19 @@ class AIOrchestrator:
 
         candidates: list[EntryCandidate] = []
         for decision in decisions:
-            gate_verdict = self._stretch_gate_verdict(decision, context_dict, pacing)
+            gate_verdict = self._with_ledger_verdict(
+                self._stretch_gate_verdict(decision, context_dict, pacing), decision, context_dict, ledger
+            )
             await self._record_ai_decision(decision, payload, pacing, gate_verdict)
             candidate = self._build_entry_candidate(decision, context_dict, gate_verdict)
-            if candidate is not None:
-                candidates.append(candidate)
+            if candidate is None:
+                continue
+            shadow_source = self._shadow_source(decision, gate_verdict)
+            if shadow_source:
+                # Recorded for the shadow evaluator and never traded, even when the row cannot be saved.
+                await self._record_shadow_entry(decision, candidate, shadow_source, context_dict)
+                continue
+            candidates.append(candidate)
 
         if not candidates:
             return None
@@ -653,6 +674,159 @@ class AIOrchestrator:
             return configured_sides
         side = self._mapped_side() if mapped is None else mapped
         return frozenset({side}) & configured_sides
+
+    def _ledger_mode(self) -> str:
+        return str(getattr(self._settings, "setup_ledger_mode", "off") or "off").strip().lower()
+
+    async def _ledger_snapshot(self) -> dict[str, tuple[BucketStats, BucketStats]]:
+        """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
+
+        A failed read is logged and also gives `{}`, so every bucket reads `learning` for this tick. The
+        ledger only ever adds blocks, so it fails open: the regime and stretch gates still apply."""
+        if self._ledger_mode() == "off":
+            return {}
+        since = self._settings.setup_ledger_since
+        try:
+            trades = await self._trade_store.closed_trade_rows_since(since)
+            shadows = await self._trade_store.shadow_outcomes_since(since)
+            return ledger_table(trades, shadows)
+        except Exception as exc:  # noqa: BLE001 - a ledger read must never stop the entry path
+            self._logger.warning(
+                "Setup ledger could not be read (%s: %s); every bucket reads as learning this tick.",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+
+    def _ledger_bucket(self, side: str, features: dict[str, Any] | None) -> str:
+        """`side|condition|atr_regime` for an entry on `side` now: the condition of the gate context set
+        before the strategy ran, the ATR regime of the symbol's 3m technicals."""
+        kondisi = str((self._current_gate_context() or {}).get("kondisi") or "")
+        return bucket_key(side, kondisi, build_setup_profile(features, side)["atr_regime"])
+
+    def _ledger_verdict(
+        self,
+        side: str,
+        features: dict[str, Any] | None,
+        ledger: dict[str, tuple[BucketStats, BucketStats]],
+    ) -> dict[str, Any]:
+        bucket = self._ledger_bucket(side, features)
+        # `ledger_table` keys only buckets with a counted row; any other bucket has no outcomes yet.
+        real, shadow = ledger.get(bucket, (bucket_stats([]), bucket_stats([])))
+        return {
+            "mode": self._ledger_mode(),
+            "bucket": bucket,
+            "n": real.n,
+            "mean_bps": real.mean_bps,
+            "upper_bps": real.upper_bps,
+            "status": ledger_status(
+                real,
+                shadow,
+                int(self._settings.setup_ledger_min_samples),
+                float(self._settings.setup_ledger_hurdle_bps),
+            ),
+        }
+
+    def _with_ledger_verdict(
+        self,
+        gate_verdict: dict[str, Any],
+        decision: EntryDecision,
+        market_context: dict[str, Any],
+        ledger: dict[str, tuple[BucketStats, BucketStats]],
+    ) -> dict[str, Any]:
+        """The gate verdict plus `ledger` for an OPEN decision while the ledger is on; otherwise unchanged.
+
+        A new dict, so the stored decision (`payload_json.gate.ledger`) and the outcome read the same verdict."""
+        if self._ledger_mode() == "off" or decision.action not in _OPEN_ACTIONS:
+            return gate_verdict
+        side = "LONG" if decision.action == "OPEN_LONG" else "SHORT"
+        features = self._features_for_symbol(market_context, decision.symbol)
+        return {**gate_verdict, "ledger": self._ledger_verdict(side, features, ledger)}
+
+    def _shadow_source(self, decision: EntryDecision, gate_verdict: dict[str, Any]) -> str:
+        """Why a candidate that cleared every entry check is recorded instead of traded; `""` trades it.
+
+        A shadow side always; a `blocked` ledger bucket only under `enforce` (`shadow` logs it and trades)."""
+        # Truthiness, not `is True`: on this path any doubt must end in "not traded".
+        if gate_verdict.get("shadow_side"):
+            return SHADOW_SIDE_SOURCE
+        ledger = gate_verdict.get("ledger")
+        if not isinstance(ledger, dict) or ledger.get("status") != STATUS_BLOCKED:
+            return ""
+        if ledger.get("mode") == "enforce":
+            return SHADOW_BLOCK_SOURCE
+        self._logger.info(
+            "Setup ledger (shadow) would block %s: bucket %s has n=%s, upper bound %s bps below the hurdle.",
+            decision.symbol,
+            ledger.get("bucket"),
+            ledger.get("n"),
+            ledger.get("upper_bps"),
+        )
+        return ""
+
+    def _shadow_row(
+        self,
+        decision: EntryDecision,
+        candidate: EntryCandidate,
+        source: str,
+        market_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """One `shadow_entries` row for a candidate that is recorded, not traded (the store adds `exchange`).
+
+        The floor is the live neutral-exit level, `100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional` plus
+        the round-trip fee, capped at the candidate's take-profit. Raises `ValueError` without a 3m price."""
+        features = self._features_for_symbol(market_context, decision.symbol) or {}
+        ref_price = float(features.get("last_price") or 0.0)
+        if not math.isfinite(ref_price) or ref_price <= 0:
+            raise ValueError(f"no 3m last price for {decision.symbol}")
+        side = candidate.direction.value
+        notional = float(self._settings.volume_profile.margin_per_entry_usdt) * float(self._settings.leverage)
+        floor_pct = min(
+            candidate.target.take_profit_pct,
+            100.0 * float(self._settings.volume_neutral_exit_min_net_usdt) / notional + self._round_trip_fee_pct,
+        )
+        return {
+            "decided_at": datetime.now(timezone.utc),
+            "symbol": decision.symbol,
+            "side": side.lower(),
+            "bucket_key": self._ledger_bucket(side, features),
+            "source": source,
+            "ref_price": ref_price,
+            "stop_loss_pct": candidate.target.stop_loss_pct,
+            "floor_pct": floor_pct,
+            "hold_minutes": int(self._settings.position_hold_minutes),
+        }
+
+    async def _record_shadow_entry(
+        self,
+        decision: EntryDecision,
+        candidate: EntryCandidate,
+        source: str,
+        market_context: dict[str, Any],
+    ) -> None:
+        """Write the candidate's shadow row. A failure is logged; the caller drops the candidate either way."""
+        try:
+            row = self._shadow_row(decision, candidate, source, market_context)
+            await self._trade_store.save_shadow_entry(row)
+        except Exception as exc:  # noqa: BLE001 - the candidate is not traded whether or not the row is saved
+            self._logger.warning(
+                "Entry candidate %s %s is not traded (%s), but its shadow row could not be saved (%s: %s).",
+                decision.symbol,
+                candidate.direction.value,
+                source,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        self._logger.info(
+            "Entry candidate %s %s is not traded (%s): shadow row for bucket %s, stop %.3f%%, floor %.3f%%.",
+            decision.symbol,
+            candidate.direction.value,
+            source,
+            row["bucket_key"],
+            row["stop_loss_pct"],
+            row["floor_pct"],
+        )
 
     def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
         if not isinstance(pacing, dict):

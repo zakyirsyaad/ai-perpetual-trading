@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 from bot.ai.brain import EntryDecision, RiskReview
@@ -1050,3 +1050,407 @@ class MapSideTests(EntryStretchGateTests):
         self.assertEqual(meta["setup"]["bucket_key"], "")
         # the pre-existing keys are untouched
         self.assertEqual(meta["setup"]["setup_key"], "LONG|stretch_up|atr_mid")
+
+
+class _LedgerStore:
+    """Trade store fake for the entry path with the shadow and ledger methods (Task 4).
+
+    Records every ledger read and every shadow row; `read_error` / `write_error` make the
+    corresponding calls raise."""
+
+    def __init__(
+        self,
+        trades: list[dict] | None = None,
+        shadows: list[dict] | None = None,
+        *,
+        read_error: Exception | None = None,
+        write_error: Exception | None = None,
+    ) -> None:
+        self.trades = trades or []
+        self.shadows = shadows or []
+        self.read_error = read_error
+        self.write_error = write_error
+        self.decisions: list[dict] = []
+        self.shadow_rows: list[dict] = []
+        self.ledger_reads: list[tuple[str, object]] = []
+
+    async def recent_performance_summary(self, limit: int = 50) -> dict:
+        return {"sample_size": 0}
+
+    async def recent_closed_trade_records(self, limit: int = 100) -> list[dict]:
+        return []
+
+    async def total_volume_for_day(self, day=None) -> float:
+        return 0.0
+
+    async def save_ai_decision(self, **kwargs) -> None:
+        self.decisions.append(kwargs)
+
+    async def closed_trade_rows_since(self, since) -> list[dict]:
+        self.ledger_reads.append(("trades", since))
+        if self.read_error is not None:
+            raise self.read_error
+        return self.trades
+
+    async def shadow_outcomes_since(self, since) -> list[dict]:
+        self.ledger_reads.append(("shadows", since))
+        if self.read_error is not None:
+            raise self.read_error
+        return self.shadows
+
+    async def save_shadow_entry(self, row: dict) -> None:
+        if self.write_error is not None:
+            raise self.write_error
+        self.shadow_rows.append(row)
+
+
+class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
+    """A shadow side and, under `enforce`, a blocked ledger bucket are recorded but never traded.
+
+    Under `ENTRY_REGIME_GATE=map` a mapped side that `ENTRY_GATE_DIRECTION` does not make live still
+    goes through every entry check; a candidate that clears them becomes a `shadow_side` row and the
+    tick holds. The setup ledger files every OPEN decision under `side|condition|atr_regime` and
+    records its verdict at `payload_json.gate.ledger`; `enforce` turns a `blocked` bucket into a
+    `ledger_block` row, `shadow` only records it. Defaults (ledger off, gate not `map`) touch none of
+    the shadow or ledger store methods.
+    """
+
+    SINCE = datetime(2026, 10, 21, 0, 0, tzinfo=timezone.utc)
+    NEAR_MEAN = 100.0     # stretch 0 ATR for either side
+    STRETCHED = 99.5      # (100 - 99.5) / 0.25 = 2 ATR above the mean
+    BUCKET = "SHORT|TURUN|atr_mid"
+
+    def _settings(self, **overrides) -> SimpleNamespace:
+        data = dict(vars(_volume_run_settings()))
+        data.update(
+            entry_regime_gate="map",
+            entry_gate_direction="short",
+            entry_stretch_gate_mode="enforce",
+            entry_stretch_gate_max_atr=0.75,
+            entry_stretch_gate_behind_schedule_entries_per_hour=0.0,
+            setup_ledger_mode="off",
+            setup_ledger_since=self.SINCE,
+            setup_ledger_min_samples=3,
+            setup_ledger_hurdle_bps=4.0,
+            volume_neutral_exit_min_net_usdt=18.0,
+            position_hold_minutes=60,
+            position_usdt=180.0,
+            volume_sides_per_entry=2,
+            trading_timezone="Asia/Jakarta",
+            ai_recent_performance_limit=12,
+            ai_trade_memory_limit=24,
+            exchange_name="bingx",
+            volume_profile=SimpleNamespace(
+                margin_per_entry_usdt=180.0,
+                volume_per_entry_usdt=36_000.0,
+                daily_volume_usdt=1_000_000.0,
+                as_log_fields=lambda: {"margin_per_entry_usdt": 180.0},
+            ),
+        )
+        data.update(overrides)
+        return SimpleNamespace(**data)
+
+    @staticmethod
+    def _context(*, ema_21: float) -> dict:
+        # atr_14 = 0.25 on a price of 100: atr_mid, an ATR-scaled stop of 0.375 % inside the 0.5 % limit.
+        constraint = {"status": "available", "max_long_stop_loss_pct": 0.5, "max_short_stop_loss_pct": 0.5}
+        return {
+            "technicals": [
+                {"symbol": "BTC/USDT", "last_price": 100.0, "ema_21": ema_21, "atr_14": 0.25, "rsi_14": 50.0},
+                {"symbol": "ETH/USDT", "last_price": 100.0, "ema_21": 100.0, "atr_14": 0.25, "rsi_14": 50.0},
+            ],
+            "external_signals": {},
+            "intelligence": {},
+            "factor_snapshots": [],
+            "active_flow_signals": [],
+            "liquidation_constraints": {"BTC/USDT": dict(constraint), "ETH/USDT": dict(constraint)},
+        }
+
+    @staticmethod
+    def _decision(action: str, symbol: str = "BTC/USDT") -> EntryDecision:
+        return EntryDecision(
+            symbol=symbol,
+            action=action,
+            confidence=0.8,
+            market_trend="Bearish",
+            stop_loss_pct=0.08,
+            take_profit_pct=0.12,
+            systemic_risk=2,
+            reason="clean setup",
+            risk_review=_approved_review() if action != "HOLD" else None,
+        )
+
+    def _orchestrator(
+        self,
+        store: _LedgerStore,
+        decisions: list[EntryDecision],
+        *,
+        gate_context: dict | None = None,
+        ema_21: float = NEAR_MEAN,
+        **overrides,
+    ) -> AIOrchestrator:
+        settings = self._settings(**overrides)
+        context = self._context(ema_21=ema_21)
+
+        class Brain:
+            last_call_metrics = None
+
+            async def entry_decisions(self, payload: dict):
+                return decisions
+
+        class Intelligence:
+            async def build_context(self) -> SimpleNamespace:
+                return SimpleNamespace(to_dict=lambda: context)
+
+        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator._gate_context = None
+        orchestrator._settings = settings
+        orchestrator._logger = logging.getLogger("test.ledger")
+        orchestrator._brain = Brain()
+        orchestrator._trade_store = store
+        orchestrator._supabase_journal = None
+        orchestrator._intelligence = Intelligence()
+        orchestrator._market_analyzer = SimpleNamespace(review=lambda ctx: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._signal_designer = SimpleNamespace(review=lambda ctx: SimpleNamespace(to_dict=lambda: {}))
+        orchestrator._compact_context = CompactDecisionContextBuilder(settings)
+        if gate_context is not None:
+            orchestrator.set_gate_context(gate_context)
+        return orchestrator
+
+    @staticmethod
+    def _turun() -> dict:
+        return {"kondisi": "TURUN", "allowed": True, "reason": "turun", "allowed_direction": "short"}
+
+    @staticmethod
+    def _naik() -> dict:
+        return {"kondisi": "NAIK", "allowed": True, "reason": "naik", "allowed_direction": "long"}
+
+    @staticmethod
+    def _state() -> DailyRiskState:
+        return DailyRiskState(
+            day=date(2026, 10, 21),
+            stop_losses=0,
+            closed_trades=0,
+            total_pnl_usdt=0.0,
+            consecutive_losses=0,
+            allowed_to_trade=True,
+        )
+
+    def _losing_shorts(self) -> list[dict]:
+        # -10, -20 and -15 bps: mean -15, SE 2.89, upper bound -11.3 < 4 -> blocked at n = 3.
+        return [
+            {
+                "direction": "SHORT",
+                "entry_price": 100.0,
+                "exit_price": exit_price,
+                "factor_metadata": {"setup": {"bucket_key": self.BUCKET}},
+            }
+            for exit_price in (100.1, 100.2, 100.15)
+        ]
+
+    @staticmethod
+    def _gate(store: _LedgerStore, symbol: str = "BTC/USDT") -> dict:
+        return next(item["payload"]["gate"] for item in store.decisions if item["symbol"] == symbol)
+
+    async def test_a_shadow_side_candidate_never_becomes_a_plan(self) -> None:
+        store = _LedgerStore()
+        orchestrator = self._orchestrator(store, [self._decision("OPEN_LONG")], gate_context=self._naik())
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNone(plan)
+        self.assertEqual(len(store.shadow_rows), 1)
+        row = store.shadow_rows[0]
+        self.assertEqual(row["source"], "shadow_side")
+        self.assertEqual(
+            (row["symbol"], row["side"], row["bucket_key"], row["hold_minutes"]),
+            ("BTC/USDT", "long", "LONG|NAIK|atr_mid", 60),
+        )
+        self.assertEqual(row["ref_price"], 100.0)
+        # the candidate's ATR-scaled stop, and the neutral floor 100 x 18 / (180 x 100) + 0.10 below the TP
+        self.assertAlmostEqual(row["stop_loss_pct"], 0.375)
+        self.assertAlmostEqual(row["floor_pct"], 0.2)
+        self.assertIsNotNone(row["decided_at"].tzinfo)
+        self.assertLess(abs((datetime.now(timezone.utc) - row["decided_at"]).total_seconds()), 60)
+        self.assertNotIn("exchange", row)
+        self.assertIs(self._gate(store)["shadow_side"], True)
+        # the ledger is off: nothing read, nothing recorded
+        self.assertEqual(store.ledger_reads, [])
+        self.assertNotIn("ledger", self._gate(store))
+
+    async def test_a_stretched_shadow_side_writes_no_row(self) -> None:
+        store = _LedgerStore()
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_LONG")], gate_context=self._naik(), ema_21=self.STRETCHED
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNone(plan)
+        self.assertEqual(store.shadow_rows, [])
+        gate = self._gate(store)
+        self.assertEqual((gate["verdict"], gate["reason"], gate["shadow_side"]), ("block", "stretch", True))
+
+    async def test_ledger_off_reads_nothing_and_records_nothing(self) -> None:
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], entry_regime_gate="off", entry_gate_direction="any",
+            entry_stretch_gate_mode="off",
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.direction, PositionDirection.SHORT)
+        self.assertEqual(store.ledger_reads, [])
+        self.assertEqual(store.shadow_rows, [])
+        # the stored gate dict is exactly today's verdict
+        expected = orchestrator._stretch_gate_verdict(
+            self._decision("OPEN_SHORT"), self._context(ema_21=self.NEAR_MEAN), None
+        )
+        self.assertEqual(self._gate(store), expected)
+        self.assertNotIn("ledger", self._gate(store))
+
+    async def test_ledger_shadow_records_the_status_and_trades(self) -> None:
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store,
+            [self._decision("OPEN_SHORT"), self._decision("HOLD", symbol="ETH/USDT")],
+            gate_context=self._turun(),
+            setup_ledger_mode="shadow",
+        )
+
+        with self.assertLogs("test.ledger", level="INFO") as logs:
+            plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.symbol, plan.direction), ("BTC/USDT", PositionDirection.SHORT))
+        self.assertEqual(store.shadow_rows, [])
+        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE)])
+        ledger = self._gate(store)["ledger"]
+        self.assertEqual(
+            (ledger["mode"], ledger["bucket"], ledger["n"], ledger["status"]),
+            ("shadow", self.BUCKET, 3, "blocked"),
+        )
+        self.assertAlmostEqual(ledger["mean_bps"], -15.0)
+        self.assertLess(ledger["upper_bps"], 4.0)
+        self.assertEqual(set(ledger), {"mode", "bucket", "n", "mean_bps", "upper_bps", "status"})
+        self.assertIn("Setup ledger (shadow) would block BTC/USDT", "\n".join(logs.output))
+        # a HOLD decision gets no ledger verdict
+        self.assertNotIn("ledger", self._gate(store, "ETH/USDT"))
+
+    async def test_ledger_enforce_turns_a_blocked_bucket_into_hold_and_a_ledger_block_row(self) -> None:
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNone(plan)
+        self.assertEqual(len(store.shadow_rows), 1)
+        row = store.shadow_rows[0]
+        self.assertEqual(
+            (row["source"], row["side"], row["bucket_key"], row["symbol"]),
+            ("ledger_block", "short", self.BUCKET, "BTC/USDT"),
+        )
+        self.assertAlmostEqual(row["stop_loss_pct"], 0.375)
+        self.assertAlmostEqual(row["floor_pct"], 0.2)
+        self.assertEqual(self._gate(store)["ledger"]["status"], "blocked")
+        self.assertEqual(self._gate(store)["ledger"]["mode"], "enforce")
+
+    async def test_ledger_enforce_lets_a_reopened_bucket_trade(self) -> None:
+        shadows = [
+            {"source": "ledger_block", "bucket_key": self.BUCKET, "gross_bps": value} for value in (20.0, 25.0, 30.0)
+        ]
+        store = _LedgerStore(self._losing_shorts(), shadows)
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.direction, PositionDirection.SHORT)
+        self.assertEqual(store.shadow_rows, [])
+        self.assertEqual(self._gate(store)["ledger"]["status"], "reopened")
+
+    async def test_a_ledger_read_failure_is_logged_and_treated_as_learning(self) -> None:
+        store = _LedgerStore(self._losing_shorts(), read_error=RuntimeError("supabase down"))
+        orchestrator = self._orchestrator(
+            store,
+            # the ETH LONG is the wrong side in TURUN: the regime gate still applies
+            [self._decision("OPEN_SHORT"), self._decision("OPEN_LONG", symbol="ETH/USDT")],
+            gate_context=self._turun(),
+            setup_ledger_mode="enforce",
+        )
+
+        with self.assertLogs("test.ledger", level="WARNING") as logs:
+            plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIn("Setup ledger could not be read (RuntimeError: supabase down)", "\n".join(logs.output))
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.symbol, plan.direction), ("BTC/USDT", PositionDirection.SHORT))
+        self.assertEqual(store.shadow_rows, [])
+        ledger = self._gate(store)["ledger"]
+        self.assertEqual((ledger["status"], ledger["n"], ledger["mean_bps"]), ("learning", 0, None))
+        eth = self._gate(store, "ETH/USDT")
+        self.assertEqual((eth["verdict"], eth["reason"]), ("block", "direction"))
+        self.assertEqual(eth["ledger"]["status"], "learning")
+
+    async def test_a_ledger_read_failure_still_lets_the_stretch_gate_block(self) -> None:
+        store = _LedgerStore(read_error=RuntimeError("supabase down"))
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce",
+            ema_21=200.0 - self.STRETCHED,   # price 2 ATR below the mean
+        )
+
+        with self.assertLogs("test.ledger", level="WARNING") as logs:
+            plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIn("Setup ledger could not be read", "\n".join(logs.output))
+        self.assertIsNone(plan)
+        self.assertEqual(store.shadow_rows, [])
+        gate = self._gate(store)
+        self.assertEqual((gate["verdict"], gate["reason"]), ("block", "stretch"))
+
+    async def test_a_failed_shadow_write_still_drops_the_candidate(self) -> None:
+        for gate_context, options in (
+            (self._naik(), {}),
+            (self._turun(), {"setup_ledger_mode": "enforce"}),
+        ):
+            with self.subTest(kondisi=gate_context["kondisi"]):
+                store = _LedgerStore(self._losing_shorts(), write_error=RuntimeError("insert refused"))
+                action = "OPEN_LONG" if gate_context["kondisi"] == "NAIK" else "OPEN_SHORT"
+                orchestrator = self._orchestrator(
+                    store, [self._decision(action)], gate_context=gate_context, **options
+                )
+
+                with self.assertLogs("test.ledger", level="WARNING") as logs:
+                    plan = await orchestrator.next_trade_plan(self._state())
+
+                self.assertIsNone(plan)
+                self.assertIn("insert refused", "\n".join(logs.output))
+
+    def test_shadow_row_floor_is_capped_at_the_take_profit(self) -> None:
+        orchestrator = self._orchestrator(
+            _LedgerStore(), [], gate_context=self._naik(), volume_neutral_exit_min_net_usdt=200.0
+        )
+        candidate = EntryCandidate(
+            decision=self._decision("OPEN_LONG"),
+            direction=PositionDirection.LONG,
+            target=ResolvedTradeTargets(
+                stop_loss_pct=0.3, take_profit_pct=0.5, atr_pct=0.25, fee_adjusted_rr=1.0, round_trip_fee_pct=0.1
+            ),
+            score=1.0,
+        )
+
+        row = orchestrator._shadow_row(
+            candidate.decision, candidate, "shadow_side", self._context(ema_21=self.NEAR_MEAN)
+        )
+
+        # 100 x 200 / 18,000 + 0.10 = 1.21 % is beyond the TP, so the floor is the TP
+        self.assertEqual(row["floor_pct"], 0.5)
+        self.assertEqual(row["stop_loss_pct"], 0.3)
+        with self.assertRaises(ValueError):
+            orchestrator._shadow_row(candidate.decision, candidate, "shadow_side", {"technicals": []})
