@@ -1187,10 +1187,11 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         *,
         gate_context: dict | None = None,
         ema_21: float = NEAR_MEAN,
+        context: dict | None = None,
         **overrides,
     ) -> AIOrchestrator:
         settings = self._settings(**overrides)
-        context = self._context(ema_21=ema_21)
+        context = context if context is not None else self._context(ema_21=ema_21)
 
         class Brain:
             last_call_metrics = None
@@ -1432,6 +1433,60 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(plan)
                 self.assertIn("insert refused", "\n".join(logs.output))
 
+    async def test_a_shadow_side_in_an_enforce_blocked_bucket_writes_one_shadow_side_row(self) -> None:
+        losing_longs = [
+            {
+                "direction": "LONG",
+                "entry_price": 100.0,
+                "exit_price": exit_price,
+                "factor_metadata": {"setup": {"bucket_key": "LONG|NAIK|atr_mid"}},
+            }
+            for exit_price in (99.9, 99.8, 99.85)
+        ]
+        store = _LedgerStore(losing_longs)
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_LONG")], gate_context=self._naik(), setup_ledger_mode="enforce"
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNone(plan)
+        gate = self._gate(store)
+        self.assertIs(gate["shadow_side"], True)
+        self.assertEqual((gate["ledger"]["status"], gate["ledger"]["mode"]), ("blocked", "enforce"))
+        # one row, filed as the shadow side it is, not as a ledger block
+        self.assertEqual([row["source"] for row in store.shadow_rows], ["shadow_side"])
+
+    async def test_the_best_scored_candidate_is_dropped_and_a_lower_scored_live_one_trades(self) -> None:
+        # BTC SHORT is in the blocked SHORT|TURUN|atr_mid bucket; ETH SHORT, with ATR 0.1 %, files under atr_low.
+        context = self._context(ema_21=self.NEAR_MEAN)
+        context["technicals"][1] = {
+            "symbol": "ETH/USDT", "last_price": 100.0, "ema_21": 100.0, "atr_14": 0.1, "rsi_14": 50.0,
+        }
+        btc = self._decision("OPEN_SHORT").model_copy(update={"confidence": 0.95})
+        eth = self._decision("OPEN_SHORT", symbol="ETH/USDT")
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [btc, eth], gate_context=self._turun(), context=context, setup_ledger_mode="enforce"
+        )
+        scores = {
+            decision.symbol: orchestrator._build_entry_candidate(
+                decision, context, orchestrator._stretch_gate_verdict(decision, context, None)
+            ).score
+            for decision in (btc, eth)
+        }
+        self.assertGreater(scores["BTC/USDT"], scores["ETH/USDT"])
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.symbol, plan.direction), ("ETH/USDT", PositionDirection.SHORT))
+        self.assertEqual(
+            [(row["symbol"], row["source"]) for row in store.shadow_rows], [("BTC/USDT", "ledger_block")]
+        )
+        self.assertEqual(self._gate(store, "ETH/USDT")["ledger"]["bucket"], "SHORT|TURUN|atr_low")
+        self.assertEqual(self._gate(store, "ETH/USDT")["ledger"]["status"], "learning")
+
     def test_shadow_row_floor_is_capped_at_the_take_profit(self) -> None:
         orchestrator = self._orchestrator(
             _LedgerStore(), [], gate_context=self._naik(), volume_neutral_exit_min_net_usdt=200.0
@@ -1452,5 +1507,19 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         # 100 x 200 / 18,000 + 0.10 = 1.21 % is beyond the TP, so the floor is the TP
         self.assertEqual(row["floor_pct"], 0.5)
         self.assertEqual(row["stop_loss_pct"], 0.3)
+
+        # below the TP the floor carries the candidate's own round-trip fee (0.07 here), not the setting's 0.10
+        cheap = EntryCandidate(
+            decision=candidate.decision,
+            direction=PositionDirection.LONG,
+            target=ResolvedTradeTargets(
+                stop_loss_pct=0.3, take_profit_pct=5.0, atr_pct=0.25, fee_adjusted_rr=1.0, round_trip_fee_pct=0.07
+            ),
+            score=1.0,
+        )
+        floor = orchestrator._shadow_row(
+            cheap.decision, cheap, "shadow_side", self._context(ema_21=self.NEAR_MEAN)
+        )["floor_pct"]
+        self.assertAlmostEqual(floor, 100.0 * 200.0 / 18_000.0 + 0.07)
         with self.assertRaises(ValueError):
             orchestrator._shadow_row(candidate.decision, candidate, "shadow_side", {"technicals": []})

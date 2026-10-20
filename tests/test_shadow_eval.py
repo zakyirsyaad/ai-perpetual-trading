@@ -213,7 +213,8 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
     NOW = DECISION_MINUTE + timedelta(minutes=HOLD + 3, seconds=10)
 
     def _series(self, count: int, *, close: float = 100.0) -> list[dict]:
-        return _quiet(count, close=close)
+        """The decision-minute candle (close REF: the walk's reference), then `count` candles closing at `close`."""
+        return [_candle(DECISION_MINUTE, close=REF)] + _quiet(count, close=close)
 
     async def test_a_due_row_is_completed_with_the_walk_result(self) -> None:
         store = FakeShadowStore([_row(7)])
@@ -266,11 +267,12 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.requests[0][0], self.NOW - timedelta(minutes=16))
 
     async def test_candles_start_after_the_decision_minute(self) -> None:
-        # The decision minute's own candle (a stop-sized low) is not walked, nor is the one before it.
+        # The decision minute's own candle (a stop-sized low) only prices the walk with its close; it is not
+        # walked, nor is the one before it.
         before = _candle(DECISION_MINUTE - timedelta(minutes=1), low=90.0)
         own = _candle(DECISION_MINUTE, low=90.0)
         store = FakeShadowStore([_row(1)])
-        client = FakeKlineClient([before, own] + self._series(HOLD + 1, close=100.0))
+        client = FakeKlineClient([before, own] + _quiet(HOLD + 1, close=100.0))
 
         await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
 
@@ -335,13 +337,83 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done, 1)
         self.assertEqual(store.completed, [(9, None, "expired")])
 
-    async def test_a_candle_starting_exactly_one_minute_after_the_decision_does_not_expire(self) -> None:
+    async def test_a_window_starting_exactly_at_the_decision_minute_does_not_expire(self) -> None:
         store = FakeShadowStore([_row(1)])
-        client = FakeKlineClient(self._series(HOLD + 2))  # oldest candle opens at decision minute + 1
+        client = FakeKlineClient(self._series(HOLD + 2))  # oldest candle opens at the decision minute
 
         await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
 
         self.assertEqual(store.completed[0][2], "time")
+
+    async def test_a_window_missing_the_decision_minute_expires(self) -> None:
+        # Every candle of the hold is there, but the decision-minute candle that prices the walk is not.
+        store = FakeShadowStore([_row(1)])
+        client = FakeKlineClient(_quiet(HOLD + 2))  # oldest candle opens at decision minute + 1
+
+        done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual((done, store.completed), (1, [(1, None, "expired")]))
+
+    async def test_a_hole_at_the_decision_minute_expires(self) -> None:
+        before = _candle(DECISION_MINUTE - timedelta(minutes=1))
+        store = FakeShadowStore([_row(1)])
+        client = FakeKlineClient([before] + _quiet(HOLD + 2))
+
+        done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual((done, store.completed), (1, [(1, None, "expired")]))
+
+    async def test_the_walk_starts_from_the_decision_minute_close(self) -> None:
+        # The stored ref_price is the price the entry path saw before the AI call; the walk ignores it. At 90 it
+        # would put the long's floor below every candle and book +32.4 bps at once.
+        outcomes = []
+        for stored in (90.0, REF):
+            store = FakeShadowStore([_row(1, ref_price=stored)])
+            client = FakeKlineClient(self._series(HOLD + 2, close=100.1))
+            await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+            outcomes.append(store.completed[0])
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0][2], "time")
+        self.assertAlmostEqual(outcomes[0][1], 10.0)
+
+        # A decision-minute close of 100.05 is the reference: (100.1 - 100.05) / 100.05 = +4.9975 bps.
+        store = FakeShadowStore([_row(2)])
+        client = FakeKlineClient([_candle(DECISION_MINUTE, close=100.05)] + _quiet(HOLD + 2, close=100.1))
+        await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+        entry_id, bps, reason = store.completed[0]
+        self.assertEqual((entry_id, reason), (2, "time"))
+        self.assertAlmostEqual(bps, (100.1 - 100.05) / 100.05 * 10_000)
+
+    async def test_an_unusable_decision_minute_close_is_a_venue_failure(self) -> None:
+        for close in (0.0, float("nan"), "garbage", None):
+            with self.subTest(close=close):
+                reference = dict(_candle(DECISION_MINUTE), close=close)
+                store = FakeShadowStore([_row(1)])
+                client = FakeKlineClient([reference] + _quiet(HOLD + 2))
+
+                with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+                    done = await evaluate_pending(
+                        store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD
+                    )
+
+                self.assertEqual((done, store.completed), (0, []))  # pending, not closed as invalid
+                self.assertTrue(all(record.levelno == logging.WARNING for record in captured.records))
+
+    async def test_the_request_always_reaches_the_decision_minute_candle(self) -> None:
+        # `minutes since the decision minute + 2` reaches one minute before the decision minute, whether the venue
+        # serves the forming candle or lags a bar, up to the venue's CANDLE_WINDOW.
+        for minutes in (HOLD + 2, 60, CANDLE_WINDOW - 1):
+            for seconds in (0, 59):
+                for forming in (True, False):
+                    with self.subTest(minutes=minutes, seconds=seconds, forming=forming):
+                        now = DECISION_MINUTE + timedelta(minutes=minutes, seconds=seconds)
+                        newest = minutes if forming else minutes - 1
+                        store = FakeShadowStore([_row(1)])
+                        client = FakeKlineClient(_quiet(newest + 6, start_minute=-5))
+
+                        await evaluate_pending(store, client, now=now, logger=_logger(), max_hold_minutes=HOLD)
+
+                        self.assertEqual(store.completed, [(1, 0.0, "time")])
 
     async def test_too_few_candles_yet_leaves_the_row_pending(self) -> None:
         store = FakeShadowStore([_row(1, hold_minutes=30)])

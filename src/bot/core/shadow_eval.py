@@ -4,6 +4,10 @@ A shadow row is an entry the bot did not take (a side the regime map does not al
 setup ledger recorded without trading). Once it is older than the longest hold plus one minute, `walk_exit`
 replays the 1m candles that followed it with the live exits, and `evaluate_pending` writes the result back:
 
+* the reference price is the close of the decision-minute candle (the candle whose open time is the minute
+  of `decided_at`), which is the open of the first walked candle, so no move between the decision and the
+  walk is lost; the row's stored `ref_price` (the 3m price the entry path saw, before the AI call) is kept
+  as a record only;
 * the stop is a percentage of the reference price and is checked first, so a candle that touches both
   levels counts as a stop; it fills one basis point worse than its level;
 * the floor is the profit level and fills exactly at its level;
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -49,8 +54,9 @@ REASON_INVALID = "invalid"
 BPS_PER_PERCENT = 100.0
 BPS_PER_UNIT = 10_000.0
 MINUTE_MS = 60_000
-# Newest candles asked for beyond the minutes since the decision: the decision minute's own candle
-# (skipped) and one spare for a venue that lags a bar.
+# Newest candles asked for beyond the minutes since the decision minute. With `minutes_since + 2` the window
+# reaches back to one minute before the decision minute even when the venue includes the forming candle, so it
+# always holds the decision-minute candle (the reference) while that is inside the venue's window.
 CANDLE_SLACK = 2
 
 SIDE_LONG = "long"
@@ -90,7 +96,8 @@ def walk_exit(
 ) -> tuple[float, str]:
     """Replay the live exits over 1m candles; return (gross bps, "stop" | "floor" | "time").
 
-    `candles` start with the first candle after the decision. Only the first `hold_minutes` of them are
+    `candles` start with the first candle after the decision minute, and `ref_price` is the close of the
+    decision-minute candle (the open of the first walked one). Only the first `hold_minutes` of them are
     walked. A stop or floor inside the candles given decides at once; reaching a time exit needs the full
     hold, so a shorter series without a touch raises `ValueError` instead of guessing a close.
     """
@@ -215,8 +222,10 @@ async def _evaluate_rows(
 async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -> Optional[Outcome]:
     """The result for one row, or None while its hold has not fully played out on closed candles.
 
-    Raises `_VenueFailure` when the venue gives no usable candles, and `KeyError`/`TypeError`/`ValueError`
-    when the row itself is unusable.
+    The walk starts from the close of the decision-minute candle. A window that no longer holds that candle
+    completes the row as `expired`. Raises `_VenueFailure` when the venue gives no usable candles, and
+    `KeyError`/`TypeError`/`ValueError` when the row itself is unusable. The stored `ref_price` is only
+    checked as part of the row; it never prices the walk.
     """
     decision_minute = _parse_utc(row["decided_at"]).replace(second=0, microsecond=0)
     symbol = str(row["symbol"])
@@ -226,7 +235,8 @@ async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -
     floor_pct = float(row["floor_pct"])
     hold_minutes = int(row["hold_minutes"])
     _check_inputs(side, ref_price, stop_loss_pct, floor_pct, hold_minutes)
-    first_open_ms = int((decision_minute + timedelta(minutes=1)).timestamp()) * 1000
+    decision_ms = int(decision_minute.timestamp()) * 1000
+    first_open_ms = decision_ms + MINUTE_MS
     minutes_since = max(0, int((now - decision_minute).total_seconds() // 60))
     limit = min(CANDLE_WINDOW, minutes_since + CANDLE_SLACK)
     try:
@@ -234,17 +244,32 @@ async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -
         if not candles:
             raise RuntimeError("the venue returned no candles")
         oldest_ms = int(candles[0]["timestamp"])
+        reference = next((candle for candle in candles if int(candle["timestamp"]) == decision_ms), None)
         after = [candle for candle in candles if int(candle["timestamp"]) >= first_open_ms]
     except Exception as exc:  # noqa: BLE001 - any failure to obtain usable candles is the venue's
         raise _VenueFailure(f"klines for {symbol} failed ({type(exc).__name__}: {exc})") from exc
-    if oldest_ms > first_open_ms:
-        return None, REASON_EXPIRED  # the window no longer reaches back to the decision
+    if oldest_ms > decision_ms:
+        return None, REASON_EXPIRED  # the window no longer reaches back to the decision-minute candle
     if len(after) < hold_minutes:
         return None
+    if reference is None:
+        return None, REASON_EXPIRED  # a hole at the decision minute: no reference price will ever come
+    walk_ref = _reference_close(reference, symbol)
     try:
-        return walk_exit(after, side, ref_price, stop_loss_pct, floor_pct, hold_minutes)
+        return walk_exit(after, side, walk_ref, stop_loss_pct, floor_pct, hold_minutes)
     except KeyError as exc:  # a candle without high, low or close is bad venue data, not a bad row
         raise _VenueFailure(f"malformed candle for {symbol} (missing {exc})") from exc
+
+
+def _reference_close(candle: Mapping[str, Any], symbol: str) -> float:
+    """The decision-minute close the walk is priced from; an unusable one is bad venue data, not a bad row."""
+    try:
+        close = float(candle["close"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _VenueFailure(f"malformed decision-minute candle for {symbol} ({type(exc).__name__}: {exc})") from exc
+    if not math.isfinite(close) or close <= 0:
+        raise _VenueFailure(f"decision-minute candle for {symbol} has no usable close ({close!r})")
+    return close
 
 
 def _parse_utc(value: Any) -> datetime:

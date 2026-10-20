@@ -783,7 +783,8 @@ class AIOrchestrator:
         notional = float(self._settings.volume_profile.margin_per_entry_usdt) * float(self._settings.leverage)
         floor_pct = min(
             candidate.target.take_profit_pct,
-            100.0 * float(self._settings.volume_neutral_exit_min_net_usdt) / notional + self._round_trip_fee_pct,
+            100.0 * float(self._settings.volume_neutral_exit_min_net_usdt) / notional
+            + candidate.target.round_trip_fee_pct,
         )
         return {
             "decided_at": datetime.now(timezone.utc),
