@@ -1074,7 +1074,7 @@ class _LedgerStore:
         self.write_error = write_error
         self.decisions: list[dict] = []
         self.shadow_rows: list[dict] = []
-        self.ledger_reads: list[tuple[str, object]] = []
+        self.ledger_reads: list[tuple] = []
 
     async def recent_performance_summary(self, limit: int = 50) -> dict:
         return {"sample_size": 0}
@@ -1094,11 +1094,11 @@ class _LedgerStore:
             raise self.read_error
         return self.trades
 
-    async def shadow_outcomes_since(self, since) -> list[dict]:
-        self.ledger_reads.append(("shadows", since))
+    async def shadow_outcomes_since(self, since, source=None) -> list[dict]:
+        self.ledger_reads.append(("shadows", since, source))
         if self.read_error is not None:
             raise self.read_error
-        return self.shadows
+        return [row for row in self.shadows if source is None or row.get("source") == source]
 
     async def save_shadow_entry(self, row: dict) -> None:
         if self.write_error is not None:
@@ -1329,7 +1329,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plan)
         self.assertEqual((plan.symbol, plan.direction), ("BTC/USDT", PositionDirection.SHORT))
         self.assertEqual(store.shadow_rows, [])
-        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE)])
+        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")])
         ledger = self._gate(store)["ledger"]
         self.assertEqual(
             (ledger["mode"], ledger["bucket"], ledger["n"], ledger["status"]),
@@ -1840,7 +1840,7 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
             [{"side": "short", "bucket": self.BUCKET, "n": 3, "mean_bps": -15.0, "status": "blocked"}],
         )
         # the decision's ledger verdict and the payload line come from one read of each table
-        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE)])
+        self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")])
         self.assertEqual(store.decisions[0]["payload"]["gate"]["ledger"]["status"], "blocked")
 
     async def test_lean_ledger_lines_cover_a_shadow_side_and_are_absent_while_the_ledger_is_off(self) -> None:

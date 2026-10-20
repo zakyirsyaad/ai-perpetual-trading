@@ -251,6 +251,30 @@ class PagedReadsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("exchange", "eq.bingx"), params)
         self.assertIn(("order", "decided_at.asc,id.asc"), params)
 
+    async def test_outcomes_read_both_sources_unless_one_is_given(self) -> None:
+        both_http, ledger_http = _FakeHTTP(), _FakeHTTP()
+
+        await _store(both_http).shadow_outcomes_since(SINCE)
+        await _store(ledger_http).shadow_outcomes_since(SINCE, source="ledger_block")
+
+        self.assertEqual([key for key, _ in both_http.gets[0]["params"] if key == "source"], [])
+        params = ledger_http.gets[0]["params"]
+        self.assertEqual([value for key, value in params if key == "source"], ["eq.ledger_block"])
+        # the other filters are unchanged
+        self.assertIn(("evaluated_at", "not.is.null"), params)
+        self.assertIn(("decided_at", "gte.2026-10-14T00:00:00+00:00"), params)
+        self.assertIn(("exchange", "eq.bingx"), params)
+        self.assertIn(("order", "decided_at.asc,id.asc"), params)
+
+    async def test_the_source_filter_holds_on_every_page(self) -> None:
+        http = _FakeHTTP(rows=[{"id": n} for n in range(PAGE + 1)])
+
+        await _store(http).shadow_outcomes_since(SINCE, source="ledger_block")
+
+        self.assertEqual(len(http.gets), 2)
+        for get in http.gets:
+            self.assertIn(("source", "eq.ledger_block"), get["params"])
+
     async def test_closed_trades_are_the_closed_trade_columns_since_the_cutoff_oldest_first(self) -> None:
         http = _FakeHTTP()
 

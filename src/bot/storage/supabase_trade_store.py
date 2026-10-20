@@ -306,11 +306,13 @@ class SupabaseTradeStore:
             },
         )
 
-    async def shadow_outcomes_since(self, since: datetime) -> list[dict[str, Any]]:
+    async def shadow_outcomes_since(self, since: datetime, source: str | None = None) -> list[dict[str, Any]]:
         """Evaluated shadow rows decided at or after `since`, oldest first, paged. Expired rows carry a null `gross_bps`.
 
+        `source` (`shadow_side` or `ledger_block`) keeps only that source's rows; `None` reads both.
         Scoped by `since` alone: the volume-cycle cutoff does not apply.
         """
+        source_filter = [] if source is None else [("source", f"eq.{source}")]
         return await self._page_all(
             _SHADOW_ENTRIES_TABLE,
             [
@@ -318,6 +320,7 @@ class SupabaseTradeStore:
                 ("exchange", f"eq.{self._exchange}"),
                 ("evaluated_at", "not.is.null"),
                 ("decided_at", f"gte.{_utc_iso(since)}"),
+                *source_filter,
                 ("order", "decided_at.asc,id.asc"),
             ],
         )

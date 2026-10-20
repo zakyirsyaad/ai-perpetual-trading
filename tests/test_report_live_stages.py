@@ -227,15 +227,17 @@ class _FakeStore:
         self._shadows = shadows or []
         self.trade_since: list[datetime] = []
         self.shadow_since: list[datetime] = []
+        self.shadow_sources: list[str | None] = []
         self.closed = False
 
     async def closed_trade_rows_since(self, since: datetime) -> list[dict]:
         self.trade_since.append(since)
         return list(self._trades)
 
-    async def shadow_outcomes_since(self, since: datetime) -> list[dict]:
+    async def shadow_outcomes_since(self, since: datetime, source: str | None = None) -> list[dict]:
         self.shadow_since.append(since)
-        return list(self._shadows)
+        self.shadow_sources.append(source)
+        return [row for row in self._shadows if source is None or row.get("source") == source]
 
     async def close(self) -> None:
         self.closed = True
@@ -344,6 +346,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(store.trade_since, [DAY0])
         self.assertEqual(store.shadow_since, [DAY0])
+        self.assertEqual(store.shadow_sources, [None])  # the report reads both sources; the engine only ledger_block
         self.assertIn("posisi berkelompok: 2 dari 2", out)
         self.assertEqual([_table_row(out, "1")[3], _table_row(out, "2")[3]], ["1", "1"])
 
