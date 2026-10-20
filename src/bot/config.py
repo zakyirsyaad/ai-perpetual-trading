@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     # per-setup feature block of the staged live-bot fixes (docs/superpowers/specs/2026-10-21-*).
     ai_entry_payload: str = Field(default="legacy", alias="AI_ENTRY_PAYLOAD")
     # Setup ledger: shadow records every candidate's forward outcome; enforce also vetoes a setup whose
-    # upper bound (mean + 1.28 x SE of net bps) stays below the hurdle. "off" changes nothing. A mode other
+    # upper bound (mean + 1.28 x SE of gross bps per trade, before fees) stays below the hurdle. "off" changes nothing. A mode other
     # than off needs a regime gate and a timezone-aware SETUP_LEDGER_SINCE (the first row it may count).
     setup_ledger_mode: str = Field(default="off", alias="SETUP_LEDGER_MODE")
     setup_ledger_since: datetime | None = Field(default=None, alias="SETUP_LEDGER_SINCE")

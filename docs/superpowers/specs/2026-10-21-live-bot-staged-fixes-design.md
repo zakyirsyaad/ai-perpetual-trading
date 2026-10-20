@@ -94,7 +94,8 @@ today's payload. `lean` changes the entry request only (the exit AI is off and o
   `intelligence.market_flow_signals`, `arena_reviews`, `learned_trade_memory`. Kept: `technicals`
   (raw 3m numbers), the pruned `external_signals`, `liquidation_constraints`, the order book and
   funding fields. Added `features`, computed in code from closed 3m candles: stretch in ATR, EMA21
-  slope over the last 5 bars in ATR, RSI14, price change over 15 and 60 minutes in %, ATR14 in %.
+  slope over the last 5 bars in ATR, RSI14, price change in % as `change_pct_5_bars` and
+  `change_pct_20_bars` with a `bar_interval` field (15 and 60 minutes on 3m candles), ATR14 in %.
 - **Confidence.** `risk_constraints.min_confidence` is removed from the payload; the code still
   enforces `AI_MIN_CONFIDENCE`.
 - **Ledger status** (Part C on): the bucket status of each allowed side, one line each.
@@ -117,8 +118,9 @@ records `payload_json.payload_profile` = `legacy` or `lean`.
   - decision side = mapped side, and `ENTRY_GATE_DIRECTION` allows it → the stretch gate runs as
     today and the entry may trade;
   - decision side = mapped side, but `ENTRY_GATE_DIRECTION` excludes it → **shadow**: the stretch
-    verdict and the plan's stop and floor are computed and recorded, the decision becomes HOLD, and
-    a `shadow_entries` row is written (Part C evaluates it);
+    verdict and the plan's stop and floor are computed and recorded, the model's decision is kept
+    unchanged in `ai_decisions` (`payload_json.gate.shadow_side=true`), the candidate is dropped so
+    the tick holds, and a `shadow_entries` row is written (Part C evaluates it);
   - decision side ≠ mapped side → blocked, `reason=direction`, `forced_by=regime_gate`.
 - **Validator.** `map` needs `ENTRY_STRETCH_GATE_MODE=enforce` and an AI strategy, like `naik`;
   `ENTRY_GATE_DIRECTION` may be `any`, `short` or `long`. `naik` still requires `long`. The
@@ -155,7 +157,8 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     and mean + 1.28 × SE ≥ `HURDLE_BPS`;
   - otherwise `open`, with `learning` while n < `MIN_SAMPLES`.
 - **Mode.** `shadow`: the verdict is recorded at `payload_json.gate.ledger` and changes nothing.
-  `enforce`: an entry in a `blocked` bucket becomes HOLD in code, logged, and written to
+  `enforce`: the candidate of an entry in a `blocked` bucket is dropped in code (the tick holds; the
+  decision row keeps the model's action, with `gate.ledger.status=blocked`), logged, and written to
   `shadow_entries` with source `ledger_block`, so the bucket can earn its way back.
 - **What the model sees** (lean payload): per allowed side, `bucket`, `n`, mean gross bps and
   status. Facts about the setup in front of it, not a list of old lessons.

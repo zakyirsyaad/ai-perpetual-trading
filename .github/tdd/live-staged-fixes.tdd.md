@@ -134,7 +134,7 @@ GREEN after the fix: 80 tests; full suite 2778.
 RED: `ImportError: cannot import name 'Z_ONE_SIDED_90' from 'bot.core.setup_ledger'`.
 
 GREEN: 21 tests; full suite 2798. `bound = mean + 1.28 x SE`; `blocked` only strictly below the hurdle
-(exactly 4.0 is `open`); n = 0 and n = 1 give a mean only; identical values give SE 0 with no
+(exactly 4.0 is `open`); n = 0 gives no mean and n = 1 a mean without an SE; identical values give SE 0 with no
 division; unpriceable trade rows and null or non-finite shadow values are skipped.
 
 ### Task 7 — ledger verdicts and shadow rows in the orchestrator (`41a84f5`, fix `189e752`)
@@ -204,7 +204,7 @@ the builder's output byte for byte.
 
 RED: `ModuleNotFoundError: No module named 'report_live_stages'`.
 
-GREEN: 35 tests; full suite 2897. The test store exposes only the two reads plus `close`, so the
+GREEN: 35 tests; full suite 2897 when it was run (before the last two tests of the branch were added; 2899 at `81e4230`). The test store exposes only the two reads plus `close`, so the
 report is read-only by construction. Exit 2 for a naive time, no stage start, a duplicate start, or an
 `--until` not after the first start.
 
@@ -248,6 +248,13 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   new store methods go onto test fakes only where a code path reaches them (Task 4); the golden is
   captured at the start of Task 8, before `compact_context` changes; `expired` also covers a hole at
   the decision minute; an `invalid` row (malformed values) is closed, not retried.
+- **The hurdle is in gross bps per trade** (from entry and exit prices, before fees): 4.0 is the -150 per 1M
+  bar at 0.035 % per leg. The two comments that said "net bps" (`.env.example`, `Settings`) were corrected
+  in the review round.
+- **A shadow or ledger-blocked decision is not a HOLD row.** `ai_decisions` keeps the model's own
+  action (OPEN_LONG/OPEN_SHORT) with `payload_json.gate.shadow_side=true` or
+  `gate.ledger.status=blocked`; only the candidate is dropped, so the tick holds and the engine logs
+  "Strategy returned HOLD". Query the gate flags, not HOLD rows.
 - **A ledger read failure fails open** (WARNING, every bucket `learning` that tick, the regime and
   stretch gates still apply). Shadow outcomes of source `shadow_side` never reopen a bucket; only
   `ledger_block` outcomes do.
@@ -261,8 +268,6 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   sentence false.
 - `SETUP_LEDGER_HURDLE_BPS` accepts `nan`/`inf` (`nan` silently disables `enforce`);
   `SETUP_LEDGER_SINCE` has no future-time guard (a year typo leaves the ledger `learning`).
-- The comments on `SETUP_LEDGER_HURDLE_BPS` in `.env.example` and `Settings` say "net bps"; the
-  ledger maths is gross bps from entry and exit prices, as the spec says.
 - `complete_shadow_entry` is not guarded by `evaluated_at is null`; harmless with the single
   evaluator. `shadow_outcomes_since` returns `expired`/`invalid` rows with NULL `gross_bps`; every
   reader skips them.
