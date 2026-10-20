@@ -6,12 +6,16 @@ completes at most three due rows per call and never lets one bad row stop the ot
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from bot.core.shadow_eval import (
     CANDLE_WINDOW,
+    EVAL_BUDGET_SECONDS,
     MAX_ROWS_PER_TICK,
     STOP_SLIP_BPS,
     evaluate_pending,
@@ -177,6 +181,15 @@ class FakeShadowStore:
         self.completed.append((entry_id, gross_bps, exit_reason))
 
 
+class AnyRowStore(FakeShadowStore):
+    """Serves every unfinished row whatever its decided_at, so malformed timestamps reach the evaluator."""
+
+    async def pending_shadow_entries(self, decided_before: datetime, limit: int) -> list[dict]:
+        self.requests.append((decided_before, limit))
+        done = {entry_id for entry_id, _, _ in self.completed}
+        return [row for row in self.rows if row.get("id") not in done][:limit]
+
+
 class FakeKlineClient:
     """Serves the newest `limit` closed 1m candles of one scripted series, like the venue."""
 
@@ -290,23 +303,6 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.completed, [])
         self.assertTrue(any("1" in line and "RuntimeError" in line for line in captured.output))
 
-    async def test_one_failing_row_does_not_stop_the_next(self) -> None:
-        class FlakyClient(FakeKlineClient):
-            async def get_klines(self, symbol, interval="1m", limit=120):
-                self.calls.append((symbol, interval, limit))
-                if len(self.calls) == 1:
-                    raise RuntimeError("klines 503")
-                return self.candles[-limit:]
-
-        store = FakeShadowStore([_row(1), _row(2)])
-        client = FlakyClient(self._series(HOLD + 2))
-
-        with self.assertLogs(LOG_NAME, level="WARNING"):
-            done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
-
-        self.assertEqual(done, 1)
-        self.assertEqual([entry_id for entry_id, _, _ in store.completed], [2])
-
     async def test_a_failed_write_leaves_the_row_pending_and_warns(self) -> None:
         store = FakeShadowStore([_row(1), _row(2)], fail_on_complete={1})
         client = FakeKlineClient(self._series(HOLD + 2))
@@ -369,45 +365,31 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(bps, -31.0)
 
     async def test_timestamps_with_odd_fractions_and_zulu_parse_on_python_3_10(self) -> None:
-        class AlwaysDueStore(FakeShadowStore):
-            async def pending_shadow_entries(self, decided_before, limit):
-                done = {entry_id for entry_id, _, _ in self.completed}
-                return [row for row in self.rows if row["id"] not in done][:limit]
-
         for text in (
             "2026-10-21T04:00:30.12+00:00", "2026-10-21T04:00:30.123456+00:00", "2026-10-21T04:00:30Z",
             "2026-10-21T04:00:30+00", "2026-10-21 04:00:30.5+00:00", "2026-10-21T11:00:30+07:00",
         ):
             with self.subTest(text=text):
-                store = AlwaysDueStore([_row(1, decided_at=text)])
+                store = AnyRowStore([_row(1, decided_at=text)])
                 client = FakeKlineClient(self._series(HOLD + 2))
 
                 done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
 
                 self.assertEqual((done, store.completed[0][2]), (1, "time"))
 
-    async def test_a_naive_timestamp_is_not_guessed_and_leaves_the_row_pending(self) -> None:
-        class AlwaysDueStore(FakeShadowStore):
-            async def pending_shadow_entries(self, decided_before, limit):
-                return self.rows[:limit]
+    async def test_a_naive_timestamp_is_not_guessed_and_the_row_is_closed_as_invalid(self) -> None:
+        store = AnyRowStore([_row(1, decided_at="2026-10-21T04:00:30")])
 
-        store = AlwaysDueStore([_row(1, decided_at="2026-10-21T04:00:30")])
-
-        with self.assertLogs(LOG_NAME, level="WARNING"):
+        with self.assertLogs(LOG_NAME, level="ERROR"):
             done = await evaluate_pending(
                 store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
                 max_hold_minutes=HOLD,
             )
 
-        self.assertEqual((done, store.completed), (0, []))
+        self.assertEqual((done, store.completed), (1, [(1, None, "invalid")]))
 
     async def test_a_datetime_decided_at_is_accepted_and_a_naive_one_or_garbage_is_not(self) -> None:
-        class AlwaysDueStore(FakeShadowStore):
-            async def pending_shadow_entries(self, decided_before, limit):
-                done = {entry_id for entry_id, _, _ in self.completed}
-                return [row for row in self.rows if row["id"] not in done][:limit]
-
-        aware = AlwaysDueStore([_row(1, decided_at=DECIDED_AT)])
+        aware = AnyRowStore([_row(1, decided_at=DECIDED_AT)])
         done = await evaluate_pending(
             aware, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(), max_hold_minutes=HOLD
         )
@@ -415,13 +397,209 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
 
         for bad in (DECIDED_AT.replace(tzinfo=None), "yesterday"):
             with self.subTest(bad=bad):
-                store = AlwaysDueStore([_row(2, decided_at=bad)])
-                with self.assertLogs(LOG_NAME, level="WARNING"):
+                store = AnyRowStore([_row(2, decided_at=bad)])
+                with self.assertLogs(LOG_NAME, level="ERROR"):
                     done = await evaluate_pending(
                         store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
                         max_hold_minutes=HOLD,
                     )
-                self.assertEqual((done, store.completed), (0, []))
+                self.assertEqual((done, store.completed), (1, [(2, None, "invalid")]))
+
+    async def test_a_venue_failure_stops_the_row_loop(self) -> None:
+        store = FakeShadowStore([_row(1), _row(2), _row(3)])
+        client = FakeKlineClient([], error=RuntimeError("klines 503"))
+
+        with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+            done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual(done, 0)
+        self.assertEqual(len(client.calls), 1)  # rows 2 and 3 do not repeat the call that just failed
+        self.assertEqual(store.completed, [])
+        self.assertEqual(len(captured.records), 1)  # one WARNING for the whole stop
+        self.assertIn("RuntimeError", captured.output[0])
+
+    async def test_rows_completed_before_a_venue_failure_are_kept(self) -> None:
+        class FailsSecondCall(FakeKlineClient):
+            async def get_klines(self, symbol, interval="1m", limit=120):
+                self.calls.append((symbol, interval, limit))
+                if len(self.calls) == 2:
+                    raise RuntimeError("klines 503")
+                return self.candles[-limit:]
+
+        store = FakeShadowStore([_row(1), _row(2), _row(3)])
+        client = FailsSecondCall(self._series(HOLD + 2))
+
+        with self.assertLogs(LOG_NAME, level="WARNING"):
+            done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual(done, 1)
+        self.assertEqual([entry_id for entry_id, _, _ in store.completed], [1])
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_an_empty_candle_answer_stops_the_row_loop(self) -> None:
+        store = FakeShadowStore([_row(1), _row(2)])
+        client = FakeKlineClient([])
+
+        with self.assertLogs(LOG_NAME, level="WARNING"):
+            await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_a_malformed_candle_is_a_venue_failure_and_not_an_invalid_row(self) -> None:
+        broken = [{"timestamp": candle["timestamp"], "close": candle["close"]} for candle in self._series(HOLD + 2)]
+        store = FakeShadowStore([_row(1), _row(2)])
+        client = FakeKlineClient(broken)
+
+        with self.assertLogs(LOG_NAME, level="WARNING"):
+            done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual((done, store.completed), (0, []))  # not closed as invalid: the rows are fine
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_a_malformed_row_is_closed_as_invalid_and_does_not_block_newer_rows(self) -> None:
+        missing_price = _row(2)
+        del missing_price["ref_price"]
+        bad_rows = [
+            _row(1, decided_at="yesterday"),
+            missing_price,
+            _row(3, stop_loss_pct=0.0),
+        ]
+        good = _row(4)
+        store = AnyRowStore(bad_rows + [good])
+        client = FakeKlineClient(self._series(HOLD + 2, close=100.1))
+
+        with self.assertLogs(LOG_NAME, level="ERROR") as captured:
+            first = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        # All three slots went to the bad rows, which are closed instead of staying pending ...
+        self.assertEqual(first, 3)
+        self.assertEqual(store.completed, [(1, None, "invalid"), (2, None, "invalid"), (3, None, "invalid")])
+        self.assertEqual(client.calls, [])  # a malformed row costs no venue call
+        self.assertEqual(len(captured.records), 3)
+        for entry_id, line in zip((1, 2, 3), captured.output):
+            self.assertIn(f"entry {entry_id} ", line)
+
+        # ... so the next call reaches the newer row.
+        second = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertEqual(second, 1)
+        self.assertEqual(store.completed[-1][0::2], (4, "time"))
+
+    async def test_an_invalid_sign_or_side_is_closed_as_invalid(self) -> None:
+        for overrides in ({"side": "sideways"}, {"floor_pct": -0.1}, {"hold_minutes": 0}, {"ref_price": 0.0}):
+            with self.subTest(overrides=overrides):
+                store = FakeShadowStore([_row(1, **overrides)])
+                with self.assertLogs(LOG_NAME, level="ERROR"):
+                    done = await evaluate_pending(
+                        store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
+                        max_hold_minutes=HOLD,
+                    )
+                self.assertEqual((done, store.completed), (1, [(1, None, "invalid")]))
+
+    async def test_a_write_failure_is_not_a_reason_to_close_the_row_as_invalid(self) -> None:
+        class RejectingStore(FakeShadowStore):
+            async def complete_shadow_entry(self, entry_id, gross_bps, exit_reason):
+                raise ValueError("serialisation")  # even a ValueError from the write is transient
+
+        store = RejectingStore([_row(1)])
+
+        with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+            done = await evaluate_pending(
+                store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
+                max_hold_minutes=HOLD,
+            )
+
+        self.assertEqual((done, store.completed), (0, []))
+        self.assertTrue(all(record.levelno == logging.WARNING for record in captured.records))
+
+    async def test_an_infinite_hold_is_closed_as_invalid(self) -> None:
+        store = FakeShadowStore([_row(1, hold_minutes=float("inf"))])
+
+        with self.assertLogs(LOG_NAME, level="ERROR"):
+            done = await evaluate_pending(
+                store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
+                max_hold_minutes=HOLD,
+            )
+
+        self.assertEqual((done, store.completed), (1, [(1, None, "invalid")]))
+
+    async def test_an_unexpected_error_leaves_the_row_pending_and_the_loop_goes_on(self) -> None:
+        calls = []
+
+        async def flaky(client, row, now):
+            calls.append(row["id"])
+            if row["id"] == 1:
+                raise RuntimeError("boom")
+            return 5.0, "time"
+
+        store = FakeShadowStore([_row(1), _row(2)])
+
+        with mock.patch("bot.core.shadow_eval._outcome", new=flaky):
+            with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+                done = await evaluate_pending(
+                    store, FakeKlineClient([]), now=self.NOW, logger=_logger(), max_hold_minutes=HOLD
+                )
+
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual((done, store.completed), (1, [(2, 5.0, "time")]))
+        self.assertIn("RuntimeError", captured.output[0])
+
+    async def test_a_naive_now_is_refused_and_is_not_blamed_on_the_rows(self) -> None:
+        store = FakeShadowStore([_row(1)])
+
+        with self.assertRaises(ValueError):
+            await evaluate_pending(
+                store, FakeKlineClient([]), now=self.NOW.replace(tzinfo=None), logger=_logger(),
+                max_hold_minutes=HOLD,
+            )
+
+        self.assertEqual(store.completed, [])
+
+    async def test_a_row_without_an_id_is_skipped_with_an_error_and_the_rest_go_on(self) -> None:
+        nameless = _row(1)
+        del nameless["id"]
+        store = AnyRowStore([nameless, _row(2)])
+
+        with self.assertLogs(LOG_NAME, level="ERROR"):
+            done = await evaluate_pending(
+                store, FakeKlineClient(self._series(HOLD + 2)), now=self.NOW, logger=_logger(),
+                max_hold_minutes=HOLD,
+            )
+
+        self.assertEqual([entry_id for entry_id, _, _ in store.completed], [2])
+        self.assertEqual(done, 1)
+
+    async def test_the_budget_stops_a_hanging_venue_call_and_keeps_finished_rows(self) -> None:
+        class HangsOnSecondCall(FakeKlineClient):
+            cancelled = False
+
+            async def get_klines(self, symbol, interval="1m", limit=120):
+                self.calls.append((symbol, interval, limit))
+                if len(self.calls) == 2:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        type(self).cancelled = True
+                        raise
+                return self.candles[-limit:]
+
+        store = FakeShadowStore([_row(1), _row(2), _row(3)])
+        client = HangsOnSecondCall(self._series(HOLD + 2))
+        started = time.monotonic()
+
+        with mock.patch("bot.core.shadow_eval.EVAL_BUDGET_SECONDS", 0.05):
+            with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+                done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(done, 1)
+        self.assertEqual([entry_id for entry_id, _, _ in store.completed], [1])
+        self.assertTrue(HangsOnSecondCall.cancelled)  # the stuck call is cancelled, not abandoned
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("budget", captured.output[0])
+
+    async def test_the_budget_is_twenty_seconds(self) -> None:
+        self.assertEqual(EVAL_BUDGET_SECONDS, 20.0)
 
     async def test_a_failing_pending_read_propagates_to_the_caller(self) -> None:
         class BrokenStore(FakeShadowStore):

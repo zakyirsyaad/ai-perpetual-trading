@@ -5,7 +5,9 @@ before: the same strategy call, no regime call and no gate context.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -417,6 +419,57 @@ class ShadowTickTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(strategy.next_calls, 1)
         self.assertTrue(any("shadow" in line.lower() for line in captured.output))
+
+    def _hanging_engine(self, strategy):
+        """An engine whose store has one due shadow row and whose venue never answers get_klines."""
+
+        class HangingClient(FakeClient):
+            cancelled = False
+
+            async def get_klines(self, symbol, interval="1m", limit=120):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    type(self).cancelled = True
+                    raise
+
+        decided_at = datetime.now(timezone.utc) - timedelta(hours=3)
+
+        class Store(FakeStore):
+            async def pending_shadow_entries(self, decided_before, limit):
+                return [{
+                    "id": 1, "decided_at": decided_at.isoformat(), "symbol": "BTC/USDT", "side": "long",
+                    "ref_price": 100.0, "stop_loss_pct": 0.3, "floor_pct": 0.324, "hold_minutes": 60,
+                }]
+
+        engine = _engine(strategy, _settings(entry_regime_gate="map"), store=Store())
+        engine._client = HangingClient()
+        return engine, HangingClient
+
+    async def test_the_evaluation_is_bounded_by_its_budget(self) -> None:
+        engine, client_class = self._hanging_engine(ContextStrategy(None))
+        started = time.monotonic()
+
+        with mock.patch("bot.core.shadow_eval.EVAL_BUDGET_SECONDS", 0.05):
+            with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+                await engine._evaluate_shadow_entries()
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(client_class.cancelled)
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("budget", captured.output[0])
+
+    async def test_a_hanging_venue_delays_the_tick_by_no_more_than_the_budget(self) -> None:
+        strategy = ContextStrategy(_plan())
+        engine, _ = self._hanging_engine(strategy)
+        started = time.monotonic()
+
+        with mock.patch("bot.core.shadow_eval.EVAL_BUDGET_SECONDS", 0.05):
+            with self.assertLogs(LOG_NAME, level="WARNING"):
+                await engine._tick()
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(strategy.next_calls, 1)  # the entry path still ran
 
     async def test_the_evaluation_gets_the_engine_client_store_and_hold_setting(self) -> None:
         store = self._store()
