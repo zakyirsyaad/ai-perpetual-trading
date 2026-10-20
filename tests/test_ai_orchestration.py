@@ -1548,7 +1548,7 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
 
     The request offers only the sides that may be decided this tick (the mapped side under `map`,
     shadow included; the live sides otherwise), states the stretch rule with the stretch the gate
-    will measure, shows the regime verdict and, with the ledger on, each side's bucket status. With
+    will measure, shows the regime verdict and, with the ledger enforcing, each side's bucket status. With
     no side to offer there is no AI call at all. Every stored decision names its payload profile.
     """
 
@@ -1830,10 +1830,10 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
             [LedgerAndShadowTests._decision("OPEN_SHORT")],
             gate_context=self._turun(),
             ai_entry_payload="lean",
-            setup_ledger_mode="shadow",
+            setup_ledger_mode="enforce",
             symbols=["BTC/USDT"],
         )
-        await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+        plan = await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
 
         self.assertEqual(
             payloads[0]["setup_ledger"],
@@ -1842,6 +1842,34 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         # the decision's ledger verdict and the payload line come from one read of each table
         self.assertEqual(store.ledger_reads, [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")])
         self.assertEqual(store.decisions[0]["payload"]["gate"]["ledger"]["status"], "blocked")
+        # the status the model was shown is the one the code enforced
+        self.assertIsNone(plan)
+        self.assertEqual([row["source"] for row in store.shadow_rows], ["ledger_block"])
+
+    async def test_lean_omits_the_ledger_block_unless_enforcing(self) -> None:
+        # A `shadow` ledger records its verdict but trades a "blocked" bucket anyway, so the model must not be
+        # told the bucket is blocked: the lean request carries `setup_ledger` only while the ledger enforces.
+        for mode, shown in (("off", False), ("shadow", False), ("enforce", True)):
+            with self.subTest(mode=mode):
+                store = _PayloadStore(self._losing_shorts())
+                orchestrator, payloads, _ = self._orchestrator(
+                    store,
+                    [LedgerAndShadowTests._decision("OPEN_SHORT")],
+                    gate_context=self._turun(),
+                    ai_entry_payload="lean",
+                    setup_ledger_mode=mode,
+                    symbols=["BTC/USDT"],
+                )
+                plan = await orchestrator.next_trade_plan(LedgerAndShadowTests._state())
+
+                self.assertEqual("setup_ledger" in payloads[0], shown)
+                gate = store.decisions[0]["payload"]["gate"]
+                if mode == "off":
+                    self.assertNotIn("ledger", gate)
+                else:
+                    # the verdict is still recorded in both modes; only enforce acts on it
+                    self.assertEqual((gate["ledger"]["mode"], gate["ledger"]["status"]), (mode, "blocked"))
+                self.assertEqual(plan is None, mode == "enforce")
 
     async def test_lean_ledger_lines_cover_a_shadow_side_and_are_absent_while_the_ledger_is_off(self) -> None:
         store = _PayloadStore()

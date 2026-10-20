@@ -118,7 +118,8 @@ class CompactDecisionContextBuilder:
         Against the legacy request: no arena reviews, trade memory, recent performance or
         `min_confidence` (the code still enforces it); `market_context` without the factor and flow
         records or `intelligence.symbol_scores`; added `features` (the 3m lean features per symbol),
-        `entry_rules`, `market_regime` (only when given) and `setup_ledger` (only with lines).
+        `entry_rules`, `market_regime` (only when given) and `setup_ledger` (only with lines, which the
+        orchestrator passes only while the ledger enforces).
         `allowed_actions` offers one OPEN per side in `allowed_sides`, then HOLD. Raises `ValueError`
         on an empty side list, an unknown side or a repeated one, so the model is never offered
         nothing but HOLD."""

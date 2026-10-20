@@ -239,8 +239,11 @@ class AIOrchestrator:
         features: dict[str, Any] | None,
         ledger: dict[str, tuple[BucketStats, BucketStats]],
     ) -> list[dict[str, Any]]:
-        """One line per offered side, from the tick's one ledger snapshot; `[]` while the ledger is off."""
-        if self._ledger_mode() == "off":
+        """One line per offered side, from the tick's one ledger snapshot; `[]` unless the ledger enforces.
+
+        A `shadow` ledger records its verdict but still trades a `blocked` bucket, so showing the model that
+        status would describe a rule the code does not apply; the lean request then has no `setup_ledger`."""
+        if self._ledger_mode() != "enforce":
             return []
         verdicts = [(side, self._ledger_verdict(side, features, ledger)) for side in sides]
         return [
