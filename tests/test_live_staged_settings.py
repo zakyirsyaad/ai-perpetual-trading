@@ -7,10 +7,16 @@ from datetime import datetime, timezone
 from bot.config import Settings
 
 AWARE_SINCE = "2026-10-22T00:00:00+07:00"
+# The shadow walk models the floor neutral exit, so map and the ledger need the live exit to be that one.
+FLOOR_EXIT = {
+    "VOLUME_NEUTRAL_EXIT_ENABLED": "true",
+    "VOLUME_NEUTRAL_EXIT_MODE": "floor",
+}
 MAP_COMPANIONS = {
     "ENTRY_STRETCH_GATE_MODE": "enforce",
     "STRATEGY_MODE": "ai_volume",
     "XAI_API_KEY": "test-xai",
+    **FLOOR_EXIT,
 }
 
 
@@ -159,6 +165,84 @@ class StagedSettingsTests(unittest.TestCase):
     def test_hurdle_is_a_float_and_can_be_overridden(self):
         self.assertEqual(mapped(SETUP_LEDGER_HURDLE_BPS="5.5").setup_ledger_hurdle_bps, 5.5)
 
+    def test_a_non_finite_hurdle_is_refused(self):
+        # nan or inf would read every sampled bucket as blocked (or never), so the field refuses both.
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as caught:
+                    mapped(SETUP_LEDGER_HURDLE_BPS=value)
+                self.assertIn("SETUP_LEDGER_HURDLE_BPS", str(caught.exception))
+
+
+class ShadowWalkExitSettingsTests(unittest.TestCase):
+    """Shadow outcomes are walked with the floor neutral exit (`shadow_eval.walk_exit`), so a Settings
+    that writes or judges them (`ENTRY_REGIME_GATE=map`, or the setup ledger on) needs the live neutral
+    exit on and in `floor` mode. `naik` with the ledger off (the pinned forward bot) is not checked."""
+
+    NEEDS_BOTH = ("VOLUME_NEUTRAL_EXIT_ENABLED=true", "VOLUME_NEUTRAL_EXIT_MODE=floor")
+
+    def test_map_refuses_without_the_floor_neutral_exit(self):
+        for override, missing in (
+            ({"VOLUME_NEUTRAL_EXIT_ENABLED": "false"}, "VOLUME_NEUTRAL_EXIT_ENABLED=true"),
+            ({"VOLUME_NEUTRAL_EXIT_MODE": "window"}, "VOLUME_NEUTRAL_EXIT_MODE=floor"),
+            ({"VOLUME_NEUTRAL_EXIT_MODE": "trailing"}, "VOLUME_NEUTRAL_EXIT_MODE=floor"),
+        ):
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError) as caught:
+                    mapped(**override)
+                message = str(caught.exception)
+                self.assertIn("ENTRY_REGIME_GATE=map", message)
+                self.assertIn(missing, message)
+                for other in self.NEEDS_BOTH:
+                    if other != missing:
+                        self.assertNotIn(other, message)
+
+    def test_one_error_names_both_missing_keys(self):
+        # the defaults: neutral exit off, window mode
+        with self.assertRaises(ValueError) as caught:
+            build_settings(
+                **{key: value for key, value in MAP_COMPANIONS.items() if key not in FLOOR_EXIT},
+                ENTRY_REGIME_GATE="map",
+            )
+        message = str(caught.exception)
+        for need in self.NEEDS_BOTH:
+            self.assertIn(need, message)
+
+    def test_the_ledger_on_refuses_without_the_floor_neutral_exit_even_under_naik(self):
+        naik_long = {**MAP_COMPANIONS, "ENTRY_REGIME_GATE": "naik", "ENTRY_GATE_DIRECTION": "long"}
+        for mode in ("shadow", "enforce"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError) as caught:
+                    build_settings(
+                        **{**naik_long, "VOLUME_NEUTRAL_EXIT_MODE": "window"},
+                        SETUP_LEDGER_MODE=mode, SETUP_LEDGER_SINCE=AWARE_SINCE,
+                    )
+                message = str(caught.exception)
+                self.assertIn(f"SETUP_LEDGER_MODE={mode}", message)
+                self.assertIn("VOLUME_NEUTRAL_EXIT_MODE=floor", message)
+                self.assertNotIn("ENTRY_REGIME_GATE=map", message)
+
+    def test_map_and_the_ledger_boot_with_the_floor_neutral_exit(self):
+        settings = mapped(SETUP_LEDGER_MODE="enforce", SETUP_LEDGER_SINCE=AWARE_SINCE)
+
+        self.assertTrue(settings.volume_neutral_exit_enabled)
+        self.assertEqual(settings.volume_neutral_exit_mode, "floor")
+
+    def test_naik_with_the_ledger_off_and_the_gate_off_are_not_checked(self):
+        naik_long = {
+            **{key: value for key, value in MAP_COMPANIONS.items() if key not in FLOOR_EXIT},
+            "ENTRY_REGIME_GATE": "naik",
+            "ENTRY_GATE_DIRECTION": "long",
+        }
+        for name, env in (
+            ("naik, ledger off", naik_long),
+            ("gate off, ledger off", {}),
+        ):
+            with self.subTest(name):
+                settings = build_settings(**env, VOLUME_NEUTRAL_EXIT_MODE="window")
+                self.assertEqual(settings.volume_neutral_exit_mode, "window")
+                self.assertFalse(settings.volume_neutral_exit_enabled)
+
 
 
 class LeanPayloadSettingsTests(unittest.TestCase):
@@ -189,6 +273,14 @@ class LeanPayloadSettingsTests(unittest.TestCase):
             lean(ENTRY_STRETCH_GATE_MAX_ATR="0")
         message = str(caught.exception)
         self.assertIn("ENTRY_STRETCH_GATE_MAX_ATR above 0", message)
+        self.assertNotIn("ENTRY_STRETCH_GATE_MODE", message)
+
+    def test_lean_refuses_an_infinite_stretch_limit(self):
+        # inf passes the field (ge=0) but no stretch ever exceeds it, so the rule sentence would be false.
+        with self.assertRaises(ValueError) as caught:
+            lean(ENTRY_STRETCH_GATE_MAX_ATR="inf")
+        message = str(caught.exception)
+        self.assertIn("a finite ENTRY_STRETCH_GATE_MAX_ATR above 0", message)
         self.assertNotIn("ENTRY_STRETCH_GATE_MODE", message)
 
     def test_lean_refuses_the_behind_schedule_relaxation(self):
@@ -230,6 +322,12 @@ class LeanPayloadSettingsTests(unittest.TestCase):
                     ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR="3",
                 )
                 self.assertEqual(settings.ai_entry_payload, "legacy")
+
+    def test_legacy_keeps_accepting_an_infinite_stretch_limit(self):
+        # the lean guard checks finiteness; the field itself is unchanged, so a legacy .env boots as before
+        settings = build_settings(ENTRY_STRETCH_GATE_MAX_ATR="inf")
+        self.assertEqual(settings.ai_entry_payload, "legacy")
+        self.assertEqual(settings.entry_stretch_gate_max_atr, float("inf"))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -113,8 +114,9 @@ class Settings(BaseSettings):
     entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
-    # Regime gate of the LONG forward bot (bot/core/regime_gate.py). "off" makes no venue call and
-    # changes nothing; "naik" lets an entry through only while the hourly mode selector reads NAIK.
+    # Hourly regime gate (bot/core/regime_gate.py). "off" makes no venue call and changes nothing;
+    # "naik" (the LONG forward bot) lets an entry through only while the hourly mode selector reads NAIK;
+    # "map" (the live bot's staged rollout) maps the hour to a side: NAIK long, TURUN short, any other none.
     entry_regime_gate: str = Field(default="off", alias="ENTRY_REGIME_GATE")
     # Volatility guard: skip entries while ATR14 (1h) exceeds this multiple of its 720-hour median,
     # and while that median is not yet known. 0 turns the guard off. Read only with the regime gate on.
@@ -124,13 +126,15 @@ class Settings(BaseSettings):
     # Entry payload shape: "legacy" is the full context the bot has always sent; "lean" is the compact
     # per-setup feature block of the staged live-bot fixes (docs/superpowers/specs/2026-10-21-*).
     ai_entry_payload: str = Field(default="legacy", alias="AI_ENTRY_PAYLOAD")
-    # Setup ledger: shadow records every candidate's forward outcome; enforce also vetoes a setup whose
-    # upper bound (mean + 1.28 x SE of gross bps per trade, before fees) stays below the hurdle. "off" changes nothing. A mode other
-    # than off needs a regime gate and a timezone-aware SETUP_LEDGER_SINCE (the first row it may count).
+    # Setup ledger: shadow only records each OPEN decision's bucket verdict at payload_json.gate.ledger and
+    # writes no shadow rows; enforce also vetoes a setup whose upper bound (mean + 1.28 x SE of gross bps per
+    # trade, before fees) stays below the hurdle and writes a ledger_block shadow row for it. "off" changes
+    # nothing. A mode other than off needs a regime gate and a timezone-aware SETUP_LEDGER_SINCE (the first
+    # row it may count).
     setup_ledger_mode: str = Field(default="off", alias="SETUP_LEDGER_MODE")
     setup_ledger_since: datetime | None = Field(default=None, alias="SETUP_LEDGER_SINCE")
     setup_ledger_min_samples: int = Field(default=60, ge=2, alias="SETUP_LEDGER_MIN_SAMPLES")
-    setup_ledger_hurdle_bps: float = Field(default=4.0, alias="SETUP_LEDGER_HURDLE_BPS")
+    setup_ledger_hurdle_bps: float = Field(default=4.0, allow_inf_nan=False, alias="SETUP_LEDGER_HURDLE_BPS")
     # Live dashboard feed (src/bot/telemetry). Read-only and off by default. The
     # listener refuses any non-loopback host: reach it through an SSH tunnel.
     telemetry_enabled: bool = Field(default=False, alias="TELEMETRY_ENABLED")
@@ -692,6 +696,7 @@ class Settings(BaseSettings):
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
         self._require_regime_gate_companions()
         self._require_setup_ledger_companions()
+        self._require_shadow_walk_companions()
         self._require_lean_payload_companions()
         return self
 
@@ -741,21 +746,54 @@ class Settings(BaseSettings):
         if problems:
             raise ValueError("SETUP_LEDGER_MODE is on; it needs " + " and ".join(problems) + ".")
 
+    def _require_shadow_walk_companions(self) -> None:
+        """The live exit the shadow walk models: the neutral exit on, in `floor` mode.
+
+        `shadow_eval.walk_exit` closes a shadow row the first time price reaches the floor
+        (100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional plus the round-trip fee), which is what the live
+        bot does only with the neutral exit on and in `floor` mode (`window` and `trailing` exit elsewhere;
+        with it off the exits are the stop, the TP and the time stop). Shadow rows are written under
+        ENTRY_REGIME_GATE=map (a shadow side) and by the ledger (its `ledger_block` rows, judged against
+        real trades), so both demand it. `naik` with the ledger off writes none and is not checked: that is
+        the pinned LONG forward bot.
+        """
+        triggers = []
+        if self.entry_regime_gate == "map":
+            triggers.append("ENTRY_REGIME_GATE=map")
+        if self.setup_ledger_mode != "off":
+            triggers.append(f"SETUP_LEDGER_MODE={self.setup_ledger_mode}")
+        if not triggers:
+            return
+        problems = []
+        if not self.volume_neutral_exit_enabled:
+            problems.append("VOLUME_NEUTRAL_EXIT_ENABLED=true")
+        if self.volume_neutral_exit_mode != "floor":
+            problems.append("VOLUME_NEUTRAL_EXIT_MODE=floor")
+        if problems:
+            raise ValueError(
+                "With "
+                + " and ".join(triggers)
+                + ", shadow entries are walked with the floor neutral exit, so the live exit must be the same; it needs "
+                + " and ".join(problems)
+                + "."
+            )
+
     def _require_lean_payload_companions(self) -> None:
         """What a lean entry payload needs for its stretch rule to be true.
 
         The lean request tells the model that an entry beyond ENTRY_STRETCH_GATE_MAX_ATR is rejected in code
         and offers only the sides the gate lets through. Both hold only while the stretch gate enforces
         (the side filter is honoured only then, or under a regime gate that already demands it), has a
-        limit to enforce, and has no behind-schedule bypass. A legacy Settings is not checked at all.
+        finite limit to enforce (`inf` passes the field but no stretch ever exceeds it), and has no
+        behind-schedule bypass. A legacy Settings is not checked at all.
         """
         if self.ai_entry_payload != "lean":
             return
         problems = []
         if self.entry_stretch_gate_mode != "enforce":
             problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
-        if self.entry_stretch_gate_max_atr <= 0:
-            problems.append("ENTRY_STRETCH_GATE_MAX_ATR above 0")
+        if not math.isfinite(self.entry_stretch_gate_max_atr) or self.entry_stretch_gate_max_atr <= 0:
+            problems.append("a finite ENTRY_STRETCH_GATE_MAX_ATR above 0")
         if self.entry_stretch_gate_behind_schedule_entries_per_hour != 0:
             problems.append("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0")
         if problems:
