@@ -227,7 +227,7 @@ LEAN_GOAL = (
     "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
     "HOLD is the expected answer most ticks."
 )
-STRETCH_RULE = "an entry beyond this limit is rejected in code"
+STRETCH_RULE = "an entry with |stretch_atr| above this limit is rejected in code"
 
 
 def _lean_context() -> dict:

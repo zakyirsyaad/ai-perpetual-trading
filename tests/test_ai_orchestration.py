@@ -7,7 +7,9 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 from bot.ai.brain import EntryDecision, RiskReview
-from bot.ai.compact_context import CompactDecisionContextBuilder
+from bot.ai.compact_context import CompactDecisionContextBuilder, compact_json
+from bot.ai.trade_memory import build_trade_decision_memory
+from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.orchestration import AIOrchestrator, EntryCandidate, ResolvedTradeTargets
 from bot.models import PositionDirection
 from bot.risk.risk_manager import DailyRiskState
@@ -1654,6 +1656,69 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         # the trade history fed only the legacy payload, so lean does not read it
         self.assertEqual(store.memory_reads, [])
 
+    async def test_the_legacy_request_is_the_builder_s_output_byte_for_byte(self) -> None:
+        # The golden pins the builder; this pins the orchestrator's legacy path into it: the same
+        # trade history, memory, objective and arena reviews, in the same bytes the brain is sent.
+        performance = {"total_trades": 2, "total_pnl_usdt": -2.25}
+        records = [
+            {
+                "symbol": "BTC/USDT", "direction": "SHORT", "pnl_usdt": -6.5, "reason": "stop_loss", "confidence": 0.78,
+                "factor_metadata": {"setup": {"setup_key": "SHORT|stretch_up|atr_mid", "family_key": "SHORT|trend_led"}},
+            },
+            {"symbol": "BTC/USDT", "direction": "LONG", "pnl_usdt": 4.25, "reason": "neutral_exit", "confidence": 0.81},
+        ]
+
+        class Store(_PayloadStore):
+            async def recent_performance_summary(self, limit: int = 50) -> dict:
+                return performance
+
+            async def recent_closed_trade_records(self, limit: int = 100) -> list[dict]:
+                return records
+
+        flow = {"symbol": "BTC/USDT", "name": "volume_spike", "direction": "SHORT", "strength": 0.7}
+        factor = {"symbol": "BTC/USDT", "name": "trend_ema", "category": "trend", "score": -0.6, "direction": "SHORT"}
+        context = self._context()
+        context.update(
+            external_signals={"dune": {"saved_queries": {}, "builtin_signals": {}}, "tradingview": {"summary": "SELL"}},
+            intelligence={
+                "regime": "normal",
+                "risk_flags": ["coinmarketcap_unavailable"],
+                "symbol_scores": {"BTC/USDT": {"composite_score": -0.4}},
+                "factor_intelligence": {"snapshots": [factor], "top_factors": ["trend_ema"]},
+                "market_flow_signals": {"active": [flow], "new_triggers": [], "trigger_names": ["volume_spike"]},
+            },
+            factor_snapshots=[factor],
+            active_flow_signals=[flow],
+        )
+        state = LedgerAndShadowTests._state()
+        orchestrator, payloads, _ = self._orchestrator(
+            Store(), [LedgerAndShadowTests._decision("HOLD")], gate_context=self._turun(), context=context
+        )
+        orchestrator._market_analyzer = MarketAnalyzer()
+        orchestrator._signal_designer = SignalDesigner()
+
+        await orchestrator.next_trade_plan(state)
+
+        expected = CompactDecisionContextBuilder(orchestrator._settings).build_entry_payload(
+            market_context=context,
+            daily_state=state,
+            recent_performance=performance,
+            trade_memory=build_trade_decision_memory(records),
+            strategy_objective={
+                "mode": "ai_volume",
+                "primary_goal": "Build exchange volume by opening a directional trade every tick.",
+                "volume_profile": {"margin_per_entry_usdt": 180.0},
+                "execution_notes": {
+                    "sizing_source": "volume_profile",
+                    "ai_responsibility": "select the best symbol and direction every tick; do not sit out",
+                    "fee_warning": "Entries/exits pay fees; prefer the side with cleaner directional lean.",
+                },
+            },
+            arena_reviews=[MarketAnalyzer().review(context).to_dict(), SignalDesigner().review(context).to_dict()],
+        )
+        self.assertEqual(compact_json(payloads[0]), compact_json(expected))
+        self.assertGreater(build_trade_decision_memory(records)["sample_size"], 0)   # a real memory, not the empty one
+
     async def test_no_mapped_side_under_lean_makes_no_ai_call(self) -> None:
         sideways = {"kondisi": "SIDEWAYS", "allowed": False, "reason": "not_mapped:SIDEWAYS", "allowed_direction": ""}
         for name, gate_context in (("sideways hour", sideways), ("no gate context", None)):
@@ -1716,7 +1781,7 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             payloads[0]["entry_rules"],
-            {"stretch_atr": 0.4, "max_stretch_atr": 0.75, "rule": "an entry beyond this limit is rejected in code"},
+            {"stretch_atr": 0.4, "max_stretch_atr": 0.75, "rule": "an entry with |stretch_atr| above this limit is rejected in code"},
         )
         self.assertEqual(store.decisions[0]["payload"]["gate"]["stretch_atr"], payloads[0]["entry_rules"]["stretch_atr"])
 

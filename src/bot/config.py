@@ -692,6 +692,7 @@ class Settings(BaseSettings):
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
         self._require_regime_gate_companions()
         self._require_setup_ledger_companions()
+        self._require_lean_payload_companions()
         return self
 
     def _require_regime_gate_companions(self) -> None:
@@ -739,6 +740,30 @@ class Settings(BaseSettings):
             problems.append("a timezone-aware SETUP_LEDGER_SINCE")
         if problems:
             raise ValueError("SETUP_LEDGER_MODE is on; it needs " + " and ".join(problems) + ".")
+
+    def _require_lean_payload_companions(self) -> None:
+        """What a lean entry payload needs for its stretch rule to be true.
+
+        The lean request tells the model that an entry beyond ENTRY_STRETCH_GATE_MAX_ATR is rejected in code
+        and offers only the sides the gate lets through. Both hold only while the stretch gate enforces
+        (the side filter is honoured only then, or under a regime gate that already demands it), has a
+        limit to enforce, and has no behind-schedule bypass. A legacy Settings is not checked at all.
+        """
+        if self.ai_entry_payload != "lean":
+            return
+        problems = []
+        if self.entry_stretch_gate_mode != "enforce":
+            problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
+        if self.entry_stretch_gate_max_atr <= 0:
+            problems.append("ENTRY_STRETCH_GATE_MAX_ATR above 0")
+        if self.entry_stretch_gate_behind_schedule_entries_per_hour != 0:
+            problems.append("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0")
+        if problems:
+            raise ValueError(
+                "AI_ENTRY_PAYLOAD=lean tells the model the stretch rule is enforced in code; it needs "
+                + ", ".join(problems)
+                + "."
+            )
 
     @property
     def exchange_name(self) -> str:

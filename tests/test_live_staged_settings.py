@@ -23,6 +23,19 @@ def mapped(**override) -> Settings:
     return build_settings(**{**MAP_COMPANIONS, "ENTRY_REGIME_GATE": "map", **override})
 
 
+# What a lean payload needs before it may tell the model "an entry with |stretch_atr| above this
+# limit is rejected in code": a stretch gate that enforces, a limit to enforce, and no behind-schedule bypass.
+LEAN_COMPANIONS = {
+    "ENTRY_STRETCH_GATE_MODE": "enforce",
+    "ENTRY_STRETCH_GATE_MAX_ATR": "0.75",
+    "ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR": "0",
+}
+
+
+def lean(**override) -> Settings:
+    return build_settings(**{**LEAN_COMPANIONS, "AI_ENTRY_PAYLOAD": "lean", **override})
+
+
 class StagedSettingsTests(unittest.TestCase):
     def test_defaults_are_legacy_and_off(self):
         settings = build_settings()
@@ -145,6 +158,78 @@ class StagedSettingsTests(unittest.TestCase):
 
     def test_hurdle_is_a_float_and_can_be_overridden(self):
         self.assertEqual(mapped(SETUP_LEDGER_HURDLE_BPS="5.5").setup_ledger_hurdle_bps, 5.5)
+
+
+
+class LeanPayloadSettingsTests(unittest.TestCase):
+    """`AI_ENTRY_PAYLOAD=lean` states the stretch rule and narrows the offered sides as if the code
+    enforced them, so Settings refuses it unless the stretch gate really does. Legacy is never checked."""
+
+    def test_lean_boots_with_an_enforcing_stretch_gate(self):
+        for name, settings in (("gate off", lean()), ("map", mapped(AI_ENTRY_PAYLOAD="lean"))):
+            with self.subTest(name):
+                self.assertEqual(settings.ai_entry_payload, "lean")
+                self.assertEqual(settings.entry_stretch_gate_mode, "enforce")
+                self.assertEqual(settings.entry_stretch_gate_max_atr, 0.75)
+                self.assertEqual(settings.entry_stretch_gate_behind_schedule_entries_per_hour, 0.0)
+
+    def test_lean_refuses_a_stretch_gate_that_does_not_enforce(self):
+        for mode in ("off", "shadow"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError) as caught:
+                    lean(ENTRY_STRETCH_GATE_MODE=mode)
+                message = str(caught.exception)
+                self.assertIn("AI_ENTRY_PAYLOAD=lean", message)
+                self.assertIn("ENTRY_STRETCH_GATE_MODE=enforce", message)
+                self.assertNotIn("ENTRY_STRETCH_GATE_MAX_ATR", message)
+                self.assertNotIn("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR", message)
+
+    def test_lean_refuses_a_zero_stretch_limit(self):
+        with self.assertRaises(ValueError) as caught:
+            lean(ENTRY_STRETCH_GATE_MAX_ATR="0")
+        message = str(caught.exception)
+        self.assertIn("ENTRY_STRETCH_GATE_MAX_ATR above 0", message)
+        self.assertNotIn("ENTRY_STRETCH_GATE_MODE", message)
+
+    def test_lean_refuses_the_behind_schedule_relaxation(self):
+        for value in ("0.5", "3"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as caught:
+                    lean(ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=value)
+                message = str(caught.exception)
+                self.assertIn("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0", message)
+                self.assertNotIn("ENTRY_STRETCH_GATE_MODE", message)
+
+    def test_lean_names_every_missing_requirement_at_once(self):
+        with self.assertRaises(ValueError) as caught:
+            lean(
+                ENTRY_STRETCH_GATE_MODE="shadow",
+                ENTRY_STRETCH_GATE_MAX_ATR="0",
+                ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR="2",
+            )
+        message = str(caught.exception)
+        for need in (
+            "ENTRY_STRETCH_GATE_MODE=enforce",
+            "ENTRY_STRETCH_GATE_MAX_ATR above 0",
+            "ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0",
+        ):
+            self.assertIn(need, message)
+
+    def test_lean_under_map_still_needs_the_stretch_limit_and_no_relaxation(self):
+        with self.assertRaises(ValueError) as caught:
+            mapped(AI_ENTRY_PAYLOAD="lean", ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR="1")
+        self.assertIn("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0", str(caught.exception))
+
+    def test_legacy_is_never_checked(self):
+        for payload in ({}, {"AI_ENTRY_PAYLOAD": "legacy"}):
+            with self.subTest(payload=payload):
+                settings = build_settings(
+                    **payload,
+                    ENTRY_STRETCH_GATE_MODE="off",
+                    ENTRY_STRETCH_GATE_MAX_ATR="0",
+                    ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR="3",
+                )
+                self.assertEqual(settings.ai_entry_payload, "legacy")
 
 
 if __name__ == "__main__":

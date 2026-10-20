@@ -27,8 +27,9 @@ LEAN_PRIMARY_GOAL = (
     "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
     "HOLD is the expected answer most ticks."
 )
-# `entry_rules.rule`: the stretch gate runs in code after the model has answered.
-STRETCH_RULE_TEXT = "an entry beyond this limit is rejected in code"
+# `entry_rules.rule`: the stretch gate runs in code after the model has answered, on the absolute
+# stretch (a signed -0.9 is beyond a 0.75 limit). Settings only allows lean while that gate enforces.
+STRETCH_RULE_TEXT = "an entry with |stretch_atr| above this limit is rejected in code"
 # What the lean payload leaves out of `market_context`: the arena's factor and flow records and
 # its per-symbol scores. The arena still runs and is still recorded; only the model stops seeing it.
 _LEAN_DROPPED_CONTEXT_KEYS = frozenset({"factor_snapshots", "active_flow_signals", "new_flow_signals"})
