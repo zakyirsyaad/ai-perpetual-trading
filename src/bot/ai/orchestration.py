@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Sequence
 
@@ -19,18 +19,12 @@ from bot.ai.compact_context import (
     payload_hash,
 )
 from bot.ai.exit_policy import AIExitPolicy
+# SHADOW_SIDE_SOURCE is re-exported: it lived here before the shadow and ledger code moved to the mixin.
+from bot.ai.shadow_ledger import OPEN_ACTIONS, SHADOW_SIDE_SOURCE, ShadowLedgerMixin  # noqa: F401
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
-from bot.core.setup_ledger import (
-    EMPTY_BUCKET_LEDGER,
-    SHADOW_BLOCK_SOURCE,
-    STATUS_BLOCKED,
-    BucketLedger,
-    bucket_key,
-    ledger_status,
-    ledger_table,
-)
+from bot.core.setup_ledger import BucketLedger, bucket_key
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
@@ -39,18 +33,6 @@ from bot.storage.interfaces import TradeStoreProtocol
 from bot.strategy.base import ExitSignal
 
 _SIDES = frozenset({"long", "short"})
-_OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
-# `shadow_entries.source` of a mapped side that ENTRY_GATE_DIRECTION does not make live.
-SHADOW_SIDE_SOURCE = "shadow_side"
-# What one shadow row spacing is kept for: (symbol, side as stored, source, bucket_key).
-ShadowKey = tuple[str, str, str, str]
-# A setup-ledger snapshot younger than this is reused instead of read again (two paged GETs).
-LEDGER_CACHE_SECONDS = 300
-
-
-def _utc_now() -> datetime:
-    """The wall clock that stamps a shadow row's `decided_at` (one seam, so tests can move it)."""
-    return datetime.now(timezone.utc)
 
 
 @dataclass(slots=True)
@@ -70,8 +52,10 @@ class EntryCandidate:
     score: float
 
 
-class AIOrchestrator:
-    """Layer 2: coordinate brain decisions, risk state, market context, and learning memory."""
+class AIOrchestrator(ShadowLedgerMixin):
+    """Layer 2: coordinate brain decisions, risk state, market context, and learning memory.
+
+    The setup ledger and the shadow rows live in `ShadowLedgerMixin` (`bot/ai/shadow_ledger.py`)."""
 
     def __init__(
         self,
@@ -94,14 +78,7 @@ class AIOrchestrator:
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
         self._gate_context: dict[str, Any] | None = None
-        # `decided_at` of the last shadow row per (symbol, side, source, bucket_key), as written here or
-        # read from the store; the keys already read from the store this process (each is read once).
-        self._shadow_rows_written_at: dict[ShadowKey, datetime] = {}
-        self._shadow_seeded_keys: frozenset[ShadowKey] = frozenset()
-        # The last setup-ledger snapshot read without error and when it was read; in memory only, `None`
-        # until the first one. Reused for `LEDGER_CACHE_SECONDS`, and on a failed read whatever its age.
-        self._last_ledger_snapshot: dict[str, BucketLedger] | None = None
-        self._last_ledger_read_at: datetime | None = None
+        self._init_shadow_ledger_state()
 
     def _current_gate_context(self) -> dict[str, Any] | None:
         return self._gate_context
@@ -253,30 +230,6 @@ class AIOrchestrator:
             "max_stretch_atr": float(getattr(self._settings, "entry_stretch_gate_max_atr", 0.0) or 0.0),
             "rule": STRETCH_RULE_TEXT,
         }
-
-    def _ledger_lines(
-        self,
-        sides: Sequence[str],
-        features: dict[str, Any] | None,
-        ledger: dict[str, BucketLedger],
-    ) -> list[dict[str, Any]]:
-        """One line per offered side, from the tick's one ledger snapshot; `[]` unless the ledger enforces.
-
-        A `shadow` ledger records its verdict but still trades a `blocked` bucket, so showing the model that
-        status would describe a rule the code does not apply; the lean request then has no `setup_ledger`."""
-        if self._ledger_mode() != "enforce":
-            return []
-        verdicts = [(side, self._ledger_verdict(side, features, ledger)) for side in sides]
-        return [
-            {
-                "side": side,
-                "bucket": verdict["bucket"],
-                "n": verdict["n"],
-                "mean_bps": round(verdict["mean_bps"], 2) if verdict["mean_bps"] is not None else None,
-                "status": verdict["status"],
-            }
-            for side, verdict in verdicts
-        ]
 
     def _primary_symbol(self) -> str:
         symbols = list(getattr(self._settings, "symbols", ()) or ())
@@ -711,7 +664,7 @@ class AIOrchestrator:
         from -2 to +170 in replay. The volume mandate still wins when the day is
         behind schedule, so a stretched entry beats no entry then.
         """
-        mode = str(getattr(self._settings, "entry_stretch_gate_mode", "off") or "off").strip().lower()
+        mode = self._stretch_gate_mode()
         max_stretch = float(getattr(self._settings, "entry_stretch_gate_max_atr", 0.0) or 0.0)
         verdict: dict[str, Any] = {
             "mode": mode,
@@ -722,34 +675,10 @@ class AIOrchestrator:
             "behind_schedule": False,
             "entries_needed_per_hour": None,
         }
-        # Under `map` the regime picks the side. The gate context is read once, here, so the side
-        # and the decision's record come from the same hour.
-        mapped_gate = self._regime_gate_mode() == "map"
-        mapped_side = self._mapped_side() if mapped_gate else ""
-        if mapped_gate:
-            verdict["mapped_side"] = mapped_side
-            verdict["shadow_side"] = False
-        if decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
+        side_fields, allowed_side, other_side = self._resolve_gate_side(decision)
+        verdict.update(side_fields)
+        if allowed_side is None:
             return verdict
-        if mapped_gate:
-            # The mapped side goes on to the stretch check whatever ENTRY_STRETCH_GATE_MODE says; every
-            # other side, and an hour with no mapped side, is a direction block. A mapped side that
-            # ENTRY_GATE_DIRECTION does not make live is a shadow side: marked here, never traded.
-            allowed_side = mapped_side
-            other_side = decision.action != f"OPEN_{mapped_side.upper()}"
-            if other_side:
-                verdict["forced_by"] = "regime_gate"
-            else:
-                verdict["shadow_side"] = mapped_side not in self._live_sides(mapped_side)
-        else:
-            allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
-            other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
-            if other_side and self._settings.entry_regime_gate != "off":
-                # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
-                # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
-                verdict["forced_by"] = "regime_gate"
-            elif mode == "off":
-                return verdict
         # The side filter comes before the schedule relaxation on purpose: being behind
         # on volume may excuse a stretched entry, never the side that has no edge.
         if other_side:
@@ -783,6 +712,45 @@ class AIOrchestrator:
             verdict["reason"] = "stretch"
         return verdict
 
+    def _stretch_gate_mode(self) -> str:
+        return str(getattr(self._settings, "entry_stretch_gate_mode", "off") or "off").strip().lower()
+
+    def _resolve_gate_side(self, decision: EntryDecision) -> tuple[dict[str, Any], str | None, bool]:
+        """The side half of the entry gate: (verdict fields, allowed side, whether the decision is on another side).
+
+        The allowed side is `None` when the verdict is already final: a HOLD, or the stretch gate off with no
+        regime gate to force the side filter. The fields come in the verdict's key order: `mapped_side` and
+        `shadow_side` under `map`, then `forced_by` when the regime gate forces the side filter."""
+        fields: dict[str, Any] = {}
+        # Under `map` the regime picks the side. The gate context is read once, here, so the side
+        # and the decision's record come from the same hour.
+        mapped_gate = self._regime_gate_mode() == "map"
+        mapped_side = self._mapped_side() if mapped_gate else ""
+        if mapped_gate:
+            fields["mapped_side"] = mapped_side
+            fields["shadow_side"] = False
+        if decision.action not in OPEN_ACTIONS:
+            return fields, None, False
+        if mapped_gate:
+            # The mapped side goes on to the stretch check whatever ENTRY_STRETCH_GATE_MODE says; every
+            # other side, and an hour with no mapped side, is a direction block. A mapped side that
+            # ENTRY_GATE_DIRECTION does not make live is a shadow side: marked here, never traded.
+            other_side = decision.action != f"OPEN_{mapped_side.upper()}"
+            if other_side:
+                fields["forced_by"] = "regime_gate"
+            else:
+                fields["shadow_side"] = mapped_side not in self._live_sides(mapped_side)
+            return fields, mapped_side, other_side
+        allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
+        other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
+        if other_side and self._settings.entry_regime_gate != "off":
+            # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
+            # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
+            fields["forced_by"] = "regime_gate"
+        elif self._stretch_gate_mode() == "off":
+            return fields, None, False
+        return fields, allowed_side, other_side
+
     def _regime_gate_mode(self) -> str:
         return str(getattr(self._settings, "entry_regime_gate", "off") or "off").strip().lower()
 
@@ -809,288 +777,6 @@ class AIOrchestrator:
             return configured_sides
         side = self._mapped_side() if mapped is None else mapped
         return frozenset({side}) & configured_sides
-
-    def _ledger_mode(self) -> str:
-        return str(getattr(self._settings, "setup_ledger_mode", "off") or "off").strip().lower()
-
-    async def _ledger_snapshot(self) -> dict[str, BucketLedger]:
-        """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
-
-        Only `ledger_block` shadow rows count, so only those are read; `ledger_table` puts them and the
-        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A snapshot read
-        less than `LEDGER_CACHE_SECONDS` ago is reused without a read. A failed read is logged and reuses
-        the last snapshot read without error, whatever its age, so a transient store error lets no entry
-        into a blocked bucket (that trade would also end the bucket's reopening run). Before the first good
-        read it gives `{}`: every bucket reads `learning` for the tick, so the ledger fails open there (an
-        ERROR under `enforce`) and the regime and stretch gates still apply."""
-        if self._ledger_mode() == "off":
-            return {}
-        now = _utc_now()
-        last, read_at = self._last_ledger_snapshot, self._last_ledger_read_at
-        if last is not None and read_at is not None and (now - read_at).total_seconds() < LEDGER_CACHE_SECONDS:
-            return last
-        since = self._settings.setup_ledger_since
-        try:
-            trades = await self._trade_store.closed_trade_rows_since(since)
-            shadows = await self._trade_store.shadow_outcomes_since(since, source=SHADOW_BLOCK_SOURCE)
-            snapshot = ledger_table(trades, shadows)
-        except Exception as exc:  # noqa: BLE001 - a ledger read must never stop the entry path
-            failing_open = last is None
-            self._logger.log(
-                logging.ERROR if failing_open and self._ledger_mode() == "enforce" else logging.WARNING,
-                "Setup ledger could not be read (%s: %s); %s",
-                type(exc).__name__,
-                exc,
-                "every bucket reads as learning this tick." if failing_open else "the last snapshot is used this tick.",
-            )
-            return {} if failing_open else last
-        # Replaced, never mutated.
-        self._last_ledger_snapshot, self._last_ledger_read_at = snapshot, now
-        return snapshot
-
-    def _ledger_bucket(self, side: str, features: dict[str, Any] | None) -> str:
-        """`side|condition|atr_regime` for an entry on `side` now: the condition of the gate context set
-        before the strategy ran, the ATR regime of the symbol's 3m technicals."""
-        kondisi = str((self._current_gate_context() or {}).get("kondisi") or "")
-        return bucket_key(side, kondisi, build_setup_profile(features, side)["atr_regime"])
-
-    def _ledger_verdict(
-        self,
-        side: str,
-        features: dict[str, Any] | None,
-        ledger: dict[str, BucketLedger],
-    ) -> dict[str, Any]:
-        bucket = self._ledger_bucket(side, features)
-        # `ledger_table` keys only buckets with a counted row; any other bucket has no outcomes yet.
-        entry = ledger.get(bucket, EMPTY_BUCKET_LEDGER)
-        return {
-            "mode": self._ledger_mode(),
-            "bucket": bucket,
-            "n": entry.real.n,
-            "mean_bps": entry.real.mean_bps,
-            "upper_bps": entry.real.upper_bps,
-            # The two samples the status turns on once the real bound is below the hurdle.
-            "shadow_run_n": entry.shadow_run.n,
-            "shadow_run_upper_bps": entry.shadow_run.upper_bps,
-            "since_block_n": entry.real_since_block.n,
-            "since_block_upper_bps": entry.real_since_block.upper_bps,
-            "status": ledger_status(
-                entry,
-                int(self._settings.setup_ledger_min_samples),
-                float(self._settings.setup_ledger_hurdle_bps),
-            ),
-        }
-
-    def _with_ledger_verdict(
-        self,
-        gate_verdict: dict[str, Any],
-        decision: EntryDecision,
-        market_context: dict[str, Any],
-        ledger: dict[str, BucketLedger],
-    ) -> dict[str, Any]:
-        """The gate verdict plus `ledger` for an OPEN decision while the ledger is on; otherwise unchanged.
-
-        A new dict, so the stored decision (`payload_json.gate.ledger`) and the outcome read the same verdict."""
-        if self._ledger_mode() == "off" or decision.action not in _OPEN_ACTIONS:
-            return gate_verdict
-        side = "LONG" if decision.action == "OPEN_LONG" else "SHORT"
-        features = self._features_for_symbol(market_context, decision.symbol)
-        return {**gate_verdict, "ledger": self._ledger_verdict(side, features, ledger)}
-
-    def _shadow_source(self, decision: EntryDecision, gate_verdict: dict[str, Any]) -> str:
-        """Why a candidate that cleared every entry check is recorded instead of traded; `""` trades it.
-
-        A shadow side always; a `blocked` ledger bucket only under `enforce` (`shadow` logs it and trades)."""
-        # Truthiness, not `is True`: on this path any doubt must end in "not traded".
-        if gate_verdict.get("shadow_side"):
-            return SHADOW_SIDE_SOURCE
-        ledger = gate_verdict.get("ledger")
-        if not isinstance(ledger, dict) or ledger.get("status") != STATUS_BLOCKED:
-            return ""
-        if ledger.get("mode") == "enforce":
-            return SHADOW_BLOCK_SOURCE
-        self._logger.info(
-            "Setup ledger (shadow) would block %s: bucket %s has n=%s, upper bound %s bps below the hurdle.",
-            decision.symbol,
-            ledger.get("bucket"),
-            ledger.get("n"),
-            ledger.get("upper_bps"),
-        )
-        return ""
-
-    def _shadow_row(
-        self,
-        decision: EntryDecision,
-        candidate: EntryCandidate,
-        source: str,
-        market_context: dict[str, Any],
-        decided_at: datetime | None = None,
-    ) -> dict[str, Any]:
-        """One `shadow_entries` row for a candidate that is recorded, not traded (the store adds `exchange`).
-
-        The floor is the live neutral-exit level, `100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional` plus
-        the round-trip fee, capped at the candidate's take-profit. `decided_at` defaults to now. Raises
-        `ValueError` without a 3m price."""
-        features = self._features_for_symbol(market_context, decision.symbol) or {}
-        ref_price = float(features.get("last_price") or 0.0)
-        if not math.isfinite(ref_price) or ref_price <= 0:
-            raise ValueError(f"no 3m last price for {decision.symbol}")
-        side = candidate.direction.value
-        notional = float(self._settings.volume_profile.margin_per_entry_usdt) * float(self._settings.leverage)
-        floor_pct = min(
-            candidate.target.take_profit_pct,
-            100.0 * float(self._settings.volume_neutral_exit_min_net_usdt) / notional
-            + candidate.target.round_trip_fee_pct,
-        )
-        return {
-            "decided_at": decided_at if decided_at is not None else _utc_now(),
-            "symbol": decision.symbol,
-            "side": side.lower(),
-            "bucket_key": self._ledger_bucket(side, features),
-            "source": source,
-            "ref_price": ref_price,
-            "stop_loss_pct": candidate.target.stop_loss_pct,
-            "floor_pct": floor_pct,
-            "hold_minutes": int(self._settings.position_hold_minutes),
-        }
-
-    def _shadow_spacing(self) -> timedelta:
-        """The least time between two shadow rows of one (symbol, side, source, bucket).
-
-        A shadow row stands for a trade that was not taken; a real trade holds up to
-        `POSITION_HOLD_MINUTES` and is followed by `COOLDOWN_MINUTES_AFTER_ENTRY`, so rows closer than that
-        would overlap their walk windows, count one move several times and understate the SE."""
-        hold = int(getattr(self._settings, "position_hold_minutes", 0) or 0)
-        cooldown = int(getattr(self._settings, "cooldown_minutes_after_entry", 0) or 0)
-        return timedelta(minutes=hold + cooldown)
-
-    def _last_shadow_rows(self) -> dict[ShadowKey, datetime]:
-        return self._shadow_rows_written_at
-
-    def _shadow_key(self, symbol: str, side: str, source: str, market_context: dict[str, Any]) -> ShadowKey:
-        """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket."""
-        features = self._features_for_symbol(market_context, symbol)
-        return (symbol, side.lower(), source, self._ledger_bucket(side.upper(), features))
-
-    async def _last_shadow_row_at(self, key: ShadowKey) -> datetime | None:
-        """`decided_at` of the key's last row: from memory, else read from the store once per process.
-
-        The store read seeds the spacing after a restart. A failed read logs a WARNING and counts as no
-        earlier row (the row is written), and it is tried again the next time the key comes up."""
-        last = self._last_shadow_rows().get(key)
-        if last is not None or key in self._shadow_seeded_keys:
-            return last
-        try:
-            last = await self._trade_store.latest_shadow_decided_at(*key)
-        except Exception as exc:  # noqa: BLE001 - a seed read must never stop the entry path
-            self._logger.warning(
-                "Shadow row spacing for %s could not be read from the store (%s: %s); treated as no earlier row.",
-                "|".join(key),
-                type(exc).__name__,
-                exc,
-            )
-            return None
-        # Replaced, never mutated.
-        self._shadow_seeded_keys = self._shadow_seeded_keys | {key}
-        if last is not None:
-            self._shadow_rows_written_at = {**self._last_shadow_rows(), key: last}
-        return last
-
-    async def _spacing_left(self, key: ShadowKey, now: datetime) -> tuple[datetime, timedelta] | None:
-        """(last row's `decided_at`, time left) while the key's last row is inside the spacing; else None."""
-        last = await self._last_shadow_row_at(key)
-        if last is None:
-            return None
-        left = self._shadow_spacing() - (now - last)
-        return (last, left) if left > timedelta(0) else None
-
-    async def _shadow_only_hour_is_spaced(self, market_context: dict[str, Any]) -> bool:
-        """True, after one INFO line, when this tick's AI call could change nothing.
-
-        Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION` does not make live can trade nothing:
-        the mapped side becomes a `shadow_side` row and every other side is blocked. While every symbol's
-        row for that side and bucket is inside its spacing, no row would be written either."""
-        if self._regime_gate_mode() != "map":
-            return False
-        mapped = self._mapped_side()
-        if not mapped or mapped in self._live_sides(mapped):
-            return False
-        now = _utc_now()
-        waits: list[tuple[ShadowKey, datetime, timedelta]] = []
-        for symbol in self._settings.symbols:
-            key = self._shadow_key(str(symbol), mapped, SHADOW_SIDE_SOURCE, market_context)
-            spaced = await self._spacing_left(key, now)
-            if spaced is None:
-                return False
-            waits.append((key, *spaced))
-        if not waits:
-            return False
-        key, last, left = min(waits, key=lambda wait: wait[2])
-        self._logger.info(
-            "Shadow-only hour (%s maps %s, which is not traded here): the last shadow row for bucket %s was "
-            "decided at %s, %.1f min of the %.0f-minute spacing remain; holding without an AI call.",
-            (self._current_gate_context() or {}).get("kondisi") or "?",
-            mapped,
-            key[3],
-            last.isoformat(timespec="seconds"),
-            left.total_seconds() / 60.0,
-            self._shadow_spacing().total_seconds() / 60.0,
-        )
-        return True
-
-    async def _record_shadow_entry(
-        self,
-        decision: EntryDecision,
-        candidate: EntryCandidate,
-        source: str,
-        market_context: dict[str, Any],
-    ) -> None:
-        """Write the candidate's shadow row, at most one per (symbol, side, source, bucket) per spacing.
-
-        A row inside the spacing is skipped (one INFO line) and a failed write is logged; the caller drops
-        the candidate in every case. Only a written row starts the spacing. After a restart the spacing of
-        a key is seeded once from the store's newest row for it."""
-        key = self._shadow_key(decision.symbol, candidate.direction.value, source, market_context)
-        now = _utc_now()
-        spaced = await self._spacing_left(key, now)
-        if spaced is not None:
-            last, left = spaced
-            self._logger.info(
-                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for bucket %s was decided "
-                "at %s, %.1f min of the %.0f-minute spacing remain.",
-                decision.symbol,
-                candidate.direction.value,
-                source,
-                key[3],
-                last.isoformat(timespec="seconds"),
-                left.total_seconds() / 60.0,
-                self._shadow_spacing().total_seconds() / 60.0,
-            )
-            return
-        try:
-            row = self._shadow_row(decision, candidate, source, market_context, decided_at=now)
-            await self._trade_store.save_shadow_entry(row)
-        except Exception as exc:  # noqa: BLE001 - the candidate is not traded whether or not the row is saved
-            self._logger.warning(
-                "Entry candidate %s %s is not traded (%s), but its shadow row could not be saved (%s: %s).",
-                decision.symbol,
-                candidate.direction.value,
-                source,
-                type(exc).__name__,
-                exc,
-            )
-            return
-        # Replaced, never mutated.
-        self._shadow_rows_written_at = {**self._last_shadow_rows(), key: row["decided_at"]}
-        self._logger.info(
-            "Entry candidate %s %s is not traded (%s): shadow row for bucket %s, stop %.3f%%, floor %.3f%%.",
-            decision.symbol,
-            candidate.direction.value,
-            source,
-            row["bucket_key"],
-            row["stop_loss_pct"],
-            row["floor_pct"],
-        )
 
     def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
         if not isinstance(pacing, dict):

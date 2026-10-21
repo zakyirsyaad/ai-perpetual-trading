@@ -29,10 +29,7 @@ def _bare_orchestrator() -> AIOrchestrator:
     context, no shadow row times, no ledger snapshot); each test adds the collaborators it needs."""
     orchestrator = object.__new__(AIOrchestrator)
     orchestrator._gate_context = None
-    orchestrator._shadow_rows_written_at = {}
-    orchestrator._shadow_seeded_keys = frozenset()
-    orchestrator._last_ledger_snapshot = None
-    orchestrator._last_ledger_read_at = None
+    orchestrator._init_shadow_ledger_state()
     return orchestrator
 
 
@@ -1680,7 +1677,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
     T0 = datetime(2026, 10, 21, 3, 0, tzinfo=timezone.utc)
 
     async def _tick_at(self, orchestrator: AIOrchestrator, moment: datetime):
-        with mock.patch("bot.ai.orchestration._utc_now", return_value=moment):
+        with mock.patch("bot.ai.shadow_ledger._utc_now", return_value=moment):
             return await orchestrator.next_trade_plan(self._state())
 
     async def test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded(self) -> None:
