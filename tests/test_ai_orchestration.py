@@ -1758,6 +1758,14 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orchestrator._brain.calls, 4)
         self.assertIsNone(plan)   # the model answered OPEN_LONG, the wrong side in TURUN
 
+    async def test_a_shadow_only_hour_with_no_symbol_is_never_spaced(self) -> None:
+        # No symbol, no key to be spaced: the check gives way (and never takes the minimum of nothing).
+        orchestrator = self._orchestrator(_LedgerStore(), [], gate_context=self._naik(), symbols=[])
+
+        spaced = await orchestrator._shadow_only_hour_is_spaced(self._context(ema_21=self.NEAR_MEAN))
+
+        self.assertFalse(spaced)
+
     async def test_spacing_is_per_bucket(self) -> None:
         # One symbol, side and source, two ATR regimes: each bucket keeps its own spacing.
         store = _LedgerStore()
