@@ -453,14 +453,19 @@ class _EvaluatorStore:
 
 
 class _CandlesFrom:
-    """A venue whose 1m window starts at `start`, after every decision minute here."""
+    """A venue whose 1m window starts at `start`, after every decision minute here, and that serves the full
+    window it is asked for (only a full window that misses the decision minute expires a row)."""
 
     def __init__(self, start: datetime) -> None:
         self.start = start
 
     async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 120) -> list[dict]:
-        moment = int(self.start.timestamp() * 1000)
-        return [{"timestamp": moment, "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0}]
+        first = int(self.start.timestamp() * 1000)
+        return [
+            {"timestamp": first + 60_000 * index, "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+             "volume": 1.0}
+            for index in range(limit)
+        ]
 
 
 class EvaluatedBlockRowTests(unittest.IsolatedAsyncioTestCase):

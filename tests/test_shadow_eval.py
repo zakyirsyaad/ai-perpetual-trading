@@ -345,14 +345,39 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.completed[0][2], "time")
 
-    async def test_a_window_missing_the_decision_minute_expires(self) -> None:
-        # Every candle of the hold is there, but the decision-minute candle that prices the walk is not.
-        store = FakeShadowStore([_row(1)])
-        client = FakeKlineClient(_quiet(HOLD + 2))  # oldest candle opens at decision minute + 1
+    async def test_a_short_answer_past_the_decision_minute_stays_pending(self) -> None:
+        # Every candle of the hold is there, but the decision-minute candle is not, and the venue served fewer
+        # candles than were asked for: it did not honour the limit, so the row stays pending (not expired) and
+        # the loop stops, as for any venue failure.
+        for now, candles in (
+            (self.NOW, _quiet(HOLD + 2)),   # limit 10, 7 served
+            (DECISION_MINUTE + timedelta(days=3), _quiet(500, start_minute=3 * 1440 - 500)),   # limit 1000, 500 served
+        ):
+            with self.subTest(served=len(candles)):
+                store = FakeShadowStore([_row(1), _row(2)])
+                client = FakeKlineClient(candles)
 
-        done = await evaluate_pending(store, client, now=self.NOW, logger=_logger(), max_hold_minutes=HOLD)
+                with self.assertLogs(LOG_NAME, level="WARNING") as captured:
+                    done = await evaluate_pending(store, client, now=now, logger=_logger(), max_hold_minutes=HOLD)
 
-        self.assertEqual((done, store.completed), (1, [(1, None, "expired")]))
+                self.assertEqual((done, store.completed), (0, []))
+                self.assertEqual(len(client.calls), 1)   # the loop stopped at the first row
+                self.assertIn("2 row(s) stay pending", "\n".join(captured.output))
+
+    async def test_a_full_window_past_the_decision_minute_expires(self) -> None:
+        # The venue served the whole window it was asked for (the forming candle may be dropped, so limit - 1
+        # counts as full) and it still starts after the decision minute: that candle is gone for good.
+        now = DECISION_MINUTE + timedelta(days=3)
+        for served in (CANDLE_WINDOW, CANDLE_WINDOW - 1):
+            with self.subTest(served=served):
+                newest = [_candle(now - timedelta(minutes=served - index)) for index in range(served)]
+                store = FakeShadowStore([_row(9)])
+                client = FakeKlineClient(newest)
+
+                done = await evaluate_pending(store, client, now=now, logger=_logger(), max_hold_minutes=HOLD)
+
+                self.assertEqual(client.calls[0][2], CANDLE_WINDOW)
+                self.assertEqual((done, store.completed), (1, [(9, None, "expired")]))
 
     async def test_a_hole_at_the_decision_minute_expires(self) -> None:
         before = _candle(DECISION_MINUTE - timedelta(minutes=1))

@@ -222,8 +222,9 @@ async def _evaluate_rows(
 async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -> Optional[Outcome]:
     """The result for one row, or None while its hold has not fully played out on closed candles.
 
-    The walk starts from the close of the decision-minute candle. A window that no longer holds that candle
-    completes the row as `expired`. Raises `_VenueFailure` when the venue gives no usable candles, and
+    The walk starts from the close of the decision-minute candle. A full window (at least `limit - 1`
+    candles) that no longer holds that candle completes the row as `expired`; a shorter one that does not
+    reach it is a venue failure. Raises `_VenueFailure` when the venue gives no usable candles, and
     `KeyError`/`TypeError`/`ValueError` when the row itself is unusable. The stored `ref_price` is only
     checked as part of the row; it never prices the walk.
     """
@@ -249,7 +250,14 @@ async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -
     except Exception as exc:  # noqa: BLE001 - any failure to obtain usable candles is the venue's
         raise _VenueFailure(f"klines for {symbol} failed ({type(exc).__name__}: {exc})") from exc
     if oldest_ms > decision_ms:
-        return None, REASON_EXPIRED  # the window no longer reaches back to the decision-minute candle
+        # A full window (the forming candle may be dropped) that no longer reaches back to the decision-minute
+        # candle has lost it for good. A shorter answer did not honour the limit and proves nothing.
+        if len(candles) < limit - 1:
+            raise _VenueFailure(
+                f"klines for {symbol} returned {len(candles)} of the {limit} candles asked for, "
+                "without the decision minute"
+            )
+        return None, REASON_EXPIRED
     if len(after) < hold_minutes:
         return None
     if reference is None:
