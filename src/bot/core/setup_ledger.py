@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Any
 
 # Store timestamps are read the way the shadow evaluator reads `decided_at`: offset required, UTC out.
-from bot.core.shadow_eval import _parse_utc
+from bot.core.shadow_eval import parse_utc
 
 # One-sided 90 % normal quantile: the bound is mean + Z * SE.
 Z_ONE_SIDED_90 = 1.28
@@ -211,7 +211,7 @@ def _moment(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
     try:
-        return _parse_utc(value)
+        return parse_utc(value)
     except (TypeError, ValueError):
         return None
 

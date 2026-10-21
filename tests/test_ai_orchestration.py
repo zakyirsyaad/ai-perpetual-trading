@@ -24,6 +24,18 @@ def _approved_review() -> RiskReview:
     )
 
 
+def _bare_orchestrator() -> AIOrchestrator:
+    """An orchestrator built without `__init__`, holding the in-memory state `__init__` sets (no gate
+    context, no shadow row times, no ledger snapshot); each test adds the collaborators it needs."""
+    orchestrator = object.__new__(AIOrchestrator)
+    orchestrator._gate_context = None
+    orchestrator._shadow_rows_written_at = {}
+    orchestrator._shadow_seeded_keys = frozenset()
+    orchestrator._last_ledger_snapshot = None
+    orchestrator._last_ledger_read_at = None
+    return orchestrator
+
+
 def _volume_run_settings() -> SimpleNamespace:
     """Settings mirroring the live volume-building run where trade-suppressing
     gates are removed (confidence/systemic/RR floors no longer veto)."""
@@ -49,7 +61,7 @@ def _volume_run_settings() -> SimpleNamespace:
 
 class EntryGateRemovalTests(unittest.IsolatedAsyncioTestCase):
     def _orchestrator(self) -> AIOrchestrator:
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = _volume_run_settings()
         orchestrator._logger = logging.getLogger("test.entry_gate_removal")
         return orchestrator
@@ -119,7 +131,7 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         store = FakeTradeStore()
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = SimpleNamespace(
             strategy_mode="grok",
             okx_instrument_type="SWAP",
@@ -166,7 +178,7 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.memory_limit, 24)
 
     async def test_candidate_to_trade_plan_uses_candidate_direction(self) -> None:
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = SimpleNamespace(
             strategy_mode="grok",
             account_balance_usdt=60.0,
@@ -209,7 +221,7 @@ class AIOrchestrationRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.take_profit_pct, 1.0)
 
     async def test_ai_volume_plan_uses_volume_margin_size(self) -> None:
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = SimpleNamespace(
             strategy_mode="ai_volume",
             account_balance_usdt=1500.0,
@@ -262,7 +274,7 @@ if __name__ == "__main__":
 
 class MergedRiskReviewGateTests(unittest.TestCase):
     def _orchestrator(self) -> AIOrchestrator:
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = _volume_run_settings()
         orchestrator._logger = logging.getLogger("test.risk_review")
         return orchestrator
@@ -361,7 +373,7 @@ class StopLossCeilingTests(unittest.TestCase):
         settings = _volume_run_settings()
         for key, value in overrides.items():
             setattr(settings, key, value)
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.stop_loss_ceiling")
         return orchestrator
@@ -511,8 +523,7 @@ class EntryPacingRecordTests(unittest.IsolatedAsyncioTestCase):
 
         store = FakeTradeStore()
         brain = FakeBrain()
-        orchestrator = object.__new__(AIOrchestrator)
-        orchestrator._gate_context = None
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = SimpleNamespace(
             strategy_mode="ai_volume",
             symbols=["BTC/USDT"],
@@ -597,7 +608,7 @@ class EntryStretchGateTests(unittest.TestCase):
         return SimpleNamespace(**data)
 
     def _orchestrator(self, **overrides) -> AIOrchestrator:
-        orchestrator = object.__new__(AIOrchestrator)
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = self._settings(**overrides)
         orchestrator._logger = logging.getLogger("test.stretch_gate")
         return orchestrator
@@ -1225,12 +1236,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
             async def build_context(self) -> SimpleNamespace:
                 return SimpleNamespace(to_dict=lambda: context)
 
-        orchestrator = object.__new__(AIOrchestrator)
-        orchestrator._gate_context = None
-        orchestrator._shadow_rows_written_at = {}
-        orchestrator._shadow_seeded_keys = frozenset()
-        orchestrator._last_ledger_snapshot = None
-        orchestrator._last_ledger_read_at = None
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.ledger")
         orchestrator._brain = Brain()
@@ -2010,12 +2016,7 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
                 builds.append("context")
                 return SimpleNamespace(to_dict=lambda: context)
 
-        orchestrator = object.__new__(AIOrchestrator)
-        orchestrator._gate_context = None
-        orchestrator._shadow_rows_written_at = {}
-        orchestrator._shadow_seeded_keys = frozenset()
-        orchestrator._last_ledger_snapshot = None
-        orchestrator._last_ledger_read_at = None
+        orchestrator = _bare_orchestrator()
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.lean")
         orchestrator._brain = Brain()

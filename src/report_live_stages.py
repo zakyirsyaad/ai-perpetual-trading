@@ -34,7 +34,7 @@ from bot.config import Settings
 from bot.core.forward_summary import PER_MILLION, WIB, format_number, format_percent
 from bot.core.setup_ledger import SHADOW_BLOCK_SOURCE, bucket_stats, gross_bps, ledger_status, ledger_table
 from bot.logger import setup_logging
-from bot.storage.supabase_trade_store import SupabaseTradeStore, _parse_timestamp
+from bot.storage.supabase_trade_store import SupabaseTradeStore, parse_timestamp
 
 __all__ = [
     "StageSummary",
@@ -139,7 +139,7 @@ def _stage_bounds(starts: Sequence[datetime], until: datetime) -> list[tuple[dat
 
 
 def _trade_facts(row: Mapping[str, Any]) -> _TradeFacts | None:
-    closed_at = _parse_timestamp(row.get("closed_at"))
+    closed_at = parse_timestamp(row.get("closed_at"))
     if closed_at is None:
         return None
     entry = _number(row.get("entry_price"))
@@ -205,7 +205,7 @@ def _within(
     kept: list[Mapping[str, Any]] = []
     unreadable = 0
     for row in rows:
-        moment = _parse_timestamp(row.get(column))
+        moment = parse_timestamp(row.get(column))
         if moment is None:
             unreadable += 1
         elif since <= moment < until:

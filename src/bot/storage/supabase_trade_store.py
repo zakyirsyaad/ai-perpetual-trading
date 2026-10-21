@@ -35,7 +35,8 @@ def _normalise_iso(value: Any) -> str:
     return _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
 
 
-def _parse_timestamp(value: Any) -> datetime | None:
+def parse_timestamp(value: Any) -> datetime | None:
+    """A datetime from a Supabase timestamp, `None` when missing or unreadable; one without an offset is UTC."""
     text = _normalise_iso(value)
     if not text:
         return None
@@ -44,6 +45,10 @@ def _parse_timestamp(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+# The old private name, kept so nothing that imported it breaks.
+_parse_timestamp = parse_timestamp
 
 
 _CLOSED_TRADE_COLUMNS = (
@@ -314,7 +319,7 @@ class SupabaseTradeStore:
                 ("limit", "1"),
             ],
         )
-        return _parse_timestamp(rows[0].get("decided_at")) if rows else None
+        return parse_timestamp(rows[0].get("decided_at")) if rows else None
 
     async def complete_shadow_entry(self, entry_id: int, gross_bps: float | None, exit_reason: str) -> None:
         """Close one shadow row. `gross_bps=None` (an expired row) still stamps `evaluated_at`, so it never pends again."""
@@ -408,7 +413,7 @@ class SupabaseTradeStore:
         rows = await self._all_closed_trade_rows("closed_at,entry_price,exit_price,quantity")
         by_day: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            closed = _parse_timestamp(row.get("closed_at"))
+            closed = parse_timestamp(row.get("closed_at"))
             if closed is None:
                 continue
             by_day.setdefault(closed.astimezone(self._trading_tz).date().isoformat(), []).append(row)
@@ -421,7 +426,7 @@ class SupabaseTradeStore:
         days: dict[str, dict[str, int]] = {}
 
         def bucket(stamp: Any) -> dict[str, int] | None:
-            moment = _parse_timestamp(stamp)
+            moment = parse_timestamp(stamp)
             if moment is None:  # an unreadable row costs that row, not the whole series
                 return None
             return days.setdefault(moment.astimezone(self._trading_tz).date().isoformat(), dict.fromkeys(_USAGE_FIELDS, 0))
@@ -520,8 +525,8 @@ class SupabaseTradeStore:
         trades: list[ClosedTrade] = []
         for row in rows:
             try:
-                opened = _parse_timestamp(row.get("opened_at"))
-                closed = _parse_timestamp(row.get("closed_at"))
+                opened = parse_timestamp(row.get("opened_at"))
+                closed = parse_timestamp(row.get("closed_at"))
                 if opened is None or closed is None:
                     raise ValueError("unreadable timestamp")
                 trades.append(

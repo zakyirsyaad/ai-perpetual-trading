@@ -7,10 +7,12 @@ completes at most three due rows per call and never lets one bad row stop the ot
 from __future__ import annotations
 
 import asyncio
+import ast
 import logging
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 from bot.core.shadow_eval import (
@@ -726,6 +728,48 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         entry_id, bps, reason = store.completed[0]
         self.assertEqual((entry_id, reason), (1, "time"))
         self.assertAlmostEqual(bps, 10.0)
+
+
+class ModuleBoundaryTests(unittest.TestCase):
+    """The core reads timestamps through one public parser each and never imports the telemetry package."""
+
+    CORE = ("src/bot/core/shadow_eval.py", "src/bot/core/setup_ledger.py")
+
+    @staticmethod
+    def _imports(path: str) -> set[str]:
+        tree = ast.parse((Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module)
+            elif isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+        return names
+
+    def test_the_core_does_not_import_telemetry(self) -> None:
+        for path in self.CORE:
+            with self.subTest(path=path):
+                self.assertEqual([name for name in self._imports(path) if name.startswith("bot.telemetry")], [])
+        self.assertIn("bot.asyncutil", self._imports("src/bot/core/shadow_eval.py"))
+
+    def test_with_timeout_has_one_definition_re_exported_by_telemetry(self) -> None:
+        from bot import asyncutil
+        from bot.telemetry import ws
+
+        self.assertIs(ws.with_timeout, asyncutil.with_timeout)
+
+    def test_the_timestamp_parsers_are_public_with_their_old_names_as_aliases(self) -> None:
+        from bot.core import setup_ledger, shadow_eval
+        from bot.storage import supabase_trade_store
+
+        self.assertIs(shadow_eval._parse_utc, shadow_eval.parse_utc)
+        self.assertIs(supabase_trade_store._parse_timestamp, supabase_trade_store.parse_timestamp)
+        self.assertIn("parse_utc", vars(setup_ledger))
+        self.assertNotIn("_parse_utc", vars(setup_ledger))
+        report_imports = self._imports("src/report_live_stages.py")
+        self.assertIn("bot.storage.supabase_trade_store", report_imports)
+        report_source = (Path(__file__).resolve().parents[1] / "src/report_live_stages.py").read_text(encoding="utf-8")
+        self.assertNotIn("_parse_timestamp", report_source)
 
 
 if __name__ == "__main__":  # pragma: no cover

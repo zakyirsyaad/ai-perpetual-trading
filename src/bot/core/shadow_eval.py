@@ -20,8 +20,9 @@ budget for the whole call, and the first venue failure stops the row loop (a dow
 row). A row that can never be evaluated (malformed fields, non-positive levels) is closed as `invalid`
 instead of pending forever, so it cannot hold one of the three slots of every tick.
 
-The only bot import is the cancellation-safe timeout helper; the module must stay free of
-`pine_indicators` and `strategy.modes`.
+The only bot import is the cancellation-safe timeout helper (`bot.asyncutil`, not the telemetry package);
+the module must stay free of `pine_indicators` and `strategy.modes`. `parse_utc` is the strict store
+timestamp reader the setup ledger shares.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
-from bot.telemetry.ws import with_timeout
+from bot.asyncutil import with_timeout
 
 STOP_SLIP_BPS = 1.0
 MAX_ROWS_PER_TICK = 3
@@ -228,7 +229,7 @@ async def _outcome(client: KlineClient, row: Mapping[str, Any], now: datetime) -
     `KeyError`/`TypeError`/`ValueError` when the row itself is unusable. The stored `ref_price` is only
     checked as part of the row; it never prices the walk.
     """
-    decision_minute = _parse_utc(row["decided_at"]).replace(second=0, microsecond=0)
+    decision_minute = parse_utc(row["decided_at"]).replace(second=0, microsecond=0)
     symbol = str(row["symbol"])
     side = str(row["side"])
     ref_price = float(row["ref_price"])
@@ -280,7 +281,7 @@ def _reference_close(candle: Mapping[str, Any], symbol: str) -> float:
     return close
 
 
-def _parse_utc(value: Any) -> datetime:
+def parse_utc(value: Any) -> datetime:
     """A timezone-aware UTC datetime from a store timestamp, on Python 3.10 as on 3.11.
 
     `datetime.fromisoformat` takes only 3 or 6 fraction digits and no `Z` before 3.11, while Postgres trims
@@ -298,6 +299,10 @@ def _parse_utc(value: Any) -> datetime:
     if moment.tzinfo is None:
         raise ValueError(f"timestamp has no timezone: {value!r}")
     return moment.astimezone(timezone.utc)
+
+
+# The old private name, kept so nothing that imported it breaks.
+_parse_utc = parse_utc
 
 
 def _offset(text: str) -> str:

@@ -104,8 +104,7 @@ class AIOrchestrator:
         self._last_ledger_read_at: datetime | None = None
 
     def _current_gate_context(self) -> dict[str, Any] | None:
-        # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
-        return getattr(self, "_gate_context", None)
+        return self._gate_context
 
     def set_gate_context(self, context: dict[str, Any]) -> None:
         """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
@@ -966,8 +965,7 @@ class AIOrchestrator:
         return timedelta(minutes=hold + cooldown)
 
     def _last_shadow_rows(self) -> dict[ShadowKey, datetime]:
-        # `getattr`: an orchestrator built without `__init__` (tests) has written no row yet.
-        return getattr(self, "_shadow_rows_written_at", None) or {}
+        return self._shadow_rows_written_at
 
     def _shadow_key(self, symbol: str, side: str, source: str, market_context: dict[str, Any]) -> ShadowKey:
         """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket."""
@@ -1164,8 +1162,9 @@ class AIOrchestrator:
         # spend can be attributed to individual decisions.
         call_metrics = getattr(self._brain, "last_call_metrics", None)
         ai_call_id = getattr(call_metrics, "call_id", None)
-        if self._gate_context:
-            gate = {**(gate or {}), "regime": self._gate_context}
+        gate_context = self._current_gate_context()
+        if gate_context:
+            gate = {**(gate or {}), "regime": gate_context}
         payload_json = {
             "decision": decision.model_dump(),
             "request": request_payload,
