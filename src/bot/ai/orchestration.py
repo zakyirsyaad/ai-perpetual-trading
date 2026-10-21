@@ -9,18 +9,22 @@ from typing import Any
 
 from bot.arena.agents import MarketAnalyzer, SignalDesigner
 from bot.ai.brain import EntryDecision, GrokBrain
-from bot.ai.compact_context import CompactDecisionContextBuilder, payload_hash
+from bot.ai.compact_context import PAYLOAD_PROFILE_LEAN, CompactDecisionContextBuilder, payload_hash
+from bot.ai.entry_gate import EntryGateMixin
 from bot.ai.exit_policy import AIExitPolicy
+from bot.ai.lean_payload import LeanPayloadMixin
+# SHADOW_SIDE_SOURCE is re-exported: it lived here before the shadow and ledger code moved to the mixin.
+from bot.ai.shadow_ledger import SHADOW_SIDE_SOURCE, ShadowLedgerMixin  # noqa: F401
 from bot.ai.trade_memory import build_trade_decision_memory
 from bot.arena.setup_profile import build_setup_profile
 from bot.config import Settings
+from bot.core.setup_ledger import BucketLedger, bucket_key
 from bot.intelligence.market_intelligence import MarketIntelligence
 from bot.models import OpenPosition, PositionDirection, TradePlan
 from bot.risk.risk_manager import DailyRiskState
 from bot.storage.supabase_journal import SupabaseJournal
 from bot.storage.interfaces import TradeStoreProtocol
 from bot.strategy.base import ExitSignal
-
 
 @dataclass(slots=True)
 class ResolvedTradeTargets:
@@ -39,8 +43,12 @@ class EntryCandidate:
     score: float
 
 
-class AIOrchestrator:
-    """Layer 2: coordinate brain decisions, risk state, market context, and learning memory."""
+class AIOrchestrator(EntryGateMixin, LeanPayloadMixin, ShadowLedgerMixin):
+    """Layer 2: coordinate brain decisions, risk state, market context, and learning memory.
+
+    The entry gate's side and stretch checks live in `EntryGateMixin` (`bot/ai/entry_gate.py`), the lean
+    entry request in `LeanPayloadMixin` (`bot/ai/lean_payload.py`), the setup ledger and the shadow rows in
+    `ShadowLedgerMixin` (`bot/ai/shadow_ledger.py`)."""
 
     def __init__(
         self,
@@ -63,6 +71,10 @@ class AIOrchestrator:
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
         self._gate_context: dict[str, Any] | None = None
+        self._init_shadow_ledger_state()
+
+    def _current_gate_context(self) -> dict[str, Any] | None:
+        return self._gate_context
 
     def set_gate_context(self, context: dict[str, Any]) -> None:
         """Keep the regime verdict; `_record_ai_decision` writes it under `payload_json.gate.regime`.
@@ -75,29 +87,19 @@ class AIOrchestrator:
         await self._intelligence.close()
 
     async def next_trade_plan(self, daily_state: DailyRiskState) -> TradePlan | None:
+        lean = self._payload_profile() == PAYLOAD_PROFILE_LEAN
+        # The sides the lean request offers come from the gate context set before the strategy ran,
+        # the same one the stretch gate and the ledger bucket read below.
+        lean_sides = self._lean_sides_offered() if lean else []
+        if lean and not lean_sides:
+            return None
         market_context = await self._intelligence.build_context()
-        recent_performance = await self._trade_store.recent_performance_summary(
-            limit=self._settings.ai_recent_performance_limit,
-        )
-        recent_trade_records = await self._trade_store.recent_closed_trade_records(
-            limit=self._settings.ai_trade_memory_limit,
-        )
-        learned_trade_memory = build_trade_decision_memory(recent_trade_records)
         context_dict = market_context.to_dict()
-        # The full context still feeds deterministic execution, attribution, and the
-        # audit record below; only the AI representation is compacted.
-        payload = self._compact_context.build_entry_payload(
-            market_context=context_dict,
-            daily_state=daily_state,
-            recent_performance=recent_performance,
-            trade_memory=learned_trade_memory,
-            strategy_objective=self._strategy_objective_payload(),
-            arena_reviews=[
-                self._market_analyzer.review(context_dict).to_dict(),
-                self._signal_designer.review(context_dict).to_dict(),
-            ],
-        )
-        decisions = await self._brain.entry_decisions(payload)
+        # Read once per tick, and only while the ledger is on; `{}` otherwise.
+        ledger = await self._ledger_snapshot()
+        if await self._call_is_spaced(context_dict, ledger):
+            return None
+        payload, decisions = await self._ask_for_entries(context_dict, daily_state, lean, lean_sides, ledger)
         if decisions is None:
             return None
 
@@ -111,9 +113,7 @@ class AIOrchestrator:
 
         candidates: list[EntryCandidate] = []
         for decision in decisions:
-            gate_verdict = self._stretch_gate_verdict(decision, context_dict, pacing)
-            await self._record_ai_decision(decision, payload, pacing, gate_verdict)
-            candidate = self._build_entry_candidate(decision, context_dict, gate_verdict)
+            candidate = await self._route_decision(decision, payload, pacing, context_dict, ledger)
             if candidate is not None:
                 candidates.append(candidate)
 
@@ -128,7 +128,72 @@ class AIOrchestrator:
             candidate.score,
             len(candidates),
         )
+        # The trade may open and close before the next strategy call; that call must read the ledger again.
+        self._expire_ledger_snapshot()
         return await self._candidate_to_trade_plan(candidate, context_dict)
+
+    async def _ask_for_entries(
+        self,
+        context_dict: dict[str, Any],
+        daily_state: DailyRiskState,
+        lean: bool,
+        lean_sides: list[str],
+        ledger: dict[str, BucketLedger],
+    ) -> tuple[dict[str, Any], list[EntryDecision] | None]:
+        """The tick's one entry call: (the request sent, the decisions or None on a failed call)."""
+        # The full context still feeds deterministic execution, attribution, and the
+        # audit record below; only the AI representation is compacted.
+        if lean:
+            payload = self._lean_entry_payload(context_dict, daily_state, lean_sides, ledger)
+            # The lean request goes out under the lean system prompt; legacy keeps today's call as it was.
+            return payload, await self._brain.entry_decisions(payload, lean=True)
+        payload = await self._legacy_entry_payload(context_dict, daily_state)
+        return payload, await self._brain.entry_decisions(payload)
+
+    async def _route_decision(
+        self,
+        decision: EntryDecision,
+        payload: dict[str, Any],
+        pacing: dict[str, Any] | None,
+        context_dict: dict[str, Any],
+        ledger: dict[str, BucketLedger],
+    ) -> EntryCandidate | None:
+        """Judge and record one decision; its candidate when it may trade, else None (no candidate, or a
+        shadow one, which is written to `shadow_entries` instead)."""
+        gate_verdict = self._with_ledger_verdict(
+            self._stretch_gate_verdict(decision, context_dict, pacing), decision, context_dict, ledger
+        )
+        await self._record_ai_decision(decision, payload, pacing, gate_verdict)
+        candidate = self._build_entry_candidate(decision, context_dict, gate_verdict)
+        if candidate is None:
+            return None
+        shadow_source = self._shadow_source(decision, gate_verdict)
+        if shadow_source:
+            # Recorded for the shadow evaluator and never traded, even when the row is skipped by the
+            # spacing or cannot be saved.
+            await self._record_shadow_entry(decision, candidate, shadow_source, context_dict)
+            return None
+        return candidate
+
+    async def _legacy_entry_payload(self, context_dict: dict[str, Any], daily_state: DailyRiskState) -> dict[str, Any]:
+        """Today's request. Its trade history and arena reviews feed this request and nothing else."""
+        recent_performance = await self._trade_store.recent_performance_summary(
+            limit=self._settings.ai_recent_performance_limit,
+        )
+        recent_trade_records = await self._trade_store.recent_closed_trade_records(
+            limit=self._settings.ai_trade_memory_limit,
+        )
+        return self._compact_context.build_entry_payload(
+            market_context=context_dict,
+            daily_state=daily_state,
+            recent_performance=recent_performance,
+            trade_memory=build_trade_decision_memory(recent_trade_records),
+            strategy_objective=self._strategy_objective_payload(),
+            arena_reviews=[
+                self._market_analyzer.review(context_dict).to_dict(),
+                self._signal_designer.review(context_dict).to_dict(),
+            ],
+        )
 
     def _dedupe_entry_decisions(self, decisions: list[EntryDecision]) -> list[EntryDecision]:
         result: list[EntryDecision] = []
@@ -267,7 +332,7 @@ class AIOrchestrator:
             decision_payload=decision.model_dump(),
             confidence=decision.confidence,
             factor_metadata=self._factor_metadata_for_symbol(
-                market_context, decision.symbol, direction.value
+                market_context, decision.symbol, direction.value, self._current_gate_context()
             ),
             trigger_metadata=self._trigger_metadata_for_symbol(market_context, decision.symbol),
         )
@@ -535,94 +600,6 @@ class AIOrchestrator:
             return False
         return True
 
-    def _stretch_gate_verdict(
-        self,
-        decision: EntryDecision,
-        market_context: dict[str, Any],
-        pacing: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        """Judge one entry by how far price sits from its own mean.
-
-        Entries opened more than `ENTRY_STRETCH_GATE_MAX_ATR` from the 21-EMA are
-        the measured loss source; keeping only near-mean entries moved gross/1M
-        from -2 to +170 in replay. The volume mandate still wins when the day is
-        behind schedule, so a stretched entry beats no entry then.
-        """
-        mode = str(getattr(self._settings, "entry_stretch_gate_mode", "off") or "off").strip().lower()
-        max_stretch = float(getattr(self._settings, "entry_stretch_gate_max_atr", 0.0) or 0.0)
-        verdict: dict[str, Any] = {
-            "mode": mode,
-            "verdict": "allow",
-            "stretch_atr": None,
-            "bucket": "unknown",
-            "max_stretch_atr": max_stretch,
-            "behind_schedule": False,
-            "entries_needed_per_hour": None,
-        }
-        if decision.action not in ("OPEN_LONG", "OPEN_SHORT"):
-            return verdict
-        allowed_side = str(self._settings.entry_gate_direction or "any").strip().lower()
-        other_side = allowed_side != "any" and decision.action != f"OPEN_{allowed_side.upper()}"
-        if other_side and self._settings.entry_regime_gate != "off":
-            # The LONG-only forward bot: with the regime gate on, the side filter enforces whatever
-            # ENTRY_STRETCH_GATE_MODE says. `mode` stays as configured; `forced_by` records why it enforced.
-            verdict["forced_by"] = "regime_gate"
-        elif mode == "off":
-            return verdict
-        # The side filter comes before the schedule relaxation on purpose: being behind
-        # on volume may excuse a stretched entry, never the side that has no edge.
-        if other_side:
-            verdict["verdict"] = "block"
-            verdict["reason"] = "direction"
-            verdict["allowed_direction"] = allowed_side
-            return verdict
-
-        if max_stretch <= 0:
-            return verdict
-
-        features = self._features_for_symbol(market_context, decision.symbol)
-        setup = build_setup_profile(features, "LONG" if decision.action == "OPEN_LONG" else "SHORT")
-        stretch = setup.get("stretch_atr")
-        verdict["stretch_atr"] = stretch
-        verdict["bucket"] = setup.get("stretch_bucket")
-
-        needed = self._entries_needed_per_hour(pacing)
-        verdict["entries_needed_per_hour"] = needed
-        threshold = float(
-            getattr(self._settings, "entry_stretch_gate_behind_schedule_entries_per_hour", 0.0) or 0.0
-        )
-        if threshold > 0 and needed is not None and needed >= threshold:
-            verdict["behind_schedule"] = True
-            return verdict
-
-        # An unreadable setup is not evidence of a bad entry; only a measured
-        # stretch beyond the limit blocks.
-        if stretch is not None and abs(float(stretch)) > max_stretch:
-            verdict["verdict"] = "block"
-            verdict["reason"] = "stretch"
-        return verdict
-
-    def _entries_needed_per_hour(self, pacing: dict[str, Any] | None) -> float | None:
-        if not isinstance(pacing, dict):
-            return None
-        target = float(pacing.get("target_volume_per_day_usdt") or 0.0)
-        done = float(pacing.get("volume_today_usdt") or 0.0)
-        hours = float(pacing.get("hours_remaining_in_trading_day") or 0.0)
-        profile = getattr(self._settings, "volume_profile", None)
-        per_entry = float(getattr(profile, "volume_per_entry_usdt", 0.0) or 0.0)
-        if per_entry <= 0:
-            margin = float(
-                getattr(profile, "margin_per_entry_usdt", 0.0)
-                or getattr(self._settings, "position_usdt", 0.0)
-                or 0.0
-            )
-            per_entry = margin * float(getattr(self._settings, "leverage", 0) or 0) * float(
-                getattr(self._settings, "volume_sides_per_entry", 2) or 2
-            )
-        if target <= 0 or hours <= 0 or per_entry <= 0:
-            return None
-        return max(0.0, target - done) / per_entry / hours
-
     async def _pacing_state(self, daily_state: DailyRiskState) -> dict[str, Any]:
         """How far the day is from its volume target, recorded beside the decision.
 
@@ -672,14 +649,17 @@ class AIOrchestrator:
         # spend can be attributed to individual decisions.
         call_metrics = getattr(self._brain, "last_call_metrics", None)
         ai_call_id = getattr(call_metrics, "call_id", None)
-        if self._gate_context:
-            gate = {**(gate or {}), "regime": self._gate_context}
+        gate_context = self._current_gate_context()
+        if gate_context:
+            gate = {**(gate or {}), "regime": gate_context}
         payload_json = {
             "decision": decision.model_dump(),
             "request": request_payload,
             "ai_call_id": ai_call_id,
             "pacing": pacing,
             "gate": gate,
+            # Beside the request, never inside it: the legacy request stays byte for byte today's.
+            "payload_profile": self._payload_profile(),
         }
         await self._trade_store.save_ai_decision(
             symbol=decision.symbol,
@@ -758,7 +738,10 @@ class AIOrchestrator:
 
     @staticmethod
     def _factor_metadata_for_symbol(
-        market_context: dict[str, Any], symbol: str, direction: str = ""
+        market_context: dict[str, Any],
+        symbol: str,
+        direction: str = "",
+        gate_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         snapshots = [
             item
@@ -766,14 +749,22 @@ class AIOrchestrator:
             if isinstance(item, dict) and item.get("symbol") == symbol
         ]
         top = sorted(snapshots, key=lambda item: abs(float(item.get("score") or 0.0)), reverse=True)[:5]
+        setup = build_setup_profile(AIOrchestrator._features_for_symbol(market_context, symbol), direction, top)
+        # The regime condition the gate read for this entry's hour, and the ledger bucket it files the
+        # entry under; both are "" when no gate context was set.
+        kondisi = str((gate_context or {}).get("kondisi") or "")
         return {
             "top_factors": [str(item.get("name")) for item in top if item.get("name")],
             "snapshots": top,
             # Persisted so attribution can bucket by the *shape* of the entry,
             # not just its symbol/direction/factors.
-            "setup": build_setup_profile(
-                AIOrchestrator._features_for_symbol(market_context, symbol), direction, top
-            ),
+            "setup": {
+                **setup,
+                "kondisi": kondisi,
+                "bucket_key": (
+                    bucket_key(setup["direction"], kondisi, setup["atr_regime"]) if kondisi else ""
+                ),
+            },
         }
 
     @staticmethod

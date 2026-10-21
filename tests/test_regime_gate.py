@@ -394,7 +394,194 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["reason"], "not_naik:TURUN")
 
 
+class MapModeTests(unittest.IsolatedAsyncioTestCase):
+    """Mode ``map`` lets an entry through with a side: NAIK long, TURUN short, nothing else."""
+
+    async def test_map_naik_allows_long(self):
+        verdict = await make_gate(FakeClient(hourly_rows(MARKETS["NAIK"])), mode="map").verdict()
+
+        self.assertIs(verdict.allowed, True)
+        self.assertEqual(verdict.reason, "naik")
+        self.assertEqual(verdict.kondisi, "NAIK")
+        self.assertEqual(verdict.allowed_direction, "long")
+
+    async def test_map_turun_allows_short(self):
+        verdict = await make_gate(FakeClient(hourly_rows(MARKETS["TURUN"])), mode="map").verdict()
+
+        self.assertIs(verdict.allowed, True)
+        self.assertEqual(verdict.reason, "turun")
+        self.assertEqual(verdict.kondisi, "TURUN")
+        self.assertEqual(verdict.allowed_direction, "short")
+
+    async def test_map_sideways_and_tidak_entry_map_no_side(self):
+        for kondisi in ("SIDEWAYS", "TIDAK_ENTRY"):
+            with self.subTest(kondisi=kondisi):
+                verdict = await make_gate(FakeClient(hourly_rows(MARKETS[kondisi])), mode="map").verdict()
+
+                self.assertEqual(verdict.kondisi, kondisi)
+                self.assertIs(verdict.allowed, False)
+                self.assertEqual(verdict.reason, f"not_mapped:{kondisi}")
+                self.assertEqual(verdict.allowed_direction, "")
+
+    async def test_map_volatility_guard_blocks_both_sides(self):
+        for kondisi in ("TURUN", "NAIK"):
+            with self.subTest(kondisi=kondisi):
+                rows = hourly_rows(MARKETS[kondisi], spike=100.0)
+
+                guarded = await make_gate(FakeClient(rows), mode="map", volatility_mult=2.0).verdict()
+                unguarded = await make_gate(FakeClient(rows), mode="map", volatility_mult=0.0).verdict()
+
+                self.assertGreater(guarded.atr14_1h, 2.0 * guarded.atr_median)
+                self.assertIs(guarded.allowed, False)
+                self.assertEqual(guarded.reason, "volatility")
+                self.assertEqual(guarded.kondisi, kondisi)
+                self.assertEqual(guarded.allowed_direction, "")
+                self.assertIs(unguarded.allowed, True)  # with the guard off the same market passes
+
+    async def test_map_unknown_median_blocks_both_sides_while_the_guard_is_on(self):
+        for kondisi in ("NAIK", "TURUN"):
+            with self.subTest(kondisi=kondisi):
+                client = FakeClient(hourly_rows(MARKETS[kondisi]), max_1h=600)
+
+                verdict = await make_gate(client, mode="map", volatility_mult=2.0).verdict()
+
+                self.assertEqual((verdict.allowed, verdict.reason), (False, "volatility_unknown"))
+                self.assertEqual(verdict.allowed_direction, "")
+
+    async def test_map_short_history_maps_no_side(self):
+        verdict = await make_gate(FakeClient(hourly_rows(MARKETS["TURUN"]), max_1h=30), mode="map").verdict()
+
+        self.assertEqual((verdict.allowed, verdict.reason), (False, "history_short"))
+        self.assertEqual(verdict.allowed_direction, "")
+
+    async def test_map_empty_answer_maps_no_side(self):
+        verdict = await make_gate(FakeClient([]), mode="map").verdict()
+
+        self.assertEqual((verdict.allowed, verdict.reason), (False, "history_short"))
+        self.assertEqual(verdict.allowed_direction, "")
+
+    async def test_map_data_error_maps_no_side(self):
+        client = FakeClient(hourly_rows(MARKETS["TURUN"]), fail=True)
+
+        with self.assertLogs("test.regime_gate", level="WARNING"):
+            verdict = await make_gate(client, mode="map").verdict()
+
+        self.assertEqual((verdict.allowed, verdict.reason), (False, "data_error"))
+        self.assertEqual(verdict.allowed_direction, "")
+        self.assertEqual(
+            (verdict.sma20_1h, verdict.sma50_1h, verdict.close_4h, verdict.ema50_4h), (None, None, None, None)
+        )
+
+    async def test_map_recovers_from_a_data_error_with_a_side(self):
+        client = FakeClient(hourly_rows(MARKETS["TURUN"]), fail=True)
+        gate = make_gate(client, mode="map")
+
+        with self.assertLogs("test.regime_gate", level="WARNING"):
+            await gate.verdict()
+        client.fail = False
+        client.now_ms += DATA_ERROR_RETRY_MS
+        recovered = await gate.verdict()
+
+        self.assertEqual((recovered.allowed, recovered.reason, recovered.allowed_direction), (True, "turun", "short"))
+
+    async def test_map_fetches_the_same_candles_as_naik(self):
+        client = FakeClient(hourly_rows(MARKETS["TURUN"]))
+
+        await make_gate(client, mode="map").verdict()
+
+        self.assertEqual(sorted(client.calls), [(SYMBOL, "1h", 1000), (SYMBOL, "4h", 500)])
+
+    async def test_map_verdict_is_cached_until_the_next_hour_close(self):
+        client = FakeClient(hourly_rows(MARKETS["TURUN"]), now_ms=hour_close(HISTORY_HOURS - 2))
+        gate = make_gate(client, mode="map")
+
+        first = await gate.verdict()
+        client.now_ms += 30 * 60_000
+        second = await gate.verdict()
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(second, first)
+
+    async def test_map_payload_carries_the_side_and_the_selector_numbers(self):
+        gate = make_gate(FakeClient(hourly_rows(MARKETS["TURUN"])), mode="map")
+
+        verdict = await gate.verdict()
+        payload = gate.as_payload()
+
+        self.assertEqual(payload, dataclasses.asdict(verdict))
+        for key in ("kondisi", "allowed", "reason", "allowed_direction", "sma20_1h", "sma50_1h",
+                    "close_4h", "ema50_4h", "atr14_1h"):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["allowed_direction"], "short")
+
+
+class SelectorNumbersEqualityTests(unittest.TestCase):
+    """The numbers on the verdict are the backtest's own ``HourlyFrame`` numbers for the same candles."""
+
+    def test_verdict_carries_the_selector_numbers(self):
+        for mode in ("naik", "map"):
+            for kondisi, price in MARKETS.items():
+                with self.subTest(mode=mode, kondisi=kondisi):
+                    client = FakeClient(hourly_rows(price))
+                    verdict = asyncio.run(make_gate(client, mode=mode).verdict())
+                    served_1h = asyncio.run(client.get_klines(SYMBOL, "1h", 1000))
+                    served_4h = asyncio.run(client.get_klines(SYMBOL, "4h", 500))
+                    expected = HourlyFrame(
+                        bars_from_rows([_tuple(r) for r in served_1h], HOUR_MS),
+                        bars_from_rows([_tuple(r) for r in served_4h], FOUR_HOUR_MS),
+                        SEL,
+                    ).context_at(client.now_ms)
+
+                    self.assertEqual(verdict.kondisi, expected.kondisi)
+                    self.assertEqual(verdict.sma20_1h, expected.sma20_1h)
+                    self.assertEqual(verdict.sma50_1h, expected.sma50_1h)
+                    self.assertEqual(verdict.close_4h, expected.close_4h)
+                    self.assertEqual(verdict.ema50_4h, expected.ema50_4h)
+                    self.assertEqual(verdict.atr14_1h, expected.atr14_1h)
+                    for number in (verdict.sma20_1h, verdict.sma50_1h, verdict.close_4h, verdict.ema50_4h):
+                        self.assertIsNotNone(number)
+
+
+class VerdictNumbersTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_blocked_verdict_after_the_selector_ran_still_carries_the_numbers(self):
+        rows = hourly_rows(MARKETS["NAIK"], spike=100.0)
+
+        for mode in ("naik", "map"):
+            with self.subTest(mode=mode):
+                verdict = await make_gate(FakeClient(rows), mode=mode, volatility_mult=2.0).verdict()
+
+                self.assertEqual(verdict.reason, "volatility")
+                for number in (verdict.sma20_1h, verdict.sma50_1h, verdict.close_4h, verdict.ema50_4h):
+                    self.assertIsNotNone(number)
+
+    async def test_naik_mode_reports_long_when_allowed(self):
+        allowed = await make_gate(FakeClient(hourly_rows(MARKETS["NAIK"])), mode="naik").verdict()
+        blocked = await make_gate(FakeClient(hourly_rows(MARKETS["TURUN"])), mode="naik").verdict()
+
+        self.assertEqual((allowed.kondisi, allowed.allowed, allowed.reason), ("NAIK", True, "naik"))
+        self.assertEqual(allowed.allowed_direction, "long")
+        self.assertEqual((blocked.kondisi, blocked.allowed, blocked.reason), ("TURUN", False, "not_naik:TURUN"))
+        self.assertEqual(blocked.allowed_direction, "")
+
+    async def test_off_mode_names_no_side(self):
+        verdict = await make_gate(FakeClient(hourly_rows(MARKETS["NAIK"])), mode="off").verdict()
+
+        self.assertEqual((verdict.allowed, verdict.reason, verdict.allowed_direction), (True, "off", ""))
+        self.assertEqual(
+            (verdict.sma20_1h, verdict.sma50_1h, verdict.close_4h, verdict.ema50_4h), (None, None, None, None)
+        )
+
+
 class VerdictTests(unittest.TestCase):
+    def test_the_new_fields_default_so_the_old_positional_form_still_builds(self):
+        verdict = RegimeVerdict("NAIK", True, "naik", 1.0, 1.0, 0)
+
+        self.assertEqual(verdict.allowed_direction, "")
+        self.assertIsNone(verdict.sma20_1h)
+        self.assertIsNone(verdict.sma50_1h)
+        self.assertIsNone(verdict.close_4h)
+        self.assertIsNone(verdict.ema50_4h)
+
     def test_verdict_is_frozen(self):
         verdict = RegimeVerdict("NAIK", True, "naik", 1.0, 1.0, 0)
 

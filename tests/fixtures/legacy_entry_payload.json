@@ -1,0 +1,199 @@
+{
+  "arena_reviews": [
+    {
+      "payload": {
+        "all": "values"
+      },
+      "role": "MarketAnalyzer"
+    }
+  ],
+  "execution_environment": {
+    "exchange": "bingx",
+    "margin_mode": "isolated",
+    "mode": "vst_demo",
+    "position_mode": "hedge",
+    "symbols": [
+      "BTC/USDT",
+      "ETH/USDT"
+    ]
+  },
+  "learned_trade_memory": {
+    "lessons": [
+      "one",
+      "two",
+      "three",
+      "four"
+    ],
+    "patterns": [
+      {
+        "raw": "all fields"
+      }
+    ]
+  },
+  "market_context": {
+    "active_flow_signals": [
+      {
+        "direction": "LONG",
+        "name": "volume_spike",
+        "strength": 0.8,
+        "symbol": "BTC/USDT"
+      }
+    ],
+    "external_signals": {
+      "coinmarketcap": {
+        "BTC": {
+          "bias": "bullish",
+          "symbol": "BTC"
+        },
+        "ETH": {
+          "bias": "bearish",
+          "symbol": "ETH"
+        },
+        "eth": {
+          "bias": "bearish"
+        },
+        "market_regime": "risk_on"
+      },
+      "dune": {
+        "GLOBAL": {
+          "RSI": 55,
+          "USD": 1
+        },
+        "macro": "global",
+        "rows": [
+          {
+            "symbol": "BTC",
+            "value": 1
+          },
+          {
+            "symbol": "ETH",
+            "value": 2
+          },
+          {
+            "ticker": "ETHUSDT",
+            "value": 3
+          },
+          {
+            "pair": "eth/usdt",
+            "value": 4
+          },
+          {
+            "state": "global",
+            "symbol": "MARKET"
+          }
+        ]
+      },
+      "tradingview": {
+        "all_rows": [
+          1,
+          2,
+          3
+        ],
+        "summary": "BUY"
+      }
+    },
+    "factor_snapshots": [
+      {
+        "direction": "LONG",
+        "name": "factor-BTC/USDT",
+        "reason": "full reason",
+        "score": 0.9,
+        "symbol": "BTC/USDT"
+      },
+      {
+        "direction": "LONG",
+        "name": "factor-ETH/USDT",
+        "reason": "full reason",
+        "score": 0.9,
+        "symbol": "ETH/USDT"
+      }
+    ],
+    "intelligence": {
+      "regime": "normal",
+      "symbol_scores": {
+        "BTC/USDT": {
+          "score": 0.8
+        },
+        "ETH/USDT": {
+          "score": -0.4
+        }
+      }
+    },
+    "liquidation_constraints": {
+      "BTC/USDT": {
+        "max_long_stop_loss_pct": 0.9,
+        "status": "available"
+      }
+    },
+    "new_flow_signals": [
+      {
+        "direction": "LONG",
+        "name": "fresh_btc_trigger",
+        "strength": 0.9,
+        "symbol": "BTC/USDT"
+      }
+    ],
+    "technicals": [
+      {
+        "ema_21": 59900.0,
+        "last_price": 60000.0,
+        "symbol": "BTC/USDT",
+        "volume": 1234.56
+      },
+      {
+        "ema_21": 2990.0,
+        "last_price": 3000.0,
+        "symbol": "ETH/USDT",
+        "volume": 999.0
+      }
+    ]
+  },
+  "output_rules": {
+    "allowed_actions": [
+      "OPEN_LONG",
+      "OPEN_SHORT",
+      "HOLD"
+    ],
+    "learning_note_max_characters": 500,
+    "only_vst_demo_trades_are_executed": true,
+    "open_requires_explicit_stop_loss_take_profit_and_risk_reward": true,
+    "open_requires_final_stop_strictly_before_estimated_liquidation_or_hold": true,
+    "reason_max_characters": 600,
+    "return_one_decision_per_symbol": true,
+    "risk_review_approved_false_vetoes_the_candidate": true,
+    "risk_review_required": true,
+    "use_only_allowed_symbols": true
+  },
+  "recent_executed_trade_performance": {
+    "records": [
+      {
+        "pnl": 1.2,
+        "reason": "complete record"
+      }
+    ],
+    "total_trades": 12
+  },
+  "risk_constraints": {
+    "closed_trades_today": 3,
+    "configured_leverage": 100,
+    "configured_position_usdt": 180.0,
+    "consecutive_losses_today": 1,
+    "day_pnl_usdt": -2.0,
+    "max_consecutive_losses": 3,
+    "max_daily_drawdown_usdt": 100.0,
+    "max_stop_losses_per_day": 2,
+    "min_confidence": 0.75,
+    "min_fee_adjusted_risk_reward": 0.1,
+    "round_trip_taker_fee_pct": 0.1,
+    "stop_losses_today": 1,
+    "trade_target_per_day": 28
+  },
+  "strategy_objective": {
+    "mode": "ai_volume",
+    "nested": {
+      "keep": true
+    },
+    "primary_goal": "full objective"
+  },
+  "task": "ai_volume_entry_decision"
+}

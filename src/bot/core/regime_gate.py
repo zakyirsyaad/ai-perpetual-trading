@@ -14,7 +14,14 @@ The gate answers one question per closed hour: may an entry go through now?
 * mode ``off``: yes, and no network call is made;
 * mode ``naik``: only while the condition is NAIK, and, when the volatility multiple is above zero,
   only while ATR14 (1h) does not exceed that multiple of its median over the last 720 hours. An
-  unknown median (fewer than 720 ATR values) blocks while the guard is on.
+  unknown median (fewer than 720 ATR values) blocks while the guard is on;
+* mode ``map``: the same candles, the same guard (a trip blocks either side), but two conditions
+  let an entry through, each with the one side it allows in ``allowed_direction``: NAIK is
+  ``long`` and TURUN is ``short``. SIDEWAYS and TIDAK_ENTRY map to no side and block.
+
+The verdict also carries the numbers the selector read (``sma20_1h``, ``sma50_1h``, ``close_4h``,
+``ema50_4h``, ``atr14_1h``) whenever the selector ran, so a decision can record why a side was or
+was not allowed. A verdict that blocks, and ``off``, names no side (``allowed_direction == ""``).
 
 The verdict is cached until the next 1h close, so the venue is read once per closed hour. A venue
 error, a gap, a non-finite price, or candles older than the last closed hour (plus slack) block with
@@ -32,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from bot.strategy.modes.regime import NAIK, pilih_mode
+from bot.strategy.modes.regime import NAIK, TURUN, pilih_mode
 from bot.strategy.pine_indicators import atr, ema, rolling_median, sma
 
 ATR_PERIOD_1H = 14  # frames.ATR_PERIOD_1H
@@ -51,15 +58,25 @@ DATA_ERROR_RETRY_MS = 60_000  # a data_error verdict is kept this long before th
 
 MODE_OFF = "off"
 MODE_NAIK = "naik"
-MODES = frozenset({MODE_OFF, MODE_NAIK})
+MODE_MAP = "map"
+MODES = frozenset({MODE_OFF, MODE_NAIK, MODE_MAP})
+
+SIDE_LONG = "long"
+SIDE_SHORT = "short"
 
 REASON_OFF = "off"
 REASON_NAIK = "naik"
+REASON_TURUN = "turun"
 REASON_VOLATILITY = "volatility"
 REASON_VOLATILITY_UNKNOWN = "volatility_unknown"
 REASON_HISTORY_SHORT = "history_short"
 REASON_DATA_ERROR = "data_error"
 _REASON_NOT_NAIK = "not_naik:"
+_REASON_NOT_MAPPED = "not_mapped:"
+
+# condition -> (reason when allowed, side it allows), per mode that lets an entry through
+_NAIK_ROUTES = {NAIK: (REASON_NAIK, SIDE_LONG)}
+_MAP_ROUTES = {NAIK: (REASON_NAIK, SIDE_LONG), TURUN: (REASON_TURUN, SIDE_SHORT)}
 
 _WARNING_REASONS = frozenset({REASON_VOLATILITY_UNKNOWN, REASON_HISTORY_SHORT, REASON_DATA_ERROR})
 
@@ -71,9 +88,12 @@ class RegimeVerdict:
     """Whether an entry may go through, and the numbers behind the answer.
 
     ``kondisi`` is what ``pilih_mode`` read (``""`` when it was not evaluated). ``reason`` is
-    ``off``, ``naik``, ``not_naik:<KONDISI>``, ``volatility``, ``volatility_unknown``,
+    ``off``, ``naik``, ``turun`` (mode ``map`` only), ``not_naik:<KONDISI>`` (mode ``naik``),
+    ``not_mapped:<KONDISI>`` (mode ``map``), ``volatility``, ``volatility_unknown``,
     ``history_short`` or ``data_error``. ``hour_close_ms`` is the close time of the last 1h candle
-    the verdict rests on."""
+    the verdict rests on. ``allowed_direction`` is ``long`` or ``short`` when an entry of that side
+    is allowed and ``""`` otherwise. The four selector numbers are ``None`` while they are unknown
+    (a verdict reached before the selector ran, or while a series is still warming up)."""
 
     kondisi: str
     allowed: bool
@@ -81,6 +101,11 @@ class RegimeVerdict:
     atr14_1h: Optional[float]
     atr_median: Optional[float]
     hour_close_ms: Optional[int]
+    allowed_direction: str = ""
+    sma20_1h: Optional[float] = None
+    sma50_1h: Optional[float] = None
+    close_4h: Optional[float] = None
+    ema50_4h: Optional[float] = None
 
 
 class CandleDataError(ValueError):
@@ -192,19 +217,28 @@ class RegimeGate:
         ema_4h = _last(ema(closes_4h, EMA_PERIOD_4H))
         kondisi = pilih_mode(sma_fast, sma_slow, atr14, close_4h, ema_4h, self._sideways_mult)
 
-        def verdict(allowed: bool, reason: str) -> RegimeVerdict:
-            return RegimeVerdict(kondisi, allowed, reason, atr14, median, hour_close_ms)
+        def verdict(allowed: bool, reason: str, side: str = "") -> RegimeVerdict:
+            return RegimeVerdict(
+                kondisi, allowed, reason, atr14, median, hour_close_ms,
+                side, sma_fast, sma_slow, close_4h, ema_4h,
+            )
 
         if None in (sma_fast, sma_slow, atr14, close_4h, ema_4h):
             return verdict(False, REASON_HISTORY_SHORT)
-        if kondisi != NAIK:
-            return verdict(False, f"{_REASON_NOT_NAIK}{kondisi}")
+        if self._mode == MODE_MAP:
+            routes, not_allowed = _MAP_ROUTES, _REASON_NOT_MAPPED
+        else:
+            routes, not_allowed = _NAIK_ROUTES, _REASON_NOT_NAIK
+        route = routes.get(kondisi)
+        if route is None:
+            return verdict(False, f"{not_allowed}{kondisi}")
         if self._volatility_mult > 0.0:
             if median is None:
                 return verdict(False, REASON_VOLATILITY_UNKNOWN)
             if atr14 > self._volatility_mult * median:
                 return verdict(False, REASON_VOLATILITY)
-        return verdict(True, REASON_NAIK)
+        reason, side = route
+        return verdict(True, reason, side)
 
     def _note(self, verdict: RegimeVerdict, detail: str) -> None:
         """Log a change of state once: WARNING for a data reason, INFO for the rest."""
