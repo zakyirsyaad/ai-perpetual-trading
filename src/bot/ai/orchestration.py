@@ -108,10 +108,10 @@ class AIOrchestrator(ShadowLedgerMixin):
             return None
         market_context = await self._intelligence.build_context()
         context_dict = market_context.to_dict()
-        if await self._shadow_only_hour_is_spaced(context_dict):
-            return None
         # Read once per tick, and only while the ledger is on; `{}` otherwise.
         ledger = await self._ledger_snapshot()
+        if await self._call_is_spaced(context_dict, ledger):
+            return None
         # The full context still feeds deterministic execution, attribution, and the
         # audit record below; only the AI representation is compacted.
         if lean:
@@ -160,6 +160,8 @@ class AIOrchestrator(ShadowLedgerMixin):
             candidate.score,
             len(candidates),
         )
+        # The trade may open and close before the next strategy call; that call must read the ledger again.
+        self._expire_ledger_snapshot()
         return await self._candidate_to_trade_plan(candidate, context_dict)
 
     def _payload_profile(self) -> str:

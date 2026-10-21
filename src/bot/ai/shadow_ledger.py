@@ -3,12 +3,12 @@
 The ledger files every OPEN decision under a bucket (`side|condition|atr_regime`) and judges the bucket on
 its realized outcomes (`bot/core/setup_ledger.py`); a candidate that may not trade (a shadow side under
 `ENTRY_REGIME_GATE=map`, or an enforce-blocked bucket) is written to `shadow_entries` instead, at most one
-row per (symbol, side, source, bucket) per spacing, for `bot/core/shadow_eval.py` to walk later.
+row per spacing key (`ShadowKey`) per spacing, for `bot/core/shadow_eval.py` to walk later.
 
 `ShadowLedgerMixin` holds that state and its methods; it expects the class it is mixed into to provide
 `_settings`, `_logger`, `_trade_store`, `_features_for_symbol`, `_current_gate_context`,
 `_regime_gate_mode`, `_mapped_side` and `_live_sides`, and to call `_init_shadow_ledger_state` from its
-`__init__`.
+`__init__` and `_expire_ledger_snapshot` whenever a tick returns a plan.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ class ShadowLedgerMixin:
 
     def _init_shadow_ledger_state(self) -> None:
         """The in-memory state, all empty: nothing survives a restart except what the store holds."""
-        # `decided_at` of the last shadow row per (symbol, side, source, bucket_key), as written here or
+        # `decided_at` of the last shadow row per spacing key (`ShadowKey`), as written here or
         # read from the store; the keys already read from the store this process (each is read once).
         self._shadow_rows_written_at = {}
         self._shadow_seeded_keys = frozenset()
@@ -124,6 +124,13 @@ class ShadowLedgerMixin:
         # Replaced, never mutated.
         self._last_ledger_snapshot, self._last_ledger_read_at = snapshot, now
         return snapshot
+
+    def _expire_ledger_snapshot(self) -> None:
+        """Make the next tick read the ledger again; the snapshot stays for a failed read to reuse.
+
+        Called when a tick returns a plan: the trade can open and close before the next strategy call, which
+        must then count it even inside `LEDGER_CACHE_SECONDS` (account 1 runs no entry cooldown)."""
+        self._last_ledger_read_at = None
 
     def _ledger_bucket(self, side: str, features: dict[str, Any] | None) -> str:
         """`side|condition|atr_regime` for an entry on `side` now: the condition of the gate context set
@@ -266,9 +273,6 @@ class ShadowLedgerMixin:
         cooldown = int(getattr(self._settings, "cooldown_minutes_after_entry", 0) or 0)
         return timedelta(minutes=hold + cooldown)
 
-    def _last_shadow_rows(self) -> dict[ShadowKey, datetime]:
-        return self._shadow_rows_written_at
-
     def _shadow_key(self, symbol: str, side: str, source: str, market_context: dict[str, Any]) -> ShadowKey:
         """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket.
 
@@ -284,7 +288,7 @@ class ShadowLedgerMixin:
 
         The store read seeds the spacing after a restart. A failed read logs a WARNING and counts as no
         earlier row (the row is written), and it is tried again the next time the key comes up."""
-        last = self._last_shadow_rows().get(key)
+        last = self._shadow_rows_written_at.get(key)
         if last is not None or key in self._shadow_seeded_keys:
             return last
         try:
@@ -300,7 +304,7 @@ class ShadowLedgerMixin:
         # Replaced, never mutated.
         self._shadow_seeded_keys = self._shadow_seeded_keys | {key}
         if last is not None:
-            self._shadow_rows_written_at = {**self._last_shadow_rows(), key: last}
+            self._shadow_rows_written_at = {**self._shadow_rows_written_at, key: last}
         return last
 
     async def _spacing_left(self, key: ShadowKey, now: datetime) -> tuple[datetime, timedelta] | None:
@@ -311,21 +315,39 @@ class ShadowLedgerMixin:
         left = self._shadow_spacing() - (now - last)
         return (last, left) if left > timedelta(0) else None
 
-    async def _shadow_only_hour_is_spaced(self, market_context: dict[str, Any]) -> bool:
+    def _only_gate_side(self) -> str:
+        """The one side that can pass the side filter this tick, or `""`: the mapped side under `map`, the
+        single side `ENTRY_GATE_DIRECTION` names under `naik`; none with the regime gate off."""
+        mode = self._regime_gate_mode()
+        if mode == "map":
+            return self._mapped_side()
+        live = self._live_sides()
+        return next(iter(live)) if mode != "off" and len(live) == 1 else ""
+
+    async def _call_is_spaced(self, market_context: dict[str, Any], ledger: dict[str, BucketLedger]) -> bool:
         """True, after one INFO line, when this tick's AI call could change nothing.
 
-        Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION` does not make live can trade nothing:
-        the mapped side becomes a `shadow_side` row and every other side is blocked. While every symbol's
-        row for that side and bucket is inside its spacing, no row would be written either."""
-        if self._regime_gate_mode() != "map":
+        Under a regime gate only one side can pass the side filter (`_only_gate_side`). When that side cannot
+        trade either, its answer can only become a shadow row: a mapped side `ENTRY_GATE_DIRECTION` does not
+        make live (`shadow_side`), or, under an enforcing ledger, a live side whose bucket is `blocked`
+        (`ledger_block`). While every symbol's row for it is inside its spacing, no row would be written."""
+        side = self._only_gate_side()
+        if not side:
             return False
-        mapped = self._mapped_side()
-        if not mapped or mapped in self._live_sides(mapped):
+        if side not in self._live_sides(side):
+            source = SHADOW_SIDE_SOURCE
+        elif self._ledger_mode() == "enforce":
+            source = SHADOW_BLOCK_SOURCE
+        else:
             return False
         now = _utc_now()
         waits: list[tuple[ShadowKey, datetime, timedelta]] = []
         for symbol in self._settings.symbols:
-            key = self._shadow_key(str(symbol), mapped, SHADOW_SIDE_SOURCE, market_context)
+            if source == SHADOW_BLOCK_SOURCE:
+                features = self._features_for_symbol(market_context, str(symbol))
+                if self._ledger_verdict(side.upper(), features, ledger)["status"] != STATUS_BLOCKED:
+                    return False
+            key = self._shadow_key(str(symbol), side, source, market_context)
             spaced = await self._spacing_left(key, now)
             if spaced is None:
                 return False
@@ -333,12 +355,16 @@ class ShadowLedgerMixin:
         if not waits:
             return False
         key, last, left = min(waits, key=lambda wait: wait[2])
+        kondisi = (self._current_gate_context() or {}).get("kondisi") or "?"
+        if source == SHADOW_SIDE_SOURCE:
+            reason = "Shadow-only hour (%s maps %s, which is not traded here)" % (kondisi, side)
+        else:
+            reason = "Ledger-blocked setup (%s maps %s, whose bucket the ledger blocks)" % (kondisi, side)
         self._logger.info(
-            "Shadow-only hour (%s maps %s, which is not traded here): the last %s shadow row (%s) was "
-            "decided at %s, %.1f min of the %.0f-minute spacing remain; holding without an AI call.",
-            (self._current_gate_context() or {}).get("kondisi") or "?",
-            mapped,
-            mapped.upper(),
+            "%s: the last %s shadow row (%s) was decided at %s, %.1f min of the %.0f-minute spacing remain; "
+            "holding without an AI call.",
+            reason,
+            side.upper(),
             _bucket_label(key[3]),
             last.isoformat(timespec="seconds"),
             left.total_seconds() / 60.0,
@@ -389,7 +415,7 @@ class ShadowLedgerMixin:
             )
             return
         # Replaced, never mutated.
-        self._shadow_rows_written_at = {**self._last_shadow_rows(), key: row["decided_at"]}
+        self._shadow_rows_written_at = {**self._shadow_rows_written_at, key: row["decided_at"]}
         self._logger.info(
             "Entry candidate %s %s is not traded (%s): shadow row for bucket %s, stop %.3f%%, floor %.3f%%.",
             decision.symbol,

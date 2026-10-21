@@ -1527,9 +1527,14 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ledger["status"], ledger["n"]), ("learning", 0))
 
     async def test_ledger_is_reused_within_the_cache_age(self) -> None:
+        # A stretched SHORT: the ledger verdict is recorded but no plan comes back, so the cache stands.
         store = _LedgerStore(self._losing_shorts())
         orchestrator = self._orchestrator(
-            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="shadow"
+            store,
+            [self._decision("OPEN_SHORT")],
+            gate_context=self._turun(),
+            setup_ledger_mode="shadow",
+            ema_21=self.STRETCHED,
         )
         one_read = [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")]
 
@@ -1541,6 +1546,20 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
 
         # at 300 s the table is read again
         await self._tick_at(orchestrator, self.T0 + timedelta(seconds=300))
+        self.assertEqual(store.ledger_reads, one_read * 2)
+
+    async def test_a_returned_plan_makes_the_next_tick_read_the_ledger_again(self) -> None:
+        # The trade can open and close before the next strategy call (account 1 runs no entry cooldown),
+        # so that call must see it even inside the cache age.
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="shadow"
+        )
+        one_read = [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")]
+
+        self.assertIsNotNone(await self._tick_at(orchestrator, self.T0))   # shadow mode trades a blocked bucket
+        await self._tick_at(orchestrator, self.T0 + timedelta(seconds=60))
+
         self.assertEqual(store.ledger_reads, one_read * 2)
 
     async def test_a_failed_read_reuses_the_last_table(self) -> None:
@@ -1707,9 +1726,10 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
             return await orchestrator.next_trade_plan(self._state())
 
     async def test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded(self) -> None:
-        # A live side in an enforce-blocked bucket: the AI is still asked every tick (the hour may trade),
-        # and the spacing is applied when the row would be written. A shadow-only hour skips the call
-        # instead (test_a_shadow_only_hour_inside_the_spacing_makes_no_ai_call).
+        # A live side in an enforce-blocked bucket, with a second symbol (ETH) that has no row yet: a row
+        # could still be written, so the AI is asked every tick and the spacing is applied when BTC's row
+        # would be written. With every key inside its spacing the call is skipped instead
+        # (test_a_blocked_live_bucket_inside_the_spacing_makes_no_ai_call).
         store = _LedgerStore(self._losing_shorts())
         orchestrator = self._orchestrator(
             store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
@@ -1760,6 +1780,36 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("the last LONG shadow row (any bucket)", logs.output[0])
         self.assertIn("40.0 min", logs.output[0])   # 70 - 30 minutes remain
 
+    async def test_a_blocked_live_bucket_inside_the_spacing_makes_no_ai_call(self) -> None:
+        # TURUN maps SHORT, which is live, but under enforce its bucket is blocked: once the ledger_block row
+        # is written, an answer inside its spacing could only be dropped, so the model is not asked.
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store,
+            [self._decision("OPEN_SHORT")],
+            gate_context=self._turun(),
+            symbols=["BTC/USDT"],
+            setup_ledger_mode="enforce",
+        )
+
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0))
+        with self.assertLogs("test.ledger", level="INFO") as logs:
+            plan = await self._tick_at(orchestrator, self.T0 + timedelta(minutes=30))
+
+        self.assertIsNone(plan)
+        self.assertEqual(orchestrator._brain.calls, 1)
+        self.assertEqual([row["source"] for row in store.shadow_rows], ["ledger_block"])
+        skip = [line for line in logs.output if "without an AI call" in line]
+        self.assertEqual(len(skip), 1)
+        self.assertIn("Ledger-blocked setup", skip[0])
+        self.assertIn("the last SHORT shadow row (bucket SHORT|TURUN|atr_mid)", skip[0])
+        self.assertIn("40.0 min", skip[0])
+
+        # under the shadow ledger a blocked bucket still trades, so the model is always asked
+        orchestrator._settings = self._settings(symbols=["BTC/USDT"], setup_ledger_mode="shadow")
+        self.assertIsNotNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=31)))
+        self.assertEqual(orchestrator._brain.calls, 2)
+
     async def test_a_shadow_only_hour_outside_the_spacing_still_calls_the_ai(self) -> None:
         store = _LedgerStore()
         orchestrator = self._orchestrator(store, [self._decision("OPEN_LONG")], gate_context=self._naik())
@@ -1788,7 +1838,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         # No symbol, no key to be spaced: the check gives way (and never takes the minimum of nothing).
         orchestrator = self._orchestrator(_LedgerStore(), [], gate_context=self._naik(), symbols=[])
 
-        spaced = await orchestrator._shadow_only_hour_is_spaced(self._context(ema_21=self.NEAR_MEAN))
+        spaced = await orchestrator._call_is_spaced(self._context(ema_21=self.NEAR_MEAN), {})
 
         self.assertFalse(spaced)
 
