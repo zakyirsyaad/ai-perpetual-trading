@@ -747,12 +747,15 @@ class Settings(BaseSettings):
             raise ValueError("SETUP_LEDGER_MODE is on; it needs " + " and ".join(problems) + ".")
 
     def _require_shadow_walk_companions(self) -> None:
-        """The live exit the shadow walk models: the neutral exit on, in `floor` mode.
+        """The live exit the shadow walk models: the neutral exit on, in `floor` mode, on the net basis,
+        with `ai_volume` sizing.
 
         `shadow_eval.walk_exit` closes a shadow row the first time price reaches the floor
         (100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional plus the round-trip fee), which is what the live
         bot does only with the neutral exit on and in `floor` mode (`window` and `trailing` exit elsewhere;
-        with it off the exits are the stop, the TP and the time stop). Shadow rows are written under
+        with it off the exits are the stop, the TP and the time stop). Adding the fee makes the threshold a
+        net one (VOLUME_NEUTRAL_EXIT_BASIS=net), and the notional is the `ai_volume` margin per entry times
+        the leverage (`grok` sizes each trade from its stop instead). Shadow rows are written under
         ENTRY_REGIME_GATE=map (a shadow side) and by the ledger (its `ledger_block` rows, judged against
         real trades), so both demand it. `naik` with the ledger off writes none and is not checked: that is
         the pinned LONG forward bot.
@@ -769,11 +772,16 @@ class Settings(BaseSettings):
             problems.append("VOLUME_NEUTRAL_EXIT_ENABLED=true")
         if self.volume_neutral_exit_mode != "floor":
             problems.append("VOLUME_NEUTRAL_EXIT_MODE=floor")
+        if self.volume_neutral_exit_basis != "net":
+            problems.append("VOLUME_NEUTRAL_EXIT_BASIS=net")
+        if self.strategy_mode != "ai_volume":
+            problems.append("STRATEGY_MODE=ai_volume")
         if problems:
             raise ValueError(
                 "With "
                 + " and ".join(triggers)
-                + ", shadow entries are walked with the floor neutral exit, so the live exit must be the same; it needs "
+                + ", shadow entries are walked with the floor neutral exit on the net basis and ai_volume sizing, "
+                "so the live bot must be the same; it needs "
                 + " and ".join(problems)
                 + "."
             )

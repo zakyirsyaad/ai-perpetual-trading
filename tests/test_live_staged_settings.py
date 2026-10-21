@@ -77,10 +77,12 @@ class StagedSettingsTests(unittest.TestCase):
             mapped(STRATEGY_MODE="volume")
         self.assertIn("STRATEGY_MODE", str(caught.exception))
 
-    def test_map_accepts_either_ai_strategy(self):
-        for strategy in ("grok", "ai_volume"):
-            with self.subTest(strategy=strategy):
-                self.assertEqual(mapped(STRATEGY_MODE=strategy).strategy_mode, strategy)
+    def test_map_accepts_ai_volume_and_refuses_grok(self):
+        # The shadow floor is sized from the ai_volume margin, so map needs ai_volume, not just an AI strategy.
+        self.assertEqual(mapped(STRATEGY_MODE="ai_volume").strategy_mode, "ai_volume")
+        with self.assertRaises(ValueError) as caught:
+            mapped(STRATEGY_MODE="grok")
+        self.assertIn("STRATEGY_MODE=ai_volume", str(caught.exception))
 
     def test_naik_still_demands_long(self):
         companions = {**MAP_COMPANIONS, "ENTRY_REGIME_GATE": "naik"}
@@ -222,11 +224,62 @@ class ShadowWalkExitSettingsTests(unittest.TestCase):
                 self.assertIn("VOLUME_NEUTRAL_EXIT_MODE=floor", message)
                 self.assertNotIn("ENTRY_REGIME_GATE=map", message)
 
+    def test_map_and_the_ledger_refuse_the_gross_neutral_exit_basis(self):
+        # The shadow floor is 100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional plus the fee: a net figure.
+        naik_long = {**MAP_COMPANIONS, "ENTRY_REGIME_GATE": "naik", "ENTRY_GATE_DIRECTION": "long"}
+        for name, build in (
+            ("map", lambda: mapped(VOLUME_NEUTRAL_EXIT_BASIS="gross")),
+            ("ledger", lambda: build_settings(
+                **naik_long, VOLUME_NEUTRAL_EXIT_BASIS="gross", SETUP_LEDGER_MODE="shadow", SETUP_LEDGER_SINCE=AWARE_SINCE
+            )),
+        ):
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as caught:
+                    build()
+                message = str(caught.exception)
+                self.assertIn("VOLUME_NEUTRAL_EXIT_BASIS=net", message)
+                for other in (*self.NEEDS_BOTH, "STRATEGY_MODE=ai_volume"):
+                    self.assertNotIn(other, message)
+
+    def test_map_and_the_ledger_refuse_the_grok_strategy(self):
+        # The shadow floor's notional is the ai_volume margin x leverage; grok sizes from risk instead.
+        naik_long = {**MAP_COMPANIONS, "ENTRY_REGIME_GATE": "naik", "ENTRY_GATE_DIRECTION": "long"}
+        for name, build in (
+            ("map", lambda: mapped(STRATEGY_MODE="grok")),
+            ("ledger", lambda: build_settings(
+                **{**naik_long, "STRATEGY_MODE": "grok"}, SETUP_LEDGER_MODE="enforce", SETUP_LEDGER_SINCE=AWARE_SINCE
+            )),
+        ):
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as caught:
+                    build()
+                message = str(caught.exception)
+                self.assertIn("STRATEGY_MODE=ai_volume", message)
+                for other in (*self.NEEDS_BOTH, "VOLUME_NEUTRAL_EXIT_BASIS=net"):
+                    self.assertNotIn(other, message)
+
+    def test_one_error_names_everything_the_shadow_walk_needs(self):
+        with self.assertRaises(ValueError) as caught:
+            build_settings(
+                **{
+                    **{key: value for key, value in MAP_COMPANIONS.items() if key not in FLOOR_EXIT},
+                    "ENTRY_REGIME_GATE": "map",
+                    "STRATEGY_MODE": "grok",
+                    "VOLUME_NEUTRAL_EXIT_BASIS": "gross",
+                }
+            )
+        message = str(caught.exception)
+        for need in (*self.NEEDS_BOTH, "VOLUME_NEUTRAL_EXIT_BASIS=net", "STRATEGY_MODE=ai_volume"):
+            self.assertIn(need, message)
+
     def test_map_and_the_ledger_boot_with_the_floor_neutral_exit(self):
         settings = mapped(SETUP_LEDGER_MODE="enforce", SETUP_LEDGER_SINCE=AWARE_SINCE)
 
         self.assertTrue(settings.volume_neutral_exit_enabled)
         self.assertEqual(settings.volume_neutral_exit_mode, "floor")
+        # account 1's live values: the net basis (the default) and ai_volume
+        self.assertEqual(settings.volume_neutral_exit_basis, "net")
+        self.assertEqual(settings.strategy_mode, "ai_volume")
 
     def test_naik_with_the_ledger_off_and_the_gate_off_are_not_checked(self):
         naik_long = {
@@ -236,11 +289,13 @@ class ShadowWalkExitSettingsTests(unittest.TestCase):
         }
         for name, env in (
             ("naik, ledger off", naik_long),
+            ("naik, ledger off, grok", {**naik_long, "STRATEGY_MODE": "grok"}),
             ("gate off, ledger off", {}),
         ):
             with self.subTest(name):
-                settings = build_settings(**env, VOLUME_NEUTRAL_EXIT_MODE="window")
+                settings = build_settings(**env, VOLUME_NEUTRAL_EXIT_MODE="window", VOLUME_NEUTRAL_EXIT_BASIS="gross")
                 self.assertEqual(settings.volume_neutral_exit_mode, "window")
+                self.assertEqual(settings.volume_neutral_exit_basis, "gross")
                 self.assertFalse(settings.volume_neutral_exit_enabled)
 
 
