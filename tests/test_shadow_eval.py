@@ -351,9 +351,13 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
         # Every candle of the hold is there, but the decision-minute candle is not, and the venue served fewer
         # candles than were asked for: it did not honour the limit, so the row stays pending (not expired) and
         # the loop stops, as for any venue failure.
+        last_reachable = CANDLE_WINDOW - 1   # minutes since the decision minute: a full window still holds it
         for now, candles in (
             (self.NOW, _quiet(HOLD + 2)),   # limit 10, 7 served
-            (DECISION_MINUTE + timedelta(days=3), _quiet(500, start_minute=3 * 1440 - 500)),   # limit 1000, 500 served
+            (   # limit 1000 (capped), 500 served
+                DECISION_MINUTE + timedelta(minutes=last_reachable),
+                _quiet(500, start_minute=last_reachable - 500),
+            ),
         ):
             with self.subTest(served=len(candles)):
                 store = FakeShadowStore([_row(1), _row(2)])
@@ -380,6 +384,19 @@ class EvaluatePendingTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(client.calls[0][2], CANDLE_WINDOW)
                 self.assertEqual((done, store.completed), (1, [(9, None, "expired")]))
+
+    async def test_a_row_past_the_candle_window_expires_whatever_the_answer_length(self) -> None:
+        # CANDLE_WINDOW or more minutes after the decision minute, no window the evaluator can ask for holds
+        # that candle, so a short answer cannot leave the row pending and stall every newer row behind it.
+        for minutes in (CANDLE_WINDOW, 3 * 1440):
+            with self.subTest(minutes=minutes):
+                now = DECISION_MINUTE + timedelta(minutes=minutes)
+                store = FakeShadowStore([_row(9), _row(10)])
+                client = FakeKlineClient(_quiet(500, start_minute=minutes - 500))
+
+                done = await evaluate_pending(store, client, now=now, logger=_logger(), max_hold_minutes=HOLD)
+
+                self.assertEqual((done, store.completed), (2, [(9, None, "expired"), (10, None, "expired")]))
 
     async def test_a_hole_at_the_decision_minute_expires(self) -> None:
         before = _candle(DECISION_MINUTE - timedelta(minutes=1))

@@ -304,8 +304,10 @@ class SupabaseTradeStore:
     ) -> datetime | None:
         """`decided_at` of the newest shadow row of this key, evaluated or not; `None` without one.
 
-        The orchestrator seeds its row spacing from it once per key after a restart. A failed read raises.
+        The orchestrator seeds its row spacing from it once per key after a restart. An empty `bucket_key`
+        reads the newest row of any bucket (the `shadow_side` spacing spans buckets). A failed read raises.
         """
+        bucket_filter = [("bucket_key", f"eq.{bucket_key}")] if bucket_key else []
         rows = await self._get_rows(
             _SHADOW_ENTRIES_TABLE,
             [
@@ -314,7 +316,7 @@ class SupabaseTradeStore:
                 ("symbol", f"eq.{symbol}"),
                 ("side", f"eq.{side}"),
                 ("source", f"eq.{source}"),
-                ("bucket_key", f"eq.{bucket_key}"),
+                *bucket_filter,
                 ("order", "decided_at.desc"),
                 ("limit", "1"),
             ],

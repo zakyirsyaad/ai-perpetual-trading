@@ -164,7 +164,9 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   - *PR #46 review:* a row expires only when the venue served a full window (at least the limit
     asked for minus one, since the forming candle may be dropped) that no longer reaches the
     decision-minute candle. A shorter answer that misses it did not honour the limit, so it is a
-    venue failure: the row stays pending and the loop stops for the tick.
+    venue failure: the row stays pending and the loop stops for the tick. *Re-review:* a row
+    `CANDLE_WINDOW` (1000) minutes old or more is out of reach of any window, so it expires whatever
+    the answer length; otherwise one old row would stall every newer row behind it.
   - *Final review:* the walk models the floor neutral exit, so `Settings` refuses
     `ENTRY_REGIME_GATE=map` or a ledger mode other than `off` unless `VOLUME_NEUTRAL_EXIT_ENABLED=true`
     and `VOLUME_NEUTRAL_EXIT_MODE=floor` (`naik` with the ledger off is not checked). *PR #46 review:*
@@ -177,11 +179,13 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     skipped candidate is still dropped (one INFO line); a failed write does not start the spacing; the
     times are kept in memory, so a restart forgets them.
   - *PR #46 review:* the spacing key is (symbol, side, source, `bucket_key`), so two buckets of one
-    side are spaced apart. A key with no time in memory is seeded once per process from the store's
+    side are spaced apart. *Re-review:* only for `ledger_block` rows (a bucket reopens on its own
+    block outcomes). `shadow_side` rows of every bucket share one spacing, because the LONG go-live
+    bar pools them and two rows a minute apart in neighbouring ATR buckets would walk the same hour. A key with no time in memory is seeded once per process from the store's
     newest row for it (any evaluation state), so a restart keeps the spacing; a failed seed read is
     a WARNING and the row is written. Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION`
-    does not make live can trade nothing, so while every symbol's `shadow_side` row for that side and
-    bucket is inside its spacing the tick returns after the context is built and before the AI call
+    does not make live can trade nothing, so while every symbol's `shadow_side` row for that side (any
+    bucket) is inside its spacing the tick returns after the context is built and before the AI call
     (one INFO line).
 - **Verdict per bucket** (pre-registered):
   - `blocked` when real n ≥ `MIN_SAMPLES` and mean + 1.28 × SE < `HURDLE_BPS` (90 % one-sided:

@@ -36,8 +36,11 @@ if TYPE_CHECKING:
 OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
 # `shadow_entries.source` of a mapped side that ENTRY_GATE_DIRECTION does not make live.
 SHADOW_SIDE_SOURCE = "shadow_side"
-# What one shadow row spacing is kept for: (symbol, side as stored, source, bucket_key).
+# What one shadow row spacing is kept for: (symbol, side as stored, source, bucket_key). The bucket is
+# ANY_BUCKET for `shadow_side`: the LONG go-live bar pools those outcomes over every bucket, so two rows a
+# minute apart in neighbouring ATR buckets would walk the same hour twice.
 ShadowKey = tuple[str, str, str, str]
+ANY_BUCKET = ""
 # A setup-ledger snapshot younger than this is reused instead of read again (two paged GETs).
 LEDGER_CACHE_SECONDS = 300
 
@@ -46,6 +49,11 @@ def _utc_now() -> datetime:
     """The wall clock that stamps a shadow row's `decided_at` and ages the ledger snapshot (one seam, so
     tests can move it)."""
     return datetime.now(timezone.utc)
+
+
+def _bucket_label(bucket: str) -> str:
+    """How a log line names a spacing key's bucket."""
+    return f"bucket {bucket}" if bucket else "any bucket"
 
 
 class ShadowLedgerMixin:
@@ -236,7 +244,7 @@ class ShadowLedgerMixin:
         }
 
     def _shadow_spacing(self) -> timedelta:
-        """The least time between two shadow rows of one (symbol, side, source, bucket).
+        """The least time between two shadow rows of one spacing key (`ShadowKey`).
 
         A shadow row stands for a trade that was not taken; a real trade holds up to
         `POSITION_HOLD_MINUTES` and is followed by `COOLDOWN_MINUTES_AFTER_ENTRY`, so rows closer than that
@@ -249,7 +257,12 @@ class ShadowLedgerMixin:
         return self._shadow_rows_written_at
 
     def _shadow_key(self, symbol: str, side: str, source: str, market_context: dict[str, Any]) -> ShadowKey:
-        """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket."""
+        """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket.
+
+        Only `ledger_block` rows are spaced per bucket, since a bucket reopens on its own block outcomes;
+        the `shadow_side` rows of every bucket share one spacing (`ANY_BUCKET`)."""
+        if source != SHADOW_BLOCK_SOURCE:
+            return (symbol, side.lower(), source, ANY_BUCKET)
         features = self._features_for_symbol(market_context, symbol)
         return (symbol, side.lower(), source, self._ledger_bucket(side.upper(), features))
 
@@ -308,11 +321,12 @@ class ShadowLedgerMixin:
             return False
         key, last, left = min(waits, key=lambda wait: wait[2])
         self._logger.info(
-            "Shadow-only hour (%s maps %s, which is not traded here): the last shadow row for bucket %s was "
+            "Shadow-only hour (%s maps %s, which is not traded here): the last %s shadow row (%s) was "
             "decided at %s, %.1f min of the %.0f-minute spacing remain; holding without an AI call.",
             (self._current_gate_context() or {}).get("kondisi") or "?",
             mapped,
-            key[3],
+            mapped.upper(),
+            _bucket_label(key[3]),
             last.isoformat(timespec="seconds"),
             left.total_seconds() / 60.0,
             self._shadow_spacing().total_seconds() / 60.0,
@@ -326,7 +340,7 @@ class ShadowLedgerMixin:
         source: str,
         market_context: dict[str, Any],
     ) -> None:
-        """Write the candidate's shadow row, at most one per (symbol, side, source, bucket) per spacing.
+        """Write the candidate's shadow row, at most one per spacing key (`ShadowKey`) per spacing.
 
         A row inside the spacing is skipped (one INFO line) and a failed write is logged; the caller drops
         the candidate in every case. Only a written row starts the spacing. After a restart the spacing of
@@ -337,12 +351,12 @@ class ShadowLedgerMixin:
         if spaced is not None:
             last, left = spaced
             self._logger.info(
-                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for bucket %s was decided "
+                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for %s was decided "
                 "at %s, %.1f min of the %.0f-minute spacing remain.",
                 decision.symbol,
                 candidate.direction.value,
                 source,
-                key[3],
+                _bucket_label(key[3]),
                 last.isoformat(timespec="seconds"),
                 left.total_seconds() / 60.0,
                 self._shadow_spacing().total_seconds() / 60.0,

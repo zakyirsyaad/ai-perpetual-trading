@@ -1122,11 +1122,12 @@ class _LedgerStore:
         self.seed_reads.append((symbol, side, source, bucket_key))
         if self.seed_error is not None:
             raise self.seed_error
-        key = (symbol, side, source, bucket_key)
+        # like the real table query: an empty bucket key does not filter on the bucket
         times = [
             row["decided_at"]
             for row in self.shadow_rows
-            if (row["symbol"], row["side"], row["source"], row["bucket_key"]) == key
+            if (row["symbol"], row["side"], row["source"]) == (symbol, side, source)
+            and (not bucket_key or row["bucket_key"] == bucket_key)
         ]
         return max(times, default=None)
 
@@ -1731,7 +1732,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs.output), 1)
         self.assertIn("INFO", logs.output[0])
         self.assertIn("without an AI call", logs.output[0])
-        self.assertIn("LONG|NAIK|atr_mid", logs.output[0])
+        self.assertIn("the last LONG shadow row (any bucket)", logs.output[0])
         self.assertIn("40.0 min", logs.output[0])   # 70 - 30 minutes remain
 
     async def test_a_shadow_only_hour_outside_the_spacing_still_calls_the_ai(self) -> None:
@@ -1766,32 +1767,61 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(spaced)
 
-    async def test_spacing_is_per_bucket(self) -> None:
-        # One symbol, side and source, two ATR regimes: each bucket keeps its own spacing.
-        store = _LedgerStore()
+    def _alternating_atr_intelligence(self, count: int) -> SimpleNamespace:
+        """An intelligence whose BTC ATR alternates atr_mid (0.25 %) and atr_low (0.1 %) tick by tick."""
         mid = self._context(ema_21=self.NEAR_MEAN)
         low = self._context(ema_21=self.NEAR_MEAN)
-        low["technicals"][0] = dict(low["technicals"][0], atr_14=0.1)   # 0.1 % ATR: atr_low
-        contexts = [mid, low, mid, low]
+        low["technicals"][0] = dict(low["technicals"][0], atr_14=0.1)
+        contexts = [mid if index % 2 == 0 else low for index in range(count)]
 
-        class Intelligence:
-            async def build_context(self) -> SimpleNamespace:
-                context = contexts.pop(0)
-                return SimpleNamespace(to_dict=lambda: context)
+        async def build_context() -> SimpleNamespace:
+            context = contexts.pop(0)
+            return SimpleNamespace(to_dict=lambda: context)
 
+        return SimpleNamespace(build_context=build_context)
+
+    async def test_shadow_side_spacing_spans_buckets(self) -> None:
+        # The LONG go-live bar pools every shadow_side LONG outcome, so a row a minute later in another ATR
+        # bucket would walk almost the same hour twice: the spacing ignores the bucket for shadow_side.
+        store = _LedgerStore()
         orchestrator = self._orchestrator(
             store, [self._decision("OPEN_LONG")], gate_context=self._naik(), symbols=["BTC/USDT"]
         )
-        orchestrator._intelligence = Intelligence()
+        orchestrator._intelligence = self._alternating_atr_intelligence(4)
         for minutes in (0, 1, 2, 3):
             await self._tick_at(orchestrator, self.T0 + timedelta(minutes=minutes))
 
         self.assertEqual(
             [(row["bucket_key"], row["decided_at"]) for row in store.shadow_rows],
-            [("LONG|NAIK|atr_mid", self.T0), ("LONG|NAIK|atr_low", self.T0 + timedelta(minutes=1))],
+            [("LONG|NAIK|atr_mid", self.T0)],
         )
-        # the third and fourth ticks found their own bucket inside its spacing and made no AI call
-        self.assertEqual(orchestrator._brain.calls, 2)
+        # every later tick, whatever its bucket, was inside the spacing of a shadow-only hour: no AI call
+        self.assertEqual(orchestrator._brain.calls, 1)
+
+    async def test_ledger_block_spacing_is_per_bucket(self) -> None:
+        # Reopening is judged per bucket, so each blocked bucket keeps its own ledger_block spacing.
+        store = _LedgerStore(
+            self._losing_shorts()
+            + [dict(row, factor_metadata={"setup": {"bucket_key": "SHORT|TURUN|atr_low"}}) for row in self._losing_shorts()]
+        )
+        orchestrator = self._orchestrator(
+            store,
+            [self._decision("OPEN_SHORT")],
+            gate_context=self._turun(),
+            symbols=["BTC/USDT"],
+            setup_ledger_mode="enforce",
+        )
+        orchestrator._intelligence = self._alternating_atr_intelligence(4)
+        for minutes in (0, 1, 2, 3):
+            self.assertIsNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=minutes)))
+
+        self.assertEqual(
+            [(row["source"], row["bucket_key"], row["decided_at"]) for row in store.shadow_rows],
+            [
+                ("ledger_block", "SHORT|TURUN|atr_mid", self.T0),
+                ("ledger_block", "SHORT|TURUN|atr_low", self.T0 + timedelta(minutes=1)),
+            ],
+        )
 
     async def test_spacing_survives_a_restart_via_the_store_seed(self) -> None:
         store = _LedgerStore()
@@ -1806,7 +1836,8 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         for minutes in (30, 40):
             self.assertIsNone(await self._tick_at(after, self.T0 + timedelta(minutes=minutes)))
         self.assertEqual(after._brain.calls, 0)
-        self.assertEqual(store.seed_reads, [("BTC/USDT", "long", "shadow_side", "LONG|NAIK|atr_mid")])
+        # a shadow_side key spans buckets: the seed asks for the newest row of any bucket
+        self.assertEqual(store.seed_reads, [("BTC/USDT", "long", "shadow_side", "")])
         self.assertEqual(len(store.shadow_rows), 1)
 
         self.assertIsNone(await self._tick_at(after, self.T0 + timedelta(minutes=70)))

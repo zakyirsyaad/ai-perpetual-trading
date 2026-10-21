@@ -248,6 +248,16 @@ class LatestShadowDecidedAtTests(unittest.IsolatedAsyncioTestCase):
         # any evaluation state: no evaluated_at filter
         self.assertNotIn("evaluated_at", [key for key, _ in get["params"]])
 
+    async def test_an_empty_bucket_key_reads_the_newest_row_of_any_bucket(self) -> None:
+        # shadow_side rows are spaced across buckets, so their seed must not filter on one
+        http = _FakeHTTP(rows=[{"decided_at": "2026-10-21T03:00:00+00:00"}])
+
+        await _store(http).latest_shadow_decided_at("BTC/USDT", "long", "shadow_side", "")
+
+        params = http.gets[0]["params"]
+        self.assertNotIn("bucket_key", [key for key, _ in params])
+        self.assertIn(("source", "eq.shadow_side"), params)
+
     async def test_no_row_or_an_unreadable_time_is_none(self) -> None:
         for rows in ([], [{"decided_at": None}], [{"decided_at": "not a time"}]):
             with self.subTest(rows=rows):

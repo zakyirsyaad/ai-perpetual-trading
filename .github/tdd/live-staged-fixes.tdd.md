@@ -812,11 +812,59 @@ the allowed side (`None` when the verdict is already final) and whether the deci
 side; the verdict function is 59 lines. `orchestration.py` goes from 1,293 to 979 lines
 (`shadow_ledger.py` 374). The full suite passed before and after with no expectation changed.
 
+### Re-review of the fixes (two defects the fixes introduced)
+
+A scoped re-review of `aadb11f..dbb254e` found no CRITICAL or HIGH defect and two MEDIUM ones, fixed
+in one commit:
+
+- **Per-bucket spacing let overlapping LONG walks into the pooled go-live sample.** BTC's 3m ATR sits
+  near the 0.15 % `atr_low`/`atr_mid` boundary, so a `shadow_side` LONG row could be written in
+  `atr_mid` and another a tick later in `atr_low`; the go-live bar pools LONG over every bucket, so the
+  two walks counted one hour twice. `_shadow_key` now keys `shadow_side` rows by (symbol, side, source)
+  with `ANY_BUCKET` (`""`) and keeps the bucket for `ledger_block`; `latest_shadow_decided_at` leaves
+  out the bucket filter for an empty bucket key; the log lines say "any bucket". Tests:
+  `test_shadow_side_spacing_spans_buckets` (replaces `test_spacing_is_per_bucket`),
+  `test_ledger_block_spacing_is_per_bucket` (passed before by design: it pins what must stay),
+  `test_an_empty_bucket_key_reads_the_newest_row_of_any_bucket`, and the seed and skip-line tests.
+- **An unreachable row stalled the shadow queue.** Once a row is `CANDLE_WINDOW` minutes old no window
+  holds its decision minute, but a short answer raised `_VenueFailure`, and pending rows are read oldest
+  first with the loop stopping at the first failure, so one old row (pending through an entries latch or
+  a stopped pm2) blocked every newer row on every tick. It now expires whatever the answer length; a
+  short answer to a row still within reach stays a venue failure. Test:
+  `test_a_row_past_the_candle_window_expires_whatever_the_answer_length` (1000 minutes and 3 days, 500
+  candles served); the 3-day subcase of `test_a_short_answer_past_the_decision_minute_stays_pending` is
+  now a row 999 minutes old, still within reach.
+
+RED:
+
+```
+FAIL: test_a_row_past_the_candle_window_expires_whatever_the_answer_length (tests.test_shadow_eval.EvaluatePendingTests) (minutes=1000)
+AssertionError: Tuples differ: (0, []) != (2, [(9, None, 'expired'), (10, None, 'expired')])
+FAIL: test_a_row_past_the_candle_window_expires_whatever_the_answer_length (tests.test_shadow_eval.EvaluatePendingTests) (minutes=4320)
+AssertionError: Tuples differ: (0, []) != (2, [(9, None, 'expired'), (10, None, 'expired')])
+FAIL: test_an_empty_bucket_key_reads_the_newest_row_of_any_bucket (tests.test_supabase_shadow_entries.LatestShadowDecidedAtTests)
+AssertionError: 'bucket_key' unexpectedly found in ['select', 'exchange', 'symbol', 'side', 'source', 'bucket_key', 'order', 'limit']
+FAIL: test_a_shadow_only_hour_inside_the_spacing_makes_no_ai_call (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: 'the last LONG shadow row (any bucket)' not found in 'INFO:test.ledger:Shadow-only hour (NAIK maps long, which is not traded here): the last shadow row for bucket LONG|NAIK|atr_mid was decided at ...'
+FAIL: test_shadow_side_spacing_spans_buckets (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('LO[81 chars]utc)), ('LONG|NAIK|atr_low', datetime.datetime[47 chars]tc))] != [('LO[81 chars]utc))]
+FAIL: test_spacing_survives_a_restart_via_the_store_seed (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('BTC/USDT', 'long', 'shadow_side', 'LONG|NAIK|atr_mid')] != [('BTC/USDT', 'long', 'shadow_side', '')]
+Ran 181 tests in 0.644s
+FAILED (failures=6)
+```
+
+GREEN: the same three modules, `Ran 181 tests ... OK`. Full gate after the fix (Python 3.10.20 `.venv`):
+`compileall -q src tests` exit 0; `Ran 2968 tests ... OK` under coverage, `TOTAL 17411 1396 92%`
+(`shadow_ledger.py` 99 %, the `TYPE_CHECKING` import; `shadow_eval.py` 100 %); `git diff --check` clean.
+
 ### Known limits of these rulings (none blocking)
 
-- The ledger snapshot can be up to 300 s old, so under `enforce` a bucket that a just-closed trade tips
-  into `blocked` can take one more entry in that window (the entry cooldown counts from the entry;
-  only `COOLDOWN_MINUTES_AFTER_EXIT` >= 5 would cover it).
+- The ledger snapshot can be up to 300 s old. This does not let a just-closed trade's bucket take one
+  more entry: the engine blocks inside the tick while a position is open, and the entry cooldown
+  (`COOLDOWN_MINUTES_AFTER_ENTRY`, 10 by default) counts from `opened_at`, so the next strategy call
+  after any trade finds the snapshot at least 10 minutes old and reads it again. It would matter only
+  with an entry cooldown below 5 minutes; otherwise it only delays a reopening by up to 5 minutes.
 - `latest_shadow_decided_at` has no matching index (the table's index is exchange, evaluated_at,
   decided_at). It runs at most once per key per process on a small table; no schema change was made.
 - With the ledger `enforce` and a blocked bucket on a live side, the AI is still asked every tick
@@ -930,7 +978,8 @@ ca3c427 refactor: public timestamp parsers, with_timeout in bot.asyncutil, direc
 f96c4c8 refactor: move the setup ledger and shadow rows into ShadowLedgerMixin   PR #46 13
 62bc92f test: the shadow-only-hour check gives way with no symbol configured   PR #46 2
 a09d50e test: a lean call skipped by the rate-limit cooldown records the lean prompt version   PR #46 5
-        docs: PR #46 review fixes in CLAUDE.md, the spec and TDD evidence     PR #46
+dbb254e docs: PR #46 review fixes in CLAUDE.md, the spec and TDD evidence     PR #46
+        fix: space shadow_side rows across buckets, expire rows out of the candle window   PR #46 re-review
 ```
 
 ## Deployment gate
