@@ -228,10 +228,10 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   lean objective keeps the volume profile but drops all `execution_notes` (`fee_warning`,
   `sizing_source`). Both are pinned by tests and are part of the one lean step on purpose: its effect
   is measured as one.
-- **The entry system prompt (`ai/brain.py`, `ENTRY_SYSTEM_PROMPT`) is unchanged.** It still says
-  volume mandate, use recent performance and trade memory, factors and flows are execution truth,
-  none of which the lean request carries. That confounds the lean experiment. Editing it is **a
-  decision for the user before rollout step 2**; this branch does not touch it.
+- ~~**The entry system prompt (`ai/brain.py`, `ENTRY_SYSTEM_PROMPT`) is unchanged.**~~ Superseded
+  by the PR #46 review fixes (point 5): `ENTRY_SYSTEM_PROMPT` is still unchanged and still sent with
+  the legacy payload, but the lean payload now goes out under `ENTRY_SYSTEM_PROMPT_LEAN`. Its wording
+  is new; the user reviews it before rollout step 2.
 - **Account 1's settings were checked read-only on 2026-10-21** (a `Settings()` allowlist on the VPS,
   02:55 WIB, no `.env` value printed): `ENTRY_STRETCH_GATE_MODE=enforce`, max ATR 0.75,
   behind-schedule entries per hour 0, `POSITION_HOLD_MINUTES=60`, neutral exit basis `net`,
@@ -255,11 +255,14 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   action (OPEN_LONG/OPEN_SHORT) with `payload_json.gate.shadow_side=true` or
   `gate.ledger.status=blocked`; only the candidate is dropped, so the tick holds and the engine logs
   "Strategy returned HOLD". Query the gate flags, not HOLD rows.
-- **A ledger read failure fails open** (WARNING, every bucket `learning` that tick, the regime and
+- **A ledger read failure fails open only before the first good read** (since the episode review
+  and PR #46: otherwise the last good snapshot is reused; falling open is an ERROR under `enforce`).
+  Originally: **a ledger read failure fails open** (WARNING, every bucket `learning` that tick, the regime and
   stretch gates still apply). Since the episode review it does so only before the first good read;
   afterwards the last snapshot is reused (section "Episode-scoped reopening"). Shadow outcomes of source `shadow_side` never reopen a bucket; only
   `ledger_block` outcomes do.
-- **`COMPACT_PROMPT_VERSION` is unchanged**, so `ai_call_metrics` cannot tell the profiles apart; the
+- ~~**`COMPACT_PROMPT_VERSION` is unchanged**, so `ai_call_metrics` cannot tell the profiles apart~~
+  (PR #46 point 5: lean calls record `lean-entry-v1`; `COMPACT_PROMPT_VERSION` itself is unchanged). Originally: the
   report separates them by stage time, and `payload_json.payload_profile` records the profile per
   decision.
 
@@ -271,7 +274,8 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
 - `complete_shadow_entry` is not guarded by `evaluated_at is null`; harmless with the single
   evaluator. `shadow_outcomes_since` returns `expired`/`invalid` rows with NULL `gross_bps`; every
   reader skips them.
-- The report's ledger section uses rows since the earliest `--stage-start`, the engine uses
+- ~~The report's ledger section uses rows since the earliest `--stage-start`~~ (fixed in the PR #46
+  review fixes, point 4: it now reads since `SETUP_LEDGER_SINCE`). Originally: the report's ledger section uses rows since the earliest `--stage-start`, the engine uses
   `SETUP_LEDGER_SINCE`; pass the same instant when comparing statuses.
 - Under `lean`, a tick with no mapped side skips `build_context`, so the flow detectors do not
   advance on those ticks (the engine normally returns at gate 10 first).
@@ -583,6 +587,269 @@ PYTHONPATH=src python -m unittest tests.test_secret_hygiene                     
 - No new import: `setup_ledger.py` still imports only `bot.core.shadow_eval` from `bot`. The
   secret-hygiene, dashboard-contract and import-structure tests pass unchanged.
 
+## PR #46 review fixes
+
+The code review of PR #46 found fifteen points. Point 1 (ledger reopening) was closed by the
+episode-scoped rule above; points 2-15 are fixed here as the controller ruled. Every default
+(`ENTRY_REGIME_GATE=off`, `AI_ENTRY_PAYLOAD=legacy`, `SETUP_LEDGER_MODE=off`, and the pinned `naik`
+forward bot with the ledger off) is unchanged, and `tests/fixtures/legacy_entry_payload.json` is
+untouched and still passes byte for byte. Before 7+11, `origin/fix/ledger-episode-reopen`
+(`a49fac4`, `72bb71e`, the user's approval relayed by the controller) was merged in (`a5541a7`); the
+one conflict, in `AIOrchestrator.__init__`, kept both branches' new attributes, and 7+11 builds on its
+`_last_ledger_snapshot` instead of duplicating it.
+
+### 2, 3, 9. Shadow row spacing per bucket, seeded from the store; no AI call in a spaced shadow-only hour (`2deffe4`)
+
+- **3.** The spacing key is (symbol, side as stored, source, `bucket_key`), not (symbol, side, source).
+- **9.** A key with no time in memory is seeded once per key per process from
+  `SupabaseTradeStore.latest_shadow_decided_at(symbol, side, source, bucket_key)` (PostgREST: the
+  exchange and those four `eq` filters, `order=decided_at.desc`, `limit=1`, any evaluation state; added
+  to `TradeStoreProtocol` and the `_LedgerStore` fake). A failed seed read is a WARNING and counts as
+  no earlier row, so the row is written; it is retried the next time the key comes up.
+- **2.** Under `map`, an hour whose mapped side is not in `_live_sides()` can trade nothing. After
+  `build_context`, `next_trade_plan` computes each symbol's (`shadow_side`) key and returns `None`
+  without the AI call, with one INFO line ("Shadow-only hour ... holding without an AI call"), while
+  every symbol's key is inside its spacing. With two symbols, one key outside its spacing is enough to
+  ask the model (a row could still be written); with none configured the check gives way
+  (`test_a_shadow_only_hour_with_no_symbol_is_never_spaced`, `62bc92f`).
+
+RED (against the unchanged source):
+
+```
+ERROR: test_it_reads_the_newest_row_of_one_key_for_this_exchange (tests.test_supabase_shadow_entries.LatestShadowDecidedAtTests)
+AttributeError: 'SupabaseTradeStore' object has no attribute 'latest_shadow_decided_at'
+(the same AttributeError in test_no_row_or_an_unreadable_time_is_none x3 and test_a_failed_read_raises_with_the_table_name)
+FAIL: test_a_failed_seed_read_writes_the_row_and_warns (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: no logs of level WARNING or higher triggered on test.ledger
+FAIL: test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: 'SHORT|TURUN|atr_mid' not found in 'INFO:test.ledger:Entry candidate BTC/USDT SHORT is not traded (ledger_block); no shadow row: the last one for it was decided at 2026-10-21T03:00:00+00:00, 40.0 min of the 70-minute spacing remain.'
+FAIL: test_a_shadow_only_hour_inside_the_spacing_makes_no_ai_call (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: 2 != 1
+FAIL: test_spacing_is_per_bucket (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('LO[81 chars]utc))] != [('LO[81 chars]utc)), ('LONG|NAIK|atr_low', datetime.datetime[47 chars]tc))]
+FAIL: test_spacing_survives_a_restart_via_the_store_seed (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: 2 != 0
+```
+
+`test_a_shadow_only_hour_outside_the_spacing_still_calls_the_ai` passed before the change by design:
+it pins that the first tick, the end of the spacing, a second symbol without a row and a live hour
+still call the model. `test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded`
+now uses an enforce-blocked live SHORT (`ledger_block`), because a shadow-only hour no longer reaches
+the write-time skip; it also checks the bucket in the INFO line and that the AI was asked both times.
+
+### 7, 11. The ledger snapshot is cached for 300 s; a failed read reuses the last one (`607fe35`)
+
+Built on the merged `_last_ledger_snapshot`: `_ledger_snapshot` reuses the last snapshot read
+without error while it is younger than `LEDGER_CACHE_SECONDS = 300` (no read at all), reads again
+once it is older, reuses it on a failed read whatever its age (one WARNING, "the last snapshot is used
+this tick"), and only with no good read yet falls open to `{}`, now at ERROR under `enforce`
+(WARNING under `shadow`). A failed read is never cached. State: `_last_ledger_snapshot` and
+`_last_ledger_read_at`, in memory, replaced together; the clock is the `_utc_now` seam.
+
+RED:
+
+```
+FAIL: test_a_failed_first_read_falls_open_with_an_error_under_enforce (tests.test_ai_orchestration.LedgerAndShadowTests) (mode='enforce')
+AssertionError: Lists differ: [30] != [40]
+FAIL: test_ledger_is_reused_within_the_cache_age (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('tr[168 chars]ock'), ('trades', datetime.datetime(2026, 10, [134 chars]ck')] != [('tr[168 chars]ock')]
+```
+
+`test_a_failed_read_reuses_the_last_table` passed at once on the merged code: it pins the any-age
+reuse over hours of failed reads, one WARNING per failed read, and that a later good read replaces
+the table. The merged `test_a_ledger_read_failure_reuses_the_last_snapshot` now moves the clock past
+the cache age, so its second tick really reads (and fails).
+
+### 5. The lean payload gets its own system prompt and prompt version (`1be1f1b`)
+
+`ENTRY_SYSTEM_PROMPT_LEAN` (`ai/brain.py`) keeps the role line, the output contract and the
+JSON/risk-review rules of `ENTRY_SYSTEM_PROMPT`; it drops the volume-building mandate and the
+instructions to use recent performance, trade memory, factors and flow signals; it says HOLD is the
+expected answer most ticks and an entry needs an edge beyond the round-trip fee, and names
+`features`, `entry_rules`, `market_regime` and `setup_ledger` (when present) as the inputs.
+`GrokBrain.entry_decisions(payload, *, lean=False)` picks the prompt and passes a `prompt_version`
+through `_ask_grok` to every `_record_metrics` call (success, failure and the rate-limit skip):
+`LEAN_PROMPT_VERSION = "lean-entry-v1"` (`ai/compact_context.py`, beside `COMPACT_PROMPT_VERSION`)
+for lean, `COMPACT_PROMPT_VERSION` otherwise. The orchestrator passes `lean=True` only for the lean
+payload; the legacy call is byte for byte the old call. `ai_call_metrics` has no prompt hash column;
+`request_hash` stays the payload hash.
+
+RED:
+
+```
+ERROR: test_ai_brain_contract (unittest.loader._FailedTest)
+ImportError: cannot import name 'ENTRY_SYSTEM_PROMPT_LEAN' from 'bot.ai.brain'
+FAIL: test_lean_profile_is_recorded_and_legacy_is_default (tests.test_ai_orchestration.LeanEntryPayloadTests)
+AssertionError: Lists differ: [False] != [True]
+```
+
+Tests (`EntrySystemPromptTests`): `test_the_legacy_entry_prompt_and_version_are_unchanged` (the
+legacy prompt pinned by its sha256 `8e125a5c...634323`, and `okx-context-parity-v3` recorded),
+`test_a_lean_call_uses_the_lean_prompt_and_records_the_lean_version`,
+`test_a_failed_lean_call_still_records_the_lean_version`,
+`test_a_lean_call_skipped_by_a_rate_limit_cooldown_records_the_lean_version` (`a09d50e`, so the
+`prompt_version` argument on that path is covered), `test_other_calls_keep_the_legacy_version`,
+`test_the_lean_prompt_drops_the_volume_mandate_and_names_the_lean_inputs`;
+`test_prompt_version_and_hash_are_stable` passes unchanged.
+
+### 6. Map and the ledger need the net basis and `ai_volume` sizing (`3e227dd`)
+
+`Settings._require_shadow_walk_companions` (map, or a ledger mode other than `off`) also requires
+`VOLUME_NEUTRAL_EXIT_BASIS=net` and `STRATEGY_MODE=ai_volume`, in the same single `ValueError` that
+names everything missing. `naik` with the ledger off is still not checked. `.env.example` says so.
+
+RED:
+
+```
+FAIL: test_map_and_the_ledger_refuse_the_grok_strategy (...ShadowWalkExitSettingsTests) [map]
+AssertionError: ValueError not raised
+FAIL: test_map_and_the_ledger_refuse_the_grok_strategy (...ShadowWalkExitSettingsTests) [ledger]
+AssertionError: ValueError not raised
+FAIL: test_map_and_the_ledger_refuse_the_gross_neutral_exit_basis (...ShadowWalkExitSettingsTests) [map]
+AssertionError: ValueError not raised
+FAIL: test_map_and_the_ledger_refuse_the_gross_neutral_exit_basis (...ShadowWalkExitSettingsTests) [ledger]
+AssertionError: ValueError not raised
+FAIL: test_one_error_names_everything_the_shadow_walk_needs (...ShadowWalkExitSettingsTests)
+AssertionError: 'VOLUME_NEUTRAL_EXIT_BASIS=net' not found in "1 validation error for Settings ..."
+FAIL: test_map_accepts_ai_volume_and_refuses_grok (tests.test_live_staged_settings.StagedSettingsTests)
+AssertionError: ValueError not raised
+```
+
+`test_map_accepts_ai_volume_and_refuses_grok` replaces `test_map_accepts_either_ai_strategy`, whose
+expectation the ruling reverses. `test_naik_with_the_ledger_off_and_the_gate_off_are_not_checked`
+now also boots `naik` with `grok` and the `gross` basis.
+
+### 10. A shadow row expires only on a full candle window (`4e98c4a`)
+
+In `shadow_eval._outcome`, a window whose oldest candle is after the decision minute expires the
+row only when it holds at least `limit - 1` candles (the forming candle may be dropped). A shorter
+answer did not honour the limit: `_VenueFailure`, the row stays pending, one WARNING, the loop stops.
+
+RED:
+
+```
+FAIL: test_a_short_answer_past_the_decision_minute_stays_pending (tests.test_shadow_eval.EvaluatePendingTests) (served=7)
+AssertionError: no logs of level WARNING or higher triggered on test.shadow
+FAIL: test_a_short_answer_past_the_decision_minute_stays_pending (tests.test_shadow_eval.EvaluatePendingTests) (served=500)
+AssertionError: no logs of level WARNING or higher triggered on test.shadow
+```
+
+`test_a_short_answer_past_the_decision_minute_stays_pending` replaces
+`test_a_window_missing_the_decision_minute_expires` (7 of 10 candles served, which the ruling now
+calls a venue failure). `test_a_full_window_past_the_decision_minute_expires` (1000 and 999 of 1000)
+passed before by design. The merged `_CandlesFrom` fake in `tests/test_setup_ledger.py` served one
+candle and so produced an `expired` row only under the old rule; it now serves the full window asked
+for (amended into the same commit after the full suite caught it).
+
+### 4, 8. The stage report reads the engine's ledger window and keeps the shadow sources apart (`6731957`)
+
+- **4.** With `SETUP_LEDGER_SINCE` set, `_execute` reads `closed_trade_rows_since(SETUP_LEDGER_SINCE)`
+  and `shadow_outcomes_since(SETUP_LEDGER_SINCE, source="ledger_block")`, cuts both at `--until` and
+  passes them to `render_ledger`, whose heading says "sejak <WIB> (SETUP_LEDGER_SINCE) sampai <WIB>".
+  Unset (ledger off), it keeps the stage rows and the heading says "SETUP_LEDGER_SINCE tidak diatur,
+  ledger mati: dibaca sejak awal tahap pertama <WIB>". Unreadable ledger rows get their own
+  PERINGATAN line.
+- **8.** `shadow_summary` groups by (source, side, bucket) and returns `(source, side, bucket, n,
+  mean_bps)`; the table has a `sumber` column.
+
+RED:
+
+```
+ERROR: test_the_shadow_section_lists_groups_and_the_unpriced_rows (tests.test_report_live_stages.CliTests)   (StopIteration: no "sumber" header)
+FAIL: test_the_ledger_heading_says_when_setup_ledger_since_is_unset (tests.test_report_live_stages.CliTests)
+AssertionError: 'SETUP_LEDGER_SINCE tidak diatur' not found in ' (minimum 2 sampel, ambang 4,00 bps) ==='
+FAIL: test_the_ledger_reads_its_own_window_when_setup_ledger_since_is_set (tests.test_report_live_stages.CliTests)
+AssertionError: Lists differ: [date[58 chars].utc)] != [date[58 chars].utc), datetime.datetime(2026, 10, 19, 0, 0, t[24 chars]utc)]
+FAIL: test_the_shadow_section_keeps_the_sources_apart (tests.test_report_live_stages.CliTests)
+AssertionError: Lists differ: ['LONG'] != ['ledger_block', 'shadow_side']
+FAIL: test_groups_by_source_side_and_bucket (tests.test_report_live_stages.ShadowSummaryTests)
+FAIL: test_rows_without_a_result_are_not_averaged (tests.test_report_live_stages.ShadowSummaryTests)
+```
+
+The report fake's `_settings()` now carries `setup_ledger_since=None` (the real `Settings` always has
+the field).
+
+### 12, 14, 15. Public parsers, `with_timeout` in `bot.asyncutil`, direct state reads (`ca3c427`, no behaviour change)
+
+- **12.** `shadow_eval.parse_utc` and `supabase_trade_store.parse_timestamp` are public, with the old
+  private names kept as aliases; `setup_ledger.py` and `report_live_stages.py` import the public ones.
+- **15.** `with_timeout` moves unchanged (code and docstring) to `src/bot/asyncutil.py`;
+  `bot.telemetry.ws` re-exports it, so telemetry and its tests are unchanged, and `shadow_eval.py`
+  imports it from `bot.asyncutil`.
+- **14.** `_current_gate_context()` and `_last_shadow_rows()` read their attributes directly, and
+  `_record_ai_decision` goes through `_current_gate_context()`. The `object.__new__` helpers in
+  `tests/test_ai_orchestration.py` share `_bare_orchestrator()`, which sets `_gate_context = None` and
+  calls the mixin's `_init_shadow_ledger_state()`. The other files' helpers never reach this state and
+  are unchanged.
+
+RED (`ModuleBoundaryTests` in `tests/test_shadow_eval.py`, against the original `ws.py`):
+
+```
+ERROR: test_the_timestamp_parsers_are_public_with_their_old_names_as_aliases (...ModuleBoundaryTests)
+AttributeError: module 'bot.core.shadow_eval' has no attribute 'parse_utc'
+ERROR: test_with_timeout_has_one_definition_re_exported_by_telemetry (...ModuleBoundaryTests)
+ImportError: cannot import name 'asyncutil' from 'bot'
+FAIL: test_the_core_does_not_import_telemetry (...ModuleBoundaryTests) (path='src/bot/core/shadow_eval.py')
+AssertionError: Lists differ: ['bot.telemetry.ws'] != []
+```
+
+Finding 14 has no RED of its own: removing the `getattr` fallbacks made four existing tests error
+(`AttributeError` on `_gate_context`) until the helpers set the state.
+
+### 13. `ShadowLedgerMixin` and `_resolve_gate_side` (`f96c4c8`, pure refactor)
+
+The ledger and shadow helpers move unchanged to `src/bot/ai/shadow_ledger.py` as
+`ShadowLedgerMixin`, which `AIOrchestrator` inherits: `_ledger_mode`, `_ledger_snapshot`,
+`_ledger_bucket`, `_ledger_verdict`, `_with_ledger_verdict`, `_ledger_lines`, `_shadow_source`,
+`_shadow_row`, `_shadow_spacing`, `_last_shadow_rows`, `_record_shadow_entry`, and the new
+`_shadow_key`, `_last_shadow_row_at`, `_spacing_left`, `_shadow_only_hour_is_spaced`, with their state
+(`_init_shadow_ledger_state`: `_shadow_rows_written_at`, `_shadow_seeded_keys`,
+`_last_ledger_snapshot`, `_last_ledger_read_at`), `_utc_now`, `OPEN_ACTIONS`, `SHADOW_SIDE_SOURCE`
+(re-exported from `orchestration`), `ShadowKey` and `LEDGER_CACHE_SECONDS`. Method names are
+unchanged; the one test patch moves to `bot.ai.shadow_ledger._utc_now`. `_stretch_gate_verdict`'s
+side resolution is `_resolve_gate_side(decision)`, returning the verdict fields in the old key order,
+the allowed side (`None` when the verdict is already final) and whether the decision is on another
+side; the verdict function is 59 lines. `orchestration.py` goes from 1,293 to 979 lines
+(`shadow_ledger.py` 374). The full suite passed before and after with no expectation changed.
+
+### Known limits of these rulings (none blocking)
+
+- The ledger snapshot can be up to 300 s old, so under `enforce` a bucket that a just-closed trade tips
+  into `blocked` can take one more entry in that window (the entry cooldown counts from the entry;
+  only `COOLDOWN_MINUTES_AFTER_EXIT` >= 5 would cover it).
+- `latest_shadow_decided_at` has no matching index (the table's index is exchange, evaluated_at,
+  decided_at). It runs at most once per key per process on a small table; no schema change was made.
+- With the ledger `enforce` and a blocked bucket on a live side, the AI is still asked every tick
+  inside the `ledger_block` spacing; the skip covers shadow-only hours only, as ruled.
+- `orchestration.py` is 979 lines, still above the 800-line soft ceiling.
+
+### Verification (PR #46 review fixes)
+
+Run on `feat/live-staged-fixes` at `a09d50e` (the docs commit adds no code), Python 3.10.20 from
+`.venv`, 2026-10-21, with `set -o pipefail`.
+
+```
+PYTHONPATH=src python -m compileall -q src tests                                   # exit 0
+PYTHONPATH=src python -m unittest discover -s tests                                # Ran 2965 tests, OK
+PYTHONPATH=src python -m coverage run --rcfile=<rc> -m unittest discover -s tests  # Ran 2965 tests, OK
+python -m coverage report --rcfile=<rc>                                            # TOTAL 17405 1396 92%   (fail_under 80)
+git diff --check origin/main...HEAD                                                # exit 0, no output (origin/main = 95e61b7)
+uv pip check --python .venv/bin/python                                             # All installed packages are compatible (17)
+```
+
+- 2,965 tests (2,935 at `aadb11f`; the merged ledger review fixes bring it to 2,945; these fixes add 20).
+- Modules: `shadow_ledger.py` 99 % (the one miss is the `TYPE_CHECKING` import), `asyncutil.py`
+  100 %, `shadow_eval.py` 100 %, `setup_ledger.py` 100 %, `orchestration.py` 96 %, `config.py` 96 %,
+  `supabase_trade_store.py` 96 %, `report_live_stages.py` 98 % (still `_run` and `main`), `brain.py`
+  85 %. No line these fixes added under `src/` is missed; the misses listed in those modules were
+  already missed before.
+- `<rc>` mirrors `pyproject.toml`'s `[tool.coverage]` (`source`, `omit`, `exclude_lines`,
+  `fail_under`), since the `.venv` 3.10 has no `tomli`.
+- `tests/fixtures/legacy_entry_payload.json` is unchanged; `test_legacy_payload_matches_the_golden`
+  and `test_the_legacy_request_is_the_builder_s_output_byte_for_byte` pass. The secret-hygiene,
+  dashboard-contract, forward-schema and import-structure tests pass; `shadow_eval.py` now imports
+  only `bot.asyncutil` from `bot`.
+
 ## Verification
 
 Run on `feat/live-staged-fixes` at `81e4230` (docs files only added after), Python 3.10.20 from
@@ -651,7 +918,19 @@ f8a2e23 feat: setup ledger statistics and status                                
 1856610 fix: scope ledger reopening to the latest blocked episode               episode scope
 aadb11f docs: episode-scoped ledger reopening in CLAUDE.md, the spec and TDD    episode scope
 a49fac4 fix: ledger review fixes (tie, last snapshot, episode verdict keys)     episode review
-        docs: ledger review fixes in CLAUDE.md, the spec and TDD evidence      episode review
+72bb71e docs: ledger review fixes in CLAUDE.md, the spec and TDD evidence      episode review
+2deffe4 fix: space shadow rows per bucket, seed the spacing from the store, skip the AI in a spaced shadow-only hour   PR #46 2, 3, 9
+a5541a7 Merge branch 'fix/ledger-episode-reopen' into feat/live-staged-fixes   episode review merged
+607fe35 fix: reuse the setup ledger for 300 s, and say ERROR when enforce falls open   PR #46 7, 11
+1be1f1b fix: lean entry payload gets its own system prompt and prompt version   PR #46 5
+3e227dd fix: map and the setup ledger need the net neutral-exit basis and ai_volume sizing   PR #46 6
+4e98c4a fix: expire a shadow row only when the venue served a full candle window   PR #46 10
+6731957 fix: stage report reads the ledger over the engine's window and splits shadow rows by source   PR #46 4, 8
+ca3c427 refactor: public timestamp parsers, with_timeout in bot.asyncutil, direct state reads   PR #46 12, 14, 15
+f96c4c8 refactor: move the setup ledger and shadow rows into ShadowLedgerMixin   PR #46 13
+62bc92f test: the shadow-only-hour check gives way with no symbol configured   PR #46 2
+a09d50e test: a lean call skipped by the rate-limit cooldown records the lean prompt version   PR #46 5
+        docs: PR #46 review fixes in CLAUDE.md, the spec and TDD evidence     PR #46
 ```
 
 ## Deployment gate
@@ -677,8 +956,8 @@ Never restart with an open position: check flat on the venue **and** in `open_po
    gross bps per trade against the previous step with its SE, and volume per day. A step worse by
    more than one SE is rolled back by reverting its settings and restarting while flat; shadow rows
    are harmless and stay.
-4. **Step 2** (`AI_ENTRY_PAYLOAD=lean`) waits for step 1's 60 SHORT trades **and** the user's decision
-   on the entry system prompt (see Deliberate choices). **Step 3** (`SETUP_LEDGER_MODE=enforce`)
+4. **Step 2** (`AI_ENTRY_PAYLOAD=lean`) waits for step 1's 60 SHORT trades **and** the user's review
+   of `ENTRY_SYSTEM_PROMPT_LEAN`, the system prompt every lean call is now sent with (PR #46 point 5). **Step 3** (`SETUP_LEDGER_MODE=enforce`)
    follows step 2's 60 trades, and needs the episode-scoped reopening (`1856610`) on the deployed
    code: without it a re-blocked bucket reads `reopened` again about an hour after its next block row.
 5. **LONG goes live** (`ENTRY_GATE_DIRECTION=any`) only when the LONG shadow outcomes reach n >= 60

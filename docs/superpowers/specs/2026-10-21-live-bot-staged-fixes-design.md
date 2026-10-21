@@ -104,6 +104,13 @@ today's payload. `lean` changes the entry request only (the exit AI is off and o
 The arena still runs and is still recorded; only what reaches the model changes. Every decision
 records `payload_json.payload_profile` = `legacy` or `lean`.
 
+*PR #46 review:* the lean request is sent under its own system prompt, `ENTRY_SYSTEM_PROMPT_LEAN`
+(same role, output contract and JSON/risk-review rules as the legacy prompt; no volume mandate, no
+instruction to use recent performance, trade memory, factors or flows; HOLD is the expected answer
+most ticks; it names `features`, `entry_rules`, `market_regime` and `setup_ledger` as the inputs),
+and its calls record `ai_call_metrics.prompt_version` = `lean-entry-v1`. The legacy prompt and
+`COMPACT_PROMPT_VERSION` are unchanged.
+
 ## 5. Part B — two-way regime gate
 
 `ENTRY_REGIME_GATE` gains the value `map` (`off` | `naik` | `map`); `naik` is unchanged.
@@ -142,6 +149,9 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   `factor_metadata.setup` at entry (`kondisi`, `bucket_key`), so a closed trade carries its bucket.
 - **Real outcomes.** For each closed trade since `SETUP_LEDGER_SINCE`: gross bps from entry and
   exit prices. Read from the store once per closed trade, cached in memory between closes.
+  *PR #46 review:* as built, the snapshot (trades and `ledger_block` outcomes) is read at most once
+  per `LEDGER_CACHE_SECONDS` = 300 s and held in memory, so a status can lag a close by up to 5
+  minutes; a restart reads it afresh.
 - **Shadow outcomes.** Table `shadow_entries` (new, in `supabase/schema.sql`; the `long_forward`
   copy is regenerated, the drift test pins it): decision time, symbol, side, bucket, reference
   price, stop %, floor %, hold minutes, source (`shadow_side` or `ledger_block`), and the outcome
@@ -151,14 +161,28 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   minute on and walks them like the live exit rules (stop first when a candle touches both, stop
   filled 1 bp worse, time exit at the last close). A read failure leaves the row for the next tick
   and is logged at WARNING; it never blocks trading.
+  - *PR #46 review:* a row expires only when the venue served a full window (at least the limit
+    asked for minus one, since the forming candle may be dropped) that no longer reaches the
+    decision-minute candle. A shorter answer that misses it did not honour the limit, so it is a
+    venue failure: the row stays pending and the loop stops for the tick.
   - *Final review:* the walk models the floor neutral exit, so `Settings` refuses
     `ENTRY_REGIME_GATE=map` or a ledger mode other than `off` unless `VOLUME_NEUTRAL_EXIT_ENABLED=true`
-    and `VOLUME_NEUTRAL_EXIT_MODE=floor` (`naik` with the ledger off is not checked).
+    and `VOLUME_NEUTRAL_EXIT_MODE=floor` (`naik` with the ledger off is not checked). *PR #46 review:*
+    the floor is 100 × `VOLUME_NEUTRAL_EXIT_MIN_NET_USDT` / (ai_volume margin × leverage) plus the
+    round-trip fee, a net threshold on the `ai_volume` notional, so the same check also requires
+    `VOLUME_NEUTRAL_EXIT_BASIS=net` and `STRATEGY_MODE=ai_volume` (one error names everything missing).
   - *Final review:* rows are spaced at write time. No new row is written for the same (symbol, side,
     source) while the last one written for it was decided less than `POSITION_HOLD_MINUTES` +
     `COOLDOWN_MINUTES_AFTER_ENTRY` minutes earlier, so walks do not overlap and n is not inflated. A
     skipped candidate is still dropped (one INFO line); a failed write does not start the spacing; the
     times are kept in memory, so a restart forgets them.
+  - *PR #46 review:* the spacing key is (symbol, side, source, `bucket_key`), so two buckets of one
+    side are spaced apart. A key with no time in memory is seeded once per process from the store's
+    newest row for it (any evaluation state), so a restart keeps the spacing; a failed seed read is
+    a WARNING and the row is written. Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION`
+    does not make live can trade nothing, so while every symbol's `shadow_side` row for that side and
+    bucket is inside its spacing the tick returns after the context is built and before the AI call
+    (one INFO line).
 - **Verdict per bucket** (pre-registered):
   - `blocked` when real n ≥ `MIN_SAMPLES` and mean + 1.28 × SE < `HURDLE_BPS` (90 % one-sided:
     the bucket cannot reach the bar);
@@ -185,7 +209,9 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     `since_block_n` and `since_block_upper_bps`, so a decision row shows why its bucket is `blocked`
     or `reopened`; and a failed ledger read reuses the last snapshot read without error (in memory),
     so a transient store error lets no entry into a blocked bucket and so cannot end its run. Before
-    the first good read the ledger still fails open (every bucket `learning`);
+    the first good read the ledger still fails open (every bucket `learning`); *PR #46 review:* the
+    reuse holds whatever the snapshot's age, a failed read is never cached, and falling open is an
+    ERROR under `enforce` (a WARNING under `shadow`);
   - otherwise `open`, with `learning` while n < `MIN_SAMPLES`.
 - **Mode.** `shadow`: the verdict is recorded at `payload_json.gate.ledger` and changes nothing.
   `enforce`: the candidate of an entry in a `blocked` bucket is dropped in code (the tick holds; the
@@ -200,7 +226,11 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
 
 `src/report_live_stages.py --stage-start <ISO> [--stage-start <ISO> ...]`: for each stage window,
 trades, win rate, gross bps ± SE, net per 1M, volume per day; the shadow table by side and bucket;
-the ledger table. Read-only, prints Indonesian headings like the other reports.
+the ledger table. Read-only, prints Indonesian headings like the other reports. *PR #46 review:* the
+shadow table groups by source as well (`shadow_side` and `ledger_block` never share a mean), and the
+ledger table reads the engine's window, every trade and `ledger_block` row since
+`SETUP_LEDGER_SINCE` up to `--until`, named in its heading (with it unset, the stage rows, and the
+heading says the ledger is off).
 
 ## 8. Rollout and measurement
 
