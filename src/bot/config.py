@@ -552,7 +552,11 @@ class Settings(BaseSettings):
             return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("SETUP_LEDGER_SINCE must be a timezone-aware ISO-8601 timestamp")
-        return value.astimezone(timezone.utc)
+        normalized = value.astimezone(timezone.utc)
+        # A future start leaves both ledger reads empty (every bucket `learning`, nothing logged).
+        if normalized > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("SETUP_LEDGER_SINCE cannot be more than 5 minutes in the future")
+        return normalized
 
     @field_validator("strategy_mode")
     @classmethod

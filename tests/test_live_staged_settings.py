@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bot.config import Settings
 
-AWARE_SINCE = "2026-10-22T00:00:00+07:00"
+# In the past: a SETUP_LEDGER_SINCE more than five minutes ahead is refused.
+AWARE_SINCE = "2026-10-20T00:00:00+07:00"
 # The shadow walk models the floor neutral exit, so map and the ledger need the live exit to be that one.
 FLOOR_EXIT = {
     "VOLUME_NEUTRAL_EXIT_ENABLED": "true",
@@ -137,7 +138,7 @@ class StagedSettingsTests(unittest.TestCase):
 
                 self.assertEqual(settings.setup_ledger_mode, "shadow")
                 self.assertEqual(
-                    settings.setup_ledger_since, datetime(2026, 10, 21, 17, 0, tzinfo=timezone.utc)
+                    settings.setup_ledger_since, datetime(2026, 10, 19, 17, 0, tzinfo=timezone.utc)
                 )
 
     def test_ledger_on_needs_an_aware_since(self):
@@ -150,6 +151,17 @@ class StagedSettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             mapped(SETUP_LEDGER_MODE="shadow")
         self.assertIn("SETUP_LEDGER_SINCE", str(caught.exception))
+
+    def test_a_since_more_than_five_minutes_ahead_is_refused(self):
+        # A future start would leave both ledger reads empty: every bucket `learning`, nothing ever blocked,
+        # and no log line, since the reads succeed. Same rule as VOLUME_CYCLE_STARTED_AT.
+        ahead = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        with self.assertRaises(ValueError) as caught:
+            mapped(SETUP_LEDGER_MODE="enforce", SETUP_LEDGER_SINCE=ahead)
+        self.assertIn("SETUP_LEDGER_SINCE cannot be more than 5 minutes in the future", str(caught.exception))
+
+        now = datetime.now(timezone.utc).isoformat()
+        self.assertIsNotNone(mapped(SETUP_LEDGER_MODE="enforce", SETUP_LEDGER_SINCE=now).setup_ledger_since)
 
     def test_a_naive_since_is_refused_even_with_the_ledger_off(self):
         with self.assertRaises(ValueError) as caught:
