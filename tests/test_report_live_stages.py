@@ -160,6 +160,18 @@ class StageRowsTests(unittest.TestCase):
         (stage,) = report.stage_rows([row], [DAY0], DAY1)
         self.assertEqual(stage.n, 1)
 
+    def test_a_stored_time_without_an_offset_is_read_as_utc_not_refused(self) -> None:
+        # The store's parser reads an offset-less time as UTC, so neither the stage split nor `_within`
+        # ever compares a naive moment with the aware bounds (and no naive guard is needed there).
+        inside, outside = _row(DAY0), _row(DAY0)
+        inside["closed_at"] = "2026-10-21T05:00:00"    # 05:00 UTC, inside [DAY0, DAY1)
+        outside["closed_at"] = "2026-10-22T00:00:00"   # DAY1 itself: the end is exclusive
+        (stage,) = report.stage_rows([inside, outside], [DAY0], DAY1)
+        kept, unreadable = report._within([inside, outside], "closed_at", DAY0, DAY1)
+
+        self.assertEqual(stage.n, 1)
+        self.assertEqual((kept, unreadable), ([inside], 0))
+
     def test_a_stage_that_starts_at_or_after_until_is_not_listed(self) -> None:
         stages = report.stage_rows([_row(DAY0)], [DAY0, DAY2, DAY4], DAY2)
         self.assertEqual([(s.start, s.end) for s in stages], [(DAY0, DAY2)])
