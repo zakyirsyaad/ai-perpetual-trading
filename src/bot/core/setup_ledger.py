@@ -152,9 +152,9 @@ def ledger_table(
 
     Per bucket, the counted trades (by `opened_at`) and the block rows (by `decided_at`) share one
     timeline; times need an offset, as the store writes them. `shadow_run` holds the outcomes of the
-    block rows decided strictly after the last trade opened strictly before the latest block row (all
-    of them when there is no such trade), and `real_since_block` the trades opened strictly after the
-    latest block row. A trade without a readable `opened_at` counts in `real` only.
+    block rows decided strictly after the last trade opened at or before the latest block row (all of
+    them when there is no such trade; a tie ends the run), and `real_since_block` the trades opened
+    strictly after the latest block row. A trade without a readable `opened_at` counts in `real` only.
     """
     trades: dict[str, list[tuple[float, datetime | None]]] = {}
     for row in trade_rows:
@@ -186,9 +186,10 @@ def _bucket_ledger(
     since_block: list[float] = []
     if blocks:
         latest = max(decided_at for decided_at, _ in blocks)
-        # The last trade opened before the latest block row ends every earlier run of block rows.
+        # The last trade opened before the latest block row ends every earlier run of block rows; a trade at
+        # the same instant ends it too, so a tie never leaves an old run standing.
         boundary = max(
-            (opened_at for _, opened_at in trades if opened_at is not None and opened_at < latest), default=None
+            (opened_at for _, opened_at in trades if opened_at is not None and opened_at <= latest), default=None
         )
         run = [
             gross for decided_at, gross in blocks if gross is not None and (boundary is None or decided_at > boundary)
