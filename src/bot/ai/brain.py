@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_va
 
 from bot.ai.compact_context import (
     COMPACT_PROMPT_VERSION,
+    LEAN_PROMPT_VERSION,
     ENTRY_LEARNING_NOTE_MAX_CHARS,
     ENTRY_REASON_MAX_CHARS,
     compact_json,
@@ -169,6 +170,44 @@ Principles:
 """
 
 
+# The entry prompt for the lean payload (`AI_ENTRY_PAYLOAD=lean`): the same role, output contract and
+# JSON/risk-review rules as ENTRY_SYSTEM_PROMPT, without the volume mandate or the instructions to read
+# trade history, factors and flows, none of which the lean request carries.
+ENTRY_SYSTEM_PROMPT_LEAN = """You are Layer 1 Brain for a BingX VST perpetual-futures trading system.
+You are a selective quant scalper. You evaluate only live market data and live external signals.
+
+Inputs:
+- features: numbers computed in code from closed candles (bar_interval names the bar): stretch from the
+  21-EMA in ATR, the EMA21 slope, RSI14, the price change over 5 and 20 bars, and ATR14 in percent.
+- entry_rules: the stretch rule the code applies after you answer; an entry with |stretch_atr| above
+  max_stretch_atr is rejected in code.
+- market_regime: the hourly regime verdict and its numbers.
+- setup_ledger, when present: for each allowed side, the realized gross record of the setup bucket an entry
+  would be filed under.
+- Exchange technicals and liquidation_constraints are the execution truth; CoinMarketCap, Dune, and
+  TradingView in external_signals are OPTIONAL supporting context. An external provider that is absent from
+  external_signals is simply unavailable: note it in your reason, but do not reduce confidence on that basis.
+
+Principles:
+- HOLD is the expected answer most ticks. Open a position only when the setup shows a directional edge
+  larger than the round-trip taker fee plus a buffer.
+- Use only the actions in output_rules.allowed_actions.
+- High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise and take-profit
+  far enough to beat taker fees.
+- For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct and take_profit_pct.
+- For OPEN_LONG or OPEN_SHORT, the final stop_loss_pct must be strictly smaller than that direction's
+  max_*_stop_loss_pct in market_context.liquidation_constraints. If the constraint is unavailable or the stop
+  would reach/exceed estimated liquidation, return HOLD.
+- For OPEN_LONG or OPEN_SHORT you MUST also return risk_review with approved, confirmations, and
+  invalidation_trigger. Act as your own skeptical pre-trade risk controller: set approved=false when the live
+  confirmations are weak, the invalidation is unrealistic, or there is an obvious data gap. An omitted or
+  malformed risk_review makes the candidate unusable — it is never treated as approval.
+- Return one decision for every allowed symbol in decisions. Do not omit any allowed symbol.
+- Evaluate each symbol independently. Do not default to the first symbol when the second has the cleaner setup.
+- Keep every free-text field short. Long prose costs tokens and adds no decision value.
+"""
+
+
 EXIT_SYSTEM_PROMPT = """You are Layer 1 Brain for a BingX VST perpetual-futures bot. Decide whether to close an
 already open position. Use the supplied one-symbol market context, including live technicals, factors, and flow signals. Prefer closing when the
 trend invalidates, volatility expands against the position, or the original setup has decayed. Deterministic stop-loss,
@@ -218,13 +257,16 @@ class GrokBrain:
             purpose="entry",
         )
 
-    async def entry_decisions(self, payload: dict[str, Any]) -> list[EntryDecision] | None:
+    async def entry_decisions(self, payload: dict[str, Any], *, lean: bool = False) -> list[EntryDecision] | None:
+        """One entry call. `lean=True` (the lean payload) sends `ENTRY_SYSTEM_PROMPT_LEAN` and records
+        `LEAN_PROMPT_VERSION`; otherwise the legacy prompt and `COMPACT_PROMPT_VERSION`, unchanged."""
         response = await self._ask_grok(
-            system_prompt=ENTRY_SYSTEM_PROMPT,
+            system_prompt=ENTRY_SYSTEM_PROMPT_LEAN if lean else ENTRY_SYSTEM_PROMPT,
             payload=payload,
             schema=EntryDecisionBatch,
             reasoning_effort=self._settings.xai_reasoning_effort,
             purpose="entry",
+            prompt_version=LEAN_PROMPT_VERSION if lean else COMPACT_PROMPT_VERSION,
         )
         if response is None:
             return None
@@ -275,6 +317,7 @@ class GrokBrain:
         reasoning_effort: str,
         purpose: str = "unknown",
         deduplicated: bool = False,
+        prompt_version: str = COMPACT_PROMPT_VERSION,
     ) -> SchemaT | None:
         """One structured provider request, with telemetry and a strict retry policy.
 
@@ -308,6 +351,7 @@ class GrokBrain:
                 error_message="skipped due to active rate-limit cooldown",
                 repaired=False,
                 deduplicated=deduplicated,
+                prompt_version=prompt_version,
             )
             return None
 
@@ -373,6 +417,7 @@ class GrokBrain:
                     error_message=None,
                     repaired=repaired,
                     deduplicated=deduplicated,
+                    prompt_version=prompt_version,
                 )
                 return result
             except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
@@ -466,6 +511,7 @@ class GrokBrain:
             error_message=str(last_error)[:400] if last_error is not None else None,
             repaired=repaired,
             deduplicated=deduplicated,
+            prompt_version=prompt_version,
         )
         return None
 
@@ -710,13 +756,14 @@ class GrokBrain:
         error_message: str | None,
         repaired: bool,
         deduplicated: bool,
+        prompt_version: str = COMPACT_PROMPT_VERSION,
     ) -> None:
         metrics = AICallMetrics(
             purpose=purpose,
             provider=str(self._settings.xai_base_url),
             model=str(self._settings.xai_model),
             api_style=str(getattr(self._settings, "xai_api_style", "responses")),
-            prompt_version=COMPACT_PROMPT_VERSION,
+            prompt_version=prompt_version,
             reasoning_effort=reasoning_effort,
             request_hash=request_hash,
             request_bytes=request_bytes,

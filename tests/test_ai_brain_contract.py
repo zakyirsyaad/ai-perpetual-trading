@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import unittest
 from types import SimpleNamespace
@@ -11,11 +12,14 @@ from pydantic import BaseModel, ValidationError
 from bot.ai.brain import (
     ENTRY_LEARNING_NOTE_MAX_CHARS,
     ENTRY_REASON_MAX_CHARS,
+    ENTRY_SYSTEM_PROMPT,
+    ENTRY_SYSTEM_PROMPT_LEAN,
     EntryDecision,
     EntryDecisionBatch,
     GrokBrain,
     RiskReview,
 )
+from bot.ai.compact_context import COMPACT_PROMPT_VERSION, LEAN_PROMPT_VERSION
 from bot.ai.usage import ErrorCategory
 
 
@@ -366,6 +370,86 @@ class MetricsTests(unittest.TestCase):
         )
         asyncio.run(brain._ask_grok(system_prompt="p", payload={"a": 1}, schema=_Result, reasoning_effort="low"))
         self.assertAlmostEqual(recorded[-1].estimated_cost_usd, 0.25)
+
+
+_HOLD_BATCH = json.dumps(
+    {
+        "decisions": [
+            {"symbol": "BTC/USDT", "action": "HOLD", "confidence": 0.5, "market_trend": "Sideways",
+             "systemic_risk": 2, "reason": "no edge"}
+        ]
+    }
+)
+
+
+class EntrySystemPromptTests(unittest.TestCase):
+    """The lean payload gets its own system prompt and its own `prompt_version`; legacy is unchanged."""
+
+    # sha256 of ENTRY_SYSTEM_PROMPT as it has been sent to the live bot; the legacy prompt must not move.
+    LEGACY_PROMPT_SHA256 = "8e125a5c98e1a908a8cd6c9af2676077aa64e0320c22cd7bc34cc0e009634323"
+
+    @staticmethod
+    def _system_text(body: dict) -> str:
+        return body["messages"][0]["content"]
+
+    def test_the_legacy_entry_prompt_and_version_are_unchanged(self) -> None:
+        self.assertEqual(hashlib.sha256(ENTRY_SYSTEM_PROMPT.encode()).hexdigest(), self.LEGACY_PROMPT_SHA256)
+        self.assertEqual(COMPACT_PROMPT_VERSION, "okx-context-parity-v3")
+        brain, client, recorded = _brain([_ok_response(_HOLD_BATCH)])
+
+        decisions = asyncio.run(brain.entry_decisions({"a": 1}))
+
+        self.assertEqual([decision.action for decision in decisions], ["HOLD"])
+        self.assertTrue(self._system_text(client.bodies[0]).startswith(ENTRY_SYSTEM_PROMPT + "\n\n"))
+        self.assertEqual((recorded[-1].purpose, recorded[-1].prompt_version), ("entry", COMPACT_PROMPT_VERSION))
+
+    def test_a_lean_call_uses_the_lean_prompt_and_records_the_lean_version(self) -> None:
+        self.assertNotEqual(LEAN_PROMPT_VERSION, COMPACT_PROMPT_VERSION)
+        brain, client, recorded = _brain([_ok_response(_HOLD_BATCH)])
+
+        decisions = asyncio.run(brain.entry_decisions({"a": 1}, lean=True))
+
+        self.assertEqual([decision.action for decision in decisions], ["HOLD"])
+        self.assertTrue(self._system_text(client.bodies[0]).startswith(ENTRY_SYSTEM_PROMPT_LEAN + "\n\n"))
+        self.assertNotIn(ENTRY_SYSTEM_PROMPT, self._system_text(client.bodies[0]))
+        self.assertEqual((recorded[-1].purpose, recorded[-1].prompt_version), ("entry", LEAN_PROMPT_VERSION))
+        self.assertEqual(recorded[-1].to_record()["prompt_version"], LEAN_PROMPT_VERSION)
+
+    def test_a_failed_lean_call_still_records_the_lean_version(self) -> None:
+        brain, _, recorded = _brain([_status_error(401)])
+
+        self.assertIsNone(asyncio.run(brain.entry_decisions({"a": 1}, lean=True)))
+
+        self.assertFalse(recorded[-1].success)
+        self.assertEqual(recorded[-1].prompt_version, LEAN_PROMPT_VERSION)
+
+    def test_other_calls_keep_the_legacy_version(self) -> None:
+        brain, _, recorded = _brain([_ok_response('{"action": "HOLD", "confidence": 0.5, "reason": "hold"}')])
+
+        asyncio.run(brain.exit_decision({"a": 1}))
+
+        self.assertEqual((recorded[-1].purpose, recorded[-1].prompt_version), ("exit", COMPACT_PROMPT_VERSION))
+
+    def test_the_lean_prompt_drops_the_volume_mandate_and_names_the_lean_inputs(self) -> None:
+        lean = ENTRY_SYSTEM_PROMPT_LEAN
+        for absent in ("volume-building", "mandate", "recent_performance", "trade_memory", "factors", "flow signals"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, lean)
+        for present in (
+            "HOLD is the expected answer most ticks",
+            "round-trip",
+            "features",
+            "entry_rules",
+            "market_regime",
+            "setup_ledger",
+            "risk_review",
+            "liquidation_constraints",
+            "Return one decision for every allowed symbol",
+        ):
+            with self.subTest(present=present):
+                self.assertIn(present, lean)
+        # the same role as the legacy prompt
+        self.assertEqual(lean.splitlines()[0], ENTRY_SYSTEM_PROMPT.splitlines()[0])
 
 
 class EntryTextLengthClampTests(unittest.TestCase):

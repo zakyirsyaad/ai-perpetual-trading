@@ -1997,8 +1997,12 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         class Brain:
             last_call_metrics = None
 
-            async def entry_decisions(self, payload: dict):
+            def __init__(self) -> None:
+                self.lean_flags: list[bool] = []
+
+            async def entry_decisions(self, payload: dict, *, lean: bool = False):
                 payloads.append(payload)
+                self.lean_flags.append(lean)
                 return decisions
 
         class Intelligence:
@@ -2049,6 +2053,8 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("features", request)
                 self.assertNotIn("payload_profile", request)
                 self.assertEqual(store.memory_reads, ["performance", "records"])
+                # the legacy request goes out under the legacy system prompt
+                self.assertEqual(orchestrator._brain.lean_flags, [False])
 
         store = _PayloadStore()
         orchestrator, payloads, _ = self._orchestrator(
@@ -2068,6 +2074,8 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["features"], self._context()["lean_features"])
         # the trade history fed only the legacy payload, so lean does not read it
         self.assertEqual(store.memory_reads, [])
+        # and the lean request goes out under the lean system prompt
+        self.assertEqual(orchestrator._brain.lean_flags, [True])
 
     async def test_the_legacy_request_is_the_builder_s_output_byte_for_byte(self) -> None:
         # The golden pins the builder; this pins the orchestrator's legacy path into it: the same

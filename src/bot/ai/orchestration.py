@@ -140,9 +140,11 @@ class AIOrchestrator:
         # audit record below; only the AI representation is compacted.
         if lean:
             payload = self._lean_entry_payload(context_dict, daily_state, lean_sides, ledger)
+            # The lean request goes out under the lean system prompt; legacy keeps today's call as it was.
+            decisions = await self._brain.entry_decisions(payload, lean=True)
         else:
             payload = await self._legacy_entry_payload(context_dict, daily_state)
-        decisions = await self._brain.entry_decisions(payload)
+            decisions = await self._brain.entry_decisions(payload)
         if decisions is None:
             return None
 

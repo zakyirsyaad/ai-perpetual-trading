@@ -12,6 +12,9 @@ from bot.ai.usage import estimate_tokens
 
 # Prompt/contract version stamped on every AI call record.
 COMPACT_PROMPT_VERSION = "okx-context-parity-v3"
+# The version stamped instead on an entry call that sends the lean payload under the lean system prompt
+# (`ENTRY_SYSTEM_PROMPT_LEAN`), so `ai_call_metrics` can tell the two profiles apart.
+LEAN_PROMPT_VERSION = "lean-entry-v1"
 
 # The free-text length contract for an entry decision. It lives here because this
 # module builds the prompt that states the limits; `ai/brain.py` imports the same
