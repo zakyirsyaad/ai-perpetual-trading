@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -421,6 +422,16 @@ class EntrySystemPromptTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(brain.entry_decisions({"a": 1}, lean=True)))
 
         self.assertFalse(recorded[-1].success)
+        self.assertEqual(recorded[-1].prompt_version, LEAN_PROMPT_VERSION)
+
+    def test_a_lean_call_skipped_by_a_rate_limit_cooldown_records_the_lean_version(self) -> None:
+        brain, client, recorded = _brain([])
+        brain._rate_limited_until = time.time() + 60.0
+
+        self.assertIsNone(asyncio.run(brain.entry_decisions({"a": 1}, lean=True)))
+
+        self.assertEqual(client.bodies, [])   # nothing was sent
+        self.assertEqual((recorded[-1].error_category, recorded[-1].attempts), ("rate_limit", 0))
         self.assertEqual(recorded[-1].prompt_version, LEAN_PROMPT_VERSION)
 
     def test_other_calls_keep_the_legacy_version(self) -> None:
