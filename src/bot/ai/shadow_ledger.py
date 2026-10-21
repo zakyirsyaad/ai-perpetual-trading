@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from bot.ai.brain import EntryDecision
 from bot.arena.setup_profile import build_setup_profile
@@ -63,6 +63,7 @@ class ShadowLedgerMixin:
     _shadow_seeded_keys: frozenset[ShadowKey]
     _last_ledger_snapshot: dict[str, BucketLedger] | None
     _last_ledger_read_at: datetime | None
+    _taker_fee_pct_by_symbol: dict[str, float]
 
     def _init_shadow_ledger_state(self) -> None:
         """The in-memory state, all empty: nothing survives a restart except what the store holds."""
@@ -74,6 +75,17 @@ class ShadowLedgerMixin:
         # one. Reused for `LEDGER_CACHE_SECONDS`, and on a failed read whatever its age.
         self._last_ledger_snapshot = None
         self._last_ledger_read_at = None
+        # The venue's taker rate per symbol, handed over by the engine (`set_taker_fee_pcts`).
+        self._taker_fee_pct_by_symbol = {}
+
+    def set_taker_fee_pcts(self, fees: Mapping[str, float]) -> None:
+        """The venue's taker rate per symbol, as the engine read it at startup. The live neutral exit nets
+        that rate (`TradeEngine._taker_fee_pct`), so the shadow floor does too; a symbol without one falls
+        back to `TAKER_FEE_PCT`, as the engine does."""
+        self._taker_fee_pct_by_symbol = dict(fees)
+
+    def _shadow_taker_fee_pct(self, symbol: str) -> float:
+        return float(self._taker_fee_pct_by_symbol.get(symbol, self._settings.taker_fee_pct))
 
     def _ledger_mode(self) -> str:
         return str(getattr(self._settings, "setup_ledger_mode", "off") or "off").strip().lower()
@@ -218,8 +230,9 @@ class ShadowLedgerMixin:
         """One `shadow_entries` row for a candidate that is recorded, not traded (the store adds `exchange`).
 
         The floor is the live neutral-exit level, `100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional` plus
-        the round-trip fee, capped at the candidate's take-profit. `decided_at` defaults to now. Raises
-        `ValueError` without a 3m price."""
+        the round-trip taker fee the live exit nets (the venue's rate, not the `TAKER_FEE_PCT` estimate in
+        the candidate's targets), capped at the candidate's take-profit. `decided_at` defaults to now.
+        Raises `ValueError` without a 3m price."""
         features = self._features_for_symbol(market_context, decision.symbol) or {}
         ref_price = float(features.get("last_price") or 0.0)
         if not math.isfinite(ref_price) or ref_price <= 0:
@@ -229,7 +242,7 @@ class ShadowLedgerMixin:
         floor_pct = min(
             candidate.target.take_profit_pct,
             100.0 * float(self._settings.volume_neutral_exit_min_net_usdt) / notional
-            + candidate.target.round_trip_fee_pct,
+            + 2.0 * self._shadow_taker_fee_pct(decision.symbol),
         )
         return {
             "decided_at": decided_at if decided_at is not None else _utc_now(),

@@ -20,6 +20,10 @@ class GrokStrategy(BaseStrategy):
         """Hand the orchestrator the regime verdict to record beside the next entry decisions."""
         self._orchestrator.set_gate_context(context)
 
+    def set_taker_fee_pcts(self, fees: dict[str, float]) -> None:
+        """Hand the orchestrator the venue's taker rate per symbol, which its shadow floor nets."""
+        self._orchestrator.set_taker_fee_pcts(fees)
+
     async def next_trade_plan(self) -> TradePlan | None:
         if self._daily_state is None:
             raise RuntimeError("Daily risk state must be set before requesting a Grok trade plan.")

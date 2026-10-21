@@ -171,6 +171,18 @@ class RegimeGateTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received, [{"kondisi": "NAIK", "reason": "naik"}])
 
 
+    def test_the_venue_taker_fees_reach_the_orchestrator(self) -> None:
+        received: list[dict] = []
+
+        class RecordingOrchestrator:
+            def set_taker_fee_pcts(self, fees: dict) -> None:
+                received.append(fees)
+
+        GrokStrategy(RecordingOrchestrator()).set_taker_fee_pcts({"BTC/USDT": 0.035})
+
+        self.assertEqual(received, [{"BTC/USDT": 0.035}])
+
+
 class PauseAfterExitTests(unittest.IsolatedAsyncioTestCase):
     async def _closed_by(self, reason: str):
         store = FakeStore()

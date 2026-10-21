@@ -1312,6 +1312,17 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.ledger_reads, [])
         self.assertNotIn("ledger", self._gate(store))
 
+    async def test_the_shadow_floor_uses_the_venue_taker_fee(self) -> None:
+        # The live neutral exit nets the venue's taker rate (TradeEngine._taker_fee_pct), not TAKER_FEE_PCT:
+        # at 0.035 % the floor is 100 x 18 / (180 x 100) + 2 x 0.035 = 0.17, not the 0.2 of the 0.05 estimate.
+        store = _LedgerStore()
+        orchestrator = self._orchestrator(store, [self._decision("OPEN_LONG")], gate_context=self._naik())
+        orchestrator.set_taker_fee_pcts({"BTC/USDT": 0.035})
+
+        await orchestrator.next_trade_plan(self._state())
+
+        self.assertAlmostEqual(store.shadow_rows[0]["floor_pct"], 0.17)
+
     async def test_a_stretched_shadow_side_writes_no_row(self) -> None:
         store = _LedgerStore()
         orchestrator = self._orchestrator(
@@ -1975,7 +1986,9 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["floor_pct"], 0.5)
         self.assertEqual(row["stop_loss_pct"], 0.3)
 
-        # below the TP the floor carries the candidate's own round-trip fee (0.07 here), not the setting's 0.10
+        # below the TP the floor carries the round-trip taker fee the live exit nets: TAKER_FEE_PCT (0.10)
+        # while the engine has handed over no venue rate, the venue's (2 x 0.035) once it has, and never
+        # the candidate's own target fee (0.07 here, which only feeds the TP and the RR)
         cheap = EntryCandidate(
             decision=candidate.decision,
             direction=PositionDirection.LONG,
@@ -1984,10 +1997,14 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
             ),
             score=1.0,
         )
-        floor = orchestrator._shadow_row(
-            cheap.decision, cheap, "shadow_side", self._context(ema_21=self.NEAR_MEAN)
-        )["floor_pct"]
-        self.assertAlmostEqual(floor, 100.0 * 200.0 / 18_000.0 + 0.07)
+        def floor() -> float:
+            return orchestrator._shadow_row(
+                cheap.decision, cheap, "shadow_side", self._context(ema_21=self.NEAR_MEAN)
+            )["floor_pct"]
+
+        self.assertAlmostEqual(floor(), 100.0 * 200.0 / 18_000.0 + 0.10)
+        orchestrator.set_taker_fee_pcts({"BTC/USDT": 0.035})
+        self.assertAlmostEqual(floor(), 100.0 * 200.0 / 18_000.0 + 0.07)
         with self.assertRaises(ValueError):
             orchestrator._shadow_row(candidate.decision, candidate, "shadow_side", {"technicals": []})
 

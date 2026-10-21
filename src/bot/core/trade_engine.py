@@ -1341,6 +1341,10 @@ class TradeEngine:
             )
         if refreshed:
             self._settings.taker_fee_pct = max(self._settings.taker_fee_pct, max(refreshed.values()))
+        # The live neutral exit nets these rates (`_taker_fee_pct`); the AI strategy's shadow floor must too.
+        set_taker_fees = getattr(self._strategy, "set_taker_fee_pcts", None)
+        if set_taker_fees is not None:
+            set_taker_fees(dict(self._taker_fee_pct_by_symbol))
 
     async def _pre_entry_execution_checks(
         self,
