@@ -10,8 +10,10 @@ Settings() reads that bot's .env:
 
 Each `--stage-start` opens a stage that ends where the next one starts; the last one ends at
 `--until` (default: now). A trade belongs to the stage that holds its `closed_at`; a trade closed at
-or after `--until` is left out of every section. The printed labels are Indonesian because the
-manager reads them.
+or after `--until` is left out of every section. The shadow table keeps the two sources apart. The
+ledger section reads the engine's window, every trade and `ledger_block` row since
+`SETUP_LEDGER_SINCE` up to `--until`; with it unset (ledger off) it falls back to the stage rows, and
+its heading says which. The printed labels are Indonesian because the manager reads them.
 
 Exit codes: 0 ok, 2 usage error (a naive time, no stage start, `--until` not after the first start).
 """
@@ -30,7 +32,7 @@ from typing import Any
 
 from bot.config import Settings
 from bot.core.forward_summary import PER_MILLION, WIB, format_number, format_percent
-from bot.core.setup_ledger import bucket_stats, gross_bps, ledger_status, ledger_table
+from bot.core.setup_ledger import SHADOW_BLOCK_SOURCE, bucket_stats, gross_bps, ledger_status, ledger_table
 from bot.logger import setup_logging
 from bot.storage.supabase_trade_store import SupabaseTradeStore, _parse_timestamp
 
@@ -93,19 +95,23 @@ def stage_rows(
     ]
 
 
-def shadow_summary(rows: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, int, float]]:
-    """`(side, bucket, n, mean_bps)` per group of evaluated shadow rows, over both sources.
+def shadow_summary(rows: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, str, int, float]]:
+    """`(source, side, bucket, n, mean_bps)` per group of evaluated shadow rows.
 
-    Rows without a finite `gross_bps` (expired and invalid ones) or without a side or bucket are not
-    averaged; `shadow_unpriced` counts them.
+    The sources are kept apart: `shadow_side` rows measure a side that is not traded (the LONG go-live
+    bar), `ledger_block` rows a bucket's way back. Rows without a finite `gross_bps` (expired and invalid
+    ones) or without a source, side or bucket are not averaged; `shadow_unpriced` counts them.
     """
-    groups: dict[tuple[str, str], list[float]] = {}
+    groups: dict[tuple[str, str, str], list[float]] = {}
     for row in rows:
         key = _shadow_group(row)
         value = _finite(row.get("gross_bps"))
         if key is not None and value is not None:
             groups.setdefault(key, []).append(value)
-    return [(side, bucket, len(values), sum(values) / len(values)) for (side, bucket), values in sorted(groups.items())]
+    return [
+        (source, side, bucket, len(values), sum(values) / len(values))
+        for (source, side, bucket), values in sorted(groups.items())
+    ]
 
 
 def shadow_unpriced(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -171,10 +177,11 @@ def _summarize_stage(start: datetime, end: datetime, members: Sequence[_TradeFac
     )
 
 
-def _shadow_group(row: Mapping[str, Any]) -> tuple[str, str] | None:
+def _shadow_group(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    source = str(row.get("source") or "").strip()
     side = str(row.get("side") or "").strip().upper()
     bucket = str(row.get("bucket_key") or "").strip()
-    return (side, bucket) if side and bucket else None
+    return (source, side, bucket) if source and side and bucket else None
 
 
 def _number(value: Any) -> float:
@@ -232,9 +239,10 @@ def render_shadow(rows: Sequence[Mapping[str, Any]]) -> str:
     lines = ["=== Shadow per sisi dan kelompok ==="]
     summary = shadow_summary(rows)
     if summary:
-        lines.append(f"{'sisi':<7}{'kelompok':<34}{'n':>6}{'rata-rata bps':>15}")
+        lines.append(f"{'sumber':<14}{'sisi':<7}{'kelompok':<34}{'n':>6}{'rata-rata bps':>15}")
         lines.extend(
-            f"{side:<7}{bucket:<34}{n:>6}{format_number(mean, 2):>15}" for side, bucket, n, mean in summary
+            f"{source:<14}{side:<7}{bucket:<34}{n:>6}{format_number(mean, 2):>15}"
+            for source, side, bucket, n, mean in summary
         )
     else:
         lines.append("belum ada baris shadow yang dievaluasi dengan hasil")
@@ -249,12 +257,14 @@ def render_ledger(
     trades: Sequence[Mapping[str, Any]],
     shadows: Sequence[Mapping[str, Any]],
     settings: Any,
+    window: str = "",
 ) -> str:
+    """The ledger table; `window` says which rows it was built from (printed in the heading)."""
     min_samples = settings.setup_ledger_min_samples
     hurdle = settings.setup_ledger_hurdle_bps
     table = ledger_table(trades, shadows)
     lines = [
-        f"=== Ledger (minimum {min_samples} sampel, ambang {format_number(hurdle, 2)} bps) ===",
+        f"=== Ledger {window}(minimum {min_samples} sampel, ambang {format_number(hurdle, 2)} bps) ===",
         f"{'kelompok':<34}{'n nyata':>8}{'rata-rata':>11}{'batas atas':>12}"
         f"{'n shadow':>10}{'rata-rata':>11}{'batas atas':>12}"
         f"{'n sejak blok':>14}{'batas atas':>12}  status",
@@ -341,9 +351,25 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
     shadow_rows, unreadable_shadows = _within(await store.shadow_outcomes_since(first), "decided_at", first, until)
     stages = stage_rows(trade_rows, starts, until)
     waiting = sorted(start for start in starts if start >= until)
+    unreadable = [(unreadable_trades, "posisi"), (unreadable_shadows, "baris shadow")]
+
+    # The engine's ledger counts every trade and ledger_block row since SETUP_LEDGER_SINCE, so the report's
+    # ledger reads that window (cut at --until). Without it the ledger is off, and the stage rows stand in.
+    ledger_since = settings.setup_ledger_since
+    if ledger_since is None:
+        ledger_trades, ledger_shadows = trade_rows, shadow_rows
+        window = f"(SETUP_LEDGER_SINCE tidak diatur, ledger mati: dibaca sejak awal tahap pertama {_wib(first)}) "
+    else:
+        ledger_trades, unreadable_ledger_trades = _within(
+            await store.closed_trade_rows_since(ledger_since), "closed_at", ledger_since, until
+        )
+        block_rows = await store.shadow_outcomes_since(ledger_since, source=SHADOW_BLOCK_SOURCE)
+        ledger_shadows, unreadable_ledger_shadows = _within(block_rows, "decided_at", ledger_since, until)
+        unreadable += [(unreadable_ledger_trades, "posisi ledger"), (unreadable_ledger_shadows, "baris shadow ledger")]
+        window = f"sejak {_wib(ledger_since)} (SETUP_LEDGER_SINCE) sampai {_wib(until)} "
 
     print(f"Dibaca sejak {_wib(first)} sampai {_wib(until)} (WIB, akhir tidak termasuk)")
-    for count, what in ((unreadable_trades, "posisi"), (unreadable_shadows, "baris shadow")):
+    for count, what in unreadable:
         if count:
             print(f"PERINGATAN: {count} {what} tanpa waktu yang terbaca dilewati.")
     print()
@@ -351,7 +377,7 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
     print()
     print(render_shadow(shadow_rows))
     print()
-    print(render_ledger(trade_rows, shadow_rows, settings))
+    print(render_ledger(ledger_trades, ledger_shadows, settings, window))
     return 0
 
 

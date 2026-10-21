@@ -183,9 +183,12 @@ class StageRowsTests(unittest.TestCase):
 
 
 class ShadowSummaryTests(unittest.TestCase):
-    def test_groups_by_side_and_bucket_over_both_sources(self) -> None:
+    def test_groups_by_source_side_and_bucket(self) -> None:
+        # The two sources answer different questions (the LONG go-live bar, a bucket's way back), so a
+        # bucket seen in both is two groups, never one mean.
         rows = [
             _shadow("long", "LONG|NAIK|atr_mid", 4.0, "shadow_side"),
+            _shadow("long", "LONG|NAIK|atr_mid", 6.0, "shadow_side"),
             _shadow("long", "LONG|NAIK|atr_mid", 8.0, "ledger_block"),
             _shadow("short", "SHORT|NAIK|atr_mid", -3.0, "shadow_side"),
             _shadow("long", "LONG|TURUN|atr_high", 1.0, "ledger_block"),
@@ -193,9 +196,10 @@ class ShadowSummaryTests(unittest.TestCase):
         self.assertEqual(
             report.shadow_summary(rows),
             [
-                ("LONG", "LONG|NAIK|atr_mid", 2, 6.0),
-                ("LONG", "LONG|TURUN|atr_high", 1, 1.0),
-                ("SHORT", "SHORT|NAIK|atr_mid", 1, -3.0),
+                ("ledger_block", "LONG", "LONG|NAIK|atr_mid", 1, 8.0),
+                ("ledger_block", "LONG", "LONG|TURUN|atr_high", 1, 1.0),
+                ("shadow_side", "LONG", "LONG|NAIK|atr_mid", 2, 5.0),
+                ("shadow_side", "SHORT", "SHORT|NAIK|atr_mid", 1, -3.0),
             ],
         )
 
@@ -205,7 +209,7 @@ class ShadowSummaryTests(unittest.TestCase):
             _shadow(gross=float("nan")),
             _shadow(gross=2.0),
         ]
-        self.assertEqual(report.shadow_summary(rows), [("LONG", "LONG|NAIK|atr_mid", 1, 2.0)])
+        self.assertEqual(report.shadow_summary(rows), [("shadow_side", "LONG", "LONG|NAIK|atr_mid", 1, 2.0)])
 
     def test_the_unpriced_rows_are_counted_by_exit_reason(self) -> None:
         rows = [
@@ -246,7 +250,7 @@ class _FakeStore:
 
 
 def _settings(**overrides: Any) -> SimpleNamespace:
-    base = dict(setup_ledger_min_samples=2, setup_ledger_hurdle_bps=4.0)
+    base = dict(setup_ledger_min_samples=2, setup_ledger_hurdle_bps=4.0, setup_ledger_since=None)
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -395,6 +399,23 @@ class CliTests(unittest.TestCase):
         shadow_part = out.split("Shadow per sisi dan kelompok", 1)[1].split("Ledger", 1)[0]
         self.assertIn("LONG|NAIK|atr_mid", shadow_part)
         self.assertIn("expired=1", shadow_part)
+        header = next(line for line in shadow_part.splitlines() if line.startswith("sumber"))
+        self.assertEqual(header.split(), ["sumber", "sisi", "kelompok", "n", "rata-rata", "bps"])
+        row = next(line for line in shadow_part.splitlines() if "LONG|NAIK|atr_mid" in line)
+        self.assertEqual(row.split()[:4], ["shadow_side", "LONG", "LONG|NAIK|atr_mid", "2"])
+
+    def test_the_shadow_section_keeps_the_sources_apart(self) -> None:
+        shadows = [
+            _shadow("long", "LONG|NAIK|atr_mid", 4.0, "shadow_side"),
+            _shadow("long", "LONG|NAIK|atr_mid", 8.0, "ledger_block"),
+        ]
+        _, out, _ = self._run(
+            ["--stage-start", DAY0.isoformat(), "--until", DAY1.isoformat()], _FakeStore([], shadows)
+        )
+        shadow_part = out.split("Shadow per sisi dan kelompok", 1)[1].split("Ledger", 1)[0]
+        rows = [line.split() for line in shadow_part.splitlines() if "LONG|NAIK|atr_mid" in line]
+        self.assertEqual([cells[0] for cells in rows], ["ledger_block", "shadow_side"])
+        self.assertEqual([cells[4] for cells in rows], ["8,00", "4,00"])
 
     def test_the_ledger_lists_each_bucket_with_its_status(self) -> None:
         trades = [
@@ -464,6 +485,54 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(cells[-1], status)
                 self.assertEqual(cells[4], run_n)  # n shadow: the latest run only
                 self.assertIn("n shadow: hasil ledger_block dari rangkaian blok terakhir", ledger_part)
+
+    def test_the_ledger_reads_its_own_window_when_setup_ledger_since_is_set(self) -> None:
+        # The engine counts trades and ledger_block rows since SETUP_LEDGER_SINCE, not since the first stage;
+        # the report's ledger reads the same window, cut at --until.
+        ledger_since = DAY0 - timedelta(days=2)
+        until = DAY1 + timedelta(hours=1)
+        before_stages = [
+            _row(DAY0 - timedelta(hours=h), entry=100.0, exit_=100.5, bucket=BUCKET, opened=DAY0 - timedelta(hours=h + 1))
+            for h in (5, 3)
+        ]
+        in_stage = _row(DAY1 + timedelta(minutes=30), bucket=BUCKET, opened=DAY1)
+        after_until = _row(until + timedelta(minutes=5), bucket=BUCKET, opened=until)
+        block = {**_shadow("short", BUCKET, 20.0, "ledger_block"), "decided_at": (DAY0 - timedelta(hours=1)).isoformat()}
+        side = {**_shadow("long", "LONG|NAIK|atr_mid", 4.0, "shadow_side"), "decided_at": (DAY0 - timedelta(hours=1)).isoformat()}
+        store = _FakeStore([*before_stages, in_stage, after_until], [block, side])
+
+        code, out, err = self._run(
+            ["--stage-start", DAY1.isoformat(), "--until", until.isoformat()],
+            store,
+            _settings(setup_ledger_since=ledger_since),
+        )
+
+        self.assertEqual(code, 0, err)
+        # the stage reads, then the ledger's own reads
+        self.assertEqual(store.trade_since, [DAY1, ledger_since])
+        self.assertEqual(store.shadow_since, [DAY1, ledger_since])
+        self.assertEqual(store.shadow_sources, [None, "ledger_block"])
+        ledger_part = out.split("Ledger", 1)[1]
+        heading = ledger_part.splitlines()[0]
+        self.assertIn("sejak 2026-10-19T07:00+07:00", heading)
+        self.assertIn("SETUP_LEDGER_SINCE", heading)
+        self.assertIn("sampai 2026-10-22T08:00+07:00", heading)
+        # the two trades before the first stage count, the one closed after --until does not
+        cells = next(row for row in ledger_part.splitlines() if row.startswith(BUCKET)).split()
+        self.assertEqual(cells[1], "3")
+        self.assertIn("posisi berkelompok: 3 dari 3", ledger_part)
+        # the stage table still counts only the stage window
+        self.assertEqual(_table_row(out, "1")[3], "1")
+
+    def test_the_ledger_heading_says_when_setup_ledger_since_is_unset(self) -> None:
+        store = _FakeStore([_row(DAY0 + timedelta(hours=1), bucket=BUCKET)])
+        _, out, _ = self._run(["--stage-start", DAY0.isoformat(), "--until", DAY1.isoformat()], store)
+
+        heading = out.split("Ledger", 1)[1].splitlines()[0]
+        self.assertIn("SETUP_LEDGER_SINCE tidak diatur", heading)
+        self.assertIn("sejak awal tahap pertama 2026-10-21T07:00+07:00", heading)
+        # one read each: the ledger uses the stage rows
+        self.assertEqual((store.trade_since, store.shadow_since), ([DAY0], [DAY0]))
 
     def test_an_empty_run_still_prints_all_sections(self) -> None:
         code, out, err = self._run(
