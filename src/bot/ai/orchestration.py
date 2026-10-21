@@ -42,6 +42,8 @@ _SIDES = frozenset({"long", "short"})
 _OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
 # `shadow_entries.source` of a mapped side that ENTRY_GATE_DIRECTION does not make live.
 SHADOW_SIDE_SOURCE = "shadow_side"
+# What one shadow row spacing is kept for: (symbol, side as stored, source, bucket_key).
+ShadowKey = tuple[str, str, str, str]
 
 
 def _utc_now() -> datetime:
@@ -90,8 +92,10 @@ class AIOrchestrator:
         self._exit_policy = AIExitPolicy(settings)
         self._active_exit_symbol: str | None = None
         self._gate_context: dict[str, Any] | None = None
-        # `decided_at` of the last shadow row written per (symbol, side, source); in memory only.
-        self._shadow_rows_written_at: dict[tuple[str, str, str], datetime] = {}
+        # `decided_at` of the last shadow row per (symbol, side, source, bucket_key), as written here or
+        # read from the store; the keys already read from the store this process (each is read once).
+        self._shadow_rows_written_at: dict[ShadowKey, datetime] = {}
+        self._shadow_seeded_keys: frozenset[ShadowKey] = frozenset()
 
     def _current_gate_context(self) -> dict[str, Any] | None:
         # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
@@ -122,6 +126,8 @@ class AIOrchestrator:
             return None
         market_context = await self._intelligence.build_context()
         context_dict = market_context.to_dict()
+        if await self._shadow_only_hour_is_spaced(context_dict):
+            return None
         # Read once per tick, and only while the ledger is on; `{}` otherwise.
         ledger = await self._ledger_snapshot()
         # The full context still feeds deterministic execution, attribution, and the
@@ -924,7 +930,7 @@ class AIOrchestrator:
         }
 
     def _shadow_spacing(self) -> timedelta:
-        """The least time between two shadow rows of one (symbol, side, source).
+        """The least time between two shadow rows of one (symbol, side, source, bucket).
 
         A shadow row stands for a trade that was not taken; a real trade holds up to
         `POSITION_HOLD_MINUTES` and is followed by `COOLDOWN_MINUTES_AFTER_ENTRY`, so rows closer than that
@@ -933,9 +939,80 @@ class AIOrchestrator:
         cooldown = int(getattr(self._settings, "cooldown_minutes_after_entry", 0) or 0)
         return timedelta(minutes=hold + cooldown)
 
-    def _last_shadow_rows(self) -> dict[tuple[str, str, str], datetime]:
+    def _last_shadow_rows(self) -> dict[ShadowKey, datetime]:
         # `getattr`: an orchestrator built without `__init__` (tests) has written no row yet.
         return getattr(self, "_shadow_rows_written_at", None) or {}
+
+    def _shadow_key(self, symbol: str, side: str, source: str, market_context: dict[str, Any]) -> ShadowKey:
+        """The spacing key of a shadow row: its symbol, side (lower case, as stored), source and bucket."""
+        features = self._features_for_symbol(market_context, symbol)
+        return (symbol, side.lower(), source, self._ledger_bucket(side.upper(), features))
+
+    async def _last_shadow_row_at(self, key: ShadowKey) -> datetime | None:
+        """`decided_at` of the key's last row: from memory, else read from the store once per process.
+
+        The store read seeds the spacing after a restart. A failed read logs a WARNING and counts as no
+        earlier row (the row is written), and it is tried again the next time the key comes up."""
+        last = self._last_shadow_rows().get(key)
+        if last is not None or key in self._shadow_seeded_keys:
+            return last
+        try:
+            last = await self._trade_store.latest_shadow_decided_at(*key)
+        except Exception as exc:  # noqa: BLE001 - a seed read must never stop the entry path
+            self._logger.warning(
+                "Shadow row spacing for %s could not be read from the store (%s: %s); treated as no earlier row.",
+                "|".join(key),
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        # Replaced, never mutated.
+        self._shadow_seeded_keys = self._shadow_seeded_keys | {key}
+        if last is not None:
+            self._shadow_rows_written_at = {**self._last_shadow_rows(), key: last}
+        return last
+
+    async def _spacing_left(self, key: ShadowKey, now: datetime) -> tuple[datetime, timedelta] | None:
+        """(last row's `decided_at`, time left) while the key's last row is inside the spacing; else None."""
+        last = await self._last_shadow_row_at(key)
+        if last is None:
+            return None
+        left = self._shadow_spacing() - (now - last)
+        return (last, left) if left > timedelta(0) else None
+
+    async def _shadow_only_hour_is_spaced(self, market_context: dict[str, Any]) -> bool:
+        """True, after one INFO line, when this tick's AI call could change nothing.
+
+        Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION` does not make live can trade nothing:
+        the mapped side becomes a `shadow_side` row and every other side is blocked. While every symbol's
+        row for that side and bucket is inside its spacing, no row would be written either."""
+        if self._regime_gate_mode() != "map":
+            return False
+        mapped = self._mapped_side()
+        if not mapped or mapped in self._live_sides(mapped):
+            return False
+        now = _utc_now()
+        waits: list[tuple[ShadowKey, datetime, timedelta]] = []
+        for symbol in self._settings.symbols:
+            key = self._shadow_key(str(symbol), mapped, SHADOW_SIDE_SOURCE, market_context)
+            spaced = await self._spacing_left(key, now)
+            if spaced is None:
+                return False
+            waits.append((key, *spaced))
+        if not waits:
+            return False
+        key, last, left = min(waits, key=lambda wait: wait[2])
+        self._logger.info(
+            "Shadow-only hour (%s maps %s, which is not traded here): the last shadow row for bucket %s was "
+            "decided at %s, %.1f min of the %.0f-minute spacing remain; holding without an AI call.",
+            (self._current_gate_context() or {}).get("kondisi") or "?",
+            mapped,
+            key[3],
+            last.isoformat(timespec="seconds"),
+            left.total_seconds() / 60.0,
+            self._shadow_spacing().total_seconds() / 60.0,
+        )
+        return True
 
     async def _record_shadow_entry(
         self,
@@ -944,25 +1021,26 @@ class AIOrchestrator:
         source: str,
         market_context: dict[str, Any],
     ) -> None:
-        """Write the candidate's shadow row, at most one per (symbol, side, source) per spacing.
+        """Write the candidate's shadow row, at most one per (symbol, side, source, bucket) per spacing.
 
         A row inside the spacing is skipped (one INFO line) and a failed write is logged; the caller drops
-        the candidate in every case. Only a written row starts the spacing. The last write times live in
-        memory, so a restart forgets them and its first row is always written."""
-        key = (decision.symbol, candidate.direction.value, source)
+        the candidate in every case. Only a written row starts the spacing. After a restart the spacing of
+        a key is seeded once from the store's newest row for it."""
+        key = self._shadow_key(decision.symbol, candidate.direction.value, source, market_context)
         now = _utc_now()
-        last = self._last_shadow_rows().get(key)
-        spacing = self._shadow_spacing()
-        if last is not None and now - last < spacing:
+        spaced = await self._spacing_left(key, now)
+        if spaced is not None:
+            last, left = spaced
             self._logger.info(
-                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for it was decided at %s, "
-                "%.1f min of the %.0f-minute spacing remain.",
+                "Entry candidate %s %s is not traded (%s); no shadow row: the last one for bucket %s was decided "
+                "at %s, %.1f min of the %.0f-minute spacing remain.",
                 decision.symbol,
                 candidate.direction.value,
                 source,
+                key[3],
                 last.isoformat(timespec="seconds"),
-                (spacing - (now - last)).total_seconds() / 60.0,
-                spacing.total_seconds() / 60.0,
+                left.total_seconds() / 60.0,
+                self._shadow_spacing().total_seconds() / 60.0,
             )
             return
         try:

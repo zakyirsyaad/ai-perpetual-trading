@@ -218,6 +218,51 @@ class CompleteShadowEntryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("shadow_entries", str(ctx.exception))
 
 
+class LatestShadowDecidedAtTests(unittest.IsolatedAsyncioTestCase):
+    """The spacing seed: the newest row of one (symbol, side, source, bucket) in any evaluation state."""
+
+    async def test_it_reads_the_newest_row_of_one_key_for_this_exchange(self) -> None:
+        http = _FakeHTTP(rows=[{"decided_at": "2026-10-21T03:00:00.12345+00:00"}])
+
+        latest = await _store(http, supabase_schema="long_forward").latest_shadow_decided_at(
+            "BTC/USDT", "long", "shadow_side", "LONG|NAIK|atr_mid"
+        )
+
+        self.assertEqual(latest, datetime(2026, 10, 21, 3, 0, 0, 123450, tzinfo=timezone.utc))
+        get = http.gets[0]
+        self.assertEqual(get["url"], "https://example.supabase.co/rest/v1/shadow_entries")
+        self.assertEqual(get["headers"]["Accept-Profile"], "long_forward")
+        self.assertEqual(
+            get["params"],
+            [
+                ("select", "decided_at"),
+                ("exchange", "eq.bingx"),
+                ("symbol", "eq.BTC/USDT"),
+                ("side", "eq.long"),
+                ("source", "eq.shadow_side"),
+                ("bucket_key", "eq.LONG|NAIK|atr_mid"),
+                ("order", "decided_at.desc"),
+                ("limit", "1"),
+            ],
+        )
+        # any evaluation state: no evaluated_at filter
+        self.assertNotIn("evaluated_at", [key for key, _ in get["params"]])
+
+    async def test_no_row_or_an_unreadable_time_is_none(self) -> None:
+        for rows in ([], [{"decided_at": None}], [{"decided_at": "not a time"}]):
+            with self.subTest(rows=rows):
+                latest = await _store(_FakeHTTP(rows=rows)).latest_shadow_decided_at(
+                    "BTC/USDT", "long", "shadow_side", "LONG|NAIK|atr_mid"
+                )
+                self.assertIsNone(latest)
+
+    async def test_a_failed_read_raises_with_the_table_name(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            await _store(_FakeHTTP(status=500)).latest_shadow_decided_at("BTC/USDT", "long", "shadow_side", "b")
+
+        self.assertIn("shadow_entries", str(ctx.exception))
+
+
 class PagedReadsTests(unittest.IsolatedAsyncioTestCase):
     async def test_outcomes_and_trades_since_page_past_1000(self) -> None:
         rows = [{"id": n} for n in range(2 * PAGE + 1)]

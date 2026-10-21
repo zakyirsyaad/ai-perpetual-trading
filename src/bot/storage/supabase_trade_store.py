@@ -294,6 +294,28 @@ class SupabaseTradeStore:
             ],
         )
 
+    async def latest_shadow_decided_at(
+        self, symbol: str, side: str, source: str, bucket_key: str
+    ) -> datetime | None:
+        """`decided_at` of the newest shadow row of this key, evaluated or not; `None` without one.
+
+        The orchestrator seeds its row spacing from it once per key after a restart. A failed read raises.
+        """
+        rows = await self._get_rows(
+            _SHADOW_ENTRIES_TABLE,
+            [
+                ("select", "decided_at"),
+                ("exchange", f"eq.{self._exchange}"),
+                ("symbol", f"eq.{symbol}"),
+                ("side", f"eq.{side}"),
+                ("source", f"eq.{source}"),
+                ("bucket_key", f"eq.{bucket_key}"),
+                ("order", "decided_at.desc"),
+                ("limit", "1"),
+            ],
+        )
+        return _parse_timestamp(rows[0].get("decided_at")) if rows else None
+
     async def complete_shadow_entry(self, entry_id: int, gross_bps: float | None, exit_reason: str) -> None:
         """Close one shadow row. `gross_bps=None` (an expired row) still stamps `evaluated_at`, so it never pends again."""
         await self._patch(

@@ -1058,8 +1058,9 @@ class MapSideTests(EntryStretchGateTests):
 class _LedgerStore:
     """Trade store fake for the entry path with the shadow and ledger methods (Task 4).
 
-    Records every ledger read and every shadow row; `read_error` / `write_error` make the
-    corresponding calls raise."""
+    Records every ledger read, every shadow row and every spacing seed read; `read_error` /
+    `write_error` / `seed_error` make the corresponding calls raise. The seed read answers from the
+    rows written to this store, as the real table would after a restart."""
 
     def __init__(
         self,
@@ -1068,14 +1069,17 @@ class _LedgerStore:
         *,
         read_error: Exception | None = None,
         write_error: Exception | None = None,
+        seed_error: Exception | None = None,
     ) -> None:
         self.trades = trades or []
         self.shadows = shadows or []
         self.read_error = read_error
         self.write_error = write_error
+        self.seed_error = seed_error
         self.decisions: list[dict] = []
         self.shadow_rows: list[dict] = []
         self.ledger_reads: list[tuple] = []
+        self.seed_reads: list[tuple] = []
 
     async def recent_performance_summary(self, limit: int = 50) -> dict:
         return {"sample_size": 0}
@@ -1105,6 +1109,18 @@ class _LedgerStore:
         if self.write_error is not None:
             raise self.write_error
         self.shadow_rows.append(row)
+
+    async def latest_shadow_decided_at(self, symbol: str, side: str, source: str, bucket_key: str):
+        self.seed_reads.append((symbol, side, source, bucket_key))
+        if self.seed_error is not None:
+            raise self.seed_error
+        key = (symbol, side, source, bucket_key)
+        times = [
+            row["decided_at"]
+            for row in self.shadow_rows
+            if (row["symbol"], row["side"], row["source"], row["bucket_key"]) == key
+        ]
+        return max(times, default=None)
 
 
 class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
@@ -1199,8 +1215,10 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
 
         class Brain:
             last_call_metrics = None
+            calls = 0
 
             async def entry_decisions(self, payload: dict):
+                self.calls += 1
                 return decisions
 
         class Intelligence:
@@ -1209,6 +1227,9 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
 
         orchestrator = object.__new__(AIOrchestrator)
         orchestrator._gate_context = None
+        orchestrator._shadow_rows_written_at = {}
+        orchestrator._shadow_seeded_keys = frozenset()
+        orchestrator._ledger_cache = None
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.ledger")
         orchestrator._brain = Brain()
@@ -1558,22 +1579,29 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
             return await orchestrator.next_trade_plan(self._state())
 
     async def test_a_second_shadow_row_within_the_spacing_is_skipped_and_still_not_traded(self) -> None:
-        store = _LedgerStore()
-        orchestrator = self._orchestrator(store, [self._decision("OPEN_LONG")], gate_context=self._naik())
+        # A live side in an enforce-blocked bucket: the AI is still asked every tick (the hour may trade),
+        # and the spacing is applied when the row would be written. A shadow-only hour skips the call
+        # instead (test_a_shadow_only_hour_inside_the_spacing_makes_no_ai_call).
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
 
         self.assertIsNone(await self._tick_at(orchestrator, self.T0))
         with self.assertLogs("test.ledger", level="INFO") as logs:
             plan = await self._tick_at(orchestrator, self.T0 + timedelta(minutes=30))
 
-        # the candidate is still dropped: spacing never lets a shadow candidate trade
+        # the candidate is still dropped: spacing never lets a recorded candidate trade
         self.assertIsNone(plan)
         self.assertEqual([row["decided_at"] for row in store.shadow_rows], [self.T0])
         skips = [line for line in logs.output if "no shadow row" in line]
         self.assertEqual(len(skips), 1)
         self.assertIn("INFO", skips[0])
         self.assertIn("40.0 min", skips[0])   # 70 - 30 minutes remain
-        # both decisions are still recorded as the model's own OPEN_LONG
-        self.assertEqual([item["action"] for item in store.decisions], ["OPEN_LONG", "OPEN_LONG"])
+        self.assertIn(self.BUCKET, skips[0])
+        # both decisions are still recorded as the model's own OPEN_SHORT
+        self.assertEqual([item["action"] for item in store.decisions], ["OPEN_SHORT", "OPEN_SHORT"])
+        self.assertEqual(orchestrator._brain.calls, 2)
 
         # one second short of the spacing still skips; at 70 minutes the next row is written
         self.assertIsNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=70, seconds=-1)))
@@ -1581,6 +1609,122 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [row["decided_at"] for row in store.shadow_rows], [self.T0, self.T0 + timedelta(minutes=70)]
         )
+
+    async def test_a_shadow_only_hour_inside_the_spacing_makes_no_ai_call(self) -> None:
+        # NAIK maps LONG, and only SHORT is live: nothing this hour can trade, so once the shadow row is
+        # written, an AI call inside its spacing could change nothing and is not made.
+        store = _LedgerStore()
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_LONG")], gate_context=self._naik(), symbols=["BTC/USDT"]
+        )
+
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0))
+        with self.assertLogs("test.ledger", level="INFO") as logs:
+            plan = await self._tick_at(orchestrator, self.T0 + timedelta(minutes=30))
+
+        self.assertIsNone(plan)
+        self.assertEqual(orchestrator._brain.calls, 1)
+        self.assertEqual([item["action"] for item in store.decisions], ["OPEN_LONG"])   # no second decision
+        self.assertEqual([row["decided_at"] for row in store.shadow_rows], [self.T0])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("INFO", logs.output[0])
+        self.assertIn("without an AI call", logs.output[0])
+        self.assertIn("LONG|NAIK|atr_mid", logs.output[0])
+        self.assertIn("40.0 min", logs.output[0])   # 70 - 30 minutes remain
+
+    async def test_a_shadow_only_hour_outside_the_spacing_still_calls_the_ai(self) -> None:
+        store = _LedgerStore()
+        orchestrator = self._orchestrator(store, [self._decision("OPEN_LONG")], gate_context=self._naik())
+
+        # the first tick of an hour has no earlier row: the AI is asked
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0))
+        self.assertEqual(orchestrator._brain.calls, 1)
+        # BTC's row is inside its spacing but ETH has none yet, so a row could still be written: asked again
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=30)))
+        self.assertEqual(orchestrator._brain.calls, 2)
+        # at the end of the spacing it is asked again, and the next row is written
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=70)))
+        self.assertEqual(orchestrator._brain.calls, 3)
+        self.assertEqual(
+            [row["decided_at"] for row in store.shadow_rows], [self.T0, self.T0 + timedelta(minutes=70)]
+        )
+
+        # a live hour is never skipped, whatever the spacing of the shadow side
+        orchestrator._settings = self._settings(symbols=["BTC/USDT"])
+        orchestrator.set_gate_context(self._turun())
+        plan = await self._tick_at(orchestrator, self.T0 + timedelta(minutes=71))
+        self.assertEqual(orchestrator._brain.calls, 4)
+        self.assertIsNone(plan)   # the model answered OPEN_LONG, the wrong side in TURUN
+
+    async def test_spacing_is_per_bucket(self) -> None:
+        # One symbol, side and source, two ATR regimes: each bucket keeps its own spacing.
+        store = _LedgerStore()
+        mid = self._context(ema_21=self.NEAR_MEAN)
+        low = self._context(ema_21=self.NEAR_MEAN)
+        low["technicals"][0] = dict(low["technicals"][0], atr_14=0.1)   # 0.1 % ATR: atr_low
+        contexts = [mid, low, mid, low]
+
+        class Intelligence:
+            async def build_context(self) -> SimpleNamespace:
+                context = contexts.pop(0)
+                return SimpleNamespace(to_dict=lambda: context)
+
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_LONG")], gate_context=self._naik(), symbols=["BTC/USDT"]
+        )
+        orchestrator._intelligence = Intelligence()
+        for minutes in (0, 1, 2, 3):
+            await self._tick_at(orchestrator, self.T0 + timedelta(minutes=minutes))
+
+        self.assertEqual(
+            [(row["bucket_key"], row["decided_at"]) for row in store.shadow_rows],
+            [("LONG|NAIK|atr_mid", self.T0), ("LONG|NAIK|atr_low", self.T0 + timedelta(minutes=1))],
+        )
+        # the third and fourth ticks found their own bucket inside its spacing and made no AI call
+        self.assertEqual(orchestrator._brain.calls, 2)
+
+    async def test_spacing_survives_a_restart_via_the_store_seed(self) -> None:
+        store = _LedgerStore()
+        options = dict(gate_context=self._naik(), symbols=["BTC/USDT"])
+        before = self._orchestrator(store, [self._decision("OPEN_LONG")], **options)
+        self.assertIsNone(await self._tick_at(before, self.T0))
+        self.assertEqual(len(store.shadow_rows), 1)
+
+        # a new process: nothing in memory, so the last row of the key is read from the store once
+        store.seed_reads.clear()
+        after = self._orchestrator(store, [self._decision("OPEN_LONG")], **options)
+        for minutes in (30, 40):
+            self.assertIsNone(await self._tick_at(after, self.T0 + timedelta(minutes=minutes)))
+        self.assertEqual(after._brain.calls, 0)
+        self.assertEqual(store.seed_reads, [("BTC/USDT", "long", "shadow_side", "LONG|NAIK|atr_mid")])
+        self.assertEqual(len(store.shadow_rows), 1)
+
+        self.assertIsNone(await self._tick_at(after, self.T0 + timedelta(minutes=70)))
+        self.assertEqual(after._brain.calls, 1)
+        self.assertEqual(
+            [row["decided_at"] for row in store.shadow_rows], [self.T0, self.T0 + timedelta(minutes=70)]
+        )
+        self.assertEqual(len(store.seed_reads), 1)
+
+    async def test_a_failed_seed_read_writes_the_row_and_warns(self) -> None:
+        store = _LedgerStore(seed_error=RuntimeError("supabase down"))
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_LONG")], gate_context=self._naik(), symbols=["BTC/USDT"]
+        )
+
+        with self.assertLogs("test.ledger", level="WARNING") as logs:
+            plan = await self._tick_at(orchestrator, self.T0)
+
+        self.assertIsNone(plan)
+        self.assertEqual(orchestrator._brain.calls, 1)
+        self.assertEqual([row["decided_at"] for row in store.shadow_rows], [self.T0])
+        self.assertTrue(any("RuntimeError: supabase down" in line for line in logs.output))
+        self.assertTrue(all(record.levelno == logging.WARNING for record in logs.records))
+        # the written row starts the spacing in memory; no further seed read is needed
+        store.seed_error = None
+        reads = len(store.seed_reads)
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0 + timedelta(minutes=5)))
+        self.assertEqual((orchestrator._brain.calls, len(store.seed_reads)), (1, reads))
 
     async def test_spacing_is_per_symbol_side_and_source(self) -> None:
         losing_longs = [
@@ -1765,6 +1909,9 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
 
         orchestrator = object.__new__(AIOrchestrator)
         orchestrator._gate_context = None
+        orchestrator._shadow_rows_written_at = {}
+        orchestrator._shadow_seeded_keys = frozenset()
+        orchestrator._ledger_cache = None
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.lean")
         orchestrator._brain = Brain()
