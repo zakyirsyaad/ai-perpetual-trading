@@ -901,10 +901,12 @@ A second recall review of the whole PR at `eea4bb0` reported eight findings (no 
 with a test; the refactor moves code verbatim.
 
 1. **The shadow floor used the config fee** (`90ee067`). The live neutral exit nets
-   `TradeEngine._taker_fee_pct` (the venue's commissionRate, 0.035 % on account 1), while the shadow floor
-   added the candidate's `round_trip_fee_pct`, which is `TAKER_FEE_PCT x 2` (0.05 % on account 1; the
-   startup refresh keeps the larger of the two in the setting). The floor sat about 3 bps further than the
-   live one. The engine now hands its venue rates to the strategy after the fee refresh
+   `TradeEngine._taker_fee_pct` (the venue's commissionRate when `USE_EXCHANGE_FEE_RATES` reads it), while
+   the shadow floor added the candidate's `round_trip_fee_pct`, which is `TAKER_FEE_PCT x 2` (the startup
+   refresh keeps the larger of the two in the setting). On an account that reads the venue rate (0.035 %
+   against a 0.05 % estimate) the floor sat about 3 bps further than the live one. *Correction found at
+   rollout step 1:* account 1 runs `USE_EXCHANGE_FEE_RATES=false`, so there both already netted the 0.05 %
+   estimate and nothing was biased; the fix matters for an account that reads the venue rate. The engine now hands its venue rates to the strategy after the fee refresh
    (`set_taker_fee_pcts`, forwarded by `GrokStrategy`), and `_shadow_row` adds twice that rate, falling
    back to `TAKER_FEE_PCT` like the engine. Tests: `test_the_shadow_floor_uses_the_venue_taker_fee`,
    `test_fee_refresh_hands_the_venue_rates_to_the_strategy`, `test_the_venue_taker_fees_reach_the_orchestrator`;

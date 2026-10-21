@@ -179,8 +179,9 @@ bucket `learning` with nothing logged), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     `VOLUME_NEUTRAL_EXIT_BASIS=net` and `STRATEGY_MODE=ai_volume` (one error names everything missing).
     *Second PR #46 review:* the fee is the venue's taker rate the live neutral exit nets
     (`TradeEngine._taker_fee_pct`, handed to the strategy after the startup fee refresh), not the
-    `TAKER_FEE_PCT` estimate in the candidate's targets: at 0.035 % against 0.05 % the floor sat about
-    3 bps further than the live one.
+    `TAKER_FEE_PCT` estimate in the candidate's targets: on an account that reads the venue rate
+    (0.035 % against 0.05 %) the floor sat about 3 bps further than the live one. Account 1 runs
+    `USE_EXCHANGE_FEE_RATES=false`, so its live exit and its floor both net the 0.05 % estimate.
   - *Final review:* rows are spaced at write time. No new row is written for the same (symbol, side,
     source) while the last one written for it was decided less than `POSITION_HOLD_MINUTES` +
     `COOLDOWN_MINUTES_AFTER_ENTRY` minutes earlier, so walks do not overlap and n is not inflated. A
