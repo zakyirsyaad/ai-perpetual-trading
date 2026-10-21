@@ -167,6 +167,18 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   - *final review:* a reopened bucket is judged again on its real trades opened (`opened_at`) after
     its latest `ledger_block` row's `decided_at`: once those reach n ≥ `MIN_SAMPLES` with
     mean + 1.28 × SE < `HURDLE_BPS` it is `blocked` again, otherwise it stays `reopened`;
+  - *episode scope (after the final review):* "since the block" means the bucket's latest blocked
+    episode. Its counted real trades (by `opened_at`) and its evaluated `ledger_block` rows (by
+    `decided_at`) share one timeline; expired and invalid rows carry no outcome and only mark time.
+    The reopening sample is the run of block rows decided after the last real trade opened before
+    the latest block row (every block row in the first episode, as before); the re-judging sample is
+    the real trades opened after the latest block row. So a re-blocked bucket stays `blocked` until a
+    fresh run reaches n ≥ `MIN_SAMPLES` with mean + 1.28 × SE ≥ `HURDLE_BPS`, and an expired or
+    invalid row can never reopen it. Before this, the next evaluated block row of a re-blocked
+    bucket moved the re-judging cutoff past every real trade while the old shadow sample still
+    counted, so the bucket read `reopened` again about an hour later. A row or trade without a
+    readable time is off the timeline (the store writes both `NOT NULL`). Stateless: the same two
+    reads per tick;
   - otherwise `open`, with `learning` while n < `MIN_SAMPLES`.
 - **Mode.** `shadow`: the verdict is recorded at `payload_json.gate.ledger` and changes nothing.
   `enforce`: the candidate of an entry in a `blocked` bucket is dropped in code (the tick holds; the

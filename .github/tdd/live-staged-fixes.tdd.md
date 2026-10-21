@@ -402,6 +402,7 @@ bucket writes its next `ledger_block` row and that row is evaluated (hold + 1 mi
 latest block time moves past every real trade, `real_since_block` restarts empty, and the old good
 shadow sample reads the bucket `reopened` again. So a re-block lasts about an hour, then another
 `min_samples` real trades must fail. Implemented as ruled; flagged for the controller.
+Closed by the episode-scoped rule (`1856610`, section "Episode-scoped reopening" below).
 
 ### Verification (final wave)
 
@@ -425,6 +426,110 @@ uv pip check --python .venv/bin/python                                          
 - The secret-hygiene, dashboard-contract, forward-schema and import-structure tests pass unchanged;
   `setup_ledger.py` now imports `bot.core.shadow_eval` (for `_parse_utc`), which imports only
   `bot.telemetry.ws`, so neither module reaches `pine_indicators` or `bot/strategy/modes/`.
+
+## Episode-scoped reopening (closes the known limit of item 3)
+
+Branch `fix/ledger-episode-reopen`, cut from `feat/live-staged-fixes` at `be6c6c8`. Only
+`SETUP_LEDGER_MODE=enforce` writes `ledger_block` rows, so the rule matters only there: it gates
+rollout step 3, not steps 1 and 2.
+
+Ruling: a bucket's counted real trades (by `opened_at`) and its evaluated `ledger_block` rows (by
+`decided_at`) share one timeline; expired and invalid rows carry no outcome and only mark time. The
+reopening sample is the run of block rows decided after the last real trade opened before the latest
+block row. The re-judging sample is the real trades opened after that run's last row, which is the
+latest block row, so it is `real_since_block` unchanged. `learning` and `open` are decided on every
+real trade as before; otherwise the bucket is `reopened` only when the run has n >= min samples with
+the bound at or above the hurdle and the re-judging sample has not reached min samples with the bound
+below it, else `blocked`. Stateless, the same two reads per tick.
+
+RED (`tests/test_setup_ledger.py`, then the callers). Ten more tests errored with
+`AttributeError: 'BucketLedger' object has no attribute 'shadow_run'`, the rename below:
+
+```
+FAIL: test_one_good_block_row_does_not_bring_back_the_old_shadow_sample (tests.test_setup_ledger.LatestEpisodeTests)
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_an_expired_or_invalid_block_row_cannot_reopen (tests.test_setup_ledger.LatestEpisodeTests) (exit_reason='expired')
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_an_expired_or_invalid_block_row_cannot_reopen (tests.test_setup_ledger.LatestEpisodeTests) (exit_reason='invalid')
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_a_re_blocked_bucket_needs_a_fresh_run_of_min_samples_to_reopen (tests.test_setup_ledger.LatestEpisodeTests)
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_ledger_enforce_keeps_a_re_blocked_bucket_blocked_until_a_fresh_run_reopens_it (tests.test_ai_orchestration.LedgerAndShadowTests) (new_values=[None])
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_ledger_enforce_keeps_a_re_blocked_bucket_blocked_until_a_fresh_run_reopens_it (tests.test_ai_orchestration.LedgerAndShadowTests) (new_values=[20.0])
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_a_re_blocked_bucket_needs_a_fresh_run_to_reopen (tests.test_report_live_stages.CliTests) (status='blocked', run_n='0')
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_a_re_blocked_bucket_needs_a_fresh_run_to_reopen (tests.test_report_live_stages.CliTests) (status='blocked', run_n='1')
+AssertionError: 'reopened' != 'blocked'
+FAIL: test_a_re_blocked_bucket_needs_a_fresh_run_to_reopen (tests.test_report_live_stages.CliTests) (status='reopened', run_n='2')
+AssertionError: '4' != '2'
+```
+
+GREEN (`1856610`): `ledger_table` collects per bucket the `(gross_bps, opened_at)` trades and the
+`(decided_at, gross_bps)` block rows and hands them to `_bucket_ledger`, which finds the latest block
+row and the boundary (the last trade opened strictly before it) and keeps the finite outcomes decided
+strictly after the boundary. `ledger_status` is unchanged. `BucketLedger.shadow` is renamed
+`shadow_run`, so no reader keeps the old meaning silently. The report reads `shadow_run` and explains
+`n shadow` in a footer line. `AIOrchestrator._ledger_verdict` and `_ledger_lines` read only `real`
+and `ledger_status`, so their code is unchanged (the `_ledger_snapshot` docstring now names the rule)
+and the stored verdict keeps its six keys.
+
+Named tests: `LatestEpisodeTests` in `tests/test_setup_ledger.py` (10:
+`test_the_first_episode_reopening_sample_is_every_block_outcome`,
+`test_a_re_blocked_bucket_stays_blocked_before_its_next_block_row`,
+`test_one_good_block_row_does_not_bring_back_the_old_shadow_sample`,
+`test_an_expired_or_invalid_block_row_cannot_reopen`,
+`test_a_re_blocked_bucket_needs_a_fresh_run_of_min_samples_to_reopen`,
+`test_an_expired_row_marks_time_without_breaking_the_run`,
+`test_a_fresh_run_is_judged_again_on_the_trades_opened_after_it`,
+`test_a_real_trade_between_block_rows_ends_the_run`,
+`test_a_block_row_without_a_readable_time_never_counts`,
+`test_a_trade_without_a_readable_open_time_does_not_end_the_run`);
+`test_ledger_enforce_keeps_a_re_blocked_bucket_blocked_until_a_fresh_run_reopens_it`
+(`tests/test_ai_orchestration.py`: the blocked cases return no plan and write one `ledger_block`
+row, three fresh outcomes trade); `test_a_re_blocked_bucket_needs_a_fresh_run_to_reopen`
+(`tests/test_report_live_stages.py`). The first episode is unchanged: `ReopenedBucketTests` and the
+orchestrator and report reopen tests pass with their old expectations.
+
+Fixture changes, each because the fixture broke the new contract:
+
+- `_shadow` in `tests/test_setup_ledger.py` now carries `decided_at=BLOCK_AT` by default
+  (`shadow_entries.decided_at` is `NOT NULL`); the "no readable block row" case passes
+  `decided_at=None` explicitly.
+- `_first_episode` (lifted out of `ReopenedBucketTests._rows`) opens its 60 losing trades 5 days
+  before `BLOCK_AT`, not 2. Its 60 block rows run 69 hours back, so with 2 days the 18 earliest rows
+  were decided before the trades that blocked the bucket, which cannot happen live, and the new rule
+  rightly left them out of the run.
+- `test_ledger_enforce_lets_a_reopened_bucket_trade` gives its three block rows a `decided_at`.
+
+Deliberate choices:
+
+- A block row without a readable `decided_at` cannot be placed, so it never counts toward reopening
+  (before, it counted). Conservative, since the ledger only adds blocks; live rows always carry one.
+- A trade without a readable `opened_at` counts in `real` only: it neither ends a run nor is
+  re-judged (re-judging already skipped it).
+- All comparisons are strict, as `real_since_block` already was: a block row decided exactly at the
+  boundary trade's `opened_at` is not in the run.
+- A priced block row decided before a reopened bucket's first trade but evaluated after it still
+  belongs to the run and can lower its bound; if that re-blocks the bucket, only a fresh run
+  reopens it.
+
+Verification (this section), Python 3.10.20 from `.venv`, 2026-10-21:
+
+```
+PYTHONPATH=src python -m compileall -q src tests                                   # exit 0
+PYTHONPATH=src python -m unittest discover -s tests                                # Ran 2935 tests, OK
+PYTHONPATH=src python -m coverage run --rcfile=<rc> -m unittest discover -s tests  # Ran 2935 tests, OK
+python -m coverage report --rcfile=<rc>                                            # TOTAL 17294 1404 92%   (fail_under 80)
+git diff --check                                                                   # exit 0, no output
+```
+
+- 2,935 tests (2,923 before: +12, 10 ledger, 1 orchestrator, 1 report).
+- `setup_ledger.py` 100 %, `report_live_stages.py` 98 % (the 4 missed lines are still `_run` and
+  `main`, the CLI glue). `<rc>` is the rcfile mirroring `pyproject.toml`, as above.
+- No new import: `setup_ledger.py` still imports only `bot.core.shadow_eval` from `bot`. The
+  secret-hygiene, dashboard-contract and import-structure tests pass unchanged.
 
 ## Verification
 
@@ -491,6 +596,8 @@ f8a2e23 feat: setup ledger statistics and status                                
 85186fb fix: space shadow rows by the hold plus the entry cooldown              final review 2
 7ab059a fix: judge a reopened ledger bucket again on its new real trades        final review 3
         docs: final review fix wave in CLAUDE.md, the spec and TDD evidence     final review
+1856610 fix: scope ledger reopening to the latest blocked episode               episode scope
+        docs: episode-scoped ledger reopening in CLAUDE.md, the spec and TDD    episode scope
 ```
 
 ## Deployment gate
@@ -518,7 +625,8 @@ Never restart with an open position: check flat on the venue **and** in `open_po
    are harmless and stay.
 4. **Step 2** (`AI_ENTRY_PAYLOAD=lean`) waits for step 1's 60 SHORT trades **and** the user's decision
    on the entry system prompt (see Deliberate choices). **Step 3** (`SETUP_LEDGER_MODE=enforce`)
-   follows step 2's 60 trades.
+   follows step 2's 60 trades, and needs the episode-scoped reopening (`1856610`) on the deployed
+   code: without it a re-blocked bucket reads `reopened` again about an hour after its next block row.
 5. **LONG goes live** (`ENTRY_GATE_DIRECTION=any`) only when the LONG shadow outcomes reach n >= 60
    with mean gross >= +4 bps. Until then LONG costs only AI calls.
 6. Record each step's start time in project memory and in CLAUDE.md ("Live staged fixes") in a
