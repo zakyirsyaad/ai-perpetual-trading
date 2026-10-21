@@ -260,7 +260,7 @@ def render_ledger(
         f"{'n sejak blok':>14}{'batas atas':>12}  status",
     ]
     for bucket, entry in sorted(table.items()):
-        real, shadow, since = entry.real, entry.shadow, entry.real_since_block
+        real, shadow, since = entry.real, entry.shadow_run, entry.real_since_block
         lines.append(
             f"{bucket:<34}{real.n:>8}{_bps(real.mean_bps):>11}{_bps(real.upper_bps):>12}"
             f"{shadow.n:>10}{_bps(shadow.mean_bps):>11}{_bps(shadow.upper_bps):>12}"
@@ -269,6 +269,11 @@ def render_ledger(
         )
     if not table:
         lines.append("belum ada posisi atau baris shadow berkelompok")
+    lines.append(
+        "n shadow: hasil ledger_block dari rangkaian blok terakhir kelompok itu (baris yang diputuskan setelah "
+        "posisi nyata terakhir sebelum baris ledger_block terakhir); hanya rangkaian itu yang bisa membuka kembali "
+        "kelompok, dan baris expired/invalid hanya penanda waktu"
+    )
     lines.append(
         "n sejak blok: posisi nyata yang dibuka setelah baris ledger_block terakhir kelompok itu; "
         "kelompok reopened diblok lagi bila jumlahnya mencapai minimum dan batas atasnya di bawah ambang"

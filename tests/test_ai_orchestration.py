@@ -1253,6 +1253,9 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
             for exit_price in (100.1, 100.2, 100.15)
         ]
 
+    def _block_row(self, gross: float | None, decided_at: datetime) -> dict:
+        return {"source": "ledger_block", "bucket_key": self.BUCKET, "gross_bps": gross, "decided_at": decided_at.isoformat()}
+
     @staticmethod
     def _gate(store: _LedgerStore, symbol: str = "BTC/USDT") -> dict:
         return next(item["payload"]["gate"] for item in store.decisions if item["symbol"] == symbol)
@@ -1365,9 +1368,7 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._gate(store)["ledger"]["mode"], "enforce")
 
     async def test_ledger_enforce_lets_a_reopened_bucket_trade(self) -> None:
-        shadows = [
-            {"source": "ledger_block", "bucket_key": self.BUCKET, "gross_bps": value} for value in (20.0, 25.0, 30.0)
-        ]
+        shadows = [self._block_row(value, datetime(2026, 10, 21, 5, 0, tzinfo=timezone.utc)) for value in (20.0, 25.0, 30.0)]
         store = _LedgerStore(self._losing_shorts(), shadows)
         orchestrator = self._orchestrator(
             store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
@@ -1396,6 +1397,36 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
                     for i, row in enumerate(self._losing_shorts()[:new_trades])
                 ]
                 store = _LedgerStore(before + after, shadows)
+                orchestrator = self._orchestrator(
+                    store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+                )
+
+                plan = await orchestrator.next_trade_plan(self._state())
+
+                self.assertEqual(self._gate(store)["ledger"]["status"], status)
+                self.assertEqual(plan is None, status == "blocked")
+                self.assertEqual(
+                    [row["source"] for row in store.shadow_rows], ["ledger_block"] if status == "blocked" else []
+                )
+
+    async def test_ledger_enforce_keeps_a_re_blocked_bucket_blocked_until_a_fresh_run_reopens_it(self) -> None:
+        # Blocked on three losers, reopened by three good ledger_block outcomes decided at 05:00, blocked again by
+        # three losers opened after that. Its next block rows start a new run: the old three no longer count, an
+        # expired row only marks time, and it takes three fresh good outcomes to reopen it.
+        block_at = datetime(2026, 10, 21, 5, 0, tzinfo=timezone.utc)
+        re_blocked_at = block_at + timedelta(hours=2)
+        before = [dict(row, opened_at="2026-10-21T01:00:00+00:00") for row in self._losing_shorts()]
+        after = [
+            dict(row, opened_at=(block_at + timedelta(minutes=10 * (i + 1))).isoformat())
+            for i, row in enumerate(self._losing_shorts())
+        ]
+        first_run = [self._block_row(value, block_at) for value in (20.0, 25.0, 30.0)]
+        for new_values, status in (([None], "blocked"), ([20.0], "blocked"), ([20.0, 25.0, 30.0], "reopened")):
+            with self.subTest(new_values=new_values):
+                new_run = [
+                    self._block_row(value, re_blocked_at + timedelta(minutes=70 * i)) for i, value in enumerate(new_values)
+                ]
+                store = _LedgerStore(before + after, first_run + new_run)
                 orchestrator = self._orchestrator(
                     store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
                 )

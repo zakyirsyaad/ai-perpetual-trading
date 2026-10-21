@@ -432,6 +432,39 @@ class CliTests(unittest.TestCase):
                 line = next(row for row in out.split("Ledger", 1)[1].splitlines() if row.startswith(BUCKET))
                 self.assertEqual(line.split()[-1], status)
 
+    def test_a_re_blocked_bucket_needs_a_fresh_run_to_reopen(self) -> None:
+        # Reopened by two good ledger_block outcomes decided at DAY0, blocked again by two losers opened after it.
+        # The next block rows (decided after those losers) start a new run; the two DAY0 outcomes no longer count.
+        losers = [
+            _row(DAY0 - timedelta(hours=2), entry=100.0, exit_=100.5, bucket=BUCKET, opened=DAY0 - timedelta(hours=3)),
+            _row(DAY0 - timedelta(hours=1), entry=100.0, exit_=100.6, bucket=BUCKET, opened=DAY0 - timedelta(hours=2)),
+            _row(DAY0 + timedelta(hours=2), entry=100.0, exit_=100.4, bucket=BUCKET, opened=DAY0 + timedelta(hours=1)),
+            _row(DAY0 + timedelta(hours=4), entry=100.0, exit_=100.7, bucket=BUCKET, opened=DAY0 + timedelta(hours=3)),
+        ]
+        first_run = [_shadow("short", BUCKET, 20.0, "ledger_block"), _shadow("short", BUCKET, 22.0, "ledger_block")]
+
+        def later(gross: float | None, hours: int) -> dict[str, Any]:
+            row = _shadow("short", BUCKET, gross, "ledger_block", "floor" if gross is not None else "expired")
+            return {**row, "decided_at": (DAY0 + timedelta(hours=hours)).isoformat()}
+
+        start = DAY0 - timedelta(days=1)
+        cases = (
+            ([later(None, 5)], "blocked", "0"),
+            ([later(21.0, 5)], "blocked", "1"),
+            ([later(21.0, 5), later(23.0, 6)], "reopened", "2"),
+        )
+        for new_run, status, run_n in cases:
+            with self.subTest(status=status, run_n=run_n):
+                _, out, _ = self._run(
+                    ["--stage-start", start.isoformat(), "--until", DAY1.isoformat()],
+                    _FakeStore(losers, first_run + new_run),
+                )
+                ledger_part = out.split("Ledger", 1)[1]
+                cells = next(row for row in ledger_part.splitlines() if row.startswith(BUCKET)).split()
+                self.assertEqual(cells[-1], status)
+                self.assertEqual(cells[4], run_n)  # n shadow: the latest run only
+                self.assertIn("n shadow: hasil ledger_block dari rangkaian blok terakhir", ledger_part)
+
     def test_an_empty_run_still_prints_all_sections(self) -> None:
         code, out, err = self._run(
             ["--stage-start", DAY0.isoformat(), "--until", DAY1.isoformat()], _FakeStore([])

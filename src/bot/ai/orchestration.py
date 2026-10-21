@@ -803,9 +803,10 @@ class AIOrchestrator:
     async def _ledger_snapshot(self) -> dict[str, BucketLedger]:
         """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
 
-        Only `ledger_block` shadow rows count, so only those are read. A failed read is logged and also
-        gives `{}`, so every bucket reads `learning` for this tick. The ledger only ever adds blocks, so it
-        fails open: the regime and stretch gates still apply."""
+        Only `ledger_block` shadow rows count, so only those are read; `ledger_table` puts them and the
+        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A failed read
+        is logged and also gives `{}`, so every bucket reads `learning` for this tick. The ledger only ever
+        adds blocks, so it fails open: the regime and stretch gates still apply."""
         if self._ledger_mode() == "off":
             return {}
         since = self._settings.setup_ledger_since
