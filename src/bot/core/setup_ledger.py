@@ -141,6 +141,7 @@ def _fails(stats: BucketStats, min_samples: int, hurdle_bps: float) -> bool:
 def ledger_table(
     trade_rows: Iterable[Mapping[str, Any]],
     shadow_rows: Iterable[Mapping[str, Any]],
+    since: datetime | None = None,
 ) -> dict[str, BucketLedger]:
     """`{bucket_key: BucketLedger}` for every bucket with a counted trade or a counted shadow outcome.
 
@@ -155,20 +156,26 @@ def ledger_table(
     block rows decided strictly after the last trade opened at or before the latest block row (all of
     them when there is no such trade; a tie ends the run), and `real_since_block` the trades opened
     strictly after the latest block row. A trade without a readable `opened_at` counts in `real` only.
+
+    With `since` (`SETUP_LEDGER_SINCE`), a trade opened before it counts nowhere: the store reads trades by
+    `closed_at`, so one opened under the earlier rules and closed after the cutoff would otherwise count.
     """
     trades: dict[str, list[tuple[float, datetime | None]]] = {}
     for row in trade_rows:
         key = _trade_bucket_key(row)
-        value = _trade_gross_bps(row) if key else None
+        value = trade_gross_bps(row) if key else None
+        opened_at = _moment(row.get("opened_at"))
+        if since is not None and opened_at is not None and opened_at < since:
+            continue
         if key and value is not None:
-            trades.setdefault(key, []).append((value, _moment(row.get("opened_at"))))
+            trades.setdefault(key, []).append((value, opened_at))
 
     blocks: dict[str, list[tuple[datetime, float | None]]] = {}
     for row in shadow_rows:
         key = _text(row.get("bucket_key"))
         decided_at = _moment(row.get("decided_at")) if row.get("source") == SHADOW_BLOCK_SOURCE else None
         if key and decided_at is not None:
-            blocks.setdefault(key, []).append((decided_at, _finite(row.get("gross_bps"))))
+            blocks.setdefault(key, []).append((decided_at, finite_or_none(row.get("gross_bps"))))
 
     ledgers = {
         key: _bucket_ledger(trades.get(key, []), blocks.get(key, []))
@@ -216,7 +223,8 @@ def _moment(value: Any) -> datetime | None:
         return None
 
 
-def _finite(value: Any) -> float | None:
+def finite_or_none(value: Any) -> float | None:
+    """`value` as a float, or `None` when it is missing, not a number, NaN or infinite."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -230,10 +238,10 @@ def _trade_bucket_key(row: Mapping[str, Any]) -> str:
     return _text(setup.get("bucket_key")) if isinstance(setup, Mapping) else ""
 
 
-def _trade_gross_bps(row: Mapping[str, Any]) -> float | None:
-    """The row's gross result in bps, or `None` when its direction or prices cannot give one."""
-    entry = _finite(row.get("entry_price"))
-    exit_ = _finite(row.get("exit_price"))
+def trade_gross_bps(row: Mapping[str, Any]) -> float | None:
+    """A closed-trade row's gross result in bps, or `None` when its direction or prices cannot give one."""
+    entry = finite_or_none(row.get("entry_price"))
+    exit_ = finite_or_none(row.get("exit_price"))
     if entry is None or exit_ is None or entry <= 0 or exit_ <= 0:
         return None
     try:

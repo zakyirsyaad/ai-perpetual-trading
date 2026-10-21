@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import math
 import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -32,7 +31,14 @@ from typing import Any
 
 from bot.config import Settings
 from bot.core.forward_summary import PER_MILLION, WIB, format_number, format_percent
-from bot.core.setup_ledger import SHADOW_BLOCK_SOURCE, bucket_stats, gross_bps, ledger_status, ledger_table
+from bot.core.setup_ledger import (
+    SHADOW_BLOCK_SOURCE,
+    bucket_stats,
+    finite_or_none,
+    ledger_status,
+    ledger_table,
+    trade_gross_bps,
+)
 from bot.logger import setup_logging
 from bot.storage.supabase_trade_store import SupabaseTradeStore, parse_timestamp
 
@@ -105,7 +111,7 @@ def shadow_summary(rows: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, st
     groups: dict[tuple[str, str, str], list[float]] = {}
     for row in rows:
         key = _shadow_group(row)
-        value = _finite(row.get("gross_bps"))
+        value = finite_or_none(row.get("gross_bps"))
         if key is not None and value is not None:
             groups.setdefault(key, []).append(value)
     return [
@@ -118,7 +124,7 @@ def shadow_unpriced(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     """Evaluated shadow rows `shadow_summary` leaves out, counted by `exit_reason` (`expired`, `invalid`, ...)."""
     counts: Counter[str] = Counter()
     for row in rows:
-        if _shadow_group(row) is None or _finite(row.get("gross_bps")) is None:
+        if _shadow_group(row) is None or finite_or_none(row.get("gross_bps")) is None:
             counts[str(row.get("exit_reason") or "tanpa alasan")] += 1
     return dict(sorted(counts.items()))
 
@@ -148,17 +154,8 @@ def _trade_facts(row: Mapping[str, Any]) -> _TradeFacts | None:
         closed_at=closed_at,
         pnl_usdt=_number(row.get("pnl_usdt")),
         volume_usdt=(entry + exit_) * _number(row.get("quantity")),
-        gross_bps=_gross(str(row.get("direction") or ""), entry, exit_),
+        gross_bps=trade_gross_bps(row),
     )
-
-
-def _gross(direction: str, entry: float, exit_: float) -> float | None:
-    if entry <= 0 or exit_ <= 0:
-        return None
-    try:
-        return gross_bps(direction, entry, exit_)
-    except ValueError:
-        return None
 
 
 def _summarize_stage(start: datetime, end: datetime, members: Sequence[_TradeFacts]) -> StageSummary:
@@ -186,16 +183,8 @@ def _shadow_group(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
 
 def _number(value: Any) -> float:
     """A float; 0.0 for a missing or non-finite value, like SupabaseTradeStore's closed-trade parser."""
-    number = _finite(value)
+    number = finite_or_none(value)
     return 0.0 if number is None else number
-
-
-def _finite(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
 
 
 def _within(
@@ -258,11 +247,13 @@ def render_ledger(
     shadows: Sequence[Mapping[str, Any]],
     settings: Any,
     window: str = "",
+    since: datetime | None = None,
 ) -> str:
-    """The ledger table; `window` says which rows it was built from (printed in the heading)."""
+    """The ledger table; `window` says which rows it was built from (printed in the heading), and `since`
+    leaves out trades opened before it, as the engine's ledger does."""
     min_samples = settings.setup_ledger_min_samples
     hurdle = settings.setup_ledger_hurdle_bps
-    table = ledger_table(trades, shadows)
+    table = ledger_table(trades, shadows, since=since)
     lines = [
         f"=== Ledger {window}(minimum {min_samples} sampel, ambang {format_number(hurdle, 2)} bps) ===",
         f"{'kelompok':<34}{'n nyata':>8}{'rata-rata':>11}{'batas atas':>12}"
@@ -377,7 +368,7 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
     print()
     print(render_shadow(shadow_rows))
     print()
-    print(render_ledger(ledger_trades, ledger_shadows, settings, window))
+    print(render_ledger(ledger_trades, ledger_shadows, settings, window, since=ledger_since))
     return 0
 
 

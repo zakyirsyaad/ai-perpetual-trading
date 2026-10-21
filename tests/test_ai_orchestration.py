@@ -1501,6 +1501,20 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         ledger = store.decisions[-1]["payload"]["gate"]["ledger"]
         self.assertEqual((ledger["status"], ledger["n"]), ("blocked", 3))
 
+    async def test_a_trade_opened_before_since_is_not_in_the_ledger(self) -> None:
+        # Three losers that would block the bucket, all opened a minute before SETUP_LEDGER_SINCE.
+        before = (self.SINCE - timedelta(minutes=1)).isoformat()
+        store = _LedgerStore([dict(row, opened_at=before) for row in self._losing_shorts()])
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
+
+        plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNotNone(plan)
+        ledger = self._gate(store)["ledger"]
+        self.assertEqual((ledger["status"], ledger["n"]), ("learning", 0))
+
     async def test_ledger_is_reused_within_the_cache_age(self) -> None:
         store = _LedgerStore(self._losing_shorts())
         orchestrator = self._orchestrator(

@@ -98,7 +98,7 @@ class ShadowLedgerMixin:
         try:
             trades = await self._trade_store.closed_trade_rows_since(since)
             shadows = await self._trade_store.shadow_outcomes_since(since, source=SHADOW_BLOCK_SOURCE)
-            snapshot = ledger_table(trades, shadows)
+            snapshot = ledger_table(trades, shadows, since=since)
         except Exception as exc:  # noqa: BLE001 - a ledger read must never stop the entry path
             failing_open = last is None
             self._logger.log(

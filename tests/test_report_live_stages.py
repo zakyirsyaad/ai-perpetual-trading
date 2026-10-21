@@ -536,6 +536,23 @@ class CliTests(unittest.TestCase):
         # the stage table still counts only the stage window
         self.assertEqual(_table_row(out, "1")[3], "1")
 
+    def test_the_ledger_leaves_out_a_trade_opened_before_setup_ledger_since(self) -> None:
+        # Closed after SETUP_LEDGER_SINCE but opened before it: the stage table counts it (by closed_at), the
+        # ledger, like the engine's, does not.
+        straddling = _row(DAY0 + timedelta(hours=1), bucket=BUCKET, opened=DAY0 - timedelta(minutes=5))
+        inside = _row(DAY0 + timedelta(hours=2), bucket=BUCKET, opened=DAY0 + timedelta(hours=1))
+        code, out, err = self._run(
+            ["--stage-start", DAY0.isoformat(), "--until", DAY1.isoformat()],
+            _FakeStore([straddling, inside]),
+            _settings(setup_ledger_since=DAY0),
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(_table_row(out, "1")[3], "2")
+        ledger_part = out.split("Ledger", 1)[1]
+        cells = next(row for row in ledger_part.splitlines() if row.startswith(BUCKET)).split()
+        self.assertEqual(cells[1], "1")
+
     def test_the_ledger_heading_says_when_setup_ledger_since_is_unset(self) -> None:
         store = _FakeStore([_row(DAY0 + timedelta(hours=1), bucket=BUCKET)])
         _, out, _ = self._run(["--stage-start", DAY0.isoformat(), "--until", DAY1.isoformat()], store)

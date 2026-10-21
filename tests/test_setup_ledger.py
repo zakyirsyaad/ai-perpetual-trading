@@ -231,6 +231,24 @@ class LedgerTableTests(unittest.TestCase):
         table = ledger_table([], [_shadow(bucket, float("nan")), _shadow(bucket, float("inf")), _shadow(bucket, 1.0)])
         self.assertEqual(table[bucket].shadow_run, BucketStats(1, 1.0, None, None))
 
+    def test_a_trade_opened_before_since_is_not_counted(self) -> None:
+        # The store reads by closed_at, so a trade opened before SETUP_LEDGER_SINCE (under the old rules) and
+        # closed after it reaches the table; with `since` it counts nowhere, not even on the episode timeline.
+        bucket = "SHORT|TURUN|atr_mid"
+        since = BLOCK_AT - timedelta(days=1)
+        trades = [
+            _trade(bucket, "SHORT", 100.0, 99.0, (since - timedelta(minutes=5)).isoformat()),   # straddles since
+            _trade(bucket, "SHORT", 100.0, 100.5, since.isoformat()),                           # opened at since
+            _trade(bucket, "SHORT", 100.0, 100.5),                                               # no opened_at
+        ]
+
+        table = ledger_table(trades, [], since=since)
+
+        self.assertEqual(table[bucket].real.n, 2)
+        self.assertAlmostEqual(table[bucket].real.mean_bps, -50.0)
+        # without `since` every row counts, as before
+        self.assertEqual(ledger_table(trades, [])[bucket].real.n, 3)
+
     def test_table_feeds_the_status_end_to_end(self) -> None:
         bucket = "SHORT|TURUN|atr_mid"
         trades = [_trade(bucket, "SHORT", 100.0, 100.01) for _ in range(60)]
