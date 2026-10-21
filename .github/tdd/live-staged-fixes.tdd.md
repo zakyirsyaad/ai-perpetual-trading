@@ -256,7 +256,8 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   `gate.ledger.status=blocked`; only the candidate is dropped, so the tick holds and the engine logs
   "Strategy returned HOLD". Query the gate flags, not HOLD rows.
 - **A ledger read failure fails open** (WARNING, every bucket `learning` that tick, the regime and
-  stretch gates still apply). Shadow outcomes of source `shadow_side` never reopen a bucket; only
+  stretch gates still apply). Since the episode review it does so only before the first good read;
+  afterwards the last snapshot is reused (section "Episode-scoped reopening"). Shadow outcomes of source `shadow_side` never reopen a bucket; only
   `ledger_block` outcomes do.
 - **`COMPACT_PROMPT_VERSION` is unchanged**, so `ai_call_metrics` cannot tell the profiles apart; the
   report separates them by stage time, and `payload_json.payload_profile` records the profile per
@@ -475,11 +476,13 @@ strictly after the boundary. `ledger_status` is unchanged. `BucketLedger.shadow`
 and `ledger_status`, so their code is unchanged (the `_ledger_snapshot` docstring now names the rule)
 and the stored verdict keeps its six keys.
 
-Named tests: `LatestEpisodeTests` in `tests/test_setup_ledger.py` (10:
+Named tests: `LatestEpisodeTests` in `tests/test_setup_ledger.py` (10 at `1856610`:
 `test_the_first_episode_reopening_sample_is_every_block_outcome`,
-`test_a_re_blocked_bucket_stays_blocked_before_its_next_block_row`,
+`test_a_re_blocked_bucket_stays_blocked_before_its_next_block_row` (a regression pin: it passed on
+the old code too, since a re-blocked bucket read `blocked` until its next block row was evaluated),
 `test_one_good_block_row_does_not_bring_back_the_old_shadow_sample`,
-`test_an_expired_or_invalid_block_row_cannot_reopen`,
+`test_an_expired_or_invalid_block_row_cannot_reopen` (moved to `EvaluatedBlockRowTests` by the
+review fixes below),
 `test_a_re_blocked_bucket_needs_a_fresh_run_of_min_samples_to_reopen`,
 `test_an_expired_row_marks_time_without_breaking_the_run`,
 `test_a_fresh_run_is_judged_again_on_the_trades_opened_after_it`,
@@ -509,25 +512,74 @@ Deliberate choices:
   (before, it counted). Conservative, since the ledger only adds blocks; live rows always carry one.
 - A trade without a readable `opened_at` counts in `real` only: it neither ends a run nor is
   re-judged (re-judging already skipped it).
-- All comparisons are strict, as `real_since_block` already was: a block row decided exactly at the
-  boundary trade's `opened_at` is not in the run.
+- Comparisons are strict, as `real_since_block` already was: a block row decided exactly at the
+  boundary trade's `opened_at` is not in the run. The boundary itself takes trades opened at or
+  before the latest block row (review fix 3 below), so a tie ends the run.
 - A priced block row decided before a reopened bucket's first trade but evaluated after it still
   belongs to the run and can lower its bound; if that re-blocks the bucket, only a fresh run
   reopens it.
 
-Verification (this section), Python 3.10.20 from `.venv`, 2026-10-21:
+### Review fixes on PR #47
+
+A recall review of the branch found seven points, none blocking; all are fixed here.
+
+1. **A trade let into a blocked bucket ended its reopening run.** The ledger failed open on any read
+   error, so one failed read let a blocked bucket trade, and under the episode rule that trade ended
+   the run (up to 59 outcomes, about 69 hours). Ruling: a failed read reuses the last snapshot read
+   without error (`AIOrchestrator._last_ledger_snapshot`, in memory); before the first good read it
+   still fails open. A rollback from `enforce` to `shadow` still lets a blocked bucket trade, by
+   design, and so restarts its episode; CLAUDE.md and the spec now say so.
+2. **The stored verdict could not explain an episode status.** `payload_json.gate.ledger` adds
+   `shadow_run_n`, `shadow_run_upper_bps`, `since_block_n` and `since_block_upper_bps`. The lean
+   payload's ledger lines are unchanged, so the model sees nothing new.
+3. **A trade opened exactly at the latest block row was in neither sample.** The boundary now takes
+   trades opened at or before the latest block row, so a tie ends the run.
+4. **The verification block had no `pip check`.** Added below.
+5. **The expired and invalid subtests fed identical rows** (the ledger never reads `exit_reason`).
+   `EvaluatedBlockRowTests` now closes a real invalid row (a stop of 0) and a real expired row (its
+   decision minute outside the venue window) through `evaluate_pending`, then feeds the rows it wrote
+   to the ledger. It passed at once: it pins the row shape, not new behaviour.
+6. **A regression pin was listed among the RED tests.** Marked as such above.
+7. **The `_status` test helper still named its argument `shadow`.** It now builds `BucketLedger` by
+   keyword with `shadow_run`.
+
+RED (1-3):
+
+```
+FAIL: test_a_trade_opened_exactly_at_the_latest_block_row_ends_the_run (tests.test_setup_ledger.LatestEpisodeTests)
+AssertionError: BucketStats(n=60, mean_bps=6.0, se_bps=0.0, upper_bps=6.0) != BucketStats(n=0, mean_bps=None, se_bps=None, upper_bps=None)
+FAIL: test_a_ledger_read_failure_reuses_the_last_snapshot (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: TradePlan(symbol='BTC/USDT', direction=<PositionDirection.SHORT: 'SHORT'>, ...) is not None
+FAIL: test_ledger_shadow_records_the_status_and_trades (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Items in the second set but not the first: (the four episode keys)
+ERROR: test_ledger_enforce_keeps_a_re_blocked_bucket_blocked_until_a_fresh_run_reopens_it (...) (new_values=[None])
+KeyError: 'shadow_run_n'
+```
+
+(the same `KeyError` in the other two subtests).
+
+GREEN (`a49fac4`): `_bucket_ledger` uses `opened_at <= latest` for the boundary;
+`_ledger_snapshot` keeps each good snapshot and, on a failed read, logs
+"Setup ledger could not be read (...); the last snapshot is used this tick." and returns it;
+`_ledger_verdict` adds the four keys. Existing tests unchanged in expectation, apart from the verdict
+key set in `test_ledger_shadow_records_the_status_and_trades`.
+
+Verification (this section, after the review fixes), Python 3.10.20 from `.venv`, 2026-10-21:
 
 ```
 PYTHONPATH=src python -m compileall -q src tests                                   # exit 0
-PYTHONPATH=src python -m unittest discover -s tests                                # Ran 2935 tests, OK
-PYTHONPATH=src python -m coverage run --rcfile=<rc> -m unittest discover -s tests  # Ran 2935 tests, OK
-python -m coverage report --rcfile=<rc>                                            # TOTAL 17294 1404 92%   (fail_under 80)
+PYTHONPATH=src python -m coverage run --rcfile=<rc> -m unittest discover -s tests  # Ran 2937 tests, OK
+python -m coverage report --rcfile=<rc>                                            # TOTAL 17298 1405 92%   (fail_under 80)
 git diff --check                                                                   # exit 0, no output
+uv pip check --python .venv/bin/python                                             # All installed packages are compatible (17)
+PYTHONPATH=src python -m unittest tests.test_secret_hygiene                        # Ran 1 test, OK
 ```
 
-- 2,935 tests (2,923 before: +12, 10 ledger, 1 orchestrator, 1 report).
-- `setup_ledger.py` 100 %, `report_live_stages.py` 98 % (the 4 missed lines are still `_run` and
-  `main`, the CLI glue). `<rc>` is the rcfile mirroring `pyproject.toml`, as above.
+- 2,937 tests (2,923 before the episode work: +14; at `1856610` 2,935, and the review fixes add
+  the tie test and the last-snapshot test, the evaluator test replacing a moved one).
+- `setup_ledger.py` 100 %, `orchestration.py` 96 % (every line the review fixes added is covered),
+  `report_live_stages.py` 98 % (the 4 missed lines are still `_run` and `main`, the CLI glue). `<rc>`
+  is the rcfile mirroring `pyproject.toml`, as above.
 - No new import: `setup_ledger.py` still imports only `bot.core.shadow_eval` from `bot`. The
   secret-hygiene, dashboard-contract and import-structure tests pass unchanged.
 
@@ -597,7 +649,9 @@ f8a2e23 feat: setup ledger statistics and status                                
 7ab059a fix: judge a reopened ledger bucket again on its new real trades        final review 3
         docs: final review fix wave in CLAUDE.md, the spec and TDD evidence     final review
 1856610 fix: scope ledger reopening to the latest blocked episode               episode scope
-        docs: episode-scoped ledger reopening in CLAUDE.md, the spec and TDD    episode scope
+aadb11f docs: episode-scoped ledger reopening in CLAUDE.md, the spec and TDD    episode scope
+a49fac4 fix: ledger review fixes (tie, last snapshot, episode verdict keys)     episode review
+        docs: ledger review fixes in CLAUDE.md, the spec and TDD evidence      episode review
 ```
 
 ## Deployment gate

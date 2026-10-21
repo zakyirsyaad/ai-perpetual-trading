@@ -1363,7 +1363,16 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertAlmostEqual(ledger["mean_bps"], -15.0)
         self.assertLess(ledger["upper_bps"], 4.0)
-        self.assertEqual(set(ledger), {"mode", "bucket", "n", "mean_bps", "upper_bps", "status"})
+        self.assertEqual(
+            set(ledger),
+            {
+                "mode", "bucket", "n", "mean_bps", "upper_bps", "status",
+                "shadow_run_n", "shadow_run_upper_bps", "since_block_n", "since_block_upper_bps",
+            },
+        )
+        # no ledger_block row yet: both episode samples are empty
+        episode = ("shadow_run_n", "shadow_run_upper_bps", "since_block_n", "since_block_upper_bps")
+        self.assertEqual(tuple(ledger[key] for key in episode), (0, None, 0, None))
         self.assertIn("Setup ledger (shadow) would block BTC/USDT", "\n".join(logs.output))
         # a HOLD decision gets no ledger verdict
         self.assertNotIn("ledger", self._gate(store, "ETH/USDT"))
@@ -1454,11 +1463,37 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
 
                 plan = await orchestrator.next_trade_plan(self._state())
 
-                self.assertEqual(self._gate(store)["ledger"]["status"], status)
+                ledger = self._gate(store)["ledger"]
+                self.assertEqual(ledger["status"], status)
                 self.assertEqual(plan is None, status == "blocked")
                 self.assertEqual(
                     [row["source"] for row in store.shadow_rows], ["ledger_block"] if status == "blocked" else []
                 )
+                # the decision row says why: the fresh run's size, and no real trade since it yet
+                finite = [value for value in new_values if value is not None]
+                self.assertEqual((ledger["shadow_run_n"], ledger["since_block_n"]), (len(finite), 0))
+                self.assertEqual(ledger["shadow_run_upper_bps"] is None, len(finite) < 2)
+
+    async def test_a_ledger_read_failure_reuses_the_last_snapshot(self) -> None:
+        # A good read files the bucket as blocked; a failed read on the next tick keeps that snapshot, so a
+        # transient store error lets no entry into a blocked bucket (whose trade would also end its run).
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
+        self.assertIsNone(await orchestrator.next_trade_plan(self._state()))
+        store.read_error = RuntimeError("supabase down")
+
+        with self.assertLogs("test.ledger", level="WARNING") as logs:
+            plan = await orchestrator.next_trade_plan(self._state())
+
+        self.assertIsNone(plan)
+        self.assertIn(
+            "Setup ledger could not be read (RuntimeError: supabase down); the last snapshot is used this tick.",
+            "\n".join(logs.output),
+        )
+        ledger = store.decisions[-1]["payload"]["gate"]["ledger"]
+        self.assertEqual((ledger["status"], ledger["n"]), ("blocked", 3))
 
     async def test_a_ledger_read_failure_is_logged_and_treated_as_learning(self) -> None:
         store = _LedgerStore(self._losing_shorts(), read_error=RuntimeError("supabase down"))

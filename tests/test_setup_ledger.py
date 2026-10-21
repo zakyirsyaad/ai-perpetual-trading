@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from bot.core.setup_ledger import (
     ledger_status,
     ledger_table,
 )
+from bot.core.shadow_eval import evaluate_pending
 
 MIN_SAMPLES = 60
 HURDLE_BPS = 4.0
@@ -59,8 +61,10 @@ def _first_episode(bucket: str, new_exits: list[float]) -> tuple[list[dict], lis
     return before + after, shadows
 
 
-def _status(real: BucketStats, shadow: BucketStats, since_block: BucketStats = EMPTY) -> str:
-    return ledger_status(BucketLedger(real, shadow, since_block), MIN_SAMPLES, HURDLE_BPS)
+def _status(real: BucketStats, shadow_run: BucketStats, since_block: BucketStats = EMPTY) -> str:
+    return ledger_status(
+        BucketLedger(real=real, shadow_run=shadow_run, real_since_block=since_block), MIN_SAMPLES, HURDLE_BPS
+    )
 
 
 class BucketKeyTests(unittest.TestCase):
@@ -315,6 +319,22 @@ class ReopenedBucketTests(unittest.TestCase):
 
 
 
+# The first episode's 60 new trades open every 10 minutes after BLOCK_AT, the last at BLOCK_AT + 600 min.
+RE_BLOCKED_AT = BLOCK_AT + timedelta(hours=11)
+
+
+def _re_blocked(bucket: str, new_rows: list[dict], new_exits: tuple[float, ...] = ()) -> BucketLedger:
+    """Reopened by the first run, blocked again by 60 losing trades opened after it; then `new_rows` and one
+    trade per `new_exits` price, opened every 10 minutes after the last new row (decided 70 minutes apart)."""
+    trades, shadows = _first_episode(bucket, [100.01] * 60)
+    last = RE_BLOCKED_AT + timedelta(minutes=70 * max(len(new_rows) - 1, 0))
+    later = [
+        _trade(bucket, "SHORT", 100.0, exit_, (last + timedelta(minutes=10 * (i + 1))).isoformat())
+        for i, exit_ in enumerate(new_exits)
+    ]
+    return ledger_table(trades + later, shadows + new_rows)[bucket]
+
+
 class LatestEpisodeTests(unittest.TestCase):
     """Only the bucket's latest blocked episode can reopen it.
 
@@ -325,28 +345,15 @@ class LatestEpisodeTests(unittest.TestCase):
     """
 
     BUCKET = "SHORT|TURUN|atr_mid"
-    # The first episode's 60 new trades open every 10 minutes after BLOCK_AT, the last at BLOCK_AT + 600 min.
-    RE_BLOCKED_AT = BLOCK_AT + timedelta(hours=11)
 
-    def _new_rows(self, values: list[float | None], exit_reason: str = "floor") -> list[dict]:
+    def _new_rows(self, values: list[float | None]) -> list[dict]:
         return [
-            {
-                **_shadow(self.BUCKET, value, decided_at=(self.RE_BLOCKED_AT + timedelta(minutes=70 * i)).isoformat()),
-                "exit_reason": exit_reason,
-            }
+            _shadow(self.BUCKET, value, decided_at=(RE_BLOCKED_AT + timedelta(minutes=70 * i)).isoformat())
             for i, value in enumerate(values)
         ]
 
     def _re_blocked(self, new_rows: list[dict], new_exits: tuple[float, ...] = ()) -> BucketLedger:
-        # Reopened by the first run, blocked again by 60 losing trades opened after it; then `new_rows` and
-        # one trade per `new_exits` price, opened every 10 minutes after the last new row.
-        trades, shadows = _first_episode(self.BUCKET, [100.01] * 60)
-        last = self.RE_BLOCKED_AT + timedelta(minutes=70 * max(len(new_rows) - 1, 0))
-        later = [
-            _trade(self.BUCKET, "SHORT", 100.0, exit_, (last + timedelta(minutes=10 * (i + 1))).isoformat())
-            for i, exit_ in enumerate(new_exits)
-        ]
-        return ledger_table(trades + later, shadows + new_rows)[self.BUCKET]
+        return _re_blocked(self.BUCKET, new_rows, new_exits)
 
     @staticmethod
     def _status(ledger: BucketLedger) -> str:
@@ -368,14 +375,6 @@ class LatestEpisodeTests(unittest.TestCase):
         self.assertEqual(self._status(ledger), "blocked")
         self.assertEqual(ledger.shadow_run, BucketStats(1, 6.0, None, None))
         self.assertEqual(ledger.real_since_block, EMPTY)
-
-    def test_an_expired_or_invalid_block_row_cannot_reopen(self) -> None:
-        for reason in ("expired", "invalid"):
-            with self.subTest(exit_reason=reason):
-                ledger = self._re_blocked(self._new_rows([None], exit_reason=reason))
-                self.assertEqual(self._status(ledger), "blocked")
-                self.assertEqual(ledger.shadow_run, EMPTY)
-                self.assertEqual(ledger.real_since_block, EMPTY)
 
     def test_a_re_blocked_bucket_needs_a_fresh_run_of_min_samples_to_reopen(self) -> None:
         self.assertEqual(self._status(self._re_blocked(self._new_rows([6.0] * 59))), "blocked")
@@ -409,6 +408,15 @@ class LatestEpisodeTests(unittest.TestCase):
         self.assertEqual(ledger.shadow_run.n, 2)
         self.assertAlmostEqual(ledger.shadow_run.mean_bps, 7.5)
 
+    def test_a_trade_opened_exactly_at_the_latest_block_row_ends_the_run(self) -> None:
+        # The tie cannot leave the earlier run standing: the trade ends it, so the run is empty.
+        trades, shadows = _first_episode(self.BUCKET, [])
+        tie = _trade(self.BUCKET, "SHORT", 100.0, 100.01, BLOCK_AT.isoformat())
+        ledger = ledger_table([*trades, tie], shadows)[self.BUCKET]
+        self.assertEqual(ledger.shadow_run, EMPTY)
+        self.assertEqual(ledger.real_since_block, EMPTY)
+        self.assertEqual(self._status(ledger), "blocked")
+
     def test_a_block_row_without_a_readable_time_never_counts(self) -> None:
         timeless = [
             _shadow(self.BUCKET, 6.0, decided_at=None),
@@ -428,6 +436,62 @@ class LatestEpisodeTests(unittest.TestCase):
         self.assertEqual(ledger.real.n, 61)
         self.assertEqual(ledger.shadow_run.n, 60)
         self.assertEqual(ledger.real_since_block, EMPTY)
+
+
+class _EvaluatorStore:
+    """Hands `evaluate_pending` every open row and keeps the outcome it closes each one with."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.closed: dict[int, tuple[float | None, str]] = {}
+
+    async def pending_shadow_entries(self, decided_before: datetime, limit: int) -> list[dict]:
+        return [row for row in self.rows if row["id"] not in self.closed][:limit]
+
+    async def complete_shadow_entry(self, entry_id: int, gross_bps: float | None, exit_reason: str) -> None:
+        self.closed[entry_id] = (gross_bps, exit_reason)
+
+
+class _CandlesFrom:
+    """A venue whose 1m window starts at `start`, after every decision minute here."""
+
+    def __init__(self, start: datetime) -> None:
+        self.start = start
+
+    async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 120) -> list[dict]:
+        moment = int(self.start.timestamp() * 1000)
+        return [{"timestamp": moment, "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0}]
+
+
+class EvaluatedBlockRowTests(unittest.IsolatedAsyncioTestCase):
+    """Expired and invalid rows exactly as `evaluate_pending` closes them carry no outcome and only mark time."""
+
+    BUCKET = "SHORT|TURUN|atr_mid"
+
+    async def test_an_expired_or_invalid_block_row_cannot_reopen(self) -> None:
+        base = {
+            "bucket_key": self.BUCKET, "source": "ledger_block", "symbol": "BTC/USDT", "side": "short",
+            "ref_price": 100.0, "stop_loss_pct": 0.3, "floor_pct": 0.324, "hold_minutes": 60,
+        }
+        rows = [
+            {**base, "id": 1, "decided_at": RE_BLOCKED_AT.isoformat(), "stop_loss_pct": 0.0},  # no walk can use it
+            {**base, "id": 2, "decided_at": (RE_BLOCKED_AT + timedelta(minutes=70)).isoformat()},  # out of the window
+        ]
+        store = _EvaluatorStore(rows)
+        now = RE_BLOCKED_AT + timedelta(days=1)
+        with self.assertLogs("test.ledger.evaluator", level="INFO"):
+            await evaluate_pending(store, _CandlesFrom(now - timedelta(minutes=5)), now=now,
+                                   logger=logging.getLogger("test.ledger.evaluator"))
+        self.assertEqual(store.closed, {1: (None, "invalid"), 2: (None, "expired")})
+
+        for row in rows:
+            gross, reason = store.closed[row["id"]]
+            evaluated = {**row, "gross_bps": gross, "exit_reason": reason, "evaluated_at": now.isoformat()}
+            with self.subTest(exit_reason=reason):
+                ledger = _re_blocked(self.BUCKET, [evaluated])
+                self.assertEqual(ledger_status(ledger, MIN_SAMPLES, HURDLE_BPS), "blocked")
+                self.assertEqual(ledger.shadow_run, EMPTY)
+                self.assertEqual(ledger.real_since_block, EMPTY)
 
 
 if __name__ == "__main__":

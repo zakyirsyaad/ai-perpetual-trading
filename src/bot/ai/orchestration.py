@@ -96,6 +96,8 @@ class AIOrchestrator:
         # read from the store; the keys already read from the store this process (each is read once).
         self._shadow_rows_written_at: dict[ShadowKey, datetime] = {}
         self._shadow_seeded_keys: frozenset[ShadowKey] = frozenset()
+        # The last setup-ledger snapshot read without error; in memory only, `None` until the first one.
+        self._last_ledger_snapshot: dict[str, BucketLedger] | None = None
 
     def _current_gate_context(self) -> dict[str, Any] | None:
         # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
@@ -810,23 +812,29 @@ class AIOrchestrator:
         """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
 
         Only `ledger_block` shadow rows count, so only those are read; `ledger_table` puts them and the
-        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A failed read
-        is logged and also gives `{}`, so every bucket reads `learning` for this tick. The ledger only ever
-        adds blocks, so it fails open: the regime and stretch gates still apply."""
+        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A failed read is
+        logged and reuses the last snapshot read without error, so a transient store error lets no entry
+        into a blocked bucket (that trade would also end the bucket's reopening run). Before the first good
+        read it gives `{}`: every bucket reads `learning` for the tick, so the ledger fails open there and
+        the regime and stretch gates still apply."""
         if self._ledger_mode() == "off":
             return {}
         since = self._settings.setup_ledger_since
         try:
             trades = await self._trade_store.closed_trade_rows_since(since)
             shadows = await self._trade_store.shadow_outcomes_since(since, source=SHADOW_BLOCK_SOURCE)
-            return ledger_table(trades, shadows)
+            snapshot = ledger_table(trades, shadows)
         except Exception as exc:  # noqa: BLE001 - a ledger read must never stop the entry path
+            last = getattr(self, "_last_ledger_snapshot", None)
             self._logger.warning(
-                "Setup ledger could not be read (%s: %s); every bucket reads as learning this tick.",
+                "Setup ledger could not be read (%s: %s); %s",
                 type(exc).__name__,
                 exc,
+                "every bucket reads as learning this tick." if last is None else "the last snapshot is used this tick.",
             )
-            return {}
+            return {} if last is None else last
+        self._last_ledger_snapshot = snapshot
+        return snapshot
 
     def _ledger_bucket(self, side: str, features: dict[str, Any] | None) -> str:
         """`side|condition|atr_regime` for an entry on `side` now: the condition of the gate context set
@@ -849,6 +857,11 @@ class AIOrchestrator:
             "n": entry.real.n,
             "mean_bps": entry.real.mean_bps,
             "upper_bps": entry.real.upper_bps,
+            # The two samples the status turns on once the real bound is below the hurdle.
+            "shadow_run_n": entry.shadow_run.n,
+            "shadow_run_upper_bps": entry.shadow_run.upper_bps,
+            "since_block_n": entry.real_since_block.n,
+            "since_block_upper_bps": entry.real_since_block.upper_bps,
             "status": ledger_status(
                 entry,
                 int(self._settings.setup_ledger_min_samples),
