@@ -860,16 +860,13 @@ GREEN: the same three modules, `Ran 181 tests ... OK`. Full gate after the fix (
 
 ### Known limits of these rulings (none blocking)
 
-- The ledger snapshot can be up to 300 s old. This does not let a just-closed trade's bucket take one
-  more entry: the engine blocks inside the tick while a position is open, and the entry cooldown
-  (`COOLDOWN_MINUTES_AFTER_ENTRY`, 10 by default) counts from `opened_at`, so the next strategy call
-  after any trade finds the snapshot at least 10 minutes old and reads it again. It would matter only
-  with an entry cooldown below 5 minutes; otherwise it only delays a reopening by up to 5 minutes.
+- *Superseded by the second review (item 2):* the ledger snapshot can be up to 300 s old, and account 1
+  runs `COOLDOWN_MINUTES_AFTER_ENTRY=0`, so a just-closed trade's bucket could take one more entry. A
+  tick that returns a plan now expires the snapshot.
 - `latest_shadow_decided_at` has no matching index (the table's index is exchange, evaluated_at,
   decided_at). It runs at most once per key per process on a small table; no schema change was made.
-- With the ledger `enforce` and a blocked bucket on a live side, the AI is still asked every tick
-  inside the `ledger_block` spacing; the skip covers shadow-only hours only, as ruled.
-- `orchestration.py` is 979 lines, still above the 800-line soft ceiling.
+- *Superseded by the second review (items 3 and 8):* the AI was still asked every tick for an
+  enforce-blocked live bucket inside its `ledger_block` spacing, and `orchestration.py` was 979 lines.
 
 ### Verification (PR #46 review fixes)
 
@@ -897,6 +894,76 @@ uv pip check --python .venv/bin/python                                          
   and `test_the_legacy_request_is_the_builder_s_output_byte_for_byte` pass. The secret-hygiene,
   dashboard-contract, forward-schema and import-structure tests pass; `shadow_eval.py` now imports
   only `bot.asyncutil` from `bot`.
+
+## Second review of PR #46 (eight findings, `fe58c16`..`7cf2691`)
+
+A second recall review of the whole PR at `eea4bb0` reported eight findings (no CRITICAL). Each is fixed
+with a test; the refactor moves code verbatim.
+
+1. **The shadow floor used the config fee** (`90ee067`). The live neutral exit nets
+   `TradeEngine._taker_fee_pct` (the venue's commissionRate, 0.035 % on account 1), while the shadow floor
+   added the candidate's `round_trip_fee_pct`, which is `TAKER_FEE_PCT x 2` (0.05 % on account 1; the
+   startup refresh keeps the larger of the two in the setting). The floor sat about 3 bps further than the
+   live one. The engine now hands its venue rates to the strategy after the fee refresh
+   (`set_taker_fee_pcts`, forwarded by `GrokStrategy`), and `_shadow_row` adds twice that rate, falling
+   back to `TAKER_FEE_PCT` like the engine. Tests: `test_the_shadow_floor_uses_the_venue_taker_fee`,
+   `test_fee_refresh_hands_the_venue_rates_to_the_strategy`, `test_the_venue_taker_fees_reach_the_orchestrator`;
+   `test_shadow_row_floor_is_capped_at_the_take_profit` now pins the setting fallback and the venue rate,
+   not the candidate's own target fee.
+2. **The ledger cache could hide a just-closed trade** (`e9e0157`). A tick that returns a plan calls
+   `_expire_ledger_snapshot`, so the next strategy call reads again (the snapshot stays for a failed read).
+   Test: `test_a_returned_plan_makes_the_next_tick_read_the_ledger_again`;
+   `test_ledger_is_reused_within_the_cache_age` now uses a stretched SHORT, so no plan comes back.
+3. **AI calls for an enforce-blocked live bucket inside its spacing** (`e9e0157`).
+   `_shadow_only_hour_is_spaced` became `_call_is_spaced(context, ledger)`: the one side that can pass the
+   side filter (`_only_gate_side`: the mapped side under `map`, the configured side under `naik`) is
+   skipped when it is a shadow side, or, under `enforce`, when its bucket is `blocked`, while every
+   symbol's row for it is inside its spacing ("Ledger-blocked setup ... holding without an AI call"). The
+   ledger is now read before the check. Test: `test_a_blocked_live_bucket_inside_the_spacing_makes_no_ai_call`
+   (a shadow ledger still asks the model).
+4. **A future `SETUP_LEDGER_SINCE` was accepted** (`fe58c16`): refused more than 5 minutes ahead, like
+   `VOLUME_CYCLE_STARTED_AT`. The settings tests' own `AWARE_SINCE` (2026-10-22 00:00 WIB) was in the
+   future and moved to 2026-10-20. Test: `test_a_since_more_than_five_minutes_ahead_is_refused`.
+5. **Trades opened before `SETUP_LEDGER_SINCE` counted** (`3135e9d`). `ledger_table(..., since=)` drops a
+   trade whose readable `opened_at` is before it; the engine and the report pass it. Tests:
+   `test_a_trade_opened_before_since_is_not_counted`, `test_a_trade_opened_before_since_is_not_in_the_ledger`,
+   `test_the_ledger_leaves_out_a_trade_opened_before_setup_ledger_since`.
+6. **The report duplicated the ledger's helpers** (`3135e9d`): it imports `trade_gross_bps` and
+   `finite_or_none` (now public) instead of its own `_gross` and `_finite`.
+7. **The `_last_shadow_rows` getter** (`e9e0157`) is gone; the state is read directly.
+8. **orchestration.py size** (`7cf2691`): `EntryGateMixin` (`bot/ai/entry_gate.py`, the side filter, the
+   regime side mapping and the stretch gate) and `LeanPayloadMixin` (`bot/ai/lean_payload.py`, the lean
+   request and the profile switch); `next_trade_plan` hands the call to `_ask_for_entries` and each
+   decision to `_route_decision`. 981 -> 780 lines; `next_trade_plan` 70 -> 46.
+
+RED (each before its fix):
+
+```
+FAIL: test_a_since_more_than_five_minutes_ahead_is_refused (tests.test_live_staged_settings.StagedSettingsTests)
+AssertionError: ValueError not raised
+ERROR: test_a_trade_opened_before_since_is_not_counted (tests.test_setup_ledger.LedgerTableTests)
+TypeError: ledger_table() got an unexpected keyword argument 'since'
+FAIL: test_the_ledger_leaves_out_a_trade_opened_before_setup_ledger_since (tests.test_report_live_stages.CliTests)
+AssertionError: '2' != '1'
+FAIL: test_a_trade_opened_before_since_is_not_in_the_ledger (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: unexpectedly None
+ERROR: test_the_shadow_floor_uses_the_venue_taker_fee (tests.test_ai_orchestration.LedgerAndShadowTests)
+AttributeError: 'AIOrchestrator' object has no attribute 'set_taker_fee_pcts'
+ERROR: test_the_venue_taker_fees_reach_the_orchestrator (tests.test_trade_engine_forward_gates.RegimeGateTickTests)
+AttributeError: 'GrokStrategy' object has no attribute 'set_taker_fee_pcts'
+FAIL: test_fee_refresh_hands_the_venue_rates_to_the_strategy (tests.test_trade_engine_execution.StartupTests)
+AssertionError: Lists differ: [] != [{'BTC/USDT': 0.035}]
+FAIL: test_a_blocked_live_bucket_inside_the_spacing_makes_no_ai_call (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: 2 != 1
+FAIL: test_a_returned_plan_makes_the_next_tick_read_the_ledger_again (tests.test_ai_orchestration.LedgerAndShadowTests)
+AssertionError: Lists differ: [('tr[168 chars]ock')] != [('tr[168 chars]ock'), ('trades', datetime.datetime(2026, 10, [134 chars]ck')]
+```
+
+Verification at `7cf2691` (Python 3.10.20 `.venv`, `set -o pipefail`): `compileall -q src tests` exit 0;
+`Ran 2978 tests ... OK` under coverage, `TOTAL 17458 1397 92%` (`setup_ledger.py` 100 %, `shadow_ledger.py`
+99 %, `lean_payload.py` 97 % and `shadow_ledger.py` miss only their `TYPE_CHECKING` imports, `entry_gate.py`
+96 % and `orchestration.py` 96 % miss only lines missed before the move); `git diff --check origin/main...HEAD`
+clean; secret hygiene and the legacy golden (`tests.test_compact_context`) pass.
 
 ## Verification
 
@@ -979,7 +1046,14 @@ f96c4c8 refactor: move the setup ledger and shadow rows into ShadowLedgerMixin  
 62bc92f test: the shadow-only-hour check gives way with no symbol configured   PR #46 2
 a09d50e test: a lean call skipped by the rate-limit cooldown records the lean prompt version   PR #46 5
 dbb254e docs: PR #46 review fixes in CLAUDE.md, the spec and TDD evidence     PR #46
-        fix: space shadow_side rows across buckets, expire rows out of the candle window   PR #46 re-review
+eea4bb0 fix: space shadow_side rows across buckets, expire rows out of the candle window   PR #46 re-review
+4abc573 test: the stage report reads a stored time without an offset as UTC   PR #46 bot comment
+fe58c16 fix: refuse a SETUP_LEDGER_SINCE more than 5 minutes in the future   second review 4
+3135e9d fix: the ledger ignores trades opened before SETUP_LEDGER_SINCE   second review 5, 6
+90ee067 fix: the shadow floor nets the venue taker fee, as the live neutral exit does   second review 1
+e9e0157 fix: re-read the ledger after a plan; no AI call for a spaced blocked bucket   second review 2, 3, 7
+7cf2691 refactor: move the entry gate and the lean payload out of orchestration.py   second review 8
+        docs: second PR #46 review in CLAUDE.md, the spec and TDD evidence   second review
 ```
 
 ## Deployment gate

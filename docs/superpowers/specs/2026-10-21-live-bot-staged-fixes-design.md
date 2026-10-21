@@ -141,7 +141,9 @@ and its calls record `ai_call_metrics.prompt_version` = `lean-entry-v1`. The leg
 
 Setting `SETUP_LEDGER_MODE` (`off` | `shadow` | `enforce`, default `off`), with
 `SETUP_LEDGER_SINCE` (timezone-aware ISO time, required when not `off`; trades before it are
-ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) and
+ignored, so no AI-exit trade mixes in; *second PR #46 review:* "before it" means opened before it,
+even when closed after, and a time more than 5 minutes ahead is refused, since it would leave every
+bucket `learning` with nothing logged), `SETUP_LEDGER_MIN_SAMPLES` (default 60) and
 `SETUP_LEDGER_HURDLE_BPS` (default 4.0, the −150 per 1M bar at 0.035 %).
 
 - **Bucket key** = `side|condition|atr_regime`, e.g. `SHORT|TURUN|atr_mid`. The condition comes from
@@ -151,7 +153,9 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
   exit prices. Read from the store once per closed trade, cached in memory between closes.
   *PR #46 review:* as built, the snapshot (trades and `ledger_block` outcomes) is read at most once
   per `LEDGER_CACHE_SECONDS` = 300 s and held in memory, so a status can lag a close by up to 5
-  minutes; a restart reads it afresh.
+  minutes; a restart reads it afresh. *Second PR #46 review:* a tick that returns a plan expires
+  the snapshot, so the next strategy call reads it again: with no entry cooldown (account 1) a trade
+  can open and close inside the 300 s, and the cache must not hide it.
 - **Shadow outcomes.** Table `shadow_entries` (new, in `supabase/schema.sql`; the `long_forward`
   copy is regenerated, the drift test pins it): decision time, symbol, side, bucket, reference
   price, stop %, floor %, hold minutes, source (`shadow_side` or `ledger_block`), and the outcome
@@ -173,6 +177,10 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     the floor is 100 × `VOLUME_NEUTRAL_EXIT_MIN_NET_USDT` / (ai_volume margin × leverage) plus the
     round-trip fee, a net threshold on the `ai_volume` notional, so the same check also requires
     `VOLUME_NEUTRAL_EXIT_BASIS=net` and `STRATEGY_MODE=ai_volume` (one error names everything missing).
+    *Second PR #46 review:* the fee is the venue's taker rate the live neutral exit nets
+    (`TradeEngine._taker_fee_pct`, handed to the strategy after the startup fee refresh), not the
+    `TAKER_FEE_PCT` estimate in the candidate's targets: at 0.035 % against 0.05 % the floor sat about
+    3 bps further than the live one.
   - *Final review:* rows are spaced at write time. No new row is written for the same (symbol, side,
     source) while the last one written for it was decided less than `POSITION_HOLD_MINUTES` +
     `COOLDOWN_MINUTES_AFTER_ENTRY` minutes earlier, so walks do not overlap and n is not inflated. A
@@ -186,7 +194,10 @@ ignored, so no AI-exit trade mixes in), `SETUP_LEDGER_MIN_SAMPLES` (default 60) 
     a WARNING and the row is written. Under `map`, an hour whose mapped side `ENTRY_GATE_DIRECTION`
     does not make live can trade nothing, so while every symbol's `shadow_side` row for that side (any
     bucket) is inside its spacing the tick returns after the context is built and before the AI call
-    (one INFO line).
+    (one INFO line). *Second PR #46 review:* the same skip covers an enforcing ledger's blocked live
+    side (the mapped side under `map`, the configured one under `naik`): its answer could only become a
+    `ledger_block` row, so while that row is inside its spacing no call is made. The ledger is read
+    before the check.
 - **Verdict per bucket** (pre-registered):
   - `blocked` when real n ≥ `MIN_SAMPLES` and mean + 1.28 × SE < `HURDLE_BPS` (90 % one-sided:
     the bucket cannot reach the bar);
