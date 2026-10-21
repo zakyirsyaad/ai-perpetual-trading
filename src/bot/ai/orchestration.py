@@ -44,6 +44,8 @@ _OPEN_ACTIONS = ("OPEN_LONG", "OPEN_SHORT")
 SHADOW_SIDE_SOURCE = "shadow_side"
 # What one shadow row spacing is kept for: (symbol, side as stored, source, bucket_key).
 ShadowKey = tuple[str, str, str, str]
+# A setup-ledger snapshot younger than this is reused instead of read again (two paged GETs).
+LEDGER_CACHE_SECONDS = 300
 
 
 def _utc_now() -> datetime:
@@ -96,8 +98,10 @@ class AIOrchestrator:
         # read from the store; the keys already read from the store this process (each is read once).
         self._shadow_rows_written_at: dict[ShadowKey, datetime] = {}
         self._shadow_seeded_keys: frozenset[ShadowKey] = frozenset()
-        # The last setup-ledger snapshot read without error; in memory only, `None` until the first one.
+        # The last setup-ledger snapshot read without error and when it was read; in memory only, `None`
+        # until the first one. Reused for `LEDGER_CACHE_SECONDS`, and on a failed read whatever its age.
         self._last_ledger_snapshot: dict[str, BucketLedger] | None = None
+        self._last_ledger_read_at: datetime | None = None
 
     def _current_gate_context(self) -> dict[str, Any] | None:
         # `getattr`: an orchestrator built without `__init__` (tests) has set no context yet.
@@ -812,28 +816,35 @@ class AIOrchestrator:
         """Real and shadow outcome statistics per bucket since `SETUP_LEDGER_SINCE`; `{}` while the ledger is off.
 
         Only `ledger_block` shadow rows count, so only those are read; `ledger_table` puts them and the
-        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A failed read is
-        logged and reuses the last snapshot read without error, so a transient store error lets no entry
+        trades on one timeline, so only a bucket's latest run of block rows can reopen it. A snapshot read
+        less than `LEDGER_CACHE_SECONDS` ago is reused without a read. A failed read is logged and reuses
+        the last snapshot read without error, whatever its age, so a transient store error lets no entry
         into a blocked bucket (that trade would also end the bucket's reopening run). Before the first good
-        read it gives `{}`: every bucket reads `learning` for the tick, so the ledger fails open there and
-        the regime and stretch gates still apply."""
+        read it gives `{}`: every bucket reads `learning` for the tick, so the ledger fails open there (an
+        ERROR under `enforce`) and the regime and stretch gates still apply."""
         if self._ledger_mode() == "off":
             return {}
+        now = _utc_now()
+        last, read_at = self._last_ledger_snapshot, self._last_ledger_read_at
+        if last is not None and read_at is not None and (now - read_at).total_seconds() < LEDGER_CACHE_SECONDS:
+            return last
         since = self._settings.setup_ledger_since
         try:
             trades = await self._trade_store.closed_trade_rows_since(since)
             shadows = await self._trade_store.shadow_outcomes_since(since, source=SHADOW_BLOCK_SOURCE)
             snapshot = ledger_table(trades, shadows)
         except Exception as exc:  # noqa: BLE001 - a ledger read must never stop the entry path
-            last = getattr(self, "_last_ledger_snapshot", None)
-            self._logger.warning(
+            failing_open = last is None
+            self._logger.log(
+                logging.ERROR if failing_open and self._ledger_mode() == "enforce" else logging.WARNING,
                 "Setup ledger could not be read (%s: %s); %s",
                 type(exc).__name__,
                 exc,
-                "every bucket reads as learning this tick." if last is None else "the last snapshot is used this tick.",
+                "every bucket reads as learning this tick." if failing_open else "the last snapshot is used this tick.",
             )
-            return {} if last is None else last
-        self._last_ledger_snapshot = snapshot
+            return {} if failing_open else last
+        # Replaced, never mutated.
+        self._last_ledger_snapshot, self._last_ledger_read_at = snapshot, now
         return snapshot
 
     def _ledger_bucket(self, side: str, features: dict[str, Any] | None) -> str:

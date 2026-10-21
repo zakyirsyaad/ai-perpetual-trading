@@ -1229,7 +1229,8 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._gate_context = None
         orchestrator._shadow_rows_written_at = {}
         orchestrator._shadow_seeded_keys = frozenset()
-        orchestrator._ledger_cache = None
+        orchestrator._last_ledger_snapshot = None
+        orchestrator._last_ledger_read_at = None
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.ledger")
         orchestrator._brain = Brain()
@@ -1475,17 +1476,18 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ledger["shadow_run_upper_bps"] is None, len(finite) < 2)
 
     async def test_a_ledger_read_failure_reuses_the_last_snapshot(self) -> None:
-        # A good read files the bucket as blocked; a failed read on the next tick keeps that snapshot, so a
-        # transient store error lets no entry into a blocked bucket (whose trade would also end its run).
+        # A good read files the bucket as blocked; a failed read on a later tick (past the cache age, so the
+        # ledger is read again) keeps that snapshot, so a transient store error lets no entry into a blocked
+        # bucket (whose trade would also end its run).
         store = _LedgerStore(self._losing_shorts())
         orchestrator = self._orchestrator(
             store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
         )
-        self.assertIsNone(await orchestrator.next_trade_plan(self._state()))
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0))
         store.read_error = RuntimeError("supabase down")
 
         with self.assertLogs("test.ledger", level="WARNING") as logs:
-            plan = await orchestrator.next_trade_plan(self._state())
+            plan = await self._tick_at(orchestrator, self.T0 + timedelta(minutes=10))
 
         self.assertIsNone(plan)
         self.assertIn(
@@ -1494,6 +1496,68 @@ class LedgerAndShadowTests(unittest.IsolatedAsyncioTestCase):
         )
         ledger = store.decisions[-1]["payload"]["gate"]["ledger"]
         self.assertEqual((ledger["status"], ledger["n"]), ("blocked", 3))
+
+    async def test_ledger_is_reused_within_the_cache_age(self) -> None:
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="shadow"
+        )
+        one_read = [("trades", self.SINCE), ("shadows", self.SINCE, "ledger_block")]
+
+        await self._tick_at(orchestrator, self.T0)
+        await self._tick_at(orchestrator, self.T0 + timedelta(seconds=299))
+        self.assertEqual(store.ledger_reads, one_read)
+        # both ticks still carry the cached verdict
+        self.assertEqual([item["payload"]["gate"]["ledger"]["status"] for item in store.decisions], ["blocked"] * 2)
+
+        # at 300 s the table is read again
+        await self._tick_at(orchestrator, self.T0 + timedelta(seconds=300))
+        self.assertEqual(store.ledger_reads, one_read * 2)
+
+    async def test_a_failed_read_reuses_the_last_table(self) -> None:
+        # Whatever its age: hours of failed reads keep the last good table, one WARNING per failed read.
+        store = _LedgerStore(self._losing_shorts())
+        orchestrator = self._orchestrator(
+            store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode="enforce"
+        )
+        self.assertIsNone(await self._tick_at(orchestrator, self.T0))
+        store.read_error = RuntimeError("supabase down")
+
+        for hours in (1, 2, 3):
+            with self.subTest(hours=hours):
+                with self.assertLogs("test.ledger", level="WARNING") as logs:
+                    plan = await self._tick_at(orchestrator, self.T0 + timedelta(hours=hours))
+
+                self.assertIsNone(plan)
+                failures = [record for record in logs.records if "could not be read" in record.getMessage()]
+                self.assertEqual([record.levelno for record in failures], [logging.WARNING])
+                self.assertIn("the last snapshot is used this tick", failures[0].getMessage())
+                ledger = store.decisions[-1]["payload"]["gate"]["ledger"]
+                self.assertEqual((ledger["status"], ledger["n"]), ("blocked", 3))
+
+        # a failed read is never cached: the next tick reads again, and a good read replaces the table
+        store.read_error = None
+        store.trades = []
+        await self._tick_at(orchestrator, self.T0 + timedelta(hours=3, seconds=1))
+        self.assertEqual(store.decisions[-1]["payload"]["gate"]["ledger"]["status"], "learning")
+
+    async def test_a_failed_first_read_falls_open_with_an_error_under_enforce(self) -> None:
+        for mode, level in (("enforce", logging.ERROR), ("shadow", logging.WARNING)):
+            with self.subTest(mode=mode):
+                store = _LedgerStore(self._losing_shorts(), read_error=RuntimeError("supabase down"))
+                orchestrator = self._orchestrator(
+                    store, [self._decision("OPEN_SHORT")], gate_context=self._turun(), setup_ledger_mode=mode
+                )
+
+                with self.assertLogs("test.ledger", level="WARNING") as logs:
+                    plan = await self._tick_at(orchestrator, self.T0)
+
+                # no table was ever read: every bucket reads learning and the SHORT trades
+                self.assertIsNotNone(plan)
+                failures = [record for record in logs.records if "could not be read" in record.getMessage()]
+                self.assertEqual([record.levelno for record in failures], [level])
+                self.assertIn("every bucket reads as learning this tick", failures[0].getMessage())
+                self.assertEqual(store.decisions[-1]["payload"]["gate"]["ledger"]["status"], "learning")
 
     async def test_a_ledger_read_failure_is_logged_and_treated_as_learning(self) -> None:
         store = _LedgerStore(self._losing_shorts(), read_error=RuntimeError("supabase down"))
@@ -1946,7 +2010,8 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._gate_context = None
         orchestrator._shadow_rows_written_at = {}
         orchestrator._shadow_seeded_keys = frozenset()
-        orchestrator._ledger_cache = None
+        orchestrator._last_ledger_snapshot = None
+        orchestrator._last_ledger_read_at = None
         orchestrator._settings = settings
         orchestrator._logger = logging.getLogger("test.lean")
         orchestrator._brain = Brain()
