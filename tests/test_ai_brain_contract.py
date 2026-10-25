@@ -568,7 +568,7 @@ class EntrySystemPromptTests(unittest.TestCase):
         self.assertTrue({"stretch_atr", "change_pct_5_bars", "ema21_slope_atr_5_bars"} <= cited)
         self.assertEqual(cited - set(features), set())
 
-    def test_the_volume_prompt_describes_the_setup_the_gate_admits(self) -> None:
+    def test_the_volume_prompt_describes_the_bounce_setup_and_the_hold_rule(self) -> None:
         volume = ENTRY_SYSTEM_PROMPT_LEAN_VOLUME
         for present in (
             "max_stretch_atr",
