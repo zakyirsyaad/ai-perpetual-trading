@@ -4,19 +4,54 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from bot.ai.usage import estimate_tokens
 
 # Prompt/contract version stamped on every AI call record.
 COMPACT_PROMPT_VERSION = "okx-context-parity-v3"
+# The version stamped instead on an entry call that sends the lean payload under the lean system prompt
+# (`ENTRY_SYSTEM_PROMPT_LEAN`), so `ai_call_metrics` can tell the two profiles apart.
+LEAN_PROMPT_VERSION = "lean-entry-v1"
+# The version stamped instead when `AI_LEAN_OBJECTIVE=volume` swaps in the volume prompt
+# (`ENTRY_SYSTEM_PROMPT_LEAN_VOLUME`).
+LEAN_VOLUME_PROMPT_VERSION = "lean-entry-volume-v1"
 
 # The free-text length contract for an entry decision. It lives here because this
 # module builds the prompt that states the limits; `ai/brain.py` imports the same
 # numbers to enforce them, so the prompt and the validator can never drift apart.
 ENTRY_REASON_MAX_CHARS = 600
 ENTRY_LEARNING_NOTE_MAX_CHARS = 500
+
+# `AI_ENTRY_PAYLOAD`: which entry request the model is sent. Recorded on every decision.
+PAYLOAD_PROFILE_LEGACY = "legacy"
+PAYLOAD_PROFILE_LEAN = "lean"
+# The lean objective (spec section 4): HOLD is the expected answer, not a failure to trade.
+LEAN_PRIMARY_GOAL = (
+    "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
+    "HOLD is the expected answer most ticks."
+)
+# `AI_LEAN_OBJECTIVE`: the two readings of the lean objective. `edge` is the goal above. `volume` trades the
+# side the hourly regime offers on a pullback into the mean (the bounce half of what the stretch gate lets
+# through) and holds only for a reason the model can name, so the code's gates and the daily cap, not the
+# model's caution, set the pace.
+LEAN_OBJECTIVE_EDGE = "edge"
+LEAN_OBJECTIVE_VOLUME = "volume"
+LEAN_VOLUME_PRIMARY_GOAL = (
+    "Build volume at the lowest cost per volume: open the allowed side on a pullback into the mean within "
+    "the stretch limit; HOLD only for a reason you can name."
+)
+# `entry_rules.rule`: the stretch gate runs in code after the model has answered, on the absolute
+# stretch (a signed -0.9 is beyond a 0.75 limit). Settings only allows lean while that gate enforces.
+STRETCH_RULE_TEXT = "an entry with |stretch_atr| above this limit is rejected in code"
+# What the lean payload leaves out of `market_context`: the arena's factor and flow records and
+# its per-symbol scores. The arena still runs and is still recorded; only the model stops seeing it.
+_LEAN_DROPPED_CONTEXT_KEYS = frozenset({"factor_snapshots", "active_flow_signals", "new_flow_signals"})
+_LEAN_DROPPED_INTELLIGENCE_KEYS = frozenset({"symbol_scores", "factor_intelligence", "market_flow_signals"})
+_LEAN_SIDES = frozenset({"long", "short"})
+_LEAN_DIGITS = 4
 
 _TECHNICAL_FIELDS: tuple[tuple[str, int], ...] = (
     ("last_price", 4),
@@ -70,34 +105,100 @@ class CompactDecisionContextBuilder:
         strategy_objective: dict[str, Any],
         arena_reviews: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """The legacy entry request (`AI_ENTRY_PAYLOAD=legacy`); a golden test pins it byte for byte."""
         return {
-            "task": "ai_volume_entry_decision" if str(getattr(self._settings, "strategy_mode", "")) == "ai_volume" else "entry_decision",
-            "execution_environment": {
-                "exchange": str(getattr(self._settings, "exchange_name", "bingx")),
-                "mode": "vst_demo",
-                "margin_mode": str(getattr(self._settings, "margin_mode", "isolated")),
-                "position_mode": str(getattr(self._settings, "position_mode", "hedge")),
-                "symbols": [str(item) for item in getattr(self._settings, "symbols", ())],
-            },
+            "task": self._entry_task(),
+            "execution_environment": self._execution_environment(),
             "strategy_objective": deepcopy(_as_dict(strategy_objective)),
             "risk_constraints": self._entry_risk_constraints(daily_state),
             "market_context": self._deduplicated_market_context(market_context),
             "arena_reviews": self._deduplicated_entry_arena_reviews(arena_reviews),
             "recent_executed_trade_performance": deepcopy(_as_dict(recent_performance)),
             "learned_trade_memory": deepcopy(_as_dict(trade_memory)),
-            "output_rules": {
-                "allowed_actions": ["OPEN_LONG", "OPEN_SHORT", "HOLD"],
-                "use_only_allowed_symbols": True,
-                "only_vst_demo_trades_are_executed": True,
-                "return_one_decision_per_symbol": True,
-                "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
-                "risk_review_required": True,
-                "risk_review_approved_false_vetoes_the_candidate": True,
-                "open_requires_final_stop_strictly_before_estimated_liquidation_or_hold": True,
-                "reason_max_characters": ENTRY_REASON_MAX_CHARS,
-                "learning_note_max_characters": ENTRY_LEARNING_NOTE_MAX_CHARS,
-            },
+            "output_rules": self._entry_output_rules(["OPEN_LONG", "OPEN_SHORT", "HOLD"]),
         }
+
+    def build_lean_entry_payload(
+        self,
+        *,
+        market_context: dict[str, Any],
+        daily_state: Any,
+        strategy_objective: dict[str, Any],
+        allowed_sides: Sequence[str],
+        entry_rules: dict[str, Any],
+        market_regime: dict[str, Any] | None,
+        ledger_lines: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """The lean entry request (`AI_ENTRY_PAYLOAD=lean`, spec section 4).
+
+        Against the legacy request: no arena reviews, trade memory, recent performance or
+        `min_confidence` (the code still enforces it); `market_context` without the factor and flow
+        records or `intelligence.symbol_scores`; added `features` (the 3m lean features per symbol),
+        `entry_rules`, `market_regime` (only when given) and `setup_ledger` (only with lines, which the
+        orchestrator passes only while the ledger enforces).
+        `allowed_actions` offers one OPEN per side in `allowed_sides`, then HOLD. Raises `ValueError`
+        on an empty side list, an unknown side or a repeated one, so the model is never offered
+        nothing but HOLD."""
+        sides = [str(side).strip().lower() for side in allowed_sides]
+        if not sides or not set(sides) <= _LEAN_SIDES or len(set(sides)) != len(sides):
+            raise ValueError(f"lean entry payload needs distinct sides among long/short, got {list(allowed_sides)!r}")
+        payload: dict[str, Any] = {
+            "task": self._entry_task(),
+            "execution_environment": self._execution_environment(),
+            "strategy_objective": deepcopy(_as_dict(strategy_objective)),
+            "risk_constraints": {
+                key: value
+                for key, value in self._entry_risk_constraints(daily_state).items()
+                if key != "min_confidence"
+            },
+            "market_context": self._lean_market_context(market_context),
+            "features": _rounded_features(_as_dict(market_context).get("lean_features")),
+            "entry_rules": deepcopy(_as_dict(entry_rules)),
+            "output_rules": self._entry_output_rules([f"OPEN_{side.upper()}" for side in sides] + ["HOLD"]),
+        }
+        if market_regime:
+            payload["market_regime"] = deepcopy(_as_dict(market_regime))
+        if ledger_lines:
+            payload["setup_ledger"] = [deepcopy(_as_dict(line)) for line in ledger_lines]
+        return payload
+
+    def _entry_task(self) -> str:
+        return "ai_volume_entry_decision" if str(getattr(self._settings, "strategy_mode", "")) == "ai_volume" else "entry_decision"
+
+    def _execution_environment(self) -> dict[str, Any]:
+        return {
+            "exchange": str(getattr(self._settings, "exchange_name", "bingx")),
+            "mode": "vst_demo",
+            "margin_mode": str(getattr(self._settings, "margin_mode", "isolated")),
+            "position_mode": str(getattr(self._settings, "position_mode", "hedge")),
+            "symbols": [str(item) for item in getattr(self._settings, "symbols", ())],
+        }
+
+    @staticmethod
+    def _entry_output_rules(allowed_actions: list[str]) -> dict[str, Any]:
+        return {
+            "allowed_actions": allowed_actions,
+            "use_only_allowed_symbols": True,
+            "only_vst_demo_trades_are_executed": True,
+            "return_one_decision_per_symbol": True,
+            "open_requires_explicit_stop_loss_take_profit_and_risk_reward": True,
+            "risk_review_required": True,
+            "risk_review_approved_false_vetoes_the_candidate": True,
+            "open_requires_final_stop_strictly_before_estimated_liquidation_or_hold": True,
+            "reason_max_characters": ENTRY_REASON_MAX_CHARS,
+            "learning_note_max_characters": ENTRY_LEARNING_NOTE_MAX_CHARS,
+        }
+
+    def _lean_market_context(self, market_context: dict[str, Any]) -> dict[str, Any]:
+        """The legacy dedupe, less the arena's factor and flow records and per-symbol scores."""
+        deduplicated = self._deduplicated_market_context(market_context)
+        context = {key: value for key, value in deduplicated.items() if key not in _LEAN_DROPPED_CONTEXT_KEYS}
+        context["intelligence"] = {
+            key: value
+            for key, value in _as_dict(deduplicated.get("intelligence")).items()
+            if key not in _LEAN_DROPPED_INTELLIGENCE_KEYS
+        }
+        return context
 
     # ------------------------------------------------------------------
     # exit
@@ -141,6 +242,9 @@ class CompactDecisionContextBuilder:
     def _deduplicated_market_context(self, market_context: dict[str, Any], symbol: str | None = None) -> dict[str, Any]:
         """Keep complete values once, removing only mirrored factor/flow arrays."""
         context = deepcopy(_as_dict(market_context))
+        # Lean features belong to the lean entry payload alone. Dropping them here keeps
+        # the legacy entry payload and the exit payload exactly as they were.
+        context.pop("lean_features", None)
         # A provider whose sub-requests all failed still returns a skeleton (Dune)
         # or an empty dict (TradingView). Forwarding those verbatim shows the model
         # a provider that is present but carries nothing, which the entry prompt
@@ -410,6 +514,46 @@ def _compact_patterns(patterns: Iterable[Any], cap: int) -> list[dict[str, Any]]
             }
         )
     return compact
+
+
+def lean_objective(settings: Any) -> str:
+    """`AI_LEAN_OBJECTIVE`: `volume`, or `edge` for anything else (a settings object without it included)."""
+    value = str(getattr(settings, "ai_lean_objective", LEAN_OBJECTIVE_EDGE) or "").strip().lower()
+    return LEAN_OBJECTIVE_VOLUME if value == LEAN_OBJECTIVE_VOLUME else LEAN_OBJECTIVE_EDGE
+
+
+def lean_market_regime(gate_context: Mapping[str, Any] | None, last_price: Any) -> dict[str, Any]:
+    """The lean payload's `market_regime`: the regime gate's verdict without `allowed`, plus
+    `price_vs_sma20_1h_atr` = (last price - 1h SMA20) / 1h ATR14, rounded to 4 places.
+
+    `last_price` is the 3m last price of the gated symbol. The distance is None when any of its
+    inputs is missing, non-finite or not positive (a zero ATR included). `{}` without a gate
+    context, which the builder leaves out rather than send an empty block."""
+    if not gate_context:
+        return {}
+    regime = {key: deepcopy(value) for key, value in gate_context.items() if key != "allowed"}
+    last = _positive_or_none(last_price)
+    sma20 = _positive_or_none(gate_context.get("sma20_1h"))
+    atr = _positive_or_none(gate_context.get("atr14_1h"))
+    regime["price_vs_sma20_1h_atr"] = (
+        round((last - sma20) / atr, _LEAN_DIGITS) if last is not None and sma20 is not None and atr is not None else None
+    )
+    return regime
+
+
+def _positive_or_none(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _rounded_features(lean_features: Any) -> dict[str, Any]:
+    """Each symbol's lean features with every number rounded to 4 places; None and text unchanged."""
+    return {
+        str(symbol): {key: _round_value(value, _LEAN_DIGITS) for key, value in _as_dict(features).items()}
+        for symbol, features in _as_dict(lean_features).items()
+    }
 
 
 def _factor_label(item: dict[str, Any]) -> dict[str, Any] | None:

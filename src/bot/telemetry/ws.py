@@ -16,10 +16,10 @@ import hashlib
 import os
 import ssl
 import struct
-from collections.abc import Awaitable
-from typing import TypeVar
 
-T = TypeVar("T")
+# Re-exported: telemetry imports `with_timeout` from here; it lives in `bot.asyncutil` so the trading core
+# can use it without importing the telemetry package.
+from bot.asyncutil import with_timeout
 
 OP_CONTINUATION = 0x0
 OP_TEXT = 0x1
@@ -85,26 +85,6 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[bool, int, bytes]:
     if mask:
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return bool(first & 0x80), first & 0x0F, payload
-
-
-async def with_timeout(awaitable: Awaitable[T], timeout: float) -> T:
-    """`asyncio.wait_for` that never swallows a cancellation.
-
-    Before Python 3.12, `wait_for` returns the finished result and drops the caller's
-    cancellation when the work completes in the same loop tick. A feed that is being stopped
-    would then keep running forever, so this waits with `asyncio.wait` instead and cancels
-    whatever is left unfinished. Raises `asyncio.TimeoutError` on timeout.
-    """
-    task = asyncio.ensure_future(awaitable)
-    try:
-        done, _ = await asyncio.wait({task}, timeout=timeout)
-        if not done:
-            raise asyncio.TimeoutError()
-        return task.result()
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
 
 class WebSocketConnection:

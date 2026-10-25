@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -15,6 +16,11 @@ from bot.exchange.bingx_client import (
     REQUIRED_SOURCE_KEY as BINGX_REQUIRED_SOURCE_KEY,
 )
 from bot.volume import VolumeBuildProfile
+
+# The confidence ENTRY_SYSTEM_PROMPT_LEAN_VOLUME tells the model an OPEN needs (AI_MIN_CONFIDENCE's floor and
+# default). The volume objective refuses a different AI_MIN_CONFIDENCE, so the sentence stays true; a test ties
+# the prompt text to this number.
+LEAN_VOLUME_MIN_CONFIDENCE = 0.75
 
 # `.com` is the mandatory primary host. `.pro` is deliberately NOT configurable:
 # the documented policy allows it only as an internal fallback after a network
@@ -113,14 +119,31 @@ class Settings(BaseSettings):
     entry_weekly_window: str = Field(default="", alias="ENTRY_WEEKLY_WINDOW")
     # Which side the entry gate lets through while it is on. "any" keeps both sides.
     entry_gate_direction: str = Field(default="any", alias="ENTRY_GATE_DIRECTION")
-    # Regime gate of the LONG forward bot (bot/core/regime_gate.py). "off" makes no venue call and
-    # changes nothing; "naik" lets an entry through only while the hourly mode selector reads NAIK.
+    # Hourly regime gate (bot/core/regime_gate.py). "off" makes no venue call and changes nothing;
+    # "naik" (the LONG forward bot) lets an entry through only while the hourly mode selector reads NAIK;
+    # "map" (the live bot's staged rollout) maps the hour to a side: NAIK long, TURUN short, any other none.
     entry_regime_gate: str = Field(default="off", alias="ENTRY_REGIME_GATE")
     # Volatility guard: skip entries while ATR14 (1h) exceeds this multiple of its 720-hour median,
     # and while that median is not yet known. 0 turns the guard off. Read only with the regime gate on.
     entry_volatility_guard_mult: float = Field(default=0.0, ge=0.0, alias="ENTRY_VOLATILITY_GUARD_MULT")
     # The selector's sideways band, in ATR (config/modes.yaml pemilih_mode.sideways_jarak_kali_atr).
     regime_sideways_atr_mult: float = Field(default=0.2, gt=0.0, alias="REGIME_SIDEWAYS_ATR_MULT")
+    # Entry payload shape: "legacy" is the full context the bot has always sent; "lean" is the compact
+    # per-setup feature block of the staged live-bot fixes (docs/superpowers/specs/2026-10-21-*).
+    ai_entry_payload: str = Field(default="legacy", alias="AI_ENTRY_PAYLOAD")
+    # Lean objective, read only with the lean payload: "edge" asks for a directional edge beyond the round-trip
+    # fee and holds most ticks; "volume" trades the side the hourly regime offers on a pullback into the mean
+    # (the bounce half of what the stretch gate lets through) and holds only for a reason the model can name.
+    ai_lean_objective: str = Field(default="edge", alias="AI_LEAN_OBJECTIVE")
+    # Setup ledger: shadow only records each OPEN decision's bucket verdict at payload_json.gate.ledger and
+    # writes no shadow rows; enforce also vetoes a setup whose upper bound (mean + 1.28 x SE of gross bps per
+    # trade, before fees) stays below the hurdle and writes a ledger_block shadow row for it. "off" changes
+    # nothing. A mode other than off needs a regime gate and a timezone-aware SETUP_LEDGER_SINCE (the first
+    # row it may count).
+    setup_ledger_mode: str = Field(default="off", alias="SETUP_LEDGER_MODE")
+    setup_ledger_since: datetime | None = Field(default=None, alias="SETUP_LEDGER_SINCE")
+    setup_ledger_min_samples: int = Field(default=60, ge=2, alias="SETUP_LEDGER_MIN_SAMPLES")
+    setup_ledger_hurdle_bps: float = Field(default=4.0, allow_inf_nan=False, alias="SETUP_LEDGER_HURDLE_BPS")
     # Live dashboard feed (src/bot/telemetry). Read-only and off by default. The
     # listener refuses any non-loopback host: reach it through an SSH tunnel.
     telemetry_enabled: bool = Field(default=False, alias="TELEMETRY_ENABLED")
@@ -425,8 +448,32 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_entry_regime_gate(cls, value: str) -> str:
         mode = str(value or "off").strip().lower()
-        if mode not in {"off", "naik"}:
-            raise ValueError("ENTRY_REGIME_GATE must be one of: off, naik.")
+        if mode not in {"off", "naik", "map"}:
+            raise ValueError("ENTRY_REGIME_GATE must be one of: off, naik, map.")
+        return mode
+
+    @field_validator("ai_entry_payload")
+    @classmethod
+    def normalize_ai_entry_payload(cls, value: str) -> str:
+        payload = str(value or "legacy").strip().lower()
+        if payload not in {"legacy", "lean"}:
+            raise ValueError("AI_ENTRY_PAYLOAD must be one of: legacy, lean.")
+        return payload
+
+    @field_validator("ai_lean_objective")
+    @classmethod
+    def normalize_ai_lean_objective(cls, value: str) -> str:
+        objective = str(value or "edge").strip().lower()
+        if objective not in {"edge", "volume"}:
+            raise ValueError("AI_LEAN_OBJECTIVE must be one of: edge, volume.")
+        return objective
+
+    @field_validator("setup_ledger_mode")
+    @classmethod
+    def normalize_setup_ledger_mode(cls, value: str) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("SETUP_LEDGER_MODE must be one of: off, shadow, enforce.")
         return mode
 
     @field_validator("telemetry_host")
@@ -496,7 +543,7 @@ class Settings(BaseSettings):
             return None
         return float(value)
 
-    @field_validator("volume_cycle_started_at", mode="before")
+    @field_validator("volume_cycle_started_at", "setup_ledger_since", mode="before")
     @classmethod
     def parse_optional_datetime(cls, value: Any) -> Any:
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -513,6 +560,19 @@ class Settings(BaseSettings):
         normalized = value.astimezone(timezone.utc)
         if normalized > datetime.now(timezone.utc) + timedelta(minutes=5):
             raise ValueError("VOLUME_CYCLE_STARTED_AT cannot be more than 5 minutes in the future")
+        return normalized
+
+    @field_validator("setup_ledger_since")
+    @classmethod
+    def require_timezone_aware_setup_ledger_since(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("SETUP_LEDGER_SINCE must be a timezone-aware ISO-8601 timestamp")
+        normalized = value.astimezone(timezone.utc)
+        # A future start leaves both ledger reads empty (every bucket `learning`, nothing logged).
+        if normalized > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("SETUP_LEDGER_SINCE cannot be more than 5 minutes in the future")
         return normalized
 
     @field_validator("strategy_mode")
@@ -655,30 +715,148 @@ class Settings(BaseSettings):
             raise ValueError("LEVERAGE cannot exceed VENUE_MAX_LEVERAGE.")
         if self.volume_execution_mode == "maker_only" and self.execution_post_only_fallback_to_market:
             raise ValueError("EXECUTION_POST_ONLY_FALLBACK_TO_MARKET must be false when VOLUME_EXECUTION_MODE=maker_only.")
-        self._require_long_only_companions()
+        self._require_regime_gate_companions()
+        self._require_setup_ledger_companions()
+        self._require_shadow_walk_companions()
+        self._require_lean_payload_companions()
+        self._require_volume_objective_companions()
         return self
 
-    def _require_long_only_companions(self) -> None:
-        """The regime gate means a LONG-only forward bot; the side filter lives elsewhere, so demand it.
+    def _require_regime_gate_companions(self) -> None:
+        """What a regime gate needs to be safe; the side filter lives elsewhere, so demand it.
 
         Only AIOrchestrator enforces ENTRY_GATE_DIRECTION, and only inside the stretch gate when its
-        mode is `enforce`; the deterministic `volume` strategy never reaches it. A gate-on .env that
-        inherited another mode would trade SHORTs. A gate-off Settings is not checked at all.
+        mode is `enforce`; the deterministic `volume` strategy never reaches it. `naik` means a LONG-only
+        bot, so a gate-on .env that inherited another direction would trade SHORTs. `map` picks the side
+        from the hourly regime itself (NAIK long, TURUN short), so it accepts any ENTRY_GATE_DIRECTION but
+        still needs the enforcing stretch gate and an AI strategy to carry that side. A gate-off Settings
+        is not checked at all.
         """
         if self.entry_regime_gate == "off":
             return
         problems = []
-        if self.entry_gate_direction != "long":
+        if self.entry_regime_gate == "naik" and self.entry_gate_direction != "long":
             problems.append("ENTRY_GATE_DIRECTION=long")
         if self.entry_stretch_gate_mode != "enforce":
             problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
         if self.strategy_mode not in {"grok", "ai_volume"}:
             problems.append("STRATEGY_MODE=grok or ai_volume")
-        if problems:
+        if not problems:
+            return
+        needs = ", ".join(problems)
+        if self.entry_regime_gate == "naik":
             raise ValueError(
                 "ENTRY_REGIME_GATE is on, which makes this a LONG-only bot; it needs "
-                + ", ".join(problems)
+                + needs
                 + " (the direction filter only runs in an AI strategy with the stretch gate enforcing)."
+            )
+        raise ValueError(
+            "ENTRY_REGIME_GATE=map picks the side from the hourly regime; it needs "
+            + needs
+            + " (the side filter only runs in an AI strategy with the stretch gate enforcing)."
+        )
+
+    def _require_setup_ledger_companions(self) -> None:
+        """A ledger that records or vetoes needs a regime gate (its buckets) and a start time."""
+        if self.setup_ledger_mode == "off":
+            return
+        problems = []
+        if self.entry_regime_gate not in {"naik", "map"}:
+            problems.append("ENTRY_REGIME_GATE=naik or map")
+        if self.setup_ledger_since is None:
+            problems.append("a timezone-aware SETUP_LEDGER_SINCE")
+        if problems:
+            raise ValueError("SETUP_LEDGER_MODE is on; it needs " + " and ".join(problems) + ".")
+
+    def _require_shadow_walk_companions(self) -> None:
+        """The live exit the shadow walk models: the neutral exit on, in `floor` mode, on the net basis,
+        with `ai_volume` sizing.
+
+        `shadow_eval.walk_exit` closes a shadow row the first time price reaches the floor
+        (100 x VOLUME_NEUTRAL_EXIT_MIN_NET_USDT / notional plus the round-trip fee), which is what the live
+        bot does only with the neutral exit on and in `floor` mode (`window` and `trailing` exit elsewhere;
+        with it off the exits are the stop, the TP and the time stop). Adding the fee makes the threshold a
+        net one (VOLUME_NEUTRAL_EXIT_BASIS=net), and the notional is the `ai_volume` margin per entry times
+        the leverage (`grok` sizes each trade from its stop instead). Shadow rows are written under
+        ENTRY_REGIME_GATE=map (a shadow side) and by the ledger (its `ledger_block` rows, judged against
+        real trades), so both demand it. `naik` with the ledger off writes none and is not checked: that is
+        the pinned LONG forward bot.
+        """
+        triggers = []
+        if self.entry_regime_gate == "map":
+            triggers.append("ENTRY_REGIME_GATE=map")
+        if self.setup_ledger_mode != "off":
+            triggers.append(f"SETUP_LEDGER_MODE={self.setup_ledger_mode}")
+        if not triggers:
+            return
+        problems = []
+        if not self.volume_neutral_exit_enabled:
+            problems.append("VOLUME_NEUTRAL_EXIT_ENABLED=true")
+        if self.volume_neutral_exit_mode != "floor":
+            problems.append("VOLUME_NEUTRAL_EXIT_MODE=floor")
+        if self.volume_neutral_exit_basis != "net":
+            problems.append("VOLUME_NEUTRAL_EXIT_BASIS=net")
+        if self.strategy_mode != "ai_volume":
+            problems.append("STRATEGY_MODE=ai_volume")
+        if problems:
+            raise ValueError(
+                "With "
+                + " and ".join(triggers)
+                + ", shadow entries are walked with the floor neutral exit on the net basis and ai_volume sizing, "
+                "so the live bot must be the same; it needs "
+                + " and ".join(problems)
+                + "."
+            )
+
+    def _require_lean_payload_companions(self) -> None:
+        """What a lean entry payload needs for its stretch rule to be true.
+
+        The lean request tells the model that an entry beyond ENTRY_STRETCH_GATE_MAX_ATR is rejected in code
+        and offers only the sides the gate lets through. Both hold only while the stretch gate enforces
+        (the side filter is honoured only then, or under a regime gate that already demands it), has a
+        finite limit to enforce (`inf` passes the field but no stretch ever exceeds it), and has no
+        behind-schedule bypass. A legacy Settings is not checked at all.
+        """
+        if self.ai_entry_payload != "lean":
+            return
+        problems = []
+        if self.entry_stretch_gate_mode != "enforce":
+            problems.append("ENTRY_STRETCH_GATE_MODE=enforce")
+        if not math.isfinite(self.entry_stretch_gate_max_atr) or self.entry_stretch_gate_max_atr <= 0:
+            problems.append("a finite ENTRY_STRETCH_GATE_MAX_ATR above 0")
+        if self.entry_stretch_gate_behind_schedule_entries_per_hour != 0:
+            problems.append("ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR=0")
+        if problems:
+            raise ValueError(
+                "AI_ENTRY_PAYLOAD=lean tells the model the stretch rule is enforced in code; it needs "
+                + ", ".join(problems)
+                + "."
+            )
+
+    def _require_volume_objective_companions(self) -> None:
+        """What the volume objective needs for its prompt to be true.
+
+        The volume prompt describes a trade on the one side the hourly regime offers, and only the lean request
+        carries the regime block and narrows the offered sides to that one; a regime gate must also be on, or
+        there is no regime verdict to follow and the lean request would offer the live sides. Its goal is volume
+        and the daily cap it relies on is the ai_volume one. It tells the model the confidence an OPEN needs,
+        so AI_MIN_CONFIDENCE must be that number. `edge`, the default, is never checked.
+        """
+        if self.ai_lean_objective != "volume":
+            return
+        problems = []
+        if self.ai_entry_payload != "lean":
+            problems.append("AI_ENTRY_PAYLOAD=lean")
+        if self.entry_regime_gate == "off":
+            problems.append("ENTRY_REGIME_GATE=naik or ENTRY_REGIME_GATE=map")
+        if self.strategy_mode != "ai_volume":
+            problems.append("STRATEGY_MODE=ai_volume")
+        if self.ai_min_confidence != LEAN_VOLUME_MIN_CONFIDENCE:
+            problems.append(f"AI_MIN_CONFIDENCE={LEAN_VOLUME_MIN_CONFIDENCE}")
+        if problems:
+            raise ValueError(
+                "AI_LEAN_OBJECTIVE=volume describes a trade in the direction of the hourly regime, on the one side "
+                "the request offers; it needs " + " and ".join(problems) + "."
             )
 
     @property

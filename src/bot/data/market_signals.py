@@ -57,6 +57,9 @@ class MarketContext:
     active_flow_signals: list[dict[str, Any]] = field(default_factory=list)
     new_flow_signals: list[dict[str, Any]] = field(default_factory=list)
     liquidation_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Per symbol, from the closed AI_KLINE_INTERVAL candles. Feeds only the lean entry
+    # payload; the legacy and exit payloads strip it (CompactDecisionContextBuilder).
+    lean_features: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,4 +70,5 @@ class MarketContext:
             "active_flow_signals": self.active_flow_signals,
             "new_flow_signals": self.new_flow_signals,
             "liquidation_constraints": self.liquidation_constraints,
+            "lean_features": self.lean_features,
         }

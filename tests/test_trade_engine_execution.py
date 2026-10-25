@@ -1170,6 +1170,28 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertAlmostEqual(engine._taker_fee_pct("BTC/USDT"), 0.05)
 
+    async def test_fee_refresh_hands_the_venue_rates_to_the_strategy(self) -> None:
+        # The shadow floor must net the same taker rate the live neutral exit does.
+        class VenueFeeClient(FakeClient):
+            async def get_trade_fee_rates(self, symbol: str):
+                return SimpleNamespace(maker_fee_pct=-0.02, taker_fee_pct=0.035, raw={})
+
+        class FeeStrategy(FakeStrategy):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fees: list[dict] = []
+
+            def set_taker_fee_pcts(self, fees: dict) -> None:
+                self.fees.append(fees)
+
+        strategy = FeeStrategy()
+        engine = _engine(VenueFeeClient(), FakeStore(), strategy, FakeRisk())
+
+        await engine._refresh_exchange_fee_rates()
+
+        self.assertEqual(strategy.fees, [{"BTC/USDT": 0.035}])
+        self.assertAlmostEqual(engine._taker_fee_pct("BTC/USDT"), 0.035)
+
     async def test_fee_refresh_failure_falls_back_to_configured_rate(self) -> None:
         client = FakeClient()
         client.fee_error = True
