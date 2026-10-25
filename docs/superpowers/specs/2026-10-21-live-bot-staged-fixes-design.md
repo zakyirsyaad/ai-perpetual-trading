@@ -265,6 +265,10 @@ setting at its default.
 - **LONG goes live** (`ENTRY_GATE_DIRECTION=any`) only when the LONG shadow outcomes reach n ≥ 60
   with mean gross ≥ +4 bps. Until then LONG costs only AI calls.
 - 60 trades at about 2–4 SHORT trades a day (TURUN only) takes 2–4 weeks per step.
+- **Update 2026-10-25:** step 1 measured 2 trades in its first 26 TURUN hours (about one a day), so 60 trades would take about
+  three months and the 60-trade wait was dropped for step 2. Step 2 went live on 2026-10-25 as lean with
+  `AI_LEAN_OBJECTIVE=volume`; the lean prompt as first specified (`edge`) answers at confidence about 0.55 and
+  `AI_MIN_CONFIDENCE` drops every answer. See `.github/tdd/lean-volume-objective.tdd.md`.
 
 ## 9. Testing
 
