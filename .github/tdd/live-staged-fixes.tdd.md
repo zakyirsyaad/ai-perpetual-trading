@@ -1081,8 +1081,11 @@ Never restart with an open position: check flat on the venue **and** in `open_po
    gross bps per trade against the previous step with its SE, and volume per day. A step worse by
    more than one SE is rolled back by reverting its settings and restarting while flat; shadow rows
    are harmless and stay.
-4. **Step 2** (`AI_ENTRY_PAYLOAD=lean`) waits for step 1's 60 SHORT trades **and** the user's review
-   of `ENTRY_SYSTEM_PROMPT_LEAN`, the system prompt every lean call is now sent with (PR #46 point 5). **Step 3** (`SETUP_LEDGER_MODE=enforce`)
+4. **Step 2** (`AI_ENTRY_PAYLOAD=lean`) was to wait for step 1's 60 SHORT trades **and** the user's review
+   of `ENTRY_SYSTEM_PROMPT_LEAN`, the system prompt every lean call is sent with (PR #46 point 5). Step 1 produced 2 trades in its
+   first 26 TURUN hours, so the wait was dropped: step 2 went live 2026-10-25 11:07:21 WIB as lean with `AI_LEAN_OBJECTIVE=volume`
+   (`ENTRY_SYSTEM_PROMPT_LEAN_VOLUME`, PR #49, record in `.github/tdd/lean-volume-objective.tdd.md`); lean alone does not trade.
+   **Step 3** (`SETUP_LEDGER_MODE=enforce`)
    follows step 2's 60 trades, and needs the episode-scoped reopening (`1856610`) on the deployed
    code: without it a re-blocked bucket reads `reopened` again about an hour after its next block row.
 5. **LONG goes live** (`ENTRY_GATE_DIRECTION=any`) only when the LONG shadow outcomes reach n >= 60

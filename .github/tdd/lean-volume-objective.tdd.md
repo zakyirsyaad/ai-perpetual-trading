@@ -143,3 +143,21 @@ Merging changes nothing: `AI_LEAN_OBJECTIVE` defaults to `edge` and only matters
 6. Judge it with `report_live_stages.py --stage-start <restart time>`; the first daily read is the funnel (calls, OPEN answers, gate drops, trades).
 
 Rollback: `AI_LEAN_OBJECTIVE=edge` is not a trading rollback (lean with `edge` does not trade, see the replay); use `AI_ENTRY_PAYLOAD=legacy` (and the guard keys back to their old values), restart while flat. The forward LONG bot (account 2) runs a pinned tag and is not touched.
+
+## Rollout record (applied 2026-10-25)
+
+Applied on the operator's go-ahead on Sunday 2026-10-25, with the entry window closed (it reopens Monday 26 Oct 07:00 WIB):
+
+| | |
+|---|---|
+| Merge | PR #49, merge commit `7a6ffa9`, CI green on head `8348664` |
+| Live checkout | `34695fd` -> `7a6ffa9` (fast-forward) |
+| `.env` backup | `.env.bak-step2-20261025T040647Z` (mode 600, in the live directory) |
+| Keys | `AI_ENTRY_PAYLOAD=lean` and `AI_LEAN_OBJECTIVE=volume` (both unset before); `VOLUME_ATTEMPT_TARGET_PER_DAY=10` (unset, so 34); `COOLDOWN_MINUTES_AFTER_STOP=20` (was 0); `MAX_STOP_LOSS_PER_DAY=5` (was 12); `MAX_DAILY_DRAWDOWN_USDT=600` (was 1500); `SETUP_LEDGER_SINCE=2026-10-25T04:07:02+00:00` (was `2026-10-21T13:53:30+00:00`). `MAX_CONSECUTIVE_LOSSES` left at 15. |
+| Validation | the new env was written to a staging copy and read back through `Settings(_env_file=...)` on the merged code with an allowlist, then installed and read back again; no pm2 process env defines any of the keys; the staging copy was deleted |
+| Restart | 2026-10-25 11:07:21 WIB (12:07:21 CST, 04:07:21 UTC); `flat_check` printed FLAT before the `.env` change, after it, right before the restart and after the restart; pm2 restarts 29 -> 30 |
+| Startup | `BINGX VST trade engine started.`, then `Entry window closed (mon 07:00-sat 00:00)`; no traceback |
+| Prompt check | on the live configuration `GrokBrain._entry_prompt(True)` returns `lean-entry-volume-v1` (sha256 prefix `22297422db9f95d3`), and a legacy call returns `okx-context-parity-v3` |
+| Stage starts for the report | `report_live_stages.py --stage-start 2026-10-21T00:18:55+07:00 --stage-start 2026-10-21T20:53:31+07:00 --stage-start 2026-10-25T11:07:21+07:00` |
+
+Not verified yet, because the window is closed: `ai_call_metrics.prompt_version = lean-entry-volume-v1` on the first entry call, the first regime gate line, and the funnel (calls, OPEN answers, gate drops, trades). Check those on Monday after 07:00 WIB, then read the first 30 trades against H1.
