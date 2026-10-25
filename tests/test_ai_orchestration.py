@@ -2093,6 +2093,10 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
         "HOLD is the expected answer most ticks."
     )
+    VOLUME_GOAL = (
+        "Build volume at the lowest cost per volume: open the allowed side on a pullback into the mean within "
+        "the stretch limit; HOLD only for a reason you can name."
+    )
 
     @staticmethod
     def _context(*, ema_21: float = 100.0) -> dict:
@@ -2458,3 +2462,30 @@ class LeanEntryPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             grok._lean_strategy_objective_payload(), {"mode": "directional_ai", "primary_goal": self.LEAN_GOAL}
         )
+
+    async def test_the_volume_objective_swaps_only_the_goal(self) -> None:
+        decisions = [LedgerAndShadowTests._decision("HOLD")]
+        volume, volume_payloads, _ = self._orchestrator(
+            _PayloadStore(), decisions, gate_context=self._turun(), ai_entry_payload="lean", ai_lean_objective="volume"
+        )
+        edge, edge_payloads, _ = self._orchestrator(
+            _PayloadStore(), decisions, gate_context=self._turun(), ai_entry_payload="lean", ai_lean_objective="edge"
+        )
+        await volume.next_trade_plan(LedgerAndShadowTests._state())
+        await edge.next_trade_plan(LedgerAndShadowTests._state())
+
+        expected = {"mode": "ai_volume", "primary_goal": self.VOLUME_GOAL, "volume_profile": {"margin_per_entry_usdt": 180.0}}
+        self.assertEqual(volume._lean_strategy_objective_payload(), expected)
+        self.assertEqual(volume_payloads[0]["strategy_objective"], expected)
+        # nothing else in the request moves: the offered sides, the stretch rule and the regime block are the same
+        self.assertEqual(set(volume_payloads[0]), set(edge_payloads[0]))
+        for key in volume_payloads[0]:
+            if key != "strategy_objective":
+                with self.subTest(key=key):
+                    self.assertEqual(volume_payloads[0][key], edge_payloads[0][key])
+
+    async def test_an_orchestrator_without_the_objective_setting_keeps_the_edge_goal(self) -> None:
+        # a settings object older than AI_LEAN_OBJECTIVE (the namespaces other tests build) means edge
+        orchestrator, _, _ = self._orchestrator(_PayloadStore(), [], ai_entry_payload="lean")
+        self.assertFalse(hasattr(orchestrator._settings, "ai_lean_objective"))
+        self.assertEqual(orchestrator._lean_strategy_objective_payload()["primary_goal"], self.LEAN_GOAL)

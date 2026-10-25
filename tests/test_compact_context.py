@@ -228,6 +228,10 @@ LEAN_GOAL = (
     "HOLD is the expected answer most ticks."
 )
 STRETCH_RULE = "an entry with |stretch_atr| above this limit is rejected in code"
+LEAN_VOLUME_GOAL = (
+    "Build volume at the lowest cost per volume: open the allowed side on a pullback into the mean within "
+    "the stretch limit; HOLD only for a reason you can name."
+)
 
 
 def _lean_context() -> dict:
@@ -376,6 +380,20 @@ class LeanPayloadTests(unittest.TestCase):
         text = compact_json(payload)
         self.assertNotIn("every tick", text)
         self.assertNotIn("sit out", text)
+
+    def test_lean_volume_objective_text_is_exact(self) -> None:
+        self.assertEqual(
+            (compact_context.LEAN_OBJECTIVE_EDGE, compact_context.LEAN_OBJECTIVE_VOLUME), ("edge", "volume")
+        )
+        self.assertEqual(compact_context.LEAN_VOLUME_PRIMARY_GOAL, LEAN_VOLUME_GOAL)
+        self.assertNotEqual(compact_context.LEAN_VOLUME_PRIMARY_GOAL, compact_context.LEAN_PRIMARY_GOAL)
+        objective = {"mode": "ai_volume", "primary_goal": compact_context.LEAN_VOLUME_PRIMARY_GOAL}
+        payload = self._lean(strategy_objective=objective)
+        self.assertEqual(payload["strategy_objective"], {"mode": "ai_volume", "primary_goal": LEAN_VOLUME_GOAL})
+        text = compact_json(payload)
+        for banned in ("every tick", "sit out", "expected answer most ticks"):
+            self.assertNotIn(banned, text)
+        self.assertEqual(compact_context.LEAN_VOLUME_PROMPT_VERSION, "lean-entry-volume-v1")
 
     def test_lean_regime_block_adds_price_vs_sma20(self) -> None:
         gate = _gate_context()

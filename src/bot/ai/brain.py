@@ -11,10 +11,13 @@ from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_va
 
 from bot.ai.compact_context import (
     COMPACT_PROMPT_VERSION,
+    LEAN_OBJECTIVE_VOLUME,
     LEAN_PROMPT_VERSION,
+    LEAN_VOLUME_PROMPT_VERSION,
     ENTRY_LEARNING_NOTE_MAX_CHARS,
     ENTRY_REASON_MAX_CHARS,
     compact_json,
+    lean_objective,
     payload_hash,
 )
 from bot.ai.usage import (
@@ -24,7 +27,7 @@ from bot.ai.usage import (
     estimate_tokens,
     parse_provider_usage,
 )
-from bot.config import Settings
+from bot.config import LEAN_VOLUME_MIN_CONFIDENCE, Settings
 
 
 class RiskReview(BaseModel):
@@ -208,6 +211,62 @@ Principles:
 """
 
 
+# The lean entry prompt under `AI_LEAN_OBJECTIVE=volume`: the same inputs and output contract as the lean
+# prompt, but the model is told the bounce half of what the stretch gate lets through (a pullback to the 21-EMA
+# against the hourly move, on the one side the regime offers; the sign split is the prompt's, the gate checks
+# only |stretch|) and to hold only for a reason it can name, instead of to hold most ticks. The code's gates and
+# the daily cap pace the entries. The confidence in the Principles is LEAN_VOLUME_MIN_CONFIDENCE (Settings
+# refuses the objective unless AI_MIN_CONFIDENCE is that number; a test ties the text to it).
+ENTRY_SYSTEM_PROMPT_LEAN_VOLUME = """You are Layer 1 Brain for a BingX VST perpetual-futures trading system.
+You are a rule-following quant scalper in a volume-building run: the aim is volume at the lowest cost per volume, not rare perfect entries. You evaluate only live market data and live external signals.
+
+Inputs:
+- market_regime: the hourly regime verdict and its numbers. The code has already chosen this hour's side:
+  output_rules.allowed_actions offers that one side and HOLD.
+- features: numbers computed in code from closed candles (bar_interval names the bar): stretch from the
+  21-EMA in ATR, the EMA21 slope, RSI14, the price change over 5 and 20 bars, and ATR14 in percent.
+- entry_rules: the stretch rule the code applies after you answer; an entry with |stretch_atr| above
+  max_stretch_atr is rejected in code.
+- setup_ledger, when present: for each allowed side, the realized gross record of the setup bucket an entry
+  would be filed under.
+- Exchange technicals and liquidation_constraints are the execution truth; CoinMarketCap, Dune, and
+  TradingView in external_signals are OPTIONAL supporting context. An external provider that is absent from
+  external_signals is simply unavailable: note it in your reason, but do not reduce confidence on that basis.
+
+The trade:
+- The system takes the bounce in a downtrend hour (SHORT) and the dip in an uptrend hour (LONG), but only the
+  side that output_rules.allowed_actions offers, one position at a time, with exits managed in code (your stop,
+  a profit exit and a time exit) and a daily cap on entries.
+- The setup is a pullback to the 21-EMA against the hourly move: for a SHORT, stretch_atr from 0 up to
+  max_stretch_atr (price has bounced up to or slightly through the EMA); for a LONG, from -max_stretch_atr up
+  to 0 (price has dipped down to or slightly through it). Price still on the trend side of the EMA, or beyond
+  max_stretch_atr, is the chase side: HOLD.
+- OPEN the allowed side when the setup is present, unless the inputs show the pullback turning into a decisive
+  move against the side (a surge through the mean carried by change_pct_5_bars and ema21_slope_atr_5_bars).
+- HOLD only for a reason you can name from the inputs: the chase side, a decisive move against the side,
+  missing data, or a stop that cannot be set safely. A small expected edge is not such a reason; the code
+  controls frequency and risk.
+
+Principles:
+- confidence is your conviction that the trade should be executed. The code executes an OPEN only at 0.75 or
+  higher: give 0.75 or more to a setup you want executed and less to one you would rather skip.
+- Use only the actions in output_rules.allowed_actions.
+- High leverage can liquidate quickly. Keep stop-loss wider than ordinary one-minute noise, around 0.25 to 0.40
+  percent, and take-profit far enough to beat taker fees.
+- For OPEN_LONG or OPEN_SHORT, provide explicit stop_loss_pct and take_profit_pct.
+- For OPEN_LONG or OPEN_SHORT, the final stop_loss_pct must be strictly smaller than that direction's
+  max_*_stop_loss_pct in market_context.liquidation_constraints. If the constraint is unavailable or the stop
+  would reach/exceed estimated liquidation, return HOLD.
+- For OPEN_LONG or OPEN_SHORT you MUST also return risk_review with approved, confirmations, and
+  invalidation_trigger. Act as your own skeptical pre-trade risk controller: set approved=false when the live
+  confirmations are weak, the invalidation is unrealistic, or there is an obvious data gap. An omitted or
+  malformed risk_review makes the candidate unusable — it is never treated as approval.
+- Return one decision for every allowed symbol in decisions. Do not omit any allowed symbol.
+- Evaluate each symbol independently. Do not default to the first symbol when the second has the cleaner setup.
+- Keep every free-text field short. Long prose costs tokens and adds no decision value.
+"""
+
+
 EXIT_SYSTEM_PROMPT = """You are Layer 1 Brain for a BingX VST perpetual-futures bot. Decide whether to close an
 already open position. Use the supplied one-symbol market context, including live technicals, factors, and flow signals. Prefer closing when the
 trend invalidates, volatility expands against the position, or the original setup has decayed. Deterministic stop-loss,
@@ -257,16 +316,26 @@ class GrokBrain:
             purpose="entry",
         )
 
+    def _entry_prompt(self, lean: bool) -> tuple[str, str]:
+        """(system prompt, prompt version) of an entry call: legacy; lean, `edge` objective; lean, `volume`."""
+        if not lean:
+            return ENTRY_SYSTEM_PROMPT, COMPACT_PROMPT_VERSION
+        if lean_objective(self._settings) == LEAN_OBJECTIVE_VOLUME:
+            return ENTRY_SYSTEM_PROMPT_LEAN_VOLUME, LEAN_VOLUME_PROMPT_VERSION
+        return ENTRY_SYSTEM_PROMPT_LEAN, LEAN_PROMPT_VERSION
+
     async def entry_decisions(self, payload: dict[str, Any], *, lean: bool = False) -> list[EntryDecision] | None:
         """One entry call. `lean=True` (the lean payload) sends `ENTRY_SYSTEM_PROMPT_LEAN` and records
-        `LEAN_PROMPT_VERSION`; otherwise the legacy prompt and `COMPACT_PROMPT_VERSION`, unchanged."""
+        `LEAN_PROMPT_VERSION`, or under `AI_LEAN_OBJECTIVE=volume` the volume prompt and its version;
+        otherwise the legacy prompt and `COMPACT_PROMPT_VERSION`, unchanged."""
+        system_prompt, prompt_version = self._entry_prompt(lean)
         response = await self._ask_grok(
-            system_prompt=ENTRY_SYSTEM_PROMPT_LEAN if lean else ENTRY_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             payload=payload,
             schema=EntryDecisionBatch,
             reasoning_effort=self._settings.xai_reasoning_effort,
             purpose="entry",
-            prompt_version=LEAN_PROMPT_VERSION if lean else COMPACT_PROMPT_VERSION,
+            prompt_version=prompt_version,
         )
         if response is None:
             return None

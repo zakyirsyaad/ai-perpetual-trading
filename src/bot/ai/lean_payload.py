@@ -12,11 +12,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Sequence
 
 from bot.ai.compact_context import (
+    LEAN_OBJECTIVE_VOLUME,
     LEAN_PRIMARY_GOAL,
+    LEAN_VOLUME_PRIMARY_GOAL,
     PAYLOAD_PROFILE_LEAN,
     PAYLOAD_PROFILE_LEGACY,
     STRETCH_RULE_TEXT,
     lean_market_regime,
+    lean_objective,
 )
 from bot.arena.setup_profile import build_setup_profile
 from bot.core.setup_ledger import BucketLedger
@@ -94,12 +97,17 @@ class LeanPayloadMixin:
         return str(symbols[0]) if symbols else ""
 
     def _lean_strategy_objective_payload(self) -> dict[str, Any]:
-        """The lean objective: an entry needs an edge beyond the fee, HOLD is the usual answer. The
-        "every tick" and "do not sit out" notes are gone; the volume profile stays as information."""
+        """The lean objective. `edge` (the default): an entry needs an edge beyond the fee, HOLD is the usual
+        answer. `volume` (`AI_LEAN_OBJECTIVE`): open the offered side on a pullback into the mean, HOLD for a
+        named reason. Either way the "every tick" and "do not sit out" notes are gone and the volume profile
+        stays as information."""
+        goal = (
+            LEAN_VOLUME_PRIMARY_GOAL if lean_objective(self._settings) == LEAN_OBJECTIVE_VOLUME else LEAN_PRIMARY_GOAL
+        )
         if self._strategy_mode != "ai_volume":
-            return {"mode": "directional_ai", "primary_goal": LEAN_PRIMARY_GOAL}
+            return {"mode": "directional_ai", "primary_goal": goal}
         return {
             "mode": "ai_volume",
-            "primary_goal": LEAN_PRIMARY_GOAL,
+            "primary_goal": goal,
             "volume_profile": self._settings.volume_profile.as_log_fields(),
         }
