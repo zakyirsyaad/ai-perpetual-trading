@@ -161,3 +161,11 @@ Applied on the operator's go-ahead on Sunday 2026-10-25, with the entry window c
 | Stage starts for the report | `report_live_stages.py --stage-start 2026-10-21T00:18:55+07:00 --stage-start 2026-10-21T20:53:31+07:00 --stage-start 2026-10-25T11:07:21+07:00` |
 
 Not verified yet, because the window is closed: `ai_call_metrics.prompt_version = lean-entry-volume-v1` on the first entry call, the first regime gate line, and the funnel (calls, OPEN answers, gate drops, trades). Check those on Monday after 07:00 WIB, then read the first 30 trades against H1.
+
+## Manager's answers (25 Oct 2026)
+
+The plain-language report of 25 Oct (section 9) put three decisions to the manager. The answers came back the same afternoon (about 15:30 WIB):
+
+1. **Accepted result for step 2: -200 to -250 per 1M.** That is gross +3 to +2 bps per trade (net per 1M = -350 + 50 x gross bps), which sits inside the report's estimate of -250 (rough range -360 to -140) and short of H1's -150 bar. The early-stop rule stays as written: at 30 trades a mean gross below 0 rolls back (zero edge is -350, outside the accepted band). 30 trades cannot tell +2 from 0 (the standard error is about 4 to 5 bps), so the 60-trade read is the one to hold against the band. The setup ledger's hurdle is +4 bps (-150 per 1M), stricter than this tolerance: settle the hurdle before step 3 (`enforce`).
+2. **The week-1 guards loosen after one week if the result is healthy.** First review Monday 2 Nov. What "healthy" means is settled at the review from that week's funnel and result (proposal: no unexplained guard trips and a result inside the accepted band), and the new values are proposed from the data then.
+3. **Account 2 is retired for good** (focus on account 1). Done on the VPS at 15:43 WIB, `flat_check` on account 2 printing FLAT first: `pm2 delete ai-perp-long` and `pm2 save` (only the two account 2 entries changed in the saved list, and the live bot kept its pid and restart count), and its supervisor cron line commented out. Backups: the saved list `~/.pm2/dump.pm2.bak-acct2-retire-20261025T164322` and the crontab `~/crontab.bak-acct2-retire-20261025T164342`. Nothing else was touched (`.env`, `logs/`, data, clone, dashboard, tunnel).

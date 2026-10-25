@@ -5,7 +5,7 @@ LONG entries while the hourly regime reads NAIK, on its own BingX VST account, i
 directory. Spec: `docs/superpowers/specs/2026-10-18-long-ai-forward-test-design.md`. Plan:
 `docs/superpowers/plans/2026-10-19-long-ai-forward-test.md`. Evidence: `.github/tdd/long-ai-forward-test.tdd.md`.
 
-**Status (2026-10-25): stopped.** The operator stopped the bot on 2026-10-25 at 11:31 WIB (`pm2 stop ai-perp-long`, flat before and after). Section 6 says why, what was kept and how to start it again; sections 2 to 4 describe the bot while it runs.
+**Status (2026-10-25): retired.** The operator stopped the bot on 2026-10-25 at 11:31 WIB (`pm2 stop ai-perp-long`, flat before and after). At 15:43 WIB, on the manager's answer to stop account 2 completely, it was removed from pm2 and its saved list. Section 6 says why, what was kept and how to start it again; sections 2 to 4 describe the bot while it runs.
 
 Ground rules:
 
@@ -152,7 +152,7 @@ Never touch `ai-perp-volume`. Never run `pm2 restart all`, `pm2 delete all` or `
 
 ## 3. Weekly (every Monday, for the week before)
 
-The bot has been stopped since 2026-10-25 (section 6): the steps below apply again once it runs. The report for `--from 2026-10-19 --to 2026-10-26` can still be produced from the kept data.
+The bot has been retired since 2026-10-25 (section 6): the steps below apply again once it runs. The report for `--from 2026-10-19 --to 2026-10-26` can still be produced from the kept data.
 
 Choose `FROM` (the previous Monday) and `TO` (this Monday, exclusive), WIB dates. The entry window is closed from Saturday
 00:00 to Monday 07:00, so by Monday every position of the week has closed.
@@ -250,16 +250,17 @@ and `test` bind that sha in the lock and must run on one code version. Either me
 or run `train` and `test` both before merging. Never merge between them, and never pull `main` between them. Mode L's
 `train` and `test` have not run as of 2026-10-19.
 
-## 6. Stopped on 2026-10-25, and how to start it again
+## 6. Retired on 2026-10-25, and how to start it again
 
-The operator stopped the bot on 2026-10-25 at 11:31:27 WIB (option B of the 25 Oct review) with `pm2 stop ai-perp-long`; `flat_check` printed FLAT right before and after.
+The operator stopped the bot on 2026-10-25 at 11:31:27 WIB (option B of the 25 Oct review) with `pm2 stop ai-perp-long`; `flat_check` printed FLAT right before and after. The manager then answered the 25 Oct report: stop account 2 completely and focus on account 1. At 15:43 WIB the stop was made permanent (see "Retired" below).
 
 - **Why.** One week gave 6 trades, all on 19 Oct (-189 USDT, -630 per 1M, 0.30M volume), and none after: 225 SHORT proposals were dropped in NAIK hours. Its AI exits averaged -4.3 bps against +7.0 bps for the rules' exits on the same entries, and the 6 trades cost 9.2M tokens. Account 1's LONG shadow rows (the AI's LONG entries in NAIK hours, walked with the rules' exits) answer the same question at no cost.
 - **Kept.** The forward `.env`, `logs/`, the `long_forward` schema, and the week-1 export `~/replay/out/fwd_week1/forward_trades_2026-10-19_2026-10-26.csv`. Nothing was deleted.
-- **Still running.** `ai-perp-long-dashboard` and `ai-perp-tunnel` (the dashboard shows frozen data) and the 5-minute supervisor cron, which takes no action on a stopped app (its dry run decides nothing).
-- **Reboot caveat.** `pm2 save` was not run, so the saved dump (19 Oct) still lists the bot as online; a VPS reboot followed by `pm2 resurrect` could start it. Run `pm2 save` on purpose, or check `pm2 status` after any reboot.
-- **To start it again,** only on the manager's decision and while flat on the venue:
+- **Still running.** `ai-perp-long-dashboard` and `ai-perp-tunnel` (the dashboard shows frozen data).
+- **Retired (15:43 WIB).** `flat_check` on account 2 printed FLAT (it has to be pointed at `/home/ubuntu/ai-perp-long` and the `long_forward` schema, because `~/replay/flat_check.py` is hard-wired to account 1), then `pm2 delete ai-perp-long` and `pm2 save`. The saved dump had still listed the bot as online and `pm2-ubuntu` is enabled, so a VPS reboot could have started it; now it is in neither pm2 nor the dump. Only the two account 2 entries changed in the saved list, and the live bot kept its pid and restart count. The dump as it was: `~/.pm2/dump.pm2.bak-acct2-retire-20261025T164322`. The 5-minute supervisor cron line is commented out (crontab backup `~/crontab.bak-acct2-retire-20261025T164342`).
+- **To start it again,** only on a new decision from the manager and while flat on the venue:
     1. Decide whether it keeps the AI exits (`AI_EXIT_MAX_CALLS_PER_TRADE=25`) or uses the rules' exits (`0`, as account 1 has since 2026-10-21).
     2. Set a new `VOLUME_CYCLE_STARTED_AT` in `/home/ubuntu/ai-perp-long/.env`. The guard and the weekly report count from it, so without a new value the old 6 trades stay in the result and two versions mix.
-    3. Back up `.env`, rerun the clean-shell check of section 2 step 6, then `pm2 restart ai-perp-long --update-env` and read the startup log.
-    4. The code stays pinned at `long-forward-v1`; a change of code is a new tag, as in section 2.
+    3. Back up `.env`, rerun the clean-shell check of section 2 step 6, then start it with the `pm2 start` command of section 2 (the pm2 entry is gone, so `pm2 restart` has nothing to restart), read the startup log and run `pm2 save`.
+    4. Uncomment the supervisor cron line (section 2, step 9).
+    5. The code stays pinned at `long-forward-v1`; a change of code is a new tag, as in section 2.
