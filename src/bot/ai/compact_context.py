@@ -15,6 +15,9 @@ COMPACT_PROMPT_VERSION = "okx-context-parity-v3"
 # The version stamped instead on an entry call that sends the lean payload under the lean system prompt
 # (`ENTRY_SYSTEM_PROMPT_LEAN`), so `ai_call_metrics` can tell the two profiles apart.
 LEAN_PROMPT_VERSION = "lean-entry-v1"
+# The version stamped instead when `AI_LEAN_OBJECTIVE=volume` swaps in the volume prompt
+# (`ENTRY_SYSTEM_PROMPT_LEAN_VOLUME`).
+LEAN_VOLUME_PROMPT_VERSION = "lean-entry-volume-v1"
 
 # The free-text length contract for an entry decision. It lives here because this
 # module builds the prompt that states the limits; `ai/brain.py` imports the same
@@ -29,6 +32,16 @@ PAYLOAD_PROFILE_LEAN = "lean"
 LEAN_PRIMARY_GOAL = (
     "Open a position only when the setup shows a directional edge larger than the round-trip fee; "
     "HOLD is the expected answer most ticks."
+)
+# `AI_LEAN_OBJECTIVE`: the two readings of the lean objective. `edge` is the goal above. `volume` trades the
+# side the hourly regime offers on a pullback into the mean (the bounce half of what the stretch gate lets
+# through) and holds only for a reason the model can name, so the code's gates and the daily cap, not the
+# model's caution, set the pace.
+LEAN_OBJECTIVE_EDGE = "edge"
+LEAN_OBJECTIVE_VOLUME = "volume"
+LEAN_VOLUME_PRIMARY_GOAL = (
+    "Build volume at the lowest cost per volume: open the allowed side on a pullback into the mean within "
+    "the stretch limit; HOLD only for a reason you can name."
 )
 # `entry_rules.rule`: the stretch gate runs in code after the model has answered, on the absolute
 # stretch (a signed -0.9 is beyond a 0.75 limit). Settings only allows lean while that gate enforces.
@@ -501,6 +514,12 @@ def _compact_patterns(patterns: Iterable[Any], cap: int) -> list[dict[str, Any]]
             }
         )
     return compact
+
+
+def lean_objective(settings: Any) -> str:
+    """`AI_LEAN_OBJECTIVE`: `volume`, or `edge` for anything else (a settings object without it included)."""
+    value = str(getattr(settings, "ai_lean_objective", LEAN_OBJECTIVE_EDGE) or "").strip().lower()
+    return LEAN_OBJECTIVE_VOLUME if value == LEAN_OBJECTIVE_VOLUME else LEAN_OBJECTIVE_EDGE
 
 
 def lean_market_regime(gate_context: Mapping[str, Any] | None, last_price: Any) -> dict[str, Any]:

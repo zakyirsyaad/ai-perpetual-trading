@@ -17,6 +17,11 @@ from bot.exchange.bingx_client import (
 )
 from bot.volume import VolumeBuildProfile
 
+# The confidence ENTRY_SYSTEM_PROMPT_LEAN_VOLUME tells the model an OPEN needs (AI_MIN_CONFIDENCE's floor and
+# default). The volume objective refuses a different AI_MIN_CONFIDENCE, so the sentence stays true; a test ties
+# the prompt text to this number.
+LEAN_VOLUME_MIN_CONFIDENCE = 0.75
+
 # `.com` is the mandatory primary host. `.pro` is deliberately NOT configurable:
 # the documented policy allows it only as an internal fallback after a network
 # error or timeout, so accepting it here would let config skip the primary.
@@ -126,6 +131,10 @@ class Settings(BaseSettings):
     # Entry payload shape: "legacy" is the full context the bot has always sent; "lean" is the compact
     # per-setup feature block of the staged live-bot fixes (docs/superpowers/specs/2026-10-21-*).
     ai_entry_payload: str = Field(default="legacy", alias="AI_ENTRY_PAYLOAD")
+    # Lean objective, read only with the lean payload: "edge" asks for a directional edge beyond the round-trip
+    # fee and holds most ticks; "volume" trades the side the hourly regime offers on a pullback into the mean
+    # (the bounce half of what the stretch gate lets through) and holds only for a reason the model can name.
+    ai_lean_objective: str = Field(default="edge", alias="AI_LEAN_OBJECTIVE")
     # Setup ledger: shadow only records each OPEN decision's bucket verdict at payload_json.gate.ledger and
     # writes no shadow rows; enforce also vetoes a setup whose upper bound (mean + 1.28 x SE of gross bps per
     # trade, before fees) stays below the hurdle and writes a ledger_block shadow row for it. "off" changes
@@ -451,6 +460,14 @@ class Settings(BaseSettings):
             raise ValueError("AI_ENTRY_PAYLOAD must be one of: legacy, lean.")
         return payload
 
+    @field_validator("ai_lean_objective")
+    @classmethod
+    def normalize_ai_lean_objective(cls, value: str) -> str:
+        objective = str(value or "edge").strip().lower()
+        if objective not in {"edge", "volume"}:
+            raise ValueError("AI_LEAN_OBJECTIVE must be one of: edge, volume.")
+        return objective
+
     @field_validator("setup_ledger_mode")
     @classmethod
     def normalize_setup_ledger_mode(cls, value: str) -> str:
@@ -702,6 +719,7 @@ class Settings(BaseSettings):
         self._require_setup_ledger_companions()
         self._require_shadow_walk_companions()
         self._require_lean_payload_companions()
+        self._require_volume_objective_companions()
         return self
 
     def _require_regime_gate_companions(self) -> None:
@@ -813,6 +831,32 @@ class Settings(BaseSettings):
                 "AI_ENTRY_PAYLOAD=lean tells the model the stretch rule is enforced in code; it needs "
                 + ", ".join(problems)
                 + "."
+            )
+
+    def _require_volume_objective_companions(self) -> None:
+        """What the volume objective needs for its prompt to be true.
+
+        The volume prompt describes a trade on the one side the hourly regime offers, and only the lean request
+        carries the regime block and narrows the offered sides to that one; a regime gate must also be on, or
+        there is no regime verdict to follow and the lean request would offer the live sides. Its goal is volume
+        and the daily cap it relies on is the ai_volume one. It tells the model the confidence an OPEN needs,
+        so AI_MIN_CONFIDENCE must be that number. `edge`, the default, is never checked.
+        """
+        if self.ai_lean_objective != "volume":
+            return
+        problems = []
+        if self.ai_entry_payload != "lean":
+            problems.append("AI_ENTRY_PAYLOAD=lean")
+        if self.entry_regime_gate == "off":
+            problems.append("ENTRY_REGIME_GATE=naik or ENTRY_REGIME_GATE=map")
+        if self.strategy_mode != "ai_volume":
+            problems.append("STRATEGY_MODE=ai_volume")
+        if self.ai_min_confidence != LEAN_VOLUME_MIN_CONFIDENCE:
+            problems.append(f"AI_MIN_CONFIDENCE={LEAN_VOLUME_MIN_CONFIDENCE}")
+        if problems:
+            raise ValueError(
+                "AI_LEAN_OBJECTIVE=volume describes a trade in the direction of the hourly regime, on the one side "
+                "the request offers; it needs " + " and ".join(problems) + "."
             )
 
     @property

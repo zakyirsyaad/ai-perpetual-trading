@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from bot.ai.compact_context import lean_objective
 from bot.config import Settings
 
 # In the past: a SETUP_LEDGER_SINCE more than five minutes ahead is refused.
@@ -395,6 +396,105 @@ class LeanPayloadSettingsTests(unittest.TestCase):
         settings = build_settings(ENTRY_STRETCH_GATE_MAX_ATR="inf")
         self.assertEqual(settings.ai_entry_payload, "legacy")
         self.assertEqual(settings.entry_stretch_gate_max_atr, float("inf"))
+
+
+class LeanObjectiveSettingsTests(unittest.TestCase):
+    """`AI_LEAN_OBJECTIVE=volume` swaps the lean prompt and goal for the volume ones. It describes a trade
+    in the direction of the hourly regime, so Settings refuses it without the lean payload (which carries the
+    regime block and offers one side) or without a regime gate. `edge`, the default, is never checked."""
+
+    def test_the_default_objective_is_edge(self):
+        for name, settings in (("legacy", build_settings()), ("lean", lean()), ("map", mapped())):
+            with self.subTest(name):
+                self.assertEqual(settings.ai_lean_objective, "edge")
+
+    def test_the_objective_is_normalised(self):
+        settings = mapped(AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE=" VOLUME ")
+        self.assertEqual(settings.ai_lean_objective, "volume")
+
+    def test_an_unknown_objective_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            mapped(AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE="aggressive")
+        self.assertIn("AI_LEAN_OBJECTIVE must be one of: edge, volume", str(caught.exception))
+
+    def test_volume_boots_with_the_lean_payload_and_a_regime_gate(self):
+        settings = mapped(AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE="volume")
+        self.assertEqual((settings.ai_entry_payload, settings.entry_regime_gate), ("lean", "map"))
+        self.assertEqual(settings.ai_lean_objective, "volume")
+        # the helper the brain and the lean payload read the setting through agrees with the field
+        self.assertEqual(lean_objective(settings), "volume")
+        self.assertEqual(lean_objective(mapped(AI_ENTRY_PAYLOAD="lean")), "edge")
+        naik = mapped(
+            ENTRY_REGIME_GATE="naik", ENTRY_GATE_DIRECTION="long", AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE="volume"
+        )
+        self.assertEqual((naik.entry_regime_gate, naik.ai_lean_objective), ("naik", "volume"))
+
+    def test_volume_refuses_the_legacy_payload(self):
+        with self.assertRaises(ValueError) as caught:
+            mapped(AI_LEAN_OBJECTIVE="volume")
+        message = str(caught.exception)
+        self.assertIn("AI_LEAN_OBJECTIVE=volume", message)
+        self.assertIn("AI_ENTRY_PAYLOAD=lean", message)
+        self.assertNotIn("ENTRY_REGIME_GATE", message)
+
+    def test_volume_refuses_without_a_regime_gate(self):
+        with self.assertRaises(ValueError) as caught:
+            lean(AI_LEAN_OBJECTIVE="volume")
+        message = str(caught.exception)
+        self.assertIn("AI_LEAN_OBJECTIVE=volume", message)
+        self.assertIn("ENTRY_REGIME_GATE", message)
+        self.assertNotIn("AI_ENTRY_PAYLOAD=lean", message)
+
+    def test_volume_refuses_a_strategy_other_than_ai_volume(self):
+        with self.assertRaises(ValueError) as caught:
+            mapped(
+                AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE="volume", ENTRY_REGIME_GATE="naik",
+                ENTRY_GATE_DIRECTION="long", STRATEGY_MODE="grok",
+            )
+        message = str(caught.exception)
+        self.assertIn("STRATEGY_MODE=ai_volume", message)
+        self.assertNotIn("AI_ENTRY_PAYLOAD=lean", message)
+
+    def test_volume_refuses_a_raised_confidence_floor(self):
+        # the prompt tells the model an OPEN needs 0.75; a higher AI_MIN_CONFIDENCE would drop answers it invited
+        with self.assertRaises(ValueError) as caught:
+            mapped(AI_ENTRY_PAYLOAD="lean", AI_LEAN_OBJECTIVE="volume", AI_MIN_CONFIDENCE="0.8")
+        self.assertIn("AI_MIN_CONFIDENCE=0.75", str(caught.exception))
+        # edge never told the model a number, so a raised floor stays legal there
+        self.assertEqual(mapped(AI_ENTRY_PAYLOAD="lean", AI_MIN_CONFIDENCE="0.8").ai_min_confidence, 0.8)
+
+    def test_volume_names_every_missing_requirement_at_once(self):
+        with self.assertRaises(ValueError) as caught:
+            build_settings(AI_LEAN_OBJECTIVE="volume", AI_MIN_CONFIDENCE="0.9")
+        message = str(caught.exception)
+        for need in ("AI_ENTRY_PAYLOAD=lean", "ENTRY_REGIME_GATE", "STRATEGY_MODE=ai_volume", "AI_MIN_CONFIDENCE=0.75"):
+            self.assertIn(need, message)
+
+    def test_an_empty_objective_means_edge_and_a_blank_one_is_refused(self):
+        self.assertEqual(lean(AI_LEAN_OBJECTIVE="").ai_lean_objective, "edge")
+        with self.assertRaises(ValueError) as caught:
+            lean(AI_LEAN_OBJECTIVE="   ")
+        self.assertIn("AI_LEAN_OBJECTIVE must be one of: edge, volume", str(caught.exception))
+
+    def test_lean_objective_reads_any_settings_object(self):
+        class Namespace:
+            pass
+
+        for value, expected in (("volume", "volume"), (" VOLUME ", "volume"), ("edge", "edge"), ("", "edge"),
+                                ("junk", "edge"), (None, "edge")):
+            with self.subTest(value=value):
+                namespace = Namespace()
+                namespace.ai_lean_objective = value
+                self.assertEqual(lean_objective(namespace), expected)
+        self.assertEqual(lean_objective(Namespace()), "edge")
+
+    def test_edge_is_never_checked(self):
+        settings = build_settings(
+            AI_LEAN_OBJECTIVE="edge",
+            ENTRY_STRETCH_GATE_MODE="off",
+            ENTRY_STRETCH_GATE_BEHIND_SCHEDULE_ENTRIES_PER_HOUR="3",
+        )
+        self.assertEqual((settings.ai_entry_payload, settings.ai_lean_objective), ("legacy", "edge"))
 
 
 if __name__ == "__main__":
