@@ -1,6 +1,6 @@
 # Laporan Perubahan Terbaru pada Bot Trading
 
-Periode 21–25 Oktober 2026 · Disusun 25 Oktober 2026 · **Dikoreksi 26 Oktober 2026 (fee; versi 3: batas bawah pita 0,05%, bukan 0,055%)**
+Periode 21–25 Oktober 2026 · Disusun 25 Oktober 2026 · **Dikoreksi 26 Oktober 2026 (fee; versi 4: untuk hasil −250 per 1 juta, untung sebelum biaya yang dibutuhkan 0,05%, bukan 0,055%; biaya satu stop 100 sampai 115 USDT, bukan 92)**
 
 Laporan ini menjelaskan dengan bahasa sederhana apa yang diubah pada bot, mengapa diubah, apa yang sudah diuji, dan apa yang belum kita ketahui. Ukuran hasilnya sama dengan laporan sebelumnya: kerugian untuk setiap 1 juta USDT nilai transaksi (disebut "per 1 juta"). Target kita: tidak lebih buruk dari −150 per 1 juta.
 
@@ -70,7 +70,7 @@ Dalam 26 jam pasar turun itu, AI dimintai pendapat 387 kali:
 | Maksimum kena batas rugi per hari | 12 kali | 5 kali |
 | Batas rugi harian | 1.500 USDT | 600 USDT |
 
-**Mengapa jeda dan dua batas rugi diperketat.** Karena bot kini bisa bertransaksi sampai 10 kali sehari, satu jam yang berbalik naik bisa memicu 3–5 batas rugi berturut-turut (sekitar 92 USDT masing-masing). Pengaman ini dipasang untuk minggu pertama dan akan dilonggarkan bila hasilnya sehat.
+**Mengapa jeda dan dua batas rugi diperketat.** Karena bot kini bisa bertransaksi sampai 10 kali sehari, satu jam yang berbalik naik bisa memicu 3–5 batas rugi berturut-turut (sekitar 100 sampai 115 USDT masing-masing). Pengaman ini dipasang untuk minggu pertama dan akan dilonggarkan bila hasilnya sehat.
 
 **Perubahan pada program.** Program kini punya mode petunjuk baru ini. Mode itu menolak berjalan bila pengaturan pendukungnya belum lengkap, sehingga tidak bisa dinyalakan setengah-setengah. Bila mode baru tidak dinyalakan, perilaku bot sama persis dengan sebelumnya.
 
