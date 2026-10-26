@@ -33,6 +33,8 @@ Forward analysis of every real trade of account 1 (519 trades, 31 Aug – 20 Oct
 entry decisions. Gross, in bps of notional per trade; at 0.035 % per leg, net per 1M = 50 x gross
 - 350, so -150 per 1M needs +4 bps.
 
+*Correction (26 Oct 2026): the 0.035 % fee held only until 20 Oct evening. BingX has charged 0.05 % per leg since (taker 0.05 %, maker 0.02 %), so net per 1M = 50 x gross - 500 and -150 per 1M needs +7 bps. The gross figures in the tables below do not depend on the fee and stand.*
+
 | Bucket (BTC) | n | Gross per trade |
 |---|---|---|
 | AI LONG, near the mean | 101 | -4.7 +- 2.3 |
@@ -249,7 +251,7 @@ report is read-only by construction. Exit 2 for a naive time, no stage start, a 
   captured at the start of Task 8, before `compact_context` changes; `expired` also covers a hole at
   the decision minute; an `invalid` row (malformed values) is closed, not retried.
 - **The hurdle is in gross bps per trade** (from entry and exit prices, before fees): 4.0 is the -150 per 1M
-  bar at 0.035 % per leg. The two comments that said "net bps" (`.env.example`, `Settings`) were corrected
+  bar at 0.035 % per leg (corrected 26 Oct 2026: at the 0.05 % per leg charged since 20 Oct evening, 4.0 is -300 per 1M and -150 needs 7.0). The two comments that said "net bps" (`.env.example`, `Settings`) were corrected
   in the review round.
 - **A shadow or ledger-blocked decision is not a HOLD row.** `ai_decisions` keeps the model's own
   action (OPEN_LONG/OPEN_SHORT) with `payload_json.gate.shadow_side=true` or
@@ -1090,6 +1092,6 @@ Never restart with an open position: check flat on the venue **and** in `open_po
    follows step 2's 60 trades, and needs the episode-scoped reopening (`1856610`) on the deployed
    code: without it a re-blocked bucket reads `reopened` again about an hour after its next block row.
 5. **LONG goes live** (`ENTRY_GATE_DIRECTION=any`) only when the LONG shadow outcomes reach n >= 60
-   with mean gross >= +4 bps. Until then LONG costs only AI calls.
+   with mean gross >= +4 bps (corrected 26 Oct 2026: that was the -150 bar at 0.035 %; at the 0.05 % charged since 20 Oct evening +4 bps is -300 per 1M and -150 needs +7 bps). Until then LONG costs only AI calls.
 6. Record each step's start time in project memory and in CLAUDE.md ("Live staged fixes") in a
    separate small docs PR. The forward bot (account 2) is not redeployed.
