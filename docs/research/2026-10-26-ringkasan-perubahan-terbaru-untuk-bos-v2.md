@@ -1,6 +1,6 @@
 # Laporan Perubahan Terbaru pada Bot Trading
 
-Periode 21–25 Oktober 2026 · Disusun 25 Oktober 2026 · **Dikoreksi 26 Oktober 2026 (fee)**
+Periode 21–25 Oktober 2026 · Disusun 25 Oktober 2026 · **Dikoreksi 26 Oktober 2026 (fee; versi 4: untuk hasil −250 per 1 juta, untung sebelum biaya yang dibutuhkan 0,05%, bukan 0,055%; biaya satu stop 100 sampai 115 USDT, bukan 92)**
 
 Laporan ini menjelaskan dengan bahasa sederhana apa yang diubah pada bot, mengapa diubah, apa yang sudah diuji, dan apa yang belum kita ketahui. Ukuran hasilnya sama dengan laporan sebelumnya: kerugian untuk setiap 1 juta USDT nilai transaksi (disebut "per 1 juta"). Target kita: tidak lebih buruk dari −150 per 1 juta.
 
@@ -14,7 +14,7 @@ Laporan 25 Oktober memakai fee 0,035% per sisi. Pemeriksaan langsung ke BingX pa
 | Biaya pulang-pergi satu transaksi | sekitar 0,07% | **sekitar 0,10%** |
 | Untung sebelum biaya agar hasil mencapai −150 | 0,04% | **0,07%** |
 | Perkiraan hasil (untung sebelum biaya 0,02%) | sekitar −250 per 1 juta | **sekitar −400 per 1 juta** |
-| Untung sebelum biaya agar hasil −200 sampai −250 | 0,02–0,03% | **0,055–0,06%** |
+| Untung sebelum biaya agar hasil −200 sampai −250 | 0,02–0,03% | **0,05–0,06%** |
 
 Persetujuan bos pada 25 Oktober (hasil −200 sampai −250 tidak masalah) diberikan atas angka lama, jadi **perlu dikonfirmasi ulang** (bagian 9).
 
@@ -70,7 +70,7 @@ Dalam 26 jam pasar turun itu, AI dimintai pendapat 387 kali:
 | Maksimum kena batas rugi per hari | 12 kali | 5 kali |
 | Batas rugi harian | 1.500 USDT | 600 USDT |
 
-**Mengapa jeda dan dua batas rugi diperketat.** Karena bot kini bisa bertransaksi sampai 10 kali sehari, satu jam yang berbalik naik bisa memicu 3–5 batas rugi berturut-turut (sekitar 92 USDT masing-masing). Pengaman ini dipasang untuk minggu pertama dan akan dilonggarkan bila hasilnya sehat.
+**Mengapa jeda dan dua batas rugi diperketat.** Karena bot kini bisa bertransaksi sampai 10 kali sehari, satu jam yang berbalik naik bisa memicu 3–5 batas rugi berturut-turut (sekitar 100 sampai 115 USDT masing-masing). Pengaman ini dipasang untuk minggu pertama dan akan dilonggarkan bila hasilnya sehat.
 
 **Perubahan pada program.** Program kini punya mode petunjuk baru ini. Mode itu menolak berjalan bila pengaturan pendukungnya belum lengkap, sehingga tidak bisa dinyalakan setengah-setengah. Bila mode baru tidak dinyalakan, perilaku bot sama persis dengan sebelumnya.
 
@@ -93,14 +93,14 @@ Dua catatan penting:
 
 ## 5. Perkiraan hasil dan risikonya
 
-Setiap transaksi dikenai biaya pulang-pergi sekitar 0,10% dari nilainya (0,05% per sisi). Dugaan terbaik kami: transaksi jenis ini rata-rata untung sekitar 0,02% sebelum biaya (dengan ketidakpastian sekitar ±0,02%). Artinya masih rugi sekitar 0,08% per transaksi setelah biaya. Agar mencapai target −150 per 1 juta, rata-rata untung sebelum biaya perlu minimal 0,07%. Untuk rentang −200 sampai −250 perlu sekitar 0,055–0,06%.
+Setiap transaksi dikenai biaya pulang-pergi sekitar 0,10% dari nilainya (0,05% per sisi). Dugaan terbaik kami: transaksi jenis ini rata-rata untung sekitar 0,02% sebelum biaya (dengan ketidakpastian sekitar ±0,02%). Artinya masih rugi sekitar 0,08% per transaksi setelah biaya. Agar mencapai target −150 per 1 juta, rata-rata untung sebelum biaya perlu minimal 0,07%. Untuk rentang −200 sampai −250 perlu sekitar 0,05–0,06%.
 
 | Skenario | Hasil per 1 juta | Rugi per hari pasar turun (volume sekitar 0,5 juta) |
 |---|---|---|
 | Untung sebelum biaya sekitar 0,02% (perkiraan kami) | sekitar −400 (kira-kira −510 sampai −290) | sekitar 200 USDT |
 | Tidak ada keunggulan sama sekali | −500 | sekitar 250 USDT |
 | Untung sebelum biaya 0,04% (dugaan kami terbukti) | −300 | sekitar 150 USDT |
-| Untung sebelum biaya 0,055–0,06% (rentang yang disetujui bos) | −250 sampai −200 | sekitar 125 sampai 100 USDT |
+| Untung sebelum biaya 0,05–0,06% (rentang yang disetujui bos) | −250 sampai −200 | sekitar 125 sampai 100 USDT |
 | Untung sebelum biaya 0,07% (target) | −150 | sekitar 75 USDT |
 
 - Bot hanya bertransaksi pada jam pasar turun, jadi volume rata-rata per hari kerja lebih rendah dari 0,5 juta.
