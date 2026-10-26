@@ -1,6 +1,6 @@
 # Pembaruan bot akun 1: hasil minggu ini dan koreksi laporan 21 Oktober
 
-Tanggal: 25 Oktober 2026, **dikoreksi 26 Oktober 2026 (fee akun 0,05%)** · Dasar: trade sungguhan akun 1 dan akun 2 (19–23 Oktober), 387 keputusan AI di jam kondisi TURUN, dan replay offline pada keputusan yang sama. Laporan ini **menggantikan** laporan 21 Oktober pada bagian yang dikoreksi di bagian 2. Istilah: 1 bps = 0,01% harga; "per 1 juta" = hasil per 1 juta USDT volume.
+Tanggal: 25 Oktober 2026, **dikoreksi 26 Oktober 2026 (fee akun 0,05%; versi 3: batas bawah pita +5,0 bps, bukan +5,5)** · Dasar: trade sungguhan akun 1 dan akun 2 (19–23 Oktober), 387 keputusan AI di jam kondisi TURUN, dan replay offline pada keputusan yang sama. Laporan ini **menggantikan** laporan 21 Oktober pada bagian yang dikoreksi di bagian 2. Istilah: 1 bps = 0,01% harga; "per 1 juta" = hasil per 1 juta USDT volume.
 
 ## Koreksi 26 Oktober: fee akun 0,05% per sisi
 
@@ -10,7 +10,7 @@ Dokumen 25 Oktober memakai fee 0,035% per sisi. Pemeriksaan ke BingX pada 26 Okt
 |---|---|---|
 | Hasil per 1 juta | 50 × gross (bps) − 350 | **50 × gross (bps) − 500** |
 | Gross untuk −150 per 1 juta | +4 bps | **+7 bps** |
-| Gross untuk −200 sampai −250 | +3 sampai +2 bps | **+6 sampai +5,5 bps** |
+| Gross untuk −200 sampai −250 | +3 sampai +2 bps | **+6,0 sampai +5,0 bps** |
 | Perkiraan (gross +2 ± 2 bps) | sekitar −250 (−360 sampai −140) | **sekitar −400 (−510 sampai −290)** |
 | Gross nol | −350 | **−500** |
 | Hipotesis +4 bps dan ambang ledger +4 bps | setara −150 | **setara −300** |
@@ -24,7 +24,7 @@ Bagian yang dikoreksi: ringkasan, bagian 3 (rumus), 4 (angka stop), 5 (tabel dan
 - **Langkah 1 berjalan sesuai desain tetapi hampir tidak trade:** hanya 2 trade dalam 26 jam kondisi TURUN. Penyebabnya sudah ditemukan: "pelajaran" yang dibaca AI menghukum satu-satunya bentuk entry yang diizinkan gerbang.
 - **Dua angka di laporan 21 Oktober keliru.** Enam puluh trade butuh sekitar 3 bulan, bukan 2–4 minggu, dan jumlah trade turun lebih dari 85%, bukan separuh.
 - **Langkah 2 dimajukan dan berjalan sejak 25 Oktober 11.07 WIB:** instruksi AI yang ramping dengan tujuan volume, ditambah pengaman minggu pertama. Di replay hasilnya 11 trade per 26 jam TURUN, dibanding 2 trade sebelumnya.
-- **Perkiraan jujur (dikoreksi 26 Oktober):** keunggulan di kantong ini sekitar **+2 ± 2 bps** per trade sebelum fee. Dengan fee 0,05% per sisi itu cukup untuk sekitar **−400 per 1 juta** (rentang kasar −510 sampai −290), bukan −250 seperti tertulis semula; −150 butuh +7 bps dan rentang yang disetujui bos (−200 sampai −250) butuh +5,5 sampai +6 bps. Uji maju beberapa minggu ke depan yang menentukan.
+- **Perkiraan jujur (dikoreksi 26 Oktober):** keunggulan di kantong ini sekitar **+2 ± 2 bps** per trade sebelum fee. Dengan fee 0,05% per sisi itu cukup untuk sekitar **−400 per 1 juta** (rentang kasar −510 sampai −290), bukan −250 seperti tertulis semula; −150 butuh +7 bps dan rentang yang disetujui bos (−200 sampai −250) butuh +5,0 sampai +6,0 bps. Uji maju beberapa minggu ke depan yang menentukan.
 - **Keputusan:** bos menjawab 25 Oktober: hasil −200 sampai −250 tidak masalah (diberikan atas fee lama, **perlu dikonfirmasi ulang**: perkiraan kini sekitar −400), pengaman dilonggarkan setelah seminggu bila sehat, dan akun 2 dihentikan total (sudah dijalankan; bagian 8).
 
 ## 1. Hasil minggu 19–23 Oktober
@@ -116,7 +116,7 @@ Tiga pengaman terakhir dipasang untuk minggu pertama: bot kini bisa trade sampai
 | Keunggulan seperti perkiraan (+2 bps) | sekitar −400 (rentang kasar −510 sampai −290) | sekitar 0,5 juta | sekitar −200 USDT |
 | Keunggulan nol | −500 | sekitar 0,5 juta | sekitar −250 USDT |
 | Keunggulan +4 bps (hipotesis terbukti) | −300 | sekitar 0,5 juta | sekitar −150 USDT |
-| Keunggulan +5,5 sampai +6 bps (rentang yang disetujui bos) | −250 sampai −200 | sekitar 0,5 juta | sekitar −125 sampai −100 USDT |
+| Keunggulan +5,0 sampai +6,0 bps (rentang yang disetujui bos) | −250 sampai −200 | sekitar 0,5 juta | sekitar −125 sampai −100 USDT |
 | Keunggulan +7 bps (target −150) | −150 | sekitar 0,5 juta | ≤ −75 USDT |
 
 - **Dampak ke siklus:** siklus sekarang −550 per 1 juta. Tambahan 3 juta volume di −400 membawanya ke sekitar −470. Selama keunggulan tidak terbukti, volume lebih besar berarti kerugian absolut lebih besar.
