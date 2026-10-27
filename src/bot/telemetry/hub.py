@@ -21,6 +21,7 @@ from bot.telemetry.wire import (
     BlockEvent,
     FillMessage,
     Meta,
+    PnlSummary,
     PriceMessage,
     PricePointFill,
     QuoteMessage,
@@ -51,6 +52,7 @@ class TelemetryHub:
         self._latest_price: dict[str, PriceMessage] = {}
         self._volume: VolumeSummary | None = None
         self._usage: UsageSummary | None = None
+        self._pnl: PnlSummary | None = None
 
     @property
     def bus(self) -> TelemetryBus:
@@ -166,6 +168,12 @@ class TelemetryHub:
         except Exception:
             LOGGER.warning("telemetry record_usage failed", exc_info=True)
 
+    def record_pnl(self, summary: PnlSummary) -> None:
+        try:
+            self._pnl = summary
+        except Exception:
+            LOGGER.warning("telemetry record_pnl failed", exc_info=True)
+
     def load_klines(self, coin: str, bar: Literal["1m", "15m"], rows: Iterable[Mapping[str, float]]) -> None:
         try:
             if self._known(coin):
@@ -189,6 +197,10 @@ class TelemetryHub:
     def usage_body(self) -> dict[str, Any]:
         """Model token figures for `GET /usage`; `{}` until the engine has published the first set."""
         return to_wire(self._usage) if self._usage is not None else {}
+
+    def pnl_body(self) -> dict[str, Any]:
+        """Realized and unrealized for `GET /pnl`; `{}` until the observer has published the first pair."""
+        return to_wire(self._pnl) if self._pnl is not None else {}
 
     def snapshot_body(self) -> dict[str, Any]:
         history = {coin: [to_wire(e) for e in clip_history(list(h))] for coin, h in self._history.items()}

@@ -11,8 +11,9 @@ import SleeveStrip from "@/components/SleeveStrip/SleeveStrip";
 import UsagePanel from "@/components/UsagePanel/UsagePanel";
 import VolumePanel from "@/components/VolumePanel/VolumePanel";
 import { lastMeaningfulCall } from "@/lib/format";
-import { portfolioPnl } from "@/lib/pnl";
+import { headerPnl } from "@/lib/pnl";
 import { useFeed } from "@/lib/useFeed";
+import { usePnl } from "@/lib/usePnl";
 import { useUsage } from "@/lib/useUsage";
 import { useIsDesktop } from "@/lib/useIsDesktop";
 import { useVolume } from "@/lib/useVolume";
@@ -39,6 +40,7 @@ export default function Page() {
   const feed = useFeed(API_URL);
   const volume = useVolume(API_URL);
   const usage = useUsage(API_URL);
+  const pnlSummary = usePnl(API_URL);
   const isDesktop = useIsDesktop();
   const [picked, setPicked] = useState<string | null>(null);
 
@@ -72,16 +74,16 @@ export default function Page() {
     return out;
   }, [coins, feed.byCoin]);
 
-  const pnl = useMemo(() => portfolioPnl(latestByCoin), [latestByCoin]);
-  const hasBooks = coins.some((c) => latestByCoin[c]);
+  // Until the first block of this run arrives, the header reads the bot's own counters from /pnl.
+  const figures = useMemo(() => headerPnl(latestByCoin, pnlSummary), [latestByCoin, pnlSummary]);
   const waiting = !feed.meta;
 
   const header = (
     <div className={styles.slotHeader}>
       <Header
         connection={feed.connection}
-        unrealized={hasBooks ? pnl.unrealized : null}
-        realized={hasBooks ? pnl.realized : null}
+        unrealized={figures?.unrealized ?? null}
+        realized={figures?.realized ?? null}
       />
     </div>
   );
