@@ -32,6 +32,7 @@ from bot.telemetry.wire import (
     Decision,
     FillData,
     FillMessage,
+    PnlSummary,
     Position,
     Probabilities,
     Quote,
@@ -241,6 +242,7 @@ class EngineTelemetry:
         self._open[coin] = held
         self._fills += 1
         self._fee_usd += fee_usdt
+        self._publish_pnl()
         fill = FillData(
             side=_open_side(position.direction),
             size=position.quantity,
@@ -259,6 +261,7 @@ class EngineTelemetry:
     def position_resumed(self, position: OpenPosition, *, leverage: int) -> None:
         coin = coin_of(position.symbol)
         self._open[coin] = self._held(position, leverage)
+        self._publish_pnl()
         number = self._next_block()
         if self._publish(coin, number, None, fallback_price=position.entry_price):
             self._entry_block[coin] = number
@@ -276,6 +279,7 @@ class EngineTelemetry:
         self._last_mark_at[coin] = now
         held = held.model_copy(update={"unrealized_usd": net_usdt})
         self._open[coin] = held
+        self._publish_pnl()
         update: dict[str, Any] = {"position": held, "totals": self._totals()}
         latest = self._hub.latest_price(coin)
         if latest is not None:
@@ -297,6 +301,7 @@ class EngineTelemetry:
         self._realized_usd += trade.pnl_usdt
         self._fee_usd += fee_usdt
         self._fills += 1
+        self._publish_pnl()
         number = self._next_block()
         side = _close_side(trade.direction)
         decision = _decision(side, "close", latency_ms=0, bias=_bias(trade.direction), reason=trade.reason)
@@ -400,6 +405,7 @@ class EngineTelemetry:
         # The header reads realized and total PnL from the next block's totals, whose counters restart
         # from zero with the process. Assigned, not added: this runs once, before any live trade.
         self._realized_usd = float(realized_usd)
+        self._publish_pnl()
 
     # -- internals ----------------------------------------------------------
 
@@ -419,6 +425,15 @@ class EngineTelemetry:
             leverage=float(leverage),
             unrealized_usd=0.0,
             unrealized_sz=0.0,
+        )
+
+    def _publish_pnl(self) -> None:
+        """Hand the hub the header's two figures, so `/pnl` serves them before the first block exists."""
+        self._hub.record_pnl(
+            PnlSummary(
+                realized_usd=self._realized_usd,
+                unrealized_usd=sum(p.unrealized_usd for p in self._open.values()),
+            )
         )
 
     def _totals(self) -> Totals:

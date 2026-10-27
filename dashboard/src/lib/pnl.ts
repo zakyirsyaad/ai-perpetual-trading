@@ -1,4 +1,4 @@
-import type { BlockEvent } from "./bot-types";
+import type { BlockEvent, PnlSummary } from "./bot-types";
 
 export type SleevePnl = {
   coin: string;
@@ -31,6 +31,21 @@ export function portfolioPnl(latestByCoin: Record<string, BlockEvent | null | un
     realized += row.realized;
   }
   return { unrealized, realized };
+}
+
+/**
+ * The header's figures. Blocks the bot published win while there are any (they carry the live mark of an
+ * open position); before the first block of a run, the bot's own counters from `/pnl` stand in. Null while
+ * neither is known, which the header draws as a skeleton.
+ */
+export function headerPnl(
+  latestByCoin: Record<string, BlockEvent | null | undefined>,
+  summary: PnlSummary | null,
+): { unrealized: number; realized: number } | null {
+  // `useFeed` paints a stub (block 0, flat, totals 0) for a sleeve that has a price mark but no block yet, and
+  // the bot's own blocks start at 1, so only `block > 0` is a block the bot published.
+  if (Object.values(latestByCoin).some((b) => b != null && b.block > 0)) return portfolioPnl(latestByCoin);
+  return summary ? { unrealized: summary.unrealizedUsd, realized: summary.realizedUsd } : null;
 }
 
 /** Unrealized as a percent of initial margin, when size, entry, and leverage exist. */

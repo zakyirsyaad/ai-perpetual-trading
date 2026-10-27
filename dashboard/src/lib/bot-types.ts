@@ -163,6 +163,12 @@ export interface UsageSummary {
   days: UsageDay[];
 }
 
+/** `GET /pnl`. The header's two figures straight from the bot's counters, so they exist before the first block does; `{}` until the first update. */
+export interface PnlSummary {
+  realizedUsd: number;
+  unrealizedUsd: number;
+}
+
 export interface BlockEvent {
   coin: string;
   block: number;

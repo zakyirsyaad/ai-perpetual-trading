@@ -172,6 +172,13 @@ class UsageSummary(_Wire):
     days: list[UsageDay]
 
 
+class PnlSummary(_Wire):
+    """The header's two figures, taken from the observer's own counters so they exist before the first block does."""
+
+    realized_usd: float
+    unrealized_usd: float
+
+
 class Resting(_Wire):
     bid_sz: float = Field(ge=0.0)
     ask_sz: float = Field(ge=0.0)

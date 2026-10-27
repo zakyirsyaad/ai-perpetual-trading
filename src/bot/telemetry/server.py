@@ -163,6 +163,7 @@ class TelemetryServer:
             "/tape": self._hub.tape_body,
             "/volume": self._hub.volume_body,
             "/usage": self._hub.usage_body,
+            "/pnl": self._hub.pnl_body,
         }
 
     async def _read_request(
