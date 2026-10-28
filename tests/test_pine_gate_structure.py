@@ -196,6 +196,28 @@ def _pine_indicator_offenders(trees):
             if p not in PINE_INDICATOR_USERS and _imports_pine_indicators(tree)]
 
 
+# The one script that may import research: the exit-variants shadow report, an analysis the manager runs by hand. It
+# may reach the exit_variants package only; the bot, main.py and every other script stay research-free.
+RESEARCH_IMPORTERS = frozenset({SRC / "report_exit_variants.py"})
+EXIT_VARIANTS = "research.exit_variants"
+
+
+def _research_names(tree):
+    return [name for name in _imports(tree)
+            if name in ("research", "<dynamic>") or name.startswith("research.")]
+
+
+def _research_offenders(trees):
+    """``path: name`` for each research import of a live source, bar the allowed script's own package."""
+    offenders = []
+    for path, tree in trees.items():
+        names = _research_names(tree)
+        if path in RESEARCH_IMPORTERS:
+            names = [n for n in names if n != EXIT_VARIANTS and not n.startswith(EXIT_VARIANTS + ".")]
+        offenders += [f"{path.relative_to(SRC).as_posix()}: {name}" for name in names]
+    return offenders
+
+
 class IsolationTests(unittest.TestCase):
     """The bot never imports research; research never touches private venue code (E8)."""
 
@@ -203,10 +225,32 @@ class IsolationTests(unittest.TestCase):
         paths = _live_sources()
         self.assertIn(SRC / "main.py", paths)
         self.assertGreater(len([p for p in paths if BOT in p.parents]), 20)
-        offenders = [f"{p.relative_to(SRC)}: {name}" for p in paths
-                     for name in _imports(_tree(p))
-                     if name in ("research", "<dynamic>") or name.startswith("research.")]
-        self.assertEqual(offenders, [])
+        self.assertEqual(_research_offenders({p: _tree(p) for p in paths}), [])
+
+    def test_the_one_script_allowed_to_import_research_really_does_and_only_its_own_package(self):
+        # an exception that nothing uses would be a dead entry; and the script may reach exit_variants only
+        (script,) = RESEARCH_IMPORTERS
+        names = _research_names(_tree(script))
+        self.assertTrue(names)
+        self.assertEqual([n for n in names if not n.startswith(EXIT_VARIANTS)], [])
+
+    def test_a_second_script_importing_research_is_refused(self):
+        tree = ast.parse("from research.exit_variants import study\n")
+        (script,) = RESEARCH_IMPORTERS
+        other = SRC / "report_other.py"
+        offenders = _research_offenders({script: tree, other: tree})
+        self.assertTrue(offenders)
+        self.assertEqual({offender.split(":")[0] for offender in offenders}, {"report_other.py"})
+
+    def test_the_allowed_script_may_not_reach_another_research_package_or_import_dynamically(self):
+        (script,) = RESEARCH_IMPORTERS
+        for source in ("from research.pine_gate import bars\n",
+                       "import research.mode_backtest.simulate\n",
+                       "import importlib\nimportlib.import_module(name)\n"):
+            with self.subTest(source=source):
+                self.assertNotEqual(_research_offenders({script: ast.parse(source)}), [])
+        self.assertEqual(_research_offenders({script: ast.parse(
+            "from research.exit_variants import study\nfrom research.exit_variants.walker import Cols\n")}), [])
 
     def test_the_guard_sees_dynamic_imports(self):
         source = ("import importlib\n"
