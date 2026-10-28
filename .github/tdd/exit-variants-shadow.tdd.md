@@ -117,27 +117,27 @@ The first GREEN pass was not clean, and every miss was in a test's expectation, 
 
 ## Verification
 
-Python 3.10.20 (the local `.venv`), on commit `06eb438`; coverage uses an rc file equivalent to `pyproject.toml` because coverage on 3.10 cannot read it:
+Python 3.10.20 (the local `.venv`), on commit `a04dc89` (code and tests; later commits touch only this document); coverage uses an rc file equivalent to `pyproject.toml` because coverage on 3.10 cannot read it:
 
 ```
 PYTHONPATH=src python -m compileall -q src tests                                   # OK
 PYTHONPATH=src python -m coverage run --rcfile=<pyproject equivalent> -m unittest discover -s tests
-Ran 3232 tests in 1229.623s
+Ran 3258 tests in 137.660s
 OK
 PYTHONPATH=src python -m coverage report --rcfile=<pyproject equivalent>
-src/report_exit_variants.py     231 statements   0 missed  100%
-src/research/exit_variants/study.py   273         0         100%
-src/research/exit_variants/walker.py  177         0         100%
-TOTAL                          18197   1399   92%          # fail_under = 80: passed
+src/report_exit_variants.py          249 statements   0 missed  100%
+src/research/exit_variants/study.py  302              0         100%
+src/research/exit_variants/walker.py 177              0         100%
+TOTAL                              18244   1398   92%            # fail_under = 80: passed
 git diff --check                                                                     # OK
 tests.test_secret_hygiene                                                            # OK (inside the full run)
 ```
 
-The new tests are 88 (walker), 73 (study) and 52 (report), plus 3 isolation guards in `tests/test_pine_gate_structure.py`; the rest of the suite is unchanged. The first full run (before the logging fix) was 3,225 tests, OK, and 92 % overall; its coverage report is what showed the "unusable kline cache" test was mostly vacuous (see the commit of the fix).
+The new tests are 88 (walker), 93 (study) and 58 (report), plus 3 isolation guards in `tests/test_pine_gate_structure.py`; the rest of the suite is unchanged. Earlier full runs on the way: 3,225 tests (first), 3,232 (after the logging fix, 92 % overall), taking 800 to 1,230 s while other sessions loaded the machine. The first coverage report is what showed that the "unusable kline cache" test was mostly vacuous (its cases shared one file name), fixed in the commit that follows it.
 
 ## Real-data check
 
-The report was run on the 22 real trades of 26 to 28 Oct: a local export of account 1's `trades` and `ai_decisions` through a fake store, with the VPS cron's kline cache (68,897 bars, no minute missing, loaded in 1.1 s). Calibration was 22 of 22 (100 %), and the paired means reproduce the scratch study's live-22 figures to the second decimal in every column it printed, A, C and B: `floor +45` +7.27 +- 6.59, `lock 40->15` +5.87 +- 4.31, `lock 45->20` +6.69 +- 4.59, `trail 40/20` +8.35 +- 5.32 under C and +3.83 +- 5.81 under B. Under the report's main row C+1bp, `lock 45->20` is +6.35 +- 4.44 USDT per trade (t 1.4) and changes 3 of the 22 trades; the verdict is "belum cukup" (22 of the 60 trades, t below 2, one week of the four). After the review fixes the same run, with `AI_MIN_FEE_ADJUSTED_RR` low enough for the plan's take-profit to bind (the live value cannot be read here), counts 3 of the 22 trades with a plan take-profit nearer than the floor, still calibrates 22 of 22, leaves `lock 45->20` at +6.35 and moves `floor +45` from +7.27 to +7.77; the verdict section counts 0 of the 22, because all of them opened before 29 Oct. The same 22 trades inspired the variants' numbers, so this checks the code, not the hypothesis.
+The report was run on the 22 real trades of 26 to 28 Oct: a local export of account 1's `trades` and `ai_decisions` through a fake store, with the VPS cron's kline cache (68,897 bars, no minute missing, loaded in 1.1 s). Calibration was 22 of 22 (100 %), and the paired means reproduce the scratch study's live-22 figures to the second decimal in every column it printed, A, C and B: `floor +45` +7.27 +- 6.59, `lock 40->15` +5.87 +- 4.31, `lock 45->20` +6.69 +- 4.59, `trail 40/20` +8.35 +- 5.32 under C and +3.83 +- 5.81 under B. Under the report's main row C+1bp, `lock 45->20` is +6.35 +- 4.44 USDT per trade (t 1.4) and changes 3 of the 22 trades; in that first run the verdict was "belum cukup" (22 of the 60 trades, t below 2, one week of the four). After the review fixes the same run, with `AI_MIN_FEE_ADJUSTED_RR` low enough for the plan's take-profit to bind (the live value cannot be read here), counts 3 of the 22 trades with a plan take-profit nearer than the floor, still calibrates 22 of 22, leaves `lock 45->20` at +6.35 and moves `floor +45` from +7.27 to +7.77; the verdict section counts 0 of the 22, because all of them opened before 29 Oct. The same 22 trades inspired the variants' numbers, so this checks the code, not the hypothesis.
 
 ## Independent review
 
