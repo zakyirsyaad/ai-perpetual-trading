@@ -12,6 +12,8 @@ import asyncio
 import io
 import json
 import logging
+import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest import mock
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -164,24 +167,35 @@ class LoadKlinesTests(_ReportCase):
         self.assertEqual(list(cols.high), [2.0, 4.0])
         self.assertEqual(list(cols.low), [0.5, 2.0])
 
-    def test_a_file_that_cannot_be_used_is_refused_with_a_reason(self) -> None:
+    def test_a_file_that_cannot_be_used_is_refused_with_its_own_reason(self) -> None:
+        # each payload is written when its case runs: the helper reuses one file name
+        no_bars = 'no 1m bars under "k1"'
+        shape = "not [open, high, low, close]"
+        prices = "not four positive prices"
         cases = (
-            ("missing", self.folder / "nope.json"),
-            ("not json", self.write("{")),
-            ("not an object", self.write([1, 2])),
-            ("no k1", self.write({"k3": {}})),
-            ("empty k1", self.write({"k1": {}})),
-            ("k1 not an object", self.write({"k1": [1]})),
-            ("bad key", self.write({"k1": {"soon": [1, 2, 0.5, 1]}})),
-            ("short row", self.write({"k1": {"60000": [1, 2, 0.5]}})),
-            ("text value", self.write({"k1": {"60000": [1, "high", 0.5, 1]}})),
-            ("zero price", self.write({"k1": {"60000": [1, 2, 0, 1]}})),
-            ("infinite", self.write('{"k1": {"60000": [1, Infinity, 0.5, 1]}}')),
+            ("not json", "{", "is not valid JSON"),
+            ("not an object", [1, 2], no_bars),
+            ("no k1", {"k3": {}}, no_bars),
+            ("empty k1", {"k1": {}}, no_bars),
+            ("k1 not an object", {"k1": [1]}, no_bars),
+            ("bad key", {"k1": {"soon": [1, 2, 0.5, 1]}}, shape),
+            ("text value", {"k1": {"60000": [1, "high", 0.5, 1]}}, shape),
+            ("not a list", {"k1": {"60000": 7}}, shape),
+            ("short row", {"k1": {"60000": [1, 2, 0.5]}}, prices),
+            ("zero price", {"k1": {"60000": [1, 2, 0, 1]}}, prices),
+            ("infinite", '{"k1": {"60000": [1, Infinity, 0.5, 1]}}', prices),
         )
-        for label, path in cases:
+        for label, payload, reason in cases:
             with self.subTest(label), self.assertRaises(report.KlinesError) as raised:
-                report.load_klines(path)
+                report.load_klines(self.write(payload))
+            self.assertIn(reason, str(raised.exception))
             self.assertEqual(len(str(raised.exception).splitlines()), 1)
+
+    def test_a_missing_file_is_refused_naming_it(self) -> None:
+        with self.assertRaises(report.KlinesError) as raised:
+            report.load_klines(self.folder / "nope.json")
+        self.assertIn("cannot read the kline cache", str(raised.exception))
+        self.assertIn("nope.json", str(raised.exception))
 
 
 class _FakeHTTP:
@@ -616,6 +630,64 @@ class FormatTests(unittest.TestCase):
     def test_missing_or_non_finite_numbers_are_a_dash(self) -> None:
         for value in (None, float("nan"), float("inf")):
             self.assertEqual(report.signed(value, 2), "–")
+
+
+class RunTests(unittest.TestCase):
+    """`_run` is the shell between `Settings()`, the store and `execute`: it must leave the bot's directory alone."""
+
+    def setUp(self) -> None:
+        self._cwd, self._data = tempfile.TemporaryDirectory(), tempfile.TemporaryDirectory()
+        self.addCleanup(self._cwd.cleanup)
+        self.addCleanup(self._data.cleanup)
+        self.cwd = Path(self._cwd.name)
+        klines = write_klines(Path(self._data.name), cols_for(SHORT, NOTHING_HAPPENS))
+        self.args = report.build_parser().parse_args(["--since", SINCE.isoformat(), "--klines", str(klines)])
+
+    def run_shell(self, settings_patch: Any) -> tuple[int, str, str, Any]:
+        """`_run` from inside ``self.cwd`` with ``Settings`` and the store replaced; returns code, stdout, stderr, store."""
+        store = _FakeStore([])
+        previous, out, err = os.getcwd(), io.StringIO(), io.StringIO()
+        os.chdir(self.cwd)
+        try:
+            with redirect_stdout(out), redirect_stderr(err), settings_patch, mock.patch.object(
+                report, "ReportStore", return_value=store
+            ) as made:
+                code = asyncio.run(report._run(self.args))
+        finally:
+            os.chdir(previous)
+        return code, out.getvalue(), err.getvalue(), made
+
+    def test_a_run_creates_no_log_file_or_directory_where_it_runs(self) -> None:
+        # setup_logging() opens logs/bot.log in the working directory: for the live bot that is its own rotating log,
+        # which a second process must not touch (and the report promises to write nothing but stdout)
+        patch = mock.patch.object(report, "Settings", return_value=make_settings(log_level="INFO"))
+        code, out, _, made = self.run_shell(patch)
+        self.assertEqual(code, 0)
+        self.assertIn("=== Sampel ===", out)
+        self.assertEqual(os.listdir(self.cwd), [])
+        made.assert_called_once()
+
+    def test_invalid_settings_are_one_error_line_without_any_value_and_no_store_is_opened(self) -> None:
+        class Model(BaseModel):
+            leverage: int
+
+        with self.assertRaises(ValidationError) as raised:
+            Model(leverage="sentinel-4242-value")
+        patch = mock.patch.object(report, "Settings", side_effect=raised.exception)
+        code, out, err, made = self.run_shell(patch)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertTrue(err.startswith("error:"))
+        self.assertIn("leverage", err)
+        self.assertNotIn("sentinel", err)
+        made.assert_not_called()
+
+    def test_main_parses_the_command_line_and_returns_the_exit_code(self) -> None:
+        shell = mock.AsyncMock(return_value=0)
+        argv = ["report_exit_variants.py", "--since", SINCE.isoformat()]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(report, "_run", shell):
+            self.assertEqual(report.main(), 0)
+        self.assertEqual(shell.await_args.args[0].since, SINCE)
 
 
 class SettingsProblemTests(unittest.TestCase):

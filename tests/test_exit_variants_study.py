@@ -12,8 +12,9 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest import mock
 
-from research.exit_variants import study
+from research.exit_variants import study, walker
 from research.exit_variants.study import (
     ALL_POSITIONS,
     CALM_POSITIONS,
@@ -397,6 +398,18 @@ class SimulateTests(unittest.TestCase):
         sims, skipped = self.simulate([FLAT] + [(2.0, 3.0, 1.0)] * 20)
         self.assertEqual(sims, [])
         self.assertEqual([s.code for s in skipped], [study.SKIP_CANDLES])
+
+    def test_a_variant_that_runs_out_of_bars_where_the_live_walk_did_not_is_a_bug_not_a_skip(self) -> None:
+        # a variant only adds exits, so it can never need more bars than the live walk; if it does, say so loudly
+        calls = []
+
+        def only_the_live_walk_succeeds(*args):
+            calls.append(args)
+            return walker.walk(*args) if len(calls) == 1 else None
+
+        with mock.patch.object(study, "walk", only_the_live_walk_succeeds), self.assertRaises(RuntimeError) as raised:
+            study.simulate([position()], cols_for(SHORT, NOTHING_HAPPENS), RULES)
+        self.assertIn("lock 45->20 [C+1bp]", str(raised.exception))
 
     def test_a_minute_missing_from_the_cache_skips_the_trade(self) -> None:
         cols = cols_for(SHORT, NOTHING_HAPPENS)

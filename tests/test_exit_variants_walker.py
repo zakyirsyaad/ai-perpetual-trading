@@ -123,6 +123,12 @@ class PriceNetTests(_SideCase):
         better = self.price(20.0) > self.price(10.0)
         self.assertEqual(better, self.side == LONG)
 
+    def test_a_net_that_cannot_be_priced_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            price_for_net(E, self.side, N, FEE_PCT, math.nan)
+        with self.assertRaises(ValueError):  # a loss so large that the exit price would be zero or below
+            price_for_net(E, self.side, N, FEE_PCT, -self.side * 1e9)
+
     def test_the_target_price_is_the_backtests_take_profit_level(self) -> None:
         rules: Any = SimpleNamespace(fee_perkiraan_persen=FEE_PCT, tp_net_usdt=LIVE_FLOOR)  # all the function reads
         self.assertAlmostEqual(self.price(LIVE_FLOOR), net_target_price(E, self.side, N, rules), places=9)

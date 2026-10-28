@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import math
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -37,7 +38,6 @@ from pydantic import ValidationError
 
 from bot.config import Settings
 from bot.core.forward_summary import MISSING, WIB, format_number, format_percent
-from bot.logger import setup_logging
 from bot.storage.supabase_trade_store import SupabaseTradeStore, parse_timestamp
 from research.exit_variants import study
 from research.exit_variants.walker import Cols
@@ -436,7 +436,9 @@ async def _run(args: argparse.Namespace) -> int:
     except ValidationError as exc:
         _error(settings_problem(exc))
         return 1
-    logger = setup_logging(settings.log_level)
+    # Not setup_logging(): it opens logs/bot.log in the working directory, which for a bot's directory is that bot's own
+    # rotating log. A report writes nothing but stdout; a plain logger leaves a store warning to Python's stderr default.
+    logger = logging.getLogger("report_exit_variants")
     return await execute(args, ReportStore(settings, logger), settings)
 
 
