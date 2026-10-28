@@ -14,12 +14,15 @@ report: only key names travel. The target is created exclusively with mode 0600.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from dotenv import dotenv_values
 
 from clean_env import _key_from_line
 
@@ -158,6 +161,20 @@ def _render(source_text: str, forced: dict[str, str]) -> str:
     return "".join(out)
 
 
+def _verify_readback(rendered: str, forced: dict[str, str]) -> None:
+    """Read the rendered file back the way the bot does (python-dotenv, keys case-folded, last one wins) and
+    refuse it unless every forced key holds its forced value.
+
+    The renderer works line by line, so a forced key inside a multi-line quoted value, or one spelled so that
+    only the bot's parser folds it onto a forced key, would otherwise slip through and leave a setting at its
+    default or a copied secret in place. Key names only in the error.
+    """
+    read = {key.lower(): value for key, value in dotenv_values(stream=io.StringIO(rendered)).items()}
+    wrong = [key for key, value in forced.items() if (read.get(key.lower()) or "") != value]
+    if wrong:
+        raise ForwardEnvError("the rendered file does not read back as intended for: " + ", ".join(wrong))
+
+
 def _write_exclusive(target: Path, text: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -172,6 +189,9 @@ def _write_exclusive(target: Path, text: str) -> None:
     except OSError as exc:
         target.unlink(missing_ok=True)
         raise ForwardEnvError(f"cannot write target: {exc.strerror or 'I/O error'}") from None
+    except BaseException:  # an interrupt must not leave a half-written file holding copied secrets
+        target.unlink(missing_ok=True)
+        raise
 
 
 def _forced_settings(cycle_start: str, mirror_live: bool) -> tuple[dict[str, str], tuple[str, ...]]:
@@ -189,7 +209,9 @@ def build_forward_env(source: Path, target: Path, cycle_start: str, *, mirror_li
     if not any(_key_of(line) == REQUIRED_SOURCE_KEY and _has_value(line) for line in _LINE_PATTERN.findall(source_text)):
         raise ForwardEnvError(f"source has no {REQUIRED_SOURCE_KEY}; is it the live bot's env file?")
     forced, set_keys = _forced_settings(cycle_start, mirror_live)
-    _write_exclusive(target, _render(source_text, forced))
+    rendered = _render(source_text, forced)
+    _verify_readback(rendered, forced)
+    _write_exclusive(target, rendered)
     return BuildReport(set_keys=set_keys, blanked_keys=BLANKED_KEYS)
 
 

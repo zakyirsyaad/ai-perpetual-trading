@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from pydantic import ValidationError
+
 import build_forward_env
 from bot.config import Settings
 from build_forward_env import ForwardEnvError, build_forward_env as build, main
@@ -383,11 +385,88 @@ class MirrorSettingsTests(MirrorCase):
              "volume_cycle_started_at", "setup_ledger_since"},
         )
 
-    def test_blanked_keys_really_come_out_blank_so_the_bot_refuses_to_boot(self) -> None:
+    def test_blanked_keys_really_come_out_blank_so_the_bot_refuses_to_boot_until_each_is_typed(self) -> None:
         self.built()
         self.assertNotIn(FAKE_VALUES["XAI_API_KEY"], self.target.read_text(encoding="utf-8"))
-        with clean_environment(), self.assertRaises(Exception):
-            Settings(_env_file=str(self.target))  # nothing typed in yet
+
+        def refusal(**typed: str) -> list[tuple[tuple, str]]:
+            with clean_environment(), self.assertRaises(ValidationError) as caught:
+                Settings(_env_file=str(self.target), **typed)
+            return [(error["loc"], error["msg"]) for error in caught.exception.errors()]
+
+        bingx = {key: value for key, value in STAND_IN_KEYS.items() if key != "XAI_API_KEY"}
+        expected_bingx = {("BINGX_API_KEY",), ("BINGX_SECRET_KEY",)}
+        self.assertEqual({loc for loc, _ in refusal()}, expected_bingx)  # nothing typed in yet
+        self.assertEqual({loc for loc, _ in refusal(XAI_API_KEY=STAND_IN_KEYS["XAI_API_KEY"])}, expected_bingx)
+        only_xai_missing = refusal(**bingx)
+        self.assertEqual(len(only_xai_missing), 1)
+        self.assertIn("XAI_API_KEY is required", only_xai_missing[0][1])
+
+
+class ReadbackAndCleanupTests(MirrorCase):
+    """The builder renders line by line but the bot reads the file with python-dotenv: a file that does not read
+    back as forced is refused (key names only), and an interrupted write leaves nothing behind. Both modes."""
+
+    def refuses(self, source_text: str, key: str) -> None:
+        for mirror in (True, False):
+            with self.subTest(mirror_live=mirror):
+                self.write_source(source_text)
+                with self.assertRaises(ForwardEnvError) as caught:
+                    build(self.source, self.target, CYCLE, mirror_live=mirror)
+                self.assertIn(key, str(caught.exception))
+                self.assert_no_fake_value(str(caught.exception))
+                self.assertFalse(self.target.exists())
+
+    def test_a_forced_key_inside_a_multi_line_quoted_value_is_refused_not_silently_missed(self) -> None:
+        self.refuses(
+            f"SUPABASE_URL={FAKE_VALUES['SUPABASE_URL']}\n"
+            'NOTE="first\n'
+            "SUPABASE_SCHEMA=public\n"
+            'last"\n',
+            "SUPABASE_SCHEMA",
+        )
+
+    def test_a_key_spelled_so_that_only_the_bots_parser_folds_it_is_refused(self) -> None:
+        # U+212A (Kelvin sign) lower-cases to "k": the bot reads this later line as BINGX_API_KEY and it would win
+        self.refuses(
+            f"SUPABASE_URL={FAKE_VALUES['SUPABASE_URL']}\n"
+            f"BINGX_API_KEY={FAKE_VALUES['BINGX_API_KEY']}\n"
+            f"BINGX_API_KEY={FAKE_VALUES['BINGX_SECRET_KEY']}\n",
+            "BINGX_API_KEY",
+        )
+
+    def test_an_ordinary_source_still_reads_back_as_forced_in_both_modes(self) -> None:
+        for mirror in (True, False):
+            with self.subTest(mirror_live=mirror):
+                build(self.source, self.target, CYCLE, mirror_live=mirror)
+                self.assertEqual(effective(self.target.read_text(encoding="utf-8"))["SUPABASE_SCHEMA"], "long_forward")
+                self.target.unlink()
+
+    def test_an_interrupted_write_leaves_no_file_behind(self) -> None:
+        real_fdopen = os.fdopen
+
+        class Interrupting:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                self._handle.close()
+                return False
+
+            def write(self, data: bytes) -> None:
+                self._handle.write(data[:20])  # a source secret may be among the first bytes
+                self._handle.flush()
+                raise KeyboardInterrupt
+
+        for mirror in (True, False):
+            with self.subTest(mirror_live=mirror):
+                with mock.patch.object(os, "fdopen", lambda fd, mode: Interrupting(real_fdopen(fd, mode))):
+                    with self.assertRaises(KeyboardInterrupt):
+                        build(self.source, self.target, CYCLE, mirror_live=mirror)
+                self.assertFalse(self.target.exists())
 
 
 class LegacyOutputUnchangedTests(MirrorCase):
