@@ -26,6 +26,9 @@ RULES = LiveRules(
     stop_loss_pct=0.35,
     atr_sl_multiplier=1.5,
     max_stop_loss_pct=0.40,
+    take_profit_pct=0.70,
+    atr_tp_multiplier=3.0,
+    min_fee_adjusted_rr=1.35,
     venue_fee_rates=False,
 )
 
@@ -57,6 +60,7 @@ def decision_row(created: Optional[datetime] = None, **overrides: Any) -> dict[s
         "action": "OPEN_SHORT",
         "confidence": 0.78,
         "stop_loss_pct": "0.30",  # a ->> extraction comes back as text
+        "take_profit_pct": "0.80",  # far above the floor's 0.32 %, so by default the floor is the live target
     }
     row.update(overrides)
     return row
@@ -86,6 +90,7 @@ def position(**overrides: Any) -> Position:
         entry_fill=ENTRY,
         notional=NOTIONAL,
         sl_pct=0.30,
+        tp_pct=0.80,
         atr_pct=0.12,
         actual_exit="WAKTU",
         volume_usdt=50_000.0,

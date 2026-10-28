@@ -24,7 +24,7 @@ from typing import Any, Optional
 from unittest import mock
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 import report_exit_variants as report
 from research.exit_variants import study
@@ -60,6 +60,9 @@ def make_settings(**overrides: Any) -> SimpleNamespace:
         stop_loss_pct=0.35,
         atr_sl_multiplier=1.5,
         max_stop_loss_pct=0.40,
+        take_profit_pct=0.70,
+        atr_tp_multiplier=3.0,
+        ai_min_fee_adjusted_rr=1.35,
         use_exchange_fee_rates=False,
     )
     base.update(overrides)
@@ -77,14 +80,18 @@ def write_klines(folder: Path, *bar_sets: Cols, name: str = "klines.json") -> Pa
     return path
 
 
-def trade_at(opened: datetime, path: list = LOCK_CATCHES, **overrides: Any):
+FORWARD_OPEN = datetime(2026, 10, 29, 1, 0, tzinfo=UTC)  # 08:00 WIB on 29 Oct: after the variants were fixed
+LATER_UNTIL = ("--until", "2026-11-09T00:00:00+07:00")
+
+
+def trade_at(opened: datetime, path: list = LOCK_CATCHES, decision: Optional[dict] = None, **overrides: Any):
     """(trade row, its decision row, its candles) for a SHORT opened at ``opened``."""
     start_ms = (int(opened.timestamp()) // 60 + 1) * 60_000
     row = trade_row(
         opened_at=opened.isoformat(), closed_at=(opened + timedelta(minutes=60)).isoformat(), **overrides
     )
-    decision = decision_row(opened - timedelta(seconds=4), confidence=row["confidence"])
-    return row, decision, cols_for(SHORT, path, start_ms)
+    made = decision_row(opened - timedelta(seconds=4), confidence=row["confidence"], **(decision or {}))
+    return row, made, cols_for(SHORT, path, start_ms)
 
 
 class _FakeStore:
@@ -252,7 +259,11 @@ class ReportStoreTests(unittest.TestCase):
         (call,) = http.gets
         self.assertEqual(call["url"], "https://example.supabase.co/rest/v1/ai_decisions")
         params = call["params"]
-        self.assertIn(("select", "created_at,symbol,action,confidence,payload_json->decision->>stop_loss_pct"), params)
+        select = (
+            "created_at,symbol,action,confidence,"
+            "payload_json->decision->>stop_loss_pct,payload_json->decision->>take_profit_pct"
+        )
+        self.assertIn(("select", select), params)
         self.assertIn(("exchange", "eq.bingx"), params)
         self.assertIn(("action", "in.(OPEN_LONG,OPEN_SHORT)"), params)
         self.assertIn(("created_at", "gte.2026-10-26T00:00:00+00:00"), params)
@@ -366,6 +377,16 @@ class UsageAndFailureTests(_ReportCase):
         code, _, err = self.run_report(["--since", SINCE.isoformat(), "--klines", str(path)], store)
         self.assertEqual(code, 1)
         self.one_line_error(err)
+
+    def test_a_simulation_that_cannot_run_is_one_error_line_not_a_traceback(self) -> None:
+        # no stop anywhere (the model gave none, the configured one and the ATR multiplier are 0): the walk refuses 0
+        zero = make_settings(stop_loss_pct=0.0, atr_sl_multiplier=0.0, max_stop_loss_pct=0.0)
+        row, decision, bars = trade_at(OPENED, decision={"stop_loss_pct": None})
+        argv = ["--since", SINCE.isoformat(), "--klines", str(write_klines(self.folder, bars))]
+        code, out, err = self.run_report(argv, _FakeStore([row], [decision]), zero)
+        self.assertEqual((code, out), (1, ""))
+        self.one_line_error(err)
+        self.assertIn("sl_pct", err)
 
     def test_a_failed_decision_read_is_an_expected_failure(self) -> None:
         class _DecisionsFail(_FakeStore):
@@ -552,8 +573,39 @@ class ReportContentTests(_ReportCase):
         self.assertEqual(out.count("-> belum cukup"), 2)
         self.assertEqual(store.decision_windows, [])
 
+    def test_the_verdict_counts_only_trades_opened_since_the_variants_were_fixed(self) -> None:
+        calm = {"setup": {"atr_pct": 0.10}}
+        in_sample = trade_at(OPENED, factor_metadata=calm)  # 26 Oct: the levels were chosen after seeing such trades
+        forward = trade_at(FORWARD_OPEN, factor_metadata=calm)
+        _, out, _, _ = self.run_scenario([in_sample, forward], extra_argv=LATER_UNTIL)
+        rule = block_of(out, "=== Aturan keputusan")
+        self.assertIn("posisi yang dihitung untuk vonis: 1 dari 2", rule)
+        self.assertIn("sejak 2026-10-29T00:00+07:00", rule)
+        self.assertIn("[ ] jumlah posisi: 1 (perlu >= 60)", rule)  # the in-sample trade is not counted
+        # the tables above stay descriptive over the whole window
+        self.assertEqual(row_cells(block_of(out, "=== Semua posisi | C:"), ONE_PRIMARY_ROW)[0], "2")
+
+    def test_a_window_of_only_in_sample_trades_decides_nothing(self) -> None:
+        _, out, _, _ = self.run_scenario([trade_at(OPENED)])
+        rule = block_of(out, "=== Aturan keputusan")
+        self.assertIn("posisi yang dihitung untuk vonis: 0 dari 1", rule)
+        self.assertIn("[ ] jumlah posisi: 0 (perlu >= 60)", rule)
+        self.assertEqual(rule.count("-> belum cukup"), 2)
+
+    def test_the_sample_counts_trades_whose_plan_take_profit_was_the_live_target(self) -> None:
+        # a take-profit of 0.28 % pays about net +45, nearer than the +56 floor
+        low = make_settings(ai_min_fee_adjusted_rr=0.1)
+        near = trade_at(OPENED, decision={"take_profit_pct": "0.28"}, factor_metadata={"setup": {"atr_pct": 0.09}})
+        far = trade_at(OPENED + timedelta(hours=3))
+        _, out, _, _ = self.run_scenario([near, far], settings=low)
+        sample = block_of(out, "=== Sampel ===")
+        self.assertIn("TP rencana lebih dekat dari lantai live (target nyata lebih rendah): 1 posisi", sample)
+        _, out, _, _ = self.run_scenario([far])
+        self.assertIn("TP rencana lebih dekat dari lantai live (target nyata lebih rendah): 0 posisi", out)
+
     def test_a_small_sample_is_not_enough_and_the_report_says_which_criteria_failed(self) -> None:
-        _, out, _, _ = self.run_scenario([trade_at(OPENED, factor_metadata={"setup": {"atr_pct": 0.10}})])  # calm too
+        calm = trade_at(FORWARD_OPEN, factor_metadata={"setup": {"atr_pct": 0.10}})  # calm too
+        _, out, _, _ = self.run_scenario([calm], extra_argv=LATER_UNTIL)
         rule = block_of(out, "=== Aturan keputusan")
         self.assertIn("varian utama: lock 45->20, dibaca pada konvensi C+1bp", rule)
         self.assertIn("kandidat semua posisi (n >= 60, rata-rata >= +5,00 USDT/posisi):", rule)
@@ -650,7 +702,7 @@ class RunTests(unittest.TestCase):
         klines = write_klines(Path(self._data.name), cols_for(SHORT, NOTHING_HAPPENS))
         self.args = report.build_parser().parse_args(["--since", SINCE.isoformat(), "--klines", str(klines)])
 
-    def run_shell(self, settings_patch: Any) -> tuple[int, str, str, Any]:
+    def run_shell(self, settings_patch: Any, args: Any = None) -> tuple[int, str, str, Any]:
         """`_run` from inside ``self.cwd`` with ``Settings`` and the store replaced; returns code, stdout, stderr, store."""
         store = _FakeStore([])
         previous, out, err = os.getcwd(), io.StringIO(), io.StringIO()
@@ -659,7 +711,7 @@ class RunTests(unittest.TestCase):
             with redirect_stdout(out), redirect_stderr(err), settings_patch, mock.patch.object(
                 report, "ReportStore", return_value=store
             ) as made:
-                code = asyncio.run(report._run(self.args))
+                code = asyncio.run(report._run(args or self.args))
         finally:
             os.chdir(previous)
         return code, out.getvalue(), err.getvalue(), made
@@ -689,6 +741,19 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("sentinel", err)
         made.assert_not_called()
 
+    def test_a_usage_error_is_reported_before_the_settings_are_loaded(self) -> None:
+        # the documented exit for a bad time is 2 whatever state the .env is in
+        for argv in (
+            ["--since", "2026-10-26T00:00:00"],
+            ["--since", SINCE.isoformat(), "--until", SINCE.isoformat()],
+        ):
+            with self.subTest(argv=argv):
+                patch = mock.patch.object(report, "Settings", side_effect=AssertionError("settings must not load"))
+                code, out, err, made = self.run_shell(patch, report.build_parser().parse_args(argv))
+                self.assertEqual((code, out), (2, ""))
+                self.assertTrue(err.startswith("error:"))
+                made.assert_not_called()
+
     def test_main_parses_the_command_line_and_returns_the_exit_code(self) -> None:
         shell = mock.AsyncMock(return_value=0)
         argv = ["report_exit_variants.py", "--since", SINCE.isoformat()]
@@ -698,6 +763,21 @@ class RunTests(unittest.TestCase):
 
 
 class SettingsProblemTests(unittest.TestCase):
+    def test_a_rule_across_several_settings_gets_a_hint_not_an_empty_field_list(self) -> None:
+        class Model(BaseModel):
+            leverage: int = 1
+
+            @model_validator(mode="after")
+            def across_settings(self) -> "Model":
+                raise ValueError("leverage exceeds a cap")
+
+        with self.assertRaises(ValidationError) as raised:
+            Model()
+        text = report.settings_problem(raised.exception)
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertNotIn("fields: )", text)
+        self.assertIn("across several settings", text)
+
     def test_it_names_the_fields_and_never_prints_a_value(self) -> None:
         # pydantic's own message echoes `input_value=...`; a bad value in a real .env could be a credential
         class Model(BaseModel):

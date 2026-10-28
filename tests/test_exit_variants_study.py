@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest import mock
@@ -85,6 +85,13 @@ class RegistryTests(unittest.TestCase):
     def test_the_variants_were_registered_for_a_live_floor_of_56(self) -> None:
         self.assertEqual(study.REGISTERED_FLOOR_NET, 56.0)
 
+    def test_only_trades_opened_since_the_registration_can_decide_the_verdict(self) -> None:
+        # the levels were chosen on the 22 trades of 26-28 Oct after seeing their peaks; the variants are fixed from 29 Oct
+        self.assertEqual(study.FORWARD_FROM, datetime(2026, 10, 29, 0, 0, tzinfo=timezone(timedelta(hours=7))))
+
+    def test_the_decision_lookup_tolerates_five_seconds_of_clock_skew(self) -> None:
+        self.assertEqual(study.DECISION_CLOCK_SKEW, timedelta(seconds=5))
+
     def test_the_market_costs_are_the_measured_live_ones(self) -> None:
         self.assertEqual(study.LIVE_COSTS, (0.5, 0.0, 0.0))  # market exit 0.5 bps, the target rests at its price
 
@@ -101,6 +108,9 @@ class LiveRulesTests(unittest.TestCase):
             stop_loss_pct=0.35,
             atr_sl_multiplier=1.5,
             max_stop_loss_pct=0.40,
+            take_profit_pct=0.70,
+            atr_tp_multiplier=3.0,
+            ai_min_fee_adjusted_rr=1.35,
             use_exchange_fee_rates=False,
         )
         base.update(overrides)
@@ -157,6 +167,32 @@ class DeriveStopTests(unittest.TestCase):
         self.assertAlmostEqual(study.derive_stop_pct(0.0, 0.10, RULES), 0.35)
 
 
+class DeriveTakeProfitTests(unittest.TestCase):
+    """The plan's own take-profit, as `_resolve_trade_targets` derives it; the engine exits at the nearer of it and the floor."""
+
+    def test_the_model_target_wins_when_it_is_the_widest(self) -> None:
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.80, 0.12, 0.30, RULES), 0.80)
+
+    def test_the_atr_target_wins_when_it_is_wider(self) -> None:
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.28, 0.30, 0.30, RULES), 0.90)  # 3 x 0.30
+
+    def test_the_minimum_fee_adjusted_reward_wins_when_it_is_wider(self) -> None:
+        # round trip 0.10 + (0.30 + 0.10) x 1.35 = 0.64
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.28, 0.12, 0.30, RULES), 0.64)
+
+    def test_a_missing_or_zero_model_target_falls_back_to_the_configured_one(self) -> None:
+        self.assertAlmostEqual(study.derive_take_profit_pct(None, 0.05, 0.30, RULES), 0.70)
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.0, 0.05, 0.30, RULES), 0.70)
+
+    def test_a_low_minimum_reward_lets_the_model_target_bind_below_the_floor(self) -> None:
+        low = LiveRules(**{**RULES.__dict__, "min_fee_adjusted_rr": 0.1})
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.28, 0.09, 0.30, low), 0.28)
+
+    def test_the_round_trip_fee_is_twice_the_taker_fee(self) -> None:
+        cheaper = LiveRules(**{**RULES.__dict__, "fee_pct": 0.04})
+        self.assertAlmostEqual(study.derive_take_profit_pct(0.28, 0.05, 0.30, cheaper), 0.08 + 0.38 * 1.35)
+
+
 class DecisionIndexTests(unittest.TestCase):
     def nearest(self, rows: list, **overrides: Any):
         query: dict[str, Any] = dict(symbol="BTC/USDT", side=SHORT, confidence=0.78, opened_at=OPENED)
@@ -186,8 +222,35 @@ class DecisionIndexTests(unittest.TestCase):
     def test_confidence_is_compared_with_a_tolerance_for_float_noise(self) -> None:
         self.assertIsNotNone(self.nearest([decision_row(confidence=0.78 + 1e-9)]))
 
-    def test_a_decision_after_the_open_is_not_the_one_that_opened_it(self) -> None:
-        self.assertIsNone(self.nearest([decision_row(OPENED + timedelta(seconds=1))]))
+    def test_a_decision_well_after_the_open_is_not_the_one_that_opened_it(self) -> None:
+        self.assertIsNone(self.nearest([decision_row(OPENED + timedelta(seconds=6))]))
+
+    def test_a_few_seconds_of_clock_skew_between_the_database_and_the_bot_are_tolerated(self) -> None:
+        # created_at is the database's now(), opened_at the bot's own clock
+        self.assertIsNotNone(self.nearest([decision_row(OPENED + timedelta(seconds=5))]))
+        self.assertIsNone(self.nearest([decision_row(OPENED + timedelta(seconds=5, milliseconds=1))]))
+
+    def test_a_true_predecessor_beats_a_later_decision_inside_the_skew(self) -> None:
+        rows = [
+            decision_row(OPENED - timedelta(seconds=4), stop_loss_pct="0.31"),
+            decision_row(OPENED + timedelta(seconds=3), stop_loss_pct="0.27"),
+        ]
+        self.assertAlmostEqual(self.nearest(rows).stop_loss_pct, 0.31)
+
+    def test_without_a_predecessor_the_earliest_later_decision_inside_the_skew_is_used(self) -> None:
+        rows = [
+            decision_row(OPENED + timedelta(seconds=4), stop_loss_pct="0.27"),
+            decision_row(OPENED + timedelta(seconds=2), stop_loss_pct="0.29"),
+        ]
+        self.assertAlmostEqual(self.nearest(rows).stop_loss_pct, 0.29)
+
+    def test_the_take_profit_of_the_decision_is_read_like_the_stop(self) -> None:
+        self.assertAlmostEqual(self.nearest([decision_row(take_profit_pct="0.28")]).take_profit_pct, 0.28)
+        self.assertAlmostEqual(self.nearest([decision_row(take_profit_pct=0.31)]).take_profit_pct, 0.31)
+        self.assertIsNone(self.nearest([decision_row(take_profit_pct=None)]).take_profit_pct)
+        row = decision_row()
+        del row["take_profit_pct"]
+        self.assertIsNone(self.nearest([row]).take_profit_pct)
 
     def test_the_window_is_fifteen_minutes_inclusive(self) -> None:
         self.assertIsNotNone(self.nearest([decision_row(OPENED - timedelta(minutes=15))]))
@@ -253,6 +316,7 @@ class LoadPositionsTests(unittest.TestCase):
         self.assertEqual((pos.side, pos.entry_fill, pos.actual_exit), (SHORT, ENTRY, "WAKTU"))
         self.assertAlmostEqual(pos.notional, NOTIONAL)
         self.assertAlmostEqual(pos.sl_pct, 0.30)  # max(model 0.30, 1.5 x 0.12) capped at 0.40
+        self.assertAlmostEqual(pos.tp_pct, 0.80)  # max(model 0.80, 3 x 0.12, 0.10 + 0.40 x 1.35)
         self.assertAlmostEqual(pos.atr_pct, 0.12)
         self.assertEqual(pos.opened_at, OPENED)
         self.assertAlmostEqual(pos.volume_usdt, (ENTRY + 99_950.0) * QTY)
@@ -263,6 +327,12 @@ class LoadPositionsTests(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual(positions[0].side, LONG)
         self.assertAlmostEqual(positions[0].sl_pct, 0.29)  # the model's 0.29 is wider than 1.5 x 0.12
+
+    def test_the_position_carries_the_plan_take_profit_the_engine_derived(self) -> None:
+        low = LiveRules(**{**RULES.__dict__, "min_fee_adjusted_rr": 0.1})
+        index = DecisionIndex([decision_row(take_profit_pct="0.28")])
+        positions, _ = study.load_positions([trade_row(factor_metadata={"setup": {"atr_pct": 0.09}})], index, low)
+        self.assertAlmostEqual(positions[0].tp_pct, 0.28)  # max(model 0.28, 3 x 0.09, 0.10 + 0.40 x 0.1)
 
     def test_the_atr_stop_is_used_when_it_is_wider(self) -> None:
         positions, _ = self.load([trade_row(factor_metadata={"setup": {"atr_pct": 0.22}})])
@@ -393,6 +463,49 @@ class SimulateTests(unittest.TestCase):
         sims, skipped = study.simulate([position()], late, RULES)
         self.assertEqual(sims, [])
         self.assertEqual([(s.code, s.opened_at, s.side) for s in skipped], [(study.SKIP_CANDLES, OPENED, "SHORT")])
+
+    def test_a_plan_take_profit_below_the_floor_is_the_live_target(self) -> None:
+        # 0.28 % is about net +45: the real trade took profit there, before a lock armed at +45 could do anything
+        (sim,), _ = study.simulate([position(tp_pct=0.28, actual_exit="TP")], cols_for(SHORT, LOCK_CATCHES), RULES)
+        self.assertEqual(sim.baseline_reason, "TP")
+        self.assertAlmostEqual(sim.baseline_net, 45.035, delta=0.01)
+        self.assertTrue(sim.plan_tp_binds)
+        for convention in ("C+1bp", "C"):
+            lock = self.delta(sim, "lock 45->20", convention)
+            self.assertEqual((lock.usdt, lock.changed), (0.0, False), convention)
+        # B stops the bar that arms the lock before it can take profit: the bad case is allowed to be worse
+        self.assertLessEqual(self.delta(sim, "lock 45->20", "B").usdt, 0.0)
+        self.assertAlmostEqual(self.delta(sim, "floor +45", "C").usdt, 45.0 - 45.035, delta=0.01)
+
+    def test_a_plan_take_profit_above_the_floor_changes_nothing(self) -> None:
+        (sim,), _ = self.simulate(LOCK_CATCHES)
+        self.assertFalse(sim.plan_tp_binds)
+
+    def test_a_plan_take_profit_at_or_below_break_even_waits_for_the_gross_to_cover_the_fee(self) -> None:
+        # the engine holds a take-profit whose gross does not cover the fee, so the target is never below net 0
+        (sim,), _ = study.simulate([position(tp_pct=0.05)], cols_for(SHORT, NOTHING_HAPPENS), RULES)
+        self.assertEqual(sim.baseline_reason, "TP")
+        self.assertGreaterEqual(sim.baseline_net, 0.0)
+
+    def test_a_trade_is_skipped_unless_the_cache_covers_the_whole_hold_window(self) -> None:
+        # the live walk ends in bar 1 (a take-profit); keeping only the trades whose walk happens to end inside the cache
+        # would favour the ones that exit early
+        early_exit = [FLAT, (0.0, 60.0, -1.0)] + [(2.0, 3.0, 1.0)] * 10
+        sims, skipped = self.simulate(early_exit)
+        self.assertEqual((sims, [s.code for s in skipped]), ([], [study.SKIP_CANDLES]))
+
+    def test_exactly_the_hold_window_of_bars_is_enough(self) -> None:
+        window = [FLAT] + [(2.0, 3.0, 1.0)] * 58  # 59 bars after the entry bar: its index 59 is the time-exit bar
+        self.assertEqual(len(self.simulate(window + [(2.0, 3.0, 1.0)])[0]), 1)
+        self.assertEqual(len(self.simulate(window)[0]), 0)  # one bar short
+
+    def test_a_minute_missing_anywhere_in_the_window_skips_the_trade_even_after_the_exit(self) -> None:
+        cols = cols_for(SHORT, [FLAT, (0.0, 60.0, -1.0)] + [(2.0, 3.0, 1.0)] * 62)  # takes profit in bar 1
+        holed = Cols(
+            [ms + (STEP if i >= 40 else 0) for i, ms in enumerate(cols.open_ms)], cols.open, cols.high, cols.low
+        )
+        sims, skipped = study.simulate([position()], holed, RULES)
+        self.assertEqual((sims, [s.code for s in skipped]), ([], [study.SKIP_CANDLES]))
 
     def test_a_cache_that_ends_before_the_exit_skips_the_trade(self) -> None:
         sims, skipped = self.simulate([FLAT] + [(2.0, 3.0, 1.0)] * 20)
@@ -533,6 +646,13 @@ class SummarizeTests(unittest.TestCase):
         ]
         self.assertEqual(self.summarize(sims, "floor +45", "C").mean, 7.0)
         self.assertEqual(self.summarize(sims, "lock 45->20", "C").mean, 1.0)
+
+    def test_the_forward_subset_keeps_trades_opened_at_or_after_the_registration(self) -> None:
+        key = (PRIMARY_VARIANT, DECISION_CONVENTION)
+        before = sim_at(study.FORWARD_FROM + timedelta(minutes=59), 1.0)  # opened a minute before
+        at = sim_at(study.FORWARD_FROM + timedelta(minutes=60), 2.0)  # opened exactly then
+        after = sim_at(study.FORWARD_FROM + timedelta(hours=3), 3.0)
+        self.assertEqual([s.deltas[key].usdt for s in study.forward_subset([before, at, after])], [2.0, 3.0])
 
     def test_the_calm_subset_keeps_trades_below_the_atr_threshold(self) -> None:
         sims = [sim_at(MONDAY, 1.0, atr=0.112), sim_at(MONDAY, 2.0, atr=0.113), sim_at(MONDAY, 3.0, atr=0.30)]

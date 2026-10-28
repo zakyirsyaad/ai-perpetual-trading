@@ -34,9 +34,11 @@ from research.exit_variants.walker import (
     Cols,
     Costs,
     ExitRule,
+    Outcome,
     day_bootstrap,
     group_by_day,
     mean_se,
+    net_for_price,
     settle,
     walk,
 )
@@ -46,7 +48,9 @@ __all__ = [
     "ALL_POSITIONS",
     "CALM_POSITIONS",
     "CONVENTIONS",
+    "DECISION_CLOCK_SKEW",
     "DECISION_CONVENTION",
+    "FORWARD_FROM",
     "PRIMARY_VARIANT",
     "REGISTERED_FLOOR_NET",
     "VARIANTS",
@@ -68,8 +72,10 @@ __all__ = [
     "calibration",
     "calm_subset",
     "derive_stop_pct",
+    "derive_take_profit_pct",
     "entry_index",
     "evaluate_rule",
+    "forward_subset",
     "iso_week",
     "live_rules_from_settings",
     "load_positions",
@@ -86,6 +92,10 @@ REGISTERED_FLOOR_NET = 56.0  # the live net floor the variants' numbers were cho
 PRIMARY_VARIANT = "lock 45->20"  # the only variant the decision rule judges; the others are descriptive
 CALM_ATR_PCT = 0.113  # ATR3m percent below which a market is calm: the train tercile of the 14-month backtest sample
 DECISION_WINDOW = timedelta(minutes=15)  # how far before the open the model's OPEN decision may lie
+DECISION_CLOCK_SKEW = timedelta(seconds=5)  # created_at is the database's clock, opened_at the bot's own
+# The variants were fixed on 28 Oct 2026, after the 22 trades of 26-28 Oct had been looked at (the levels were chosen on their
+# peaks). Only trades opened from here on may decide the verdict; earlier ones are described, never counted.
+FORWARD_FROM = datetime(2026, 10, 29, 0, 0, tzinfo=WIB)
 CONFIDENCE_TOLERANCE = 1e-6  # the trade and its decision carry the same float; this absorbs storage noise
 MIN_BOOTSTRAP_DAYS = 8  # a resampling of fewer days is not an interval worth printing
 
@@ -100,6 +110,7 @@ MIN_CALIBRATION = 0.90  # the live-rule walk must reproduce at least this share 
 # market cost; convention C+1bp adds one more bp to it, the closest reading to a live stop-market order.
 LIVE_COSTS = Costs(exit_market_bps=0.5, tp_bps=0.0, lock_extra_bps=0.0)
 
+_MIN_TARGET_NET = 0.01  # USDT; see ``_plan_target_net``
 _ACTION_OF_SIDE = {LONG: "OPEN_LONG", SHORT: "OPEN_SHORT"}
 _SIDE_NAMES = {"LONG": LONG, "SHORT": SHORT}
 _ACTUAL_EXIT = {EXIT_TP: TP, EXIT_SL: SL, EXIT_TIME: WAKTU}  # forward_summary's buckets as the walker's reasons
@@ -173,6 +184,9 @@ class LiveRules:
     stop_loss_pct: float  # STOP_LOSS_PCT: the stop when the model gives none
     atr_sl_multiplier: float
     max_stop_loss_pct: float  # MAX_STOP_LOSS_PCT; 0 means no cap
+    take_profit_pct: float  # TAKE_PROFIT_PCT: the plan's target when the model gives none
+    atr_tp_multiplier: float  # ATR_TP_MULTIPLIER
+    min_fee_adjusted_rr: float  # AI_MIN_FEE_ADJUSTED_RR: sets the smallest target the plan may have
     venue_fee_rates: bool  # USE_EXCHANGE_FEE_RATES: the live exit then nets the venue's rate, not TAKER_FEE_PCT
 
 
@@ -202,6 +216,9 @@ def live_rules_from_settings(settings: Any) -> LiveRules:
         stop_loss_pct=float(settings.stop_loss_pct),
         atr_sl_multiplier=float(settings.atr_sl_multiplier),
         max_stop_loss_pct=float(settings.max_stop_loss_pct),
+        take_profit_pct=float(settings.take_profit_pct),
+        atr_tp_multiplier=float(settings.atr_tp_multiplier),
+        min_fee_adjusted_rr=float(settings.ai_min_fee_adjusted_rr),
         venue_fee_rates=bool(settings.use_exchange_fee_rates),
     )
 
@@ -215,6 +232,17 @@ def derive_stop_pct(ai_stop_pct: Optional[float], atr_pct: float, rules: LiveRul
     if rules.max_stop_loss_pct > 0:
         stop = min(stop, rules.max_stop_loss_pct)
     return stop
+
+
+def derive_take_profit_pct(ai_tp_pct: Optional[float], atr_pct: float, sl_pct: float, rules: LiveRules) -> float:
+    """The plan's own take-profit distance in percent, as ``_resolve_trade_targets`` derives it (after the stop).
+
+    The widest of the model's target (the configured one when it gave none), ``atr_tp_multiplier`` x the ATR percent and
+    the smallest target that still pays ``min_fee_adjusted_rr`` times the risk after the round-trip fee (twice the taker
+    fee). The engine exits at this target as well as at the net floor, so the live exit is the nearer of the two."""
+    round_trip = 2.0 * rules.fee_pct
+    min_for_reward = round_trip + (sl_pct + round_trip) * rules.min_fee_adjusted_rr
+    return max(ai_tp_pct or rules.take_profit_pct, atr_pct * rules.atr_tp_multiplier, min_for_reward)
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -233,6 +261,7 @@ def _positive(value: Any) -> Optional[float]:
 class Decision(NamedTuple):
     created_at: datetime
     stop_loss_pct: Optional[float]  # the stop the model asked for; None when it gave none
+    take_profit_pct: Optional[float]  # the target the model asked for; None when it gave none
 
 
 class _DecisionFacts(NamedTuple):
@@ -241,14 +270,15 @@ class _DecisionFacts(NamedTuple):
     action: str
     confidence: float
     stop_loss_pct: Optional[float]
+    take_profit_pct: Optional[float]
 
 
 class DecisionIndex:
     """The OPEN decisions of a window, parsed once and searchable by time.
 
-    Rows are the store's decision rows: ``created_at``, ``symbol``, ``action``, ``confidence`` and ``stop_loss_pct``
-    (the model's stop, a number or the text PostgREST gives for a JSON extraction). A row that cannot be read, or that
-    is not an OPEN decision, is dropped."""
+    Rows are the store's decision rows: ``created_at``, ``symbol``, ``action``, ``confidence``, ``stop_loss_pct`` and
+    ``take_profit_pct`` (the model's levels, a number or the text PostgREST gives for a JSON extraction). A row that
+    cannot be read, or that is not an OPEN decision, is dropped."""
 
     def __init__(self, rows: Iterable[Mapping[str, Any]]) -> None:
         facts = [fact for fact in map(self._read, rows) if fact is not None]
@@ -264,19 +294,28 @@ class DecisionIndex:
         if created_at is None or confidence is None or action not in _ACTION_OF_SIDE.values():
             return None
         return _DecisionFacts(
-            created_at, str(row.get("symbol") or ""), action, confidence, _positive(row.get("stop_loss_pct"))
+            created_at,
+            str(row.get("symbol") or ""),
+            action,
+            confidence,
+            _positive(row.get("stop_loss_pct")),
+            _positive(row.get("take_profit_pct")),
         )
 
     def nearest(self, symbol: str, side: int, confidence: float, opened_at: datetime) -> Optional[Decision]:
         """The latest OPEN decision of this symbol, side and confidence from the 15 minutes up to and including the
-        open of the trade, or ``None``."""
+        open of the trade, or ``None``.
+
+        ``created_at`` is the database's clock and ``opened_at`` the bot's, so with no decision before the open the
+        earliest one up to ``DECISION_CLOCK_SKEW`` after it is taken (a true predecessor always wins)."""
         action = _ACTION_OF_SIDE[side]
-        newest = bisect_right(self._times, opened_at)  # created_at <= opened_at
         oldest = bisect_left(self._times, opened_at - DECISION_WINDOW)
-        for i in range(newest - 1, oldest - 1, -1):
+        newest = bisect_right(self._times, opened_at)  # created_at <= opened_at
+        latest = bisect_right(self._times, opened_at + DECISION_CLOCK_SKEW)
+        for i in [*range(newest - 1, oldest - 1, -1), *range(newest, latest)]:
             fact = self._facts[i]
             if fact.symbol == symbol and fact.action == action and abs(fact.confidence - confidence) <= CONFIDENCE_TOLERANCE:
-                return Decision(fact.created_at, fact.stop_loss_pct)
+                return Decision(fact.created_at, fact.stop_loss_pct, fact.take_profit_pct)
         return None
 
 
@@ -302,6 +341,7 @@ class Position:
     entry_fill: float
     notional: float
     sl_pct: float
+    tp_pct: float
     atr_pct: float
     actual_exit: str
     volume_usdt: float
@@ -332,13 +372,15 @@ def _position_of(
     decision = None if confidence is None else index.nearest(symbol, side, confidence, opened_at)
     if decision is None:
         return Skip(opened_at, label, SKIP_DECISION)
+    sl_pct = derive_stop_pct(decision.stop_loss_pct, atr_pct, rules)
     return Position(
         opened_at=opened_at,
         closed_at=closed_at,
         side=side,
         entry_fill=entry,
         notional=qty * entry,
-        sl_pct=derive_stop_pct(decision.stop_loss_pct, atr_pct, rules),
+        sl_pct=sl_pct,
+        tp_pct=derive_take_profit_pct(decision.take_profit_pct, atr_pct, sl_pct, rules),
         atr_pct=atr_pct,
         actual_exit=_ACTUAL_EXIT.get(classify_exit(str(row.get("reason") or "")), ""),
         volume_usdt=(entry + exit_) * qty,
@@ -378,18 +420,33 @@ class Delta(NamedTuple):
 
 @dataclass(frozen=True)
 class Simulated:
-    """One trade walked under the live rules and every variant: ``deltas`` is keyed by (variant name, convention name)."""
+    """One trade walked under the live rules and every variant: ``deltas`` is keyed by (variant name, convention name).
+
+    ``plan_tp_binds`` is True when the plan's own take-profit lies nearer than the net floor, so that was the live target."""
 
     position: Position
     baseline_reason: str
     baseline_net: float
     deltas: Mapping[tuple[str, str], Delta]
+    plan_tp_binds: bool = False
 
 
-def _rule_for(variant: Variant, convention: Convention, rules: LiveRules) -> ExitRule:
+def _plan_target_net(position: Position, rules: LiveRules) -> float:
+    """The net the plan's own take-profit pays: ``tp_pct`` away from the fill.
+
+    Never below ``_MIN_TARGET_NET``: the engine holds a take-profit whose gross does not cover the fee, so it can only
+    trigger once the net is above zero."""
+    price = position.entry_fill * (1 + position.side * position.tp_pct / 100)
+    net = net_for_price(position.entry_fill, position.side, position.notional, rules.fee_pct, price)
+    return max(net, _MIN_TARGET_NET)
+
+
+def _rule_for(variant: Variant, convention: Convention, rules: LiveRules, plan_net: float) -> ExitRule:
+    """The variant under the convention. The target stays the nearer of its floor and the plan's own take-profit."""
+    floor = rules.floor_net if variant.tp_net is None else variant.tp_net
     return ExitRule(
         name=f"{variant.name} [{convention.name}]",
-        tp_net=rules.floor_net if variant.tp_net is None else variant.tp_net,
+        tp_net=min(floor, plan_net),
         limit_min=rules.hold_minutes - 1,  # the walk starts a minute after the real entry
         lock_steps=variant.lock_steps,
         trail_arm=variant.trail_arm,
@@ -399,28 +456,42 @@ def _rule_for(variant: Variant, convention: Convention, rules: LiveRules) -> Exi
     )
 
 
+def _covers(cols: Cols, start: int, limit: int) -> bool:
+    """Whether the cache holds every minute from the entry bar to the time-exit bar, ``limit`` bars on.
+
+    The whole window is required, not just the bars up to the exit this walk happens to take: keeping the trades whose
+    walk ends inside a cache that stops short would keep the early exits and drop the long holds."""
+    end = start + limit
+    return end < len(cols.open_ms) and cols.open_ms[end] - cols.open_ms[start] == limit * INTERVAL_1M
+
+
+def _must_walk(label: str, cols: Cols, start: int, args: tuple, rule: ExitRule) -> Outcome:
+    outcome = walk(cols, start, *args, rule)
+    if outcome is None:  # the window was checked to be covered, so a walk always ends inside it
+        raise RuntimeError(f"{label} ran out of covered bars")
+    return outcome
+
+
 def _simulate_position(position: Position, cols: Cols, rules: LiveRules) -> Optional[Simulated]:
+    limit = rules.hold_minutes - 1
     start = entry_index(cols, position.opened_at)
-    if start is None:
+    if start is None or not _covers(cols, start, limit):
         return None
     args = (position.side, position.entry_fill, position.sl_pct, position.notional, rules.fee_pct)
-    live = ExitRule("live", tp_net=rules.floor_net, limit_min=rules.hold_minutes - 1)
-    base = walk(cols, start, *args, live)
-    if base is None:
-        return None
+    plan_net = _plan_target_net(position, rules)
+    base = _must_walk("the live walk", cols, start, args, ExitRule("live", tp_net=min(rules.floor_net, plan_net), limit_min=limit))
     base_net = settle(position.entry_fill, position.side, base, start, position.notional, rules.fee_pct, LIVE_COSTS).net
     base_exit = (base.reason, base.idx, base.raw_price)
     deltas: dict[tuple[str, str], Delta] = {}
     for variant in VARIANTS:
         for convention in CONVENTIONS:
-            outcome = walk(cols, start, *args, _rule_for(variant, convention, rules))
-            if outcome is None:  # a variant only adds exits, so it never needs more bars than the live walk did
-                raise RuntimeError(f"{variant.name} [{convention.name}] ran out of bars where the live walk did not")
+            label = f"{variant.name} [{convention.name}]"
+            outcome = _must_walk(label, cols, start, args, _rule_for(variant, convention, rules, plan_net))
             costs = LIVE_COSTS._replace(lock_extra_bps=convention.lock_extra_bps)
             net = settle(position.entry_fill, position.side, outcome, start, position.notional, rules.fee_pct, costs).net
             changed = (outcome.reason, outcome.idx, outcome.raw_price) != base_exit
             deltas[(variant.name, convention.name)] = Delta(net - base_net, changed)
-    return Simulated(position, base.reason, base_net, deltas)
+    return Simulated(position, base.reason, base_net, deltas, plan_tp_binds=plan_net < rules.floor_net)
 
 
 def simulate(
@@ -472,6 +543,11 @@ class Calibration:
 def calibration(simulated: Sequence[Simulated]) -> Calibration:
     matches = sum(1 for sim in simulated if sim.baseline_reason == sim.position.actual_exit)
     return Calibration(matches, len(simulated))
+
+
+def forward_subset(simulated: Sequence[Simulated]) -> list[Simulated]:
+    """The trades opened since the variants were fixed (``FORWARD_FROM``): the only ones the decision rule may count."""
+    return [sim for sim in simulated if sim.position.opened_at >= FORWARD_FROM]
 
 
 def calm_subset(simulated: Sequence[Simulated]) -> list[Simulated]:

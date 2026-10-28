@@ -2,7 +2,7 @@
 
 Analysis only and read-only: it GETs closed trades and the model's OPEN decisions through the store, reads 1m candles
 from a local cache file and prints text. It never writes to Supabase, places or changes an order, touches pm2 or prints a
-setting. For every closed trade it replays the live exits and a few pre-registered variants over the same candles and
+secret (the Parameter block shows only the fee, floor and hold time it used). For every closed trade it replays the live exits and a few pre-registered variants over the same candles and
 reports the paired difference per trade (``research.exit_variants.study``); the printed labels are Indonesian because the
 manager reads them. Run it from a bot's directory so ``Settings()`` reads that bot's ``.env`` and so the schema is that
 bot's (account 1 ``public``, account 2 ``long_forward``):
@@ -62,7 +62,10 @@ __all__ = [
 ]
 
 DEFAULT_KLINES = Path.home() / "replay" / "edge_klines.json"
-_DECISION_COLUMNS = "created_at,symbol,action,confidence,payload_json->decision->>stop_loss_pct"
+_DECISION_COLUMNS = (
+    "created_at,symbol,action,confidence,"
+    "payload_json->decision->>stop_loss_pct,payload_json->decision->>take_profit_pct"
+)
 _ERROR_CHARS = 600  # an error line is one line and not a page
 _DECISION_END_SLACK = timedelta(seconds=1)  # the window is half open, and a decision may carry the second of the open
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -130,8 +133,9 @@ class ReportStore(SupabaseTradeStore):
     async def open_decision_rows_between(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
         """The model's OPEN decisions made in [start, end), oldest first, paged past the 1000-row cap.
 
-        Only the scalars the study reads come back: the request payload of a decision is tens of kilobytes, so the stop is
-        extracted on the server (``payload_json->decision->>stop_loss_pct``, returned under the key ``stop_loss_pct``).
+        Only the scalars the study reads come back: the request payload of a decision is tens of kilobytes, so the model's
+        stop and target are extracted on the server (``payload_json->decision->>stop_loss_pct``, returned under the key
+        ``stop_loss_pct``, and the same for ``take_profit_pct``).
         Scoped to this store's schema and exchange, so each bot reads its own decisions."""
         return await self._page_all(
             self._ai_decisions_table,
@@ -199,6 +203,8 @@ def render_sample(result: study.Study) -> str:
     if used:
         opened = [sim.position.opened_at.astimezone(WIB).date().isoformat() for sim in result.simulated]
         lines.append(f"periode posisi dipakai (dibuka, WIB): {min(opened)} sampai {max(opened)}")
+    binding = sum(1 for sim in result.simulated if sim.plan_tp_binds)
+    lines.append(f"TP rencana lebih dekat dari lantai live (target nyata lebih rendah): {binding} posisi")
     if result.skipped:
         lines.append("dilewati:")
         for skip in sorted(result.skipped, key=_skip_order):
@@ -320,14 +326,18 @@ def render_candidate(candidate: study.Candidate, verdict: study.Verdict) -> str:
 
 
 def render_rule(result: study.Study) -> str:
-    ratio = study.calibration(result.simulated).ratio
+    forward = study.forward_subset(result.simulated)
+    ratio = study.calibration(forward).ratio
     lines = [
         "=== Aturan keputusan yang didaftarkan sebelumnya ===",
         f"varian utama: {study.PRIMARY_VARIANT}, dibaca pada konvensi {study.DECISION_CONVENTION}; varian lain hanya "
         "deskriptif (tanpa vonis, karena tidak ada koreksi untuk banyaknya varian yang dicoba)",
+        f"posisi yang dihitung untuk vonis: {len(forward)} dari {len(result.simulated)} (hanya yang dibuka sejak "
+        f"{_wib(study.FORWARD_FROM)}, setelah varian ditetapkan; posisi sebelumnya ikut memilih angka varian, jadi hanya "
+        "deskriptif)",
     ]
     for candidate in (study.ALL_POSITIONS, study.CALM_POSITIONS):
-        pool = list(result.simulated) if candidate is study.ALL_POSITIONS else study.calm_subset(result.simulated)
+        pool = forward if candidate is study.ALL_POSITIONS else study.calm_subset(forward)
         summary = study.summarize(pool, study.PRIMARY_VARIANT, study.DECISION_CONVENTION)
         lines.append(render_candidate(candidate, study.evaluate_rule(candidate, summary, ratio)))
     return "\n".join(lines)
@@ -356,8 +366,12 @@ def render_report(
 
 def settings_problem(exc: ValidationError) -> str:
     """One line naming the settings fields that failed to validate. Never a value: a bad secret would otherwise be echoed."""
-    fields = sorted({".".join(str(part) for part in error["loc"]) for error in exc.errors()})
-    return "invalid settings in .env or the environment (fields: " + ", ".join(fields) + ")"
+    errors = exc.errors()
+    fields = sorted({".".join(str(part) for part in error["loc"]) for error in errors if error["loc"]})
+    parts = ["fields: " + ", ".join(fields)] if fields else []
+    if any(not error["loc"] for error in errors):
+        parts.append("a rule across several settings failed: start the bot once to read which, or compare .env with .env.example")
+    return "invalid settings in .env or the environment (" + "; ".join(parts) + ")"
 
 
 def _parse_moment(text: str) -> datetime:
@@ -413,28 +427,40 @@ async def execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
         await store.close()
 
 
-async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
+def _window(args: argparse.Namespace) -> tuple[datetime, datetime, Optional[str]]:
+    """The window of the run and, when it is unusable, the one-line reason (a usage error)."""
     since = args.since
     until = args.until if args.until is not None else datetime.now(timezone.utc)
     if since.tzinfo is None or until.tzinfo is None:
-        _error("--since and --until must carry a timezone (for example +07:00 or Z)")
-        return 2
+        return since, until, "--since and --until must carry a timezone (for example +07:00 or Z)"
     if until <= since:
-        _error(f"--until {until.isoformat()} is not after --since {since.isoformat()}")
+        return since, until, f"--until {until.isoformat()} is not after --since {since.isoformat()}"
+    return since, until, None
+
+
+async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
+    since, until, problem = _window(args)
+    if problem is not None:
+        _error(problem)
         return 2
     try:
         rules = study.live_rules_from_settings(settings)
         cols = load_klines(args.klines.expanduser())
         trades, unreadable, decisions = await _read(store, since, until)
+        result = study.run_study(trades, decisions, cols, rules)
+        text = render_report(result, rules, settings, since, until, unreadable)
     except (ValueError, RuntimeError, OSError, httpx.HTTPError) as exc:
         _error(str(exc))
         return 1
-    result = study.run_study(trades, decisions, cols, rules)
-    print(render_report(result, rules, settings, since, until, unreadable))
+    print(text)
     return 0
 
 
 async def _run(args: argparse.Namespace) -> int:
+    problem = _window(args)[2]
+    if problem is not None:  # a usage error is a usage error whatever state the .env is in
+        _error(problem)
+        return 2
     try:
         settings = Settings()
     except ValidationError as exc:
