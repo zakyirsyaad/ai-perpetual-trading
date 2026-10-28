@@ -97,4 +97,45 @@ The first GREEN pass was not clean, and every miss was in a test's expectation, 
 - The study is tested against hand-computed deltas (a path that peaks at net +47 and ends at +5: `lock 45->20` +15.0 under C and +12.5 under C+1bp, `floor +45` +41.25, `trail 40/20` +22.0 and +19.5, `lock 40->15` free under C and -2.5 under C+1bp), every skip code, the WIB week boundary (Sunday 23:30 WIB is week 44, Monday 00:30 WIB is week 45) and each criterion of the rule failing on its own.
 - The script is tested with a fake store that has only the two reads the report may use, a temporary kline file, the one-line `error:` rule (a multi-line Supabase body collapses to one line), the exit codes, and the `ai_decisions` request through the store's own fake HTTP: select, exchange filter, action filter, the time window, ordering, paging past 1,000 rows, and `Accept-Profile` for both schemas.
 
-VERIFICATION-PENDING
+## Verification
+
+Python 3.10.20 (the local `.venv`), on commit `06eb438`; coverage uses an rc file equivalent to `pyproject.toml` because coverage on 3.10 cannot read it:
+
+```
+PYTHONPATH=src python -m compileall -q src tests                                   # OK
+PYTHONPATH=src python -m coverage run --rcfile=<pyproject equivalent> -m unittest discover -s tests
+Ran 3232 tests in 1229.623s
+OK
+PYTHONPATH=src python -m coverage report --rcfile=<pyproject equivalent>
+src/report_exit_variants.py     231 statements   0 missed  100%
+src/research/exit_variants/study.py   273         0         100%
+src/research/exit_variants/walker.py  177         0         100%
+TOTAL                          18197   1399   92%          # fail_under = 80: passed
+git diff --check                                                                     # OK
+tests.test_secret_hygiene                                                            # OK (inside the full run)
+```
+
+The new tests are 88 (walker), 73 (study) and 52 (report), plus 3 isolation guards in `tests/test_pine_gate_structure.py`; the rest of the suite is unchanged. The first full run (before the logging fix) was 3,225 tests, OK, and 92 % overall; its coverage report is what showed the "unusable kline cache" test was mostly vacuous (see the commit of the fix).
+
+## Real-data check
+
+The report was run on the 22 real trades of 26 to 28 Oct: a local export of account 1's `trades` and `ai_decisions` through a fake store, with the VPS cron's kline cache (68,897 bars, no minute missing, loaded in 1.1 s). Calibration was 22 of 22 (100 %), and the paired means reproduce the scratch study's live-22 figures to the second decimal in every column it printed, A, C and B: `floor +45` +7.27 +- 6.59, `lock 40->15` +5.87 +- 4.31, `lock 45->20` +6.69 +- 4.59, `trail 40/20` +8.35 +- 5.32 under C and +3.83 +- 5.81 under B. Under the report's main row C+1bp, `lock 45->20` is +6.35 +- 4.44 USDT per trade (t 1.4) and changes 3 of the 22 trades; the verdict is "belum cukup" (22 of the 60 trades, t below 2, one week of the four). The same 22 trades inspired the variants' numbers, so this checks the code, not the hypothesis.
+
+## Limitations
+
+1. **1m bars.** A 5-second poll can see a touch that a bar's range hides, and the walk reads a bar's close as the next bar's open. C and B bracket the realistic reading and the bad case; booking A is not reported because it is not a bound.
+2. **Costs.** The target is booked at 0 bps while a lock pays 0.5 bps (live floor exits averaged +1.5 USDT better than the level, stops 1.7 worse). C+1bp is the closest reading to a live stop-market order, and the decision rule reads it.
+3. **Statistics.** Most trades are unchanged (difference 0) and a few move a lot (above, a lock changes 3 of 22), so t is a rough guide; the day-bootstrap interval and the weekly sign check are the guards. Trades of one day are not independent, and a week with one trade counts like a week with ten.
+4. **Multiplicity.** Four variants, three conventions and two subsets are printed but only the primary variant under C+1bp is judged, and the 14-month backtest's "test half" was not a holdout. A secondary variant that stands out is a hypothesis for a new pre-registration, not a candidate.
+5. **The cache.** It is refreshed daily by cron, so the newest trades (under 60 minutes of candles) are skipped and listed, and a hole in the cache skips the trades that cross it.
+6. **The stop is derived.** If the engine's formula changes, `derive_stop_pct` must follow; a trade whose OPEN decision row is missing is skipped. Calibration (the live walk reproduces the real exit reason) is what shows the derivation and the floor are right, and below 90 % the report says so.
+7. **The `ai_decisions` read** uses PostgREST JSON extraction, `payload_json->decision->>stop_loss_pct`. The PostgREST documentation gives the returned key as the last path segment (`stop_loss_pct`), the `in.(A,B)` filter as written, and two filters on `created_at` are the pattern `_closed_trade_rows_for_day` already uses in production. It is tested here through the store's fake HTTP (parameters, paging, schema header) and not against the live API, which this session could not reach (no network, no `.env`); if the server rejects it, the report exits 1 with the response body in its one `error:` line, so the first run on the VPS settles it.
+8. **Account 2** (retired) used AI exits, so its trades calibrate low and the report says so. With `USE_EXCHANGE_FEE_RATES=true` the report warns that it uses `TAKER_FEE_PCT` while the bot nets the venue's rate.
+9. **Second-order effects.** The report asks what a rule would have done to trades the current rules opened. A different exit changes how long a position is open and so when the next entry can happen (one position at a time); that is not measured.
+10. **Logging.** The script does not call `setup_logging`: that opens `logs/bot.log` in the working directory, which in a bot's directory is the bot's own rotating log (a test pins that no `logs/` appears).
+
+## Deployment gate
+
+1. Merging changes nothing for trading: no setting, no trade path, nothing under `src/bot` imports the new code, and `src/bot` is not edited. Pulling `main` on the VPS needs no restart.
+2. Run it by hand from the bot's directory: `cd /home/ubuntu/ai-perpetual-trading && PYTHONPATH=src python src/report_exit_variants.py --since <ISO with timezone>`. The first run also settles the PostgREST select (limitation 7).
+3. Its verdict is data for a decision point. Enabling any exit variant is a separate change with its own spec, hypothesis, offline test and a restart while flat; the report says so itself.

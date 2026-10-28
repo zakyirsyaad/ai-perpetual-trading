@@ -181,6 +181,8 @@ class LoadKlinesTests(_ReportCase):
             ("bad key", {"k1": {"soon": [1, 2, 0.5, 1]}}, shape),
             ("text value", {"k1": {"60000": [1, "high", 0.5, 1]}}, shape),
             ("not a list", {"k1": {"60000": 7}}, shape),
+            ("a string that spells four digits", {"k1": {"60000": "1234"}}, shape),
+            ("an object", {"k1": {"60000": {"open": 1}}}, shape),
             ("short row", {"k1": {"60000": [1, 2, 0.5]}}, prices),
             ("zero price", {"k1": {"60000": [1, 2, 0, 1]}}, prices),
             ("infinite", '{"k1": {"60000": [1, Infinity, 0.5, 1]}}', prices),
@@ -518,6 +520,11 @@ class ReportContentTests(_ReportCase):
         self.assertIn("batas waktu 60 menit", parameters)
         self.assertIn("posisi tenang: setup.atr_pct di bawah 0,113%", parameters)
         self.assertIn("lock 45->20 (utama), floor +45, lock 40->15, trail 40/20", parameters)
+        self.assertIn(
+            "selisih/posisi = net varian dikurangi net aturan live pada posisi yang sama (USDT, setelah biaya); "
+            "positif berarti varian lebih baik",
+            parameters,
+        )
         self.assertNotIn("PERINGATAN", parameters)
 
     def test_a_floor_other_than_the_registered_one_warns(self) -> None:

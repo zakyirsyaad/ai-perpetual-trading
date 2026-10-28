@@ -92,6 +92,8 @@ class KlinesError(ValueError):
 
 def _bar(path: Path, key: str, value: Any) -> tuple[int, float, float, float]:
     try:
+        if not isinstance(value, list):  # a string such as "1234" would otherwise iterate into four "prices"
+            raise TypeError("a bar is a list")
         open_ms = int(key)
         prices = [float(price) for price in value]
     except (TypeError, ValueError) as exc:
@@ -237,6 +239,8 @@ def render_parameters(rules: study.LiveRules) -> str:
         "baris C+1bp menambah 1,0 bps pada keluaran kunci",
         f"posisi tenang: setup.atr_pct di bawah {format_number(study.CALM_ATR_PCT, 3)}%",
         "varian: " + ", ".join(names),
+        "selisih/posisi = net varian dikurangi net aturan live pada posisi yang sama (USDT, setelah biaya); "
+        "positif berarti varian lebih baik",
     ]
     if rules.floor_net != study.REGISTERED_FLOOR_NET:
         lines.append(
