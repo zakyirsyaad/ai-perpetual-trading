@@ -26,7 +26,12 @@ DEFAULT_BASE = Path(__file__).resolve().parents[1] / "supabase" / "schema.sql"
 
 _SCHEMA_NAME = re.compile(r"[a-z_][a-z0-9_]*")
 _MAX_NAME_LENGTH = 63  # PostgreSQL silently truncates longer identifiers
-_RESERVED_NAMES = frozenset({"public", "information_schema"})
+# Never a target: `public` is the live bot's schema, the rest are Postgres and Supabase system schemas (the
+# generated grants would hand them to service_role).
+_RESERVED_NAMES = frozenset({
+    "public", "information_schema", "auth", "storage", "realtime", "extensions", "graphql", "graphql_public",
+    "vault", "cron", "net", "pgsodium", "pgsodium_masks", "supabase_functions", "supabase_migrations", "pgbouncer",
+})
 _QUALIFIED_PUBLIC = re.compile(r"(?<![\w.])public\.")
 _BARE_PUBLIC = re.compile(r"\bpublic\b", re.IGNORECASE)
 
@@ -35,8 +40,12 @@ _FIRST_TABLE_REFERENCE = re.compile(r"(?<![\w.])public\.([A-Za-z_][A-Za-z0-9_]*)
 _CREATE_TABLE = re.compile(
     r"\s*create\s+table\s+(?:if\s+not\s+exists\s+)?public\.([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE
 )
-_CREATES_OBJECT = re.compile(r"\s*create\s+(?:unique\s+)?(?:table|index)\b", re.IGNORECASE)
-_IF_NOT_EXISTS = re.compile(r"\bif\s+not\s+exists\b", re.IGNORECASE)
+# A statement that cannot be run twice: a create or an add column whose keywords are not directly followed by
+# `if not exists`. Anchored at the keywords, so the phrase inside a default or a comment proves nothing.
+_NOT_RERUNNABLE = re.compile(
+    r"\s*(?:create\s+(?:unique\s+)?(?:table|index)|alter\s+table\s+\S+\s+add\s+column)\s+(?!if\s+not\s+exists\b)",
+    re.IGNORECASE,
+)
 
 
 def _validate_schema_name(schema: str) -> None:
@@ -90,6 +99,7 @@ def schema_sql(schema: str, base_sql: str) -> str:
 class _Statement:
     text: str  # as written, the comment lines above it included, without the closing semicolon
     code: str  # the same without comments
+    ends_in_comment: bool = False  # a `--` comment runs up to the closing semicolon, which then needs its own line
 
     @property
     def table(self) -> str | None:
@@ -103,17 +113,15 @@ class _Statement:
 
 
 def _after_quoted(sql: str, start: int) -> int:
-    """Index just past the quoted text that opens at ``start`` (a doubled quote is an escaped one)."""
-    quote = sql[start]
-    position = start + 1
-    while True:
-        end = sql.find(quote, position)
-        if end == -1:
-            raise ValueError("base SQL has an unterminated quoted string")
-        if sql.startswith(quote * 2, end):
-            position = end + 2
-            continue
-        return end + 1
+    """Index just past the quoted text that opens at ``start``.
+
+    SQL escapes a quote by doubling it, which needs no special case here: ``'it''s'`` reads as the quoted
+    pieces ``'it'`` and ``'s'`` side by side, and together they cover the same characters.
+    """
+    end = sql.find(sql[start], start + 1)
+    if end == -1:
+        raise ValueError("base SQL has an unterminated quoted string")
+    return end + 1
 
 
 def _split_statements(base_sql: str) -> list[_Statement]:
@@ -133,6 +141,7 @@ def _split_statements(base_sql: str) -> list[_Statement]:
     code: list[str] = []
     depth = 0
     position = 0
+    ends_in_comment = False
     while position < len(base_sql):
         char = base_sql[position]
         if base_sql.startswith("--", position):
@@ -140,20 +149,24 @@ def _split_statements(base_sql: str) -> list[_Statement]:
             end = len(base_sql) if end == -1 else end
             text.append(base_sql[position:end])
             position = end
+            ends_in_comment = True
         elif char in "'\"":
             end = _after_quoted(base_sql, position)
             text.append(base_sql[position:end])
             code.append(base_sql[position:end])
             position = end
+            ends_in_comment = False
         elif char == ";" and depth == 0:
-            statements.append(_Statement("".join(text).strip(), "".join(code)))
+            statements.append(_Statement("".join(text).strip(), "".join(code), ends_in_comment))
             text, code = [], []
             position += 1
+            ends_in_comment = False
         else:
             text.append(char)
             code.append(char)
             depth += (char == "(") - (char == ")")
             position += 1
+            ends_in_comment = ends_in_comment and char.isspace()
     if "".join(code).strip():
         raise ValueError("base SQL ends inside a statement (no closing semicolon)")
     return statements
@@ -171,16 +184,24 @@ def table_sql(schema: str, table: str, base_sql: str) -> str:
     known = [match.group(1) for statement in statements if (match := _CREATE_TABLE.match(statement.code))]
     if table not in known:
         raise ValueError(f"unknown table {table!r}; schema.sql creates: {', '.join(known)}")
+    for statement in statements:
+        unplaceable = statement.table is None and (
+            _BARE_PUBLIC.search(statement.code) or any(re.search(rf"\b{name}\b", statement.code) for name in known)
+        )
+        if unplaceable:
+            raise ValueError("a statement names `public` or a table without a qualified public.<table> name, so --only cannot place it")
     chosen = [statement for statement in statements if statement.table == table]
     for statement in chosen:
-        if _CREATES_OBJECT.match(statement.code) and not _IF_NOT_EXISTS.search(statement.code):
-            raise ValueError(f"a create statement for {table!r} lacks 'if not exists', so it cannot be run again safely")
-    body, _ = _QUALIFIED_PUBLIC.subn(f"{schema}.", "\n\n".join(f"{statement.text};" for statement in chosen))
+        if _NOT_RERUNNABLE.match(statement.code):
+            raise ValueError(f"a statement for {table!r} lacks 'if not exists' (create or add column), so it cannot be run again safely")
+    pieces = (f"{statement.text}{chr(10) if statement.ends_in_comment else ''};" for statement in chosen)
+    body, _ = _QUALIFIED_PUBLIC.subn(f"{schema}.", "\n\n".join(pieces))
     if _BARE_PUBLIC.search(body):
         raise ValueError("base SQL still mentions public after the rewrite")
     return (
         f"-- Generated from supabase/schema.sql by src/forward_schema.py (--only {table}); do not edit by hand.\n"
-        f"-- Adds the {table} table to the existing '{schema}' schema; every statement is safe to run again.\n"
+        f"-- Adds the {table} table to the existing '{schema}' schema. The generator checked that every create "
+        "and add column in it is `if not exists`.\n"
         "\n"
         f"{body}\n"
         "\n"

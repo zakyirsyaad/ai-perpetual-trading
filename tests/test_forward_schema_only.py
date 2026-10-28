@@ -6,6 +6,8 @@ same base so the two cannot drift.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import re
 import subprocess
 import sys
@@ -50,6 +52,12 @@ class ShadowEntriesOnlyTests(unittest.TestCase):
         self.assertIn("src/forward_schema.py", first)
         self.assertIn("schema.sql", first)
         self.assertIn("shadow_entries", first)
+
+    def test_the_header_states_what_was_checked_not_a_blanket_guarantee(self) -> None:
+        second = self.sql.splitlines()[1]
+        self.assertTrue(second.startswith("--"))
+        self.assertIn("if not exists", second)
+        self.assertNotIn("every statement", second)
 
     def test_holds_the_table_its_index_and_row_level_security_in_that_order(self) -> None:
         positions = [
@@ -117,6 +125,16 @@ class EveryTableTests(unittest.TestCase):
     def test_the_full_schema_generator_is_unchanged_by_the_refactor(self) -> None:
         full = forward_schema.schema_sql("long_forward", base_sql())
         self.assertTrue(full.endswith("\n".join(GRANTS) + "\n"))
+
+    def test_every_statement_of_the_base_is_emitted_by_exactly_one_only(self) -> None:
+        # a new statement that names no table, or one the splitter attributes wrongly, would reach no `--only`
+        base = base_sql()
+        statements = forward_schema._split_statements(base)
+        self.assertEqual([statement.text for statement in statements if statement.table is None], [])
+        grants = len(forward_schema._grants("lf").splitlines())
+        tables = re.findall(r"create table if not exists public\.(\w+)", base)
+        emitted = sum(len(forward_schema._split_statements(forward_schema.table_sql("lf", t, base))) - grants for t in tables)
+        self.assertEqual(emitted, len(statements))
 
 
 class StatementOwnershipTests(unittest.TestCase):
@@ -189,6 +207,16 @@ class StatementOwnershipTests(unittest.TestCase):
         self.assertIn("create table if not exists lf.t (id int);", out)
         self.assertNotIn("the end", out)
 
+    def test_a_comment_before_the_closing_semicolon_does_not_swallow_it(self) -> None:
+        base = "create table if not exists public.t (id int) -- note\n;\n"
+        out = self.only("t", base)
+        self.assertIn("-- note\n;", out)
+        self.assertNotIn("-- note;", out)
+
+    def test_a_doubled_quote_inside_a_string_does_not_end_it(self) -> None:
+        base = "create table if not exists public.t (note text default 'it''s; fine');\n"
+        self.assertIn("default 'it''s; fine');", self.only("t", base))
+
 
 class FailClosedTests(unittest.TestCase):
     def test_unknown_tables_are_refused_in_one_line_that_names_the_known_ones(self) -> None:
@@ -234,6 +262,50 @@ class FailClosedTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             forward_schema.table_sql("lf", "t", "-- the public schema\ncreate table if not exists public.t (id int);\n")
 
+    def test_an_upper_case_public_table_is_refused_not_emitted_as_a_file_without_its_create(self) -> None:
+        with self.assertRaises(ValueError):
+            forward_schema.table_sql("lf", "t", "CREATE TABLE IF NOT EXISTS PUBLIC.t (id int);\n")
+
+    def test_if_not_exists_must_follow_the_create_keyword_not_appear_anywhere(self) -> None:
+        base = "create table public.t (id int, note text default 'if not exists');\n"
+        with self.assertRaises(ValueError):
+            forward_schema.table_sql("lf", "t", base)
+
+    def test_add_column_must_be_safe_to_run_again_too(self) -> None:
+        head = "create table if not exists public.t (id int);\n"
+        with self.assertRaises(ValueError):
+            forward_schema.table_sql("lf", "t", head + "alter table public.t add column x int;\n")
+        out = forward_schema.table_sql("lf", "t", head + "alter table public.t add column if not exists x int;\n")
+        self.assertIn("add column if not exists x int;", out)
+
+    def test_a_statement_that_names_public_or_a_table_without_a_qualified_name_is_refused(self) -> None:
+        head = "create table if not exists public.t (id int);\n"
+        for label, extra in {
+            "upper case schema": "ALTER TABLE PUBLIC.t ENABLE ROW LEVEL SECURITY;\n",
+            "quoted schema": 'alter table "public"."t" enable row level security;\n',
+            "unqualified table": "alter table t enable row level security;\n",
+        }.items():
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    forward_schema.table_sql("lf", "t", head + extra)
+
+    def test_a_statement_that_names_no_table_and_no_schema_is_left_out(self) -> None:
+        out = forward_schema.table_sql(
+            "lf", "t", "create extension if not exists pgcrypto;\ncreate table if not exists public.t (id int);\n"
+        )
+        self.assertNotIn("pgcrypto", out)
+
+    def test_supabase_system_schemas_are_refused_as_a_target(self) -> None:
+        for name in (
+            "auth", "storage", "realtime", "extensions", "graphql", "graphql_public", "vault", "cron", "net",
+            "pgsodium", "supabase_functions", "supabase_migrations", "pgbouncer",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    forward_schema.table_sql(name, "shadow_entries", base_sql())
+                with self.assertRaises(ValueError):
+                    forward_schema.schema_sql(name, base_sql())
+
 
 class OnlyCliTests(unittest.TestCase):
     def test_unknown_table_is_one_error_line_and_exit_2(self) -> None:
@@ -267,6 +339,38 @@ class OnlyCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("create schema if not exists long_forward;", result.stdout)
         self.assertIn("create table if not exists long_forward.trades (", result.stdout)
+
+
+class OnlyMainInProcessTests(unittest.TestCase):
+    """The same CLI contract as OnlyCliTests, called in-process so that coverage sees `main`."""
+
+    def run_main(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = forward_schema.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_only_prints_that_tables_sql(self) -> None:
+        code, out, err = self.run_main("--schema", "long_forward", "--only", "shadow_entries")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, GENERATED.read_text(encoding="utf-8"))
+
+    def test_without_only_it_prints_the_whole_schema(self) -> None:
+        code, out, err = self.run_main("--schema", "long_forward")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, (REPO / "supabase" / "long_forward_schema.sql").read_text(encoding="utf-8"))
+
+    def test_an_unknown_table_is_exit_2_with_one_error_line(self) -> None:
+        code, out, err = self.run_main("--schema", "long_forward", "--only", "nope")
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertTrue(err.startswith("error: unknown table 'nope'"))
+
+    def test_an_unreadable_base_is_exit_1_with_one_error_line(self) -> None:
+        code, out, err = self.run_main("--schema", "lf", "--base", "/nonexistent/x.sql", "--only", "t")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertTrue(err.startswith("error: cannot read"))
 
 
 if __name__ == "__main__":
