@@ -4,6 +4,10 @@ The operator runs this on the VPS. It copies the source file line by line, force
 forward bot's settings (its own Supabase schema first of all), and blanks the three
 secrets that belong to the second account: the account owner types those by hand.
 
+`--mirror-live` builds the other kind of target: account 1's file as it is, so account 2
+runs account 1's settings (regime gate, payload, ledger, exits) with LONG where account 1
+trades SHORT. Only MIRROR_OVERRIDES, the two start timestamps and the three secrets change.
+
 No value read from the source is ever printed, logged or put in an error or in the
 report: only key names travel. The target is created exclusively with mode 0600.
 """
@@ -49,7 +53,20 @@ FORWARD_OVERRIDES: dict[str, str] = {
     "MAX_DAILY_DRAWDOWN_USDT": "1000000000",
     "MAX_CONSECUTIVE_LOSSES": "1000",
 }
+# --mirror-live: these keys are forced on top of a copy of account 1's file, and nothing else is.
+# Under ENTRY_REGIME_GATE=map the hourly regime picks the side (NAIK long, TURUN short) and
+# ENTRY_GATE_DIRECTION says which of the two may trade, so `long` makes LONG live in NAIK hours and
+# turns the SHORT of TURUN hours into shadow rows.
+MIRROR_OVERRIDES: dict[str, str] = {
+    "SUPABASE_SCHEMA": "long_forward",
+    "ENTRY_GATE_DIRECTION": "long",
+    # main.py refuses the regime gate with more than one symbol, and the live .env may list several.
+    "SYMBOLS": "BTC/USDT",
+    # Account 1's dashboard feed owns 3917; ai-perp-long-dashboard proxies this port.
+    "TELEMETRY_PORT": "3919",
+}
 CYCLE_KEY = "VOLUME_CYCLE_STARTED_AT"
+LEDGER_SINCE_KEY = "SETUP_LEDGER_SINCE"  # mirror mode only: account 2's ledger counts from its own start
 BLANKED_KEYS: tuple[str, ...] = ("BINGX_API_KEY", "BINGX_SECRET_KEY", "XAI_API_KEY")
 REQUIRED_SOURCE_KEY = "SUPABASE_URL"
 
@@ -157,16 +174,23 @@ def _write_exclusive(target: Path, text: str) -> None:
         raise ForwardEnvError(f"cannot write target: {exc.strerror or 'I/O error'}") from None
 
 
-def build_forward_env(source: Path, target: Path, cycle_start: str) -> BuildReport:
+def _forced_settings(cycle_start: str, mirror_live: bool) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Every key the target forces with its value, and the names of those that are set rather than blanked."""
+    overrides = MIRROR_OVERRIDES if mirror_live else FORWARD_OVERRIDES
+    starts = {CYCLE_KEY: cycle_start, **({LEDGER_SINCE_KEY: cycle_start} if mirror_live else {})}
+    return {**overrides, **starts, **{key: "" for key in BLANKED_KEYS}}, (*overrides, *starts)
+
+
+def build_forward_env(source: Path, target: Path, cycle_start: str, *, mirror_live: bool = False) -> BuildReport:
     source, target = Path(source), Path(target)
     _validate_cycle_start(cycle_start)
     _check_paths(source, target)
     source_text = _read_source(source)
     if not any(_key_of(line) == REQUIRED_SOURCE_KEY and _has_value(line) for line in _LINE_PATTERN.findall(source_text)):
         raise ForwardEnvError(f"source has no {REQUIRED_SOURCE_KEY}; is it the live bot's env file?")
-    forced = {**FORWARD_OVERRIDES, CYCLE_KEY: cycle_start, **{key: "" for key in BLANKED_KEYS}}
+    forced, set_keys = _forced_settings(cycle_start, mirror_live)
     _write_exclusive(target, _render(source_text, forced))
-    return BuildReport(set_keys=(*FORWARD_OVERRIDES, CYCLE_KEY), blanked_keys=BLANKED_KEYS)
+    return BuildReport(set_keys=set_keys, blanked_keys=BLANKED_KEYS)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,9 +200,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", required=True, type=Path, help="The live bot's .env (read only).")
     parser.add_argument("--target", required=True, type=Path, help="The new file to create (must not exist).")
     parser.add_argument("--cycle-start", required=True, help="Timezone-aware ISO-8601 start of the forward test.")
+    parser.add_argument(
+        "--mirror-live",
+        action="store_true",
+        help="Copy the source as it is and change only the mirror's keys: account 2 runs account 1's settings with LONG.",
+    )
     args = parser.parse_args(argv)
     try:
-        report = build_forward_env(args.source, args.target, args.cycle_start)
+        report = build_forward_env(args.source, args.target, args.cycle_start, mirror_live=args.mirror_live)
     except ForwardEnvError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
