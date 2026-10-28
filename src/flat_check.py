@@ -3,22 +3,26 @@
 Run it from the bot's directory. That directory's `.env`, read through `Settings` like the bot
 reads it, decides which BingX account and which Supabase schema are looked at:
 
-    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/flat_check.py
+    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/flat_check.py --expect-schema long_forward
 
-It asks the venue for the position of every symbol in SYMBOLS and reads the persisted open
+It asks the venue for the position rows of every symbol in SYMBOLS and reads the persisted open
 positions (`open_position_state`) from the schema that `.env` names. It prints `FLAT` and exits 0
 only when both are clear. Otherwise it prints one line per finding and exits 1:
 
-    OPEN venue BTC/USDT side=LONG size=0.01
+    OPEN venue BTC-USDT side=LONG size=0.01
     OPEN persisted BTC/USDT LONG status=open quantity=0.01
-    UNREADABLE ExchangeAPIError (venue position of BTC/USDT)
+    UNREADABLE VenueAnswerError (venue position of BTC/USDT)
 
-A source that cannot be read is never flat. Only exception class names are printed, never their
-text (a settings error carries the offending value, a store error the response body), and nothing
-is logged: no key, URL or setting value reaches an output. The context line on stderr names the
-symbols and the schema, so a run from the wrong directory shows at once. It places, cancels and
-closes nothing, and it does not look at pending orders: the position read is the authority the
-bot itself uses.
+A source that cannot be read is never flat. The venue answer is read strictly: it must hold a list of
+rows with a numeric `positionAmt`, and any nonzero amount counts whatever symbol the row names (the
+client's own reader maps a malformed answer to "no position"). `--expect-schema NAME` refuses to run
+unless `.env` names that schema, so a run from the wrong directory fails instead of reporting another
+account as flat.
+
+Only exception class names are printed, never their text (a settings error carries the offending value,
+a store error the response body), and nothing is logged. The context line on stderr names the symbols,
+the BingX env and the schema: no secret, and enough to see at once which directory was read. It places,
+cancels and closes nothing, and it does not look at pending orders: look at the venue app for those.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import contextlib
 import logging
 import sys
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Protocol
 
 from bot.config import Settings
@@ -39,6 +44,10 @@ _PERSISTED_PAGE = 50  # the engine reads at most this many; one row already mean
 
 class PositionRows(Protocol):
     async def open_position_rows(self) -> list[dict[str, Any]]: ...
+
+
+class VenueAnswerError(Exception):
+    """BingX answered, but not with position rows this check can read."""
 
 
 @dataclass(frozen=True)
@@ -76,11 +85,32 @@ def _unreadable(exc: Exception, what: str) -> str:
     return f"UNREADABLE {type(exc).__name__} ({what})"
 
 
-async def check_flat(settings: Any, client: Any, store: PositionRows) -> FlatReport:
-    """Check the venue position of every symbol and the persisted open positions.
+async def _venue_findings(client: Any, symbol: str) -> list[str]:
+    """The OPEN lines for one symbol, read strictly from the raw positions answer.
 
-    `client` needs `get_symbol_position_details(symbol)`, `store` needs `open_position_rows()`; `settings`
-    needs `symbols`. Every source is read even when another failed, so one run shows everything.
+    `client.get_symbol_position_details` is not used: it maps an answer without a list of rows, a row it
+    cannot parse and a row naming another symbol to "no position", and a flat check must never do that.
+    """
+    answer = await client.get_position_info(symbol)
+    rows = answer.get("data") if isinstance(answer, dict) else None
+    if not isinstance(rows, list):
+        raise VenueAnswerError("no list of position rows")
+    findings: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise VenueAnswerError("a position row is not an object")
+        amount = Decimal(str(row.get("positionAmt")))  # a missing or garbled amount raises InvalidOperation
+        if amount != 0:  # NaN is not equal to zero either
+            size = format(abs(amount).normalize(), "f")
+            findings.append(f"OPEN venue {row.get('symbol') or symbol} side={row.get('positionSide') or '?'} size={size}")
+    return findings
+
+
+async def check_flat(settings: Any, client: Any, store: PositionRows) -> FlatReport:
+    """Check the venue position rows of every symbol and the persisted open positions.
+
+    `client` needs `get_position_info(symbol)`, `store` needs `open_position_rows()`; `settings` needs
+    `symbols`. Every source is read even when another failed, so one run shows everything.
     """
     findings: list[str] = []
     symbols = tuple(settings.symbols)
@@ -88,12 +118,9 @@ async def check_flat(settings: Any, client: Any, store: PositionRows) -> FlatRep
         findings.append("UNREADABLE NoSymbols (SYMBOLS is empty, so no venue position was checked)")
     for symbol in symbols:
         try:
-            details = await client.get_symbol_position_details(symbol)
+            findings.extend(await _venue_findings(client, symbol))
         except Exception as exc:  # unreadable exposure must never look flat
             findings.append(_unreadable(exc, f"venue position of {symbol}"))
-            continue
-        if details.exchange_size > 0:
-            findings.append(f"OPEN venue {symbol} side={details.pos_side or '?'} size={details.exchange_size}")
     try:
         rows = await store.open_position_rows()
     except Exception as exc:
@@ -107,7 +134,7 @@ async def check_flat(settings: Any, client: Any, store: PositionRows) -> FlatRep
     return FlatReport(flat=not findings, lines=tuple(findings) or ("FLAT",))
 
 
-async def _run() -> int:
+async def _run(expected_schema: str | None) -> int:
     try:
         settings = Settings()
     except Exception as exc:  # the text of a settings error carries the offending value
@@ -118,6 +145,9 @@ async def _run() -> int:
         f"store schema {settings.supabase_schema}",
         file=sys.stderr,
     )
+    if expected_schema is not None and settings.supabase_schema != expected_schema:
+        print(f"UNREADABLE SchemaMismatch (store schema is not {expected_schema})")
+        return 1
     client = store = None
     try:
         store = SupabaseTradeStore(settings, logging.getLogger("flat_check"))
@@ -148,8 +178,13 @@ async def _run() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.parse_args(argv)  # takes no options; a stray argument is a usage error (exit 2)
-    return asyncio.run(_run())
+    parser.add_argument(
+        "--expect-schema",
+        metavar="NAME",
+        help="refuse to run unless .env names this Supabase schema (guards against the wrong directory)",
+    )
+    args = parser.parse_args(argv)
+    return asyncio.run(_run(args.expect_schema))
 
 
 if __name__ == "__main__":

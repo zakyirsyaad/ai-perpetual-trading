@@ -20,7 +20,9 @@ import httpx
 
 import flat_check
 from bot.config import Settings
-from bot.exchange.contracts import ExchangeAPIError, PositionDetails
+from build_forward_env import build_forward_env
+from tests.test_build_forward_env_mirror import CYCLE, LIVE_LIKE_SOURCE, STAND_IN_KEYS
+from bot.exchange.contracts import ExchangeAPIError
 from bot.storage.supabase_trade_store import SupabaseTradeStore
 
 REPO = Path(__file__).resolve().parents[1]
@@ -28,27 +30,37 @@ SCRIPT = REPO / "src" / "flat_check.py"
 CANARY = "x-test-canary-value-7"
 
 
-def position(symbol: str, size: float = 0.0, side: str | None = None) -> PositionDetails:
-    return PositionDetails(
-        symbol=symbol, exchange_size=size, base_quantity=size, avg_price=None, mark_price=None,
-        liquidation_price=None, pos_side=side, raw={},
-    )
+def venue_row(symbol: str, amount, side: str | None = "LONG") -> dict:
+    row = {"symbol": symbol.replace("/", "-"), "positionAmt": amount}
+    if side is not None:
+        row["positionSide"] = side
+    return row
 
 
 class FakeClient:
-    def __init__(self, sizes: dict | None = None, errors: dict | None = None, close_error: Exception | None = None) -> None:
-        self.sizes = sizes or {}  # symbol -> (size, side)
+    """Answers the raw positions call the way BingX does: rows of zeros when flat, the open row otherwise."""
+
+    def __init__(
+        self, sizes: dict | None = None, errors: dict | None = None, answers: dict | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self.sizes = sizes or {}  # symbol -> (size, side) of the one open row
         self.errors = errors or {}  # symbol -> exception to raise
+        self.answers = answers or {}  # symbol -> the whole answer verbatim, for malformed ones
         self.close_error = close_error
         self.calls: list[str] = []
         self.closed = False
 
-    async def get_symbol_position_details(self, symbol: str) -> PositionDetails:
+    async def get_position_info(self, symbol: str):
         self.calls.append(symbol)
         if symbol in self.errors:
             raise self.errors[symbol]
-        size, side = self.sizes.get(symbol, (0.0, None))
-        return position(symbol, size, side)
+        if symbol in self.answers:
+            return self.answers[symbol]
+        size, side = self.sizes.get(symbol, (0.0, "LONG"))
+        if not size:
+            return {"code": 0, "data": [venue_row(symbol, "0.0000", "LONG"), venue_row(symbol, "0.0000", "SHORT")]}
+        return {"code": 0, "data": [venue_row(symbol, str(size), side)]}
 
     async def close(self) -> None:
         self.closed = True
@@ -112,8 +124,8 @@ def persisted_row(**overrides) -> dict:
 
 
 class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
-    async def check(self, *, symbols=("BTC/USDT",), sizes=None, errors=None, rows=None, store_error=None):
-        client = FakeClient(sizes, errors)
+    async def check(self, *, symbols=("BTC/USDT",), sizes=None, errors=None, answers=None, rows=None, store_error=None):
+        client = FakeClient(sizes, errors, answers)
         positions = FakePositions(rows, store_error)
         report = await flat_check.check_flat(SimpleNamespace(symbols=symbols), client, positions)
         return report, client, positions
@@ -128,17 +140,17 @@ class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_open_venue_position_is_reported_with_side_and_size(self) -> None:
         report, _, _ = await self.check(sizes={"BTC/USDT": (0.01, "LONG")})
         self.assertFalse(report.flat)
-        self.assertEqual(report.lines, ("OPEN venue BTC/USDT side=LONG size=0.01",))
+        self.assertEqual(report.lines, ("OPEN venue BTC-USDT side=LONG size=0.01",))
 
     async def test_every_configured_symbol_is_checked(self) -> None:
         report, client, _ = await self.check(symbols=("BTC/USDT", "ETH/USDT"), sizes={"ETH/USDT": (0.5, "SHORT")})
         self.assertFalse(report.flat)
-        self.assertEqual(report.lines, ("OPEN venue ETH/USDT side=SHORT size=0.5",))
+        self.assertEqual(report.lines, ("OPEN venue ETH-USDT side=SHORT size=0.5",))
         self.assertEqual(client.calls, ["BTC/USDT", "ETH/USDT"])
 
     async def test_a_venue_position_without_a_side_still_counts(self) -> None:
         report, _, _ = await self.check(sizes={"BTC/USDT": (0.01, None)})
-        self.assertEqual(report.lines, ("OPEN venue BTC/USDT side=? size=0.01",))
+        self.assertEqual(report.lines, ("OPEN venue BTC-USDT side=? size=0.01",))
 
     async def test_a_persisted_position_counts_even_when_the_venue_is_flat(self) -> None:
         report, _, _ = await self.check(rows=[persisted_row()])
@@ -152,7 +164,7 @@ class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             report.lines,
             (
-                "OPEN venue BTC/USDT side=LONG size=0.01",
+                "OPEN venue BTC-USDT side=LONG size=0.01",
                 "OPEN persisted BTC/USDT LONG status=open quantity=0.01",
                 "OPEN persisted ETH/USDT LONG status=closing quantity=0.01",
             ),
@@ -181,7 +193,7 @@ class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
             report.lines,
             (
                 "UNREADABLE TimeoutError (venue position of BTC/USDT)",
-                "OPEN venue ETH/USDT side=SHORT size=0.5",
+                "OPEN venue ETH-USDT side=SHORT size=0.5",
                 "UNREADABLE ValueError (persisted open positions)",
             ),
         )
@@ -200,6 +212,50 @@ class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(report.lines), 1)
         self.assertTrue(report.lines[0].startswith("UNREADABLE NoSymbols"))
         self.assertEqual(client.calls, [])
+
+    async def test_an_answer_that_is_not_a_list_of_rows_is_unreadable_never_flat(self) -> None:
+        for answer in (
+            {"code": 0, "data": None}, {"code": 0}, {"code": 0, "data": {"positions": []}},
+            ["rows"], None, {"code": 0, "data": ["row"]},
+        ):
+            with self.subTest(answer=answer):
+                report, _, _ = await self.check(answers={"BTC/USDT": answer})
+                self.assertFalse(report.flat)
+                self.assertEqual(report.lines, ("UNREADABLE VenueAnswerError (venue position of BTC/USDT)",))
+
+    async def test_a_row_whose_amount_cannot_be_read_is_unreadable_never_flat(self) -> None:
+        for row in (
+            {"symbol": "BTC-USDT", "positionAmt": "abc"}, {"symbol": "BTC-USDT"}, {"symbol": "BTC-USDT", "positionAmt": None},
+        ):
+            with self.subTest(row=row):
+                report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [row]}})
+                self.assertFalse(report.flat)
+                self.assertEqual(report.lines, ("UNREADABLE InvalidOperation (venue position of BTC/USDT)",))
+
+    async def test_a_nonzero_amount_counts_whatever_symbol_the_row_names(self) -> None:
+        row = {"symbol": "BTCUSDT", "positionAmt": "0.01", "positionSide": "LONG"}
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [row]}})
+        self.assertEqual(report.lines, ("OPEN venue BTCUSDT side=LONG size=0.01",))
+
+    async def test_both_sides_of_a_hedge_position_are_reported(self) -> None:
+        data = [venue_row("BTC/USDT", "0.01", "LONG"), venue_row("BTC/USDT", "-0.02", "SHORT")]
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": data}})
+        self.assertEqual(
+            report.lines, ("OPEN venue BTC-USDT side=LONG size=0.01", "OPEN venue BTC-USDT side=SHORT size=0.02"),
+        )
+
+    async def test_amounts_are_compared_as_numbers_not_as_text(self) -> None:
+        for flat_amount in ("0.0000", "-0.0", "0E-8", "0", 0, 0.0):
+            with self.subTest(amount=flat_amount):
+                report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [venue_row("BTC/USDT", flat_amount)]}})
+                self.assertEqual(report.lines, ("FLAT",))
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [venue_row("BTC/USDT", "-0.5", "SHORT")]}})
+        self.assertEqual(report.lines, ("OPEN venue BTC-USDT side=SHORT size=0.5",))
+
+    async def test_an_amount_that_is_not_a_number_is_not_flat(self) -> None:
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [venue_row("BTC/USDT", "NaN")]}})
+        self.assertFalse(report.flat)
+        self.assertEqual(report.lines, ("OPEN venue BTC-USDT side=LONG size=NaN",))
 
 
 class PersistedPositionsTests(unittest.IsolatedAsyncioTestCase):
@@ -280,7 +336,7 @@ class MainTests(unittest.TestCase):
 
     def test_an_open_venue_position_exits_1(self) -> None:
         code, out, _, _, _, _ = self.run_main(client=FakeClient(sizes={"BTC/USDT": (0.01, "LONG")}))
-        self.assertEqual((code, out), (1, "OPEN venue BTC/USDT side=LONG size=0.01\n"))
+        self.assertEqual((code, out), (1, "OPEN venue BTC-USDT side=LONG size=0.01\n"))
 
     def test_a_persisted_position_exits_1(self) -> None:
         code, out, _, _, _, _ = self.run_main(http=FakeHTTP(payload=[persisted_row()]))
@@ -330,6 +386,102 @@ class MainTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             self.run_main(argv=("--bogus",))
         self.assertEqual(caught.exception.code, 2)
+
+    def test_expect_schema_passes_when_the_directorys_schema_is_the_expected_one(self) -> None:
+        code, out, _, _, _, _ = self.run_main(argv=("--expect-schema", "long_forward"))
+        self.assertEqual((code, out), (0, "FLAT\n"))
+
+    def test_expect_schema_refuses_another_schema_before_any_network_call(self) -> None:
+        code, out, err, client, http, built = self.run_main(
+            settings=bot_settings(supabase_schema="public"), argv=("--expect-schema", "long_forward"),
+        )
+        self.assertEqual((code, out), (1, "UNREADABLE SchemaMismatch (store schema is not long_forward)\n"))
+        self.assertIn("store schema public", err)
+        self.assertEqual((client.calls, http.gets), ([], []))
+        self.assertNotIn("client_kwargs", built)
+
+
+class RealClientEndToEndTests(unittest.TestCase):
+    """The real BingXFuturesClient and SupabaseTradeStore over a mock transport, run from a built mirror .env:
+    what the venue's raw answer does to the verdict, and that nothing but reads is ever sent."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        source = self.root / "live.env"
+        source.write_text("\n".join(LIVE_LIKE_SOURCE) + "\n", encoding="utf-8")
+        build_forward_env(source, self.root / ".env", CYCLE, mirror_live=True)
+        with (self.root / ".env").open("a", encoding="utf-8") as handle:  # the account owner's typing
+            handle.write("".join(f"{key}={value}\n" for key, value in STAND_IN_KEYS.items()))
+
+    def run_check(self, venue_answer, *, store_status: int = 200, store_rows: tuple = ()):
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(f"{request.method} {request.url.host}{request.url.path}")
+            if request.url.host.endswith("bingx.com"):
+                return httpx.Response(200, json=venue_answer)
+            return httpx.Response(store_status, json=list(store_rows))
+
+        real_init = httpx.AsyncClient.__init__
+
+        def with_transport(client, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            real_init(client, *args, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        previous = Path.cwd()
+        os.chdir(self.root)
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(httpx.AsyncClient, "__init__", with_transport), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = flat_check.main(["--expect-schema", "long_forward"])
+        finally:
+            os.chdir(previous)
+        return code, out.getvalue(), err.getvalue(), requests
+
+    def test_a_flat_account_is_flat_and_only_two_reads_were_made(self) -> None:
+        zero = {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.0000"}
+        code, out, err, requests = self.run_check({"code": 0, "data": [zero]})
+        self.assertEqual((code, out), (0, "FLAT\n"))
+        self.assertIn("store schema long_forward", err)
+        self.assertEqual(
+            requests,
+            ["GET open-api-vst.bingx.com/openApi/swap/v2/user/positions",
+             "GET x-test-project-4.example.test/rest/v1/open_position_state"],
+        )
+
+    def test_an_open_position_is_open(self) -> None:
+        row = {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.0100"}
+        code, out, _, _ = self.run_check({"code": 0, "data": [row]})
+        self.assertEqual((code, out), (1, "OPEN venue BTC-USDT side=LONG size=0.01\n"))
+
+    def test_answers_the_client_alone_would_read_as_no_position_are_not_flat(self) -> None:
+        for label, answer in {
+            "data null": {"code": 0, "data": None},
+            "no data": {"code": 0},
+            "rows wrapped in an object": {"code": 0, "data": {"positions": [{"symbol": "BTC-USDT", "positionAmt": "0.01"}]}},
+            "unreadable amount": {"code": 0, "data": [{"symbol": "BTC-USDT", "positionAmt": "abc"}]},
+        }.items():
+            with self.subTest(label):
+                code, out, _, _ = self.run_check(answer)
+                self.assertEqual(code, 1)
+                self.assertTrue(out.startswith("UNREADABLE "), out)
+        other_symbol = {"symbol": "BTCUSDT", "positionSide": "LONG", "positionAmt": "0.01"}
+        code, out, _, _ = self.run_check({"code": 0, "data": [other_symbol]})
+        self.assertEqual((code, out), (1, "OPEN venue BTCUSDT side=LONG size=0.01\n"))
+
+    def test_a_venue_error_a_failing_store_and_a_closing_row_are_not_flat(self) -> None:
+        code, out, _, _ = self.run_check({"code": 100413, "msg": "Incorrect apiKey"})
+        self.assertEqual((code, out), (1, "UNREADABLE ExchangeAPIError (venue position of BTC/USDT)\n"))
+        zero = {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.0000"}
+        code, out, _, _ = self.run_check({"code": 0, "data": [zero]}, store_status=500)
+        self.assertEqual((code, out), (1, "UNREADABLE RuntimeError (persisted open positions)\n"))
+        closing = {"symbol": "BTC/USDT", "direction": "LONG", "status": "closing", "quantity": 0.01}
+        code, out, _, _ = self.run_check({"code": 0, "data": [zero]}, store_rows=(closing,))
+        self.assertEqual((code, out), (1, "OPEN persisted BTC/USDT LONG status=closing quantity=0.01\n"))
 
 
 class ScriptTests(unittest.TestCase):
