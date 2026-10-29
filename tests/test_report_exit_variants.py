@@ -27,6 +27,7 @@ import httpx
 from pydantic import BaseModel, ValidationError, model_validator
 
 import report_exit_variants as report
+from bot.storage.supabase_trade_store import parse_timestamp
 from research.exit_variants import study
 from research.exit_variants.walker import SHORT, Cols
 from tests.exit_variants_helpers import (
@@ -113,7 +114,8 @@ class _FakeStore:
 
     async def open_decision_rows_between(self, start: datetime, end: datetime) -> list:
         self.decision_windows.append((start, end))
-        return list(self._decisions)
+        # like the real query: created_at >= start and created_at < end
+        return [row for row in self._decisions if start <= parse_timestamp(row["created_at"]) < end]
 
     async def close(self) -> None:
         self.closed = True
@@ -179,6 +181,7 @@ class LoadKlinesTests(_ReportCase):
         no_bars = 'no 1m bars under "k1"'
         shape = "not [open, high, low, close]"
         prices = "not four positive prices"
+        bracket = "do not bracket its open and close"
         cases = (
             ("not json", "{", "is not valid JSON"),
             ("not an object", [1, 2], no_bars),
@@ -193,6 +196,19 @@ class LoadKlinesTests(_ReportCase):
             ("short row", {"k1": {"60000": [1, 2, 0.5]}}, prices),
             ("zero price", {"k1": {"60000": [1, 2, 0, 1]}}, prices),
             ("infinite", '{"k1": {"60000": [1, Infinity, 0.5, 1]}}', prices),
+            # what research.pine_gate.checks' reader of the same file refuses too
+            ("numeric text prices", {"k1": {"60000": ["1", "2", "0.5", "1.5"]}}, shape),
+            ("bool prices", {"k1": {"60000": [True, True, True, True]}}, shape),
+            ("a padded key", {"k1": {" 60000": [1, 2, 0.5, 1.5]}}, shape),
+            ("a signed key", {"k1": {"+60000": [1, 2, 0.5, 1.5]}}, shape),
+            ("a price too large for a float", '{"k1": {"60000": [1, ' + "9" * 400 + ", 0.5, 1]}}", shape),
+            ("high below low", {"k1": {"60000": [100, 90, 110, 100]}}, bracket),
+            ("close above the high", {"k1": {"60000": [100, 101, 99, 102]}}, bracket),
+            (
+                "two keys for one minute",
+                {"k1": {"60000": [1, 2, 0.5, 1.5], "060000": [1, 2, 0.5, 1.5]}},
+                "two bars for the same minute",
+            ),
         )
         for label, payload, reason in cases:
             with self.subTest(label), self.assertRaises(report.KlinesError) as raised:
@@ -306,6 +322,22 @@ class ParserTests(unittest.TestCase):
         args = report.build_parser().parse_args(["--since", "2026-10-26T00:00:00+07:00", "--until", "2026-10-29T00:00:00+07:00"])
         self.assertEqual((args.since, args.until), (SINCE, UNTIL))
 
+    def test_the_spellings_python_3_10_alone_would_refuse_are_read(self) -> None:
+        # the VPS runs 3.10 and CI 3.11: the same command line has to mean the same time on both
+        half = timedelta(milliseconds=500)
+        for text, expected in (
+            ("2026-10-26T00:00:00+0700", SINCE),  # what `date +%z` prints
+            ("2026-10-25T17:00:00z", SINCE),
+            ("2026-10-26T00:00:00.5+07:00", SINCE + half),
+            ("2026-10-26T00:00:00.5+0700", SINCE + half),
+            ("2026-10-25T17:00:00.1234567Z", SINCE + timedelta(microseconds=123456)),
+        ):
+            with self.subTest(text):
+                self.assertEqual(report._parse_moment(text), expected)
+
+    def test_a_time_without_an_offset_stays_naive_so_the_window_check_can_refuse_it(self) -> None:
+        self.assertIsNone(report._parse_moment("2026-10-26T00:00:00").tzinfo)
+
     def test_the_kline_cache_defaults_to_the_replay_folder(self) -> None:
         args = report.build_parser().parse_args(["--since", SINCE.isoformat()])
         self.assertEqual(args.klines, report.DEFAULT_KLINES)
@@ -371,6 +403,29 @@ class UsageAndFailureTests(_ReportCase):
         self.assertIn("denied", err)
         self.assertTrue(store.closed)
 
+    def test_the_response_body_survives_the_long_request_url_in_the_store_message(self) -> None:
+        # the store puts httpx's text, which holds the whole request URL, before the PostgREST body
+        url = "https://example.supabase.co/rest/v1/ai_decisions?select=" + "x" * 500
+        failure = RuntimeError(
+            f"Supabase request failed for table ai_decisions: Client error '400 Bad Request' for url '{url}'\n"
+            "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400 "
+            'body={"code":"PGRST100","message":"failed to parse select"}'
+        )
+        self.assertGreater(str(failure).index("body="), 600)  # past the old cut-off
+        path = write_klines(self.folder, cols_for(SHORT, NOTHING_HAPPENS))
+        code, _, err = self.run_report(["--since", SINCE.isoformat(), "--klines", str(path)], _FakeStore([], fail=failure))
+        self.assertEqual(code, 1)
+        self.one_line_error(err)
+        self.assertIn('"message":"failed to parse select"', err)
+
+    def test_a_timeout_names_its_class_because_it_has_no_message(self) -> None:
+        path = write_klines(self.folder, cols_for(SHORT, NOTHING_HAPPENS))
+        store = _FakeStore([], fail=httpx.ReadTimeout(""))
+        code, out, err = self.run_report(["--since", SINCE.isoformat(), "--klines", str(path)], store)
+        self.assertEqual((code, out), (1, ""))
+        self.one_line_error(err)
+        self.assertIn("ReadTimeout", err)
+
     def test_a_network_error_is_an_expected_failure_too(self) -> None:
         path = write_klines(self.folder, cols_for(SHORT, NOTHING_HAPPENS))
         store = _FakeStore([], fail=httpx.ConnectError("name resolution failed"))
@@ -429,8 +484,25 @@ class ReportContentTests(_ReportCase):
         self.assertEqual(store.trade_since, [SINCE])
         self.assertEqual(
             store.decision_windows,
-            [(OPENED - timedelta(minutes=15), OPENED + timedelta(hours=5, seconds=1))],
+            # the end reaches the matcher's five seconds of clock skew past the last open, plus the second of the open
+            [(OPENED - timedelta(minutes=15), OPENED + timedelta(hours=5, seconds=6))],
         )
+
+    def test_a_decision_stamped_seconds_after_the_newest_open_is_fetched_and_matched(self) -> None:
+        # the database clock ahead of the bot's: the matcher takes such a decision, so the read has to reach it
+        late = {"created_at": (OPENED + timedelta(seconds=3)).isoformat()}
+        code, out, err, _ = self.run_scenario([trade_at(OPENED, decision=late)])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("dipakai: 1 | dilewati: 0", out)
+
+    def test_a_since_later_than_the_registered_start_is_warned_about(self) -> None:
+        later = ("--since", "2026-10-30T00:00:00+07:00", *LATER_UNTIL)
+        _, out, _, _ = self.run_scenario([trade_at(FORWARD_OPEN + timedelta(days=1))], extra_argv=later)
+        self.assertIn("PERINGATAN: --since 2026-10-30T00:00+07:00 lebih baru dari 2026-10-29T00:00+07:00", out)
+
+    def test_a_since_at_or_before_the_registered_start_is_not(self) -> None:
+        _, out, _, _ = self.run_scenario([trade_at(FORWARD_OPEN)], extra_argv=LATER_UNTIL)
+        self.assertNotIn("PERINGATAN: --since", out)
 
     def test_the_primary_row_shows_the_paired_difference_of_one_trade(self) -> None:
         scenario = [trade_at(OPENED)]

@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -66,8 +67,10 @@ _DECISION_COLUMNS = (
     "created_at,symbol,action,confidence,"
     "payload_json->decision->>stop_loss_pct,payload_json->decision->>take_profit_pct"
 )
-_ERROR_CHARS = 600  # an error line is one line and not a page
-_DECISION_END_SLACK = timedelta(seconds=1)  # the window is half open, and a decision may carry the second of the open
+_ERROR_CHARS = 2000  # an error line is one line and not a page; the store's message carries the request URL before the body
+# The window is half open, and the matcher takes a decision up to DECISION_CLOCK_SKEW after the open, so the fetch must
+# reach that far (plus the second of the open itself) or the newest trade of a window never sees such a decision.
+_DECISION_END_SLACK = study.DECISION_CLOCK_SKEW + timedelta(seconds=1)
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _SKIP_TEXT = {
@@ -94,16 +97,25 @@ class KlinesError(ValueError):
 
 
 def _bar(path: Path, key: str, value: Any) -> tuple[int, float, float, float]:
+    """One cache entry as (open ms, open, high, low). The same rules as research.pine_gate.checks' reader of this file:
+    digits for a key, plain numbers (no text, no bool) for prices, and a high and low that bracket the open and close."""
     try:
         if not isinstance(value, list):  # a string such as "1234" would otherwise iterate into four "prices"
             raise TypeError("a bar is a list")
+        if not (key.isascii() and key.isdigit()):  # int() alone would take " 60000", "+60000" and "6_0000"
+            raise ValueError("a bar key is the open time in milliseconds")
         open_ms = int(key)
+        if any(isinstance(price, bool) or not isinstance(price, (int, float)) for price in value):
+            raise TypeError("a price is a number")
         prices = [float(price) for price in value]
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise KlinesError(f"the kline cache {path} has a bar that is not [open, high, low, close]: {key!r}") from exc
     if len(prices) != 4 or not all(math.isfinite(price) and price > 0 for price in prices):
         raise KlinesError(f"the kline cache {path} has a bar that is not four positive prices: {key!r}")
-    return open_ms, prices[0], prices[1], prices[2]
+    open_, high, low, close = prices
+    if high < max(open_, close) or low > min(open_, close):
+        raise KlinesError(f"the kline cache {path} has a bar whose high and low do not bracket its open and close: {key!r}")
+    return open_ms, open_, high, low
 
 
 def load_klines(path: Path) -> Cols:
@@ -118,6 +130,8 @@ def load_klines(path: Path) -> Cols:
     if not isinstance(bars, dict) or not bars:
         raise KlinesError(f'the kline cache {path} has no 1m bars under "k1"')
     rows = sorted(_bar(path, key, value) for key, value in bars.items())
+    if len({row[0] for row in rows}) != len(rows):  # two spellings of one minute ("60000" and "060000")
+        raise KlinesError(f"the kline cache {path} has two bars for the same minute")
     return Cols([row[0] for row in rows], [row[1] for row in rows], [row[2] for row in rows], [row[3] for row in rows])
 
 
@@ -325,7 +339,7 @@ def render_candidate(candidate: study.Candidate, verdict: study.Verdict) -> str:
     return "\n".join(lines)
 
 
-def render_rule(result: study.Study) -> str:
+def render_rule(result: study.Study, since: Optional[datetime] = None) -> str:
     forward = study.forward_subset(result.simulated)
     ratio = study.calibration(forward).ratio
     lines = [
@@ -336,6 +350,12 @@ def render_rule(result: study.Study) -> str:
         f"{_wib(study.FORWARD_FROM)}, setelah varian ditetapkan; posisi sebelumnya ikut memilih angka varian, jadi hanya "
         "deskriptif)",
     ]
+    if since is not None and since > study.FORWARD_FROM:  # the sample would silently be a subset of the registered one
+        lines.append(
+            f"PERINGATAN: --since {_wib(since)} lebih baru dari {_wib(study.FORWARD_FROM)}: posisi yang ditutup sebelum "
+            "--since tidak dibaca, jadi sampel vonis ini lebih kecil dari yang didaftarkan. Baca vonis dengan --since "
+            "tidak lebih baru dari itu."
+        )
     for candidate in (study.ALL_POSITIONS, study.CALM_POSITIONS):
         pool = forward if candidate is study.ALL_POSITIONS else study.calm_subset(forward)
         summary = study.summarize(pool, study.PRIMARY_VARIANT, study.DECISION_CONVENTION)
@@ -360,7 +380,7 @@ def render_report(
     for title, pick in _SUBSETS:
         pool = list(result.simulated) if pick is None else pick(result.simulated)
         parts += [render_block(title, pool, convention) for convention in study.CONVENTIONS]
-    parts += [render_rule(result), _CLOSING]
+    parts += [render_rule(result, since), _CLOSING]
     return "\n\n".join(parts)
 
 
@@ -374,10 +394,20 @@ def settings_problem(exc: ValidationError) -> str:
     return "invalid settings in .env or the environment (" + "; ".join(parts) + ")"
 
 
+_ISO_FRACTION = re.compile(r"\.(\d+)")
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+
 def _parse_moment(text: str) -> datetime:
-    """An ISO-8601 time; a trailing `Z` means UTC. A time without an offset stays naive so `execute` can refuse it."""
+    """An ISO-8601 time; a trailing `Z` means UTC. A time without an offset stays naive so `execute` can refuse it.
+
+    Python 3.10 (the VPS) reads fewer spellings than 3.11 (CI), so the text is normalised first: a lower-case `z`, a
+    compact offset such as `+0700` (what ``date +%z`` prints) and a fraction of any length become the forms 3.10 reads."""
+    spelled = re.sub(r"[zZ]$", "+00:00", text.strip())
+    spelled = _COMPACT_OFFSET.sub(r"\1\2:\3", spelled)
+    spelled = _ISO_FRACTION.sub(lambda match: "." + (match.group(1) + "000000")[:6], spelled, count=1)
     try:
-        return datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+        return datetime.fromisoformat(spelled)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"not an ISO-8601 time: {text!r}") from exc
 
@@ -403,6 +433,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _error(message: str) -> None:
     print(f"error: {' '.join(str(message).split())[:_ERROR_CHARS]}", file=sys.stderr)
+
+
+def _describe(exc: Exception) -> str:
+    """The text of ``exc`` for the error line. httpx's timeout errors carry none, so the class name stands in."""
+    return str(exc).strip() or type(exc).__name__
 
 
 async def _read(
@@ -450,7 +485,7 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
         result = study.run_study(trades, decisions, cols, rules)
         text = render_report(result, rules, settings, since, until, unreadable)
     except (ValueError, RuntimeError, OSError, httpx.HTTPError) as exc:
-        _error(str(exc))
+        _error(_describe(exc))
         return 1
     print(text)
     return 0

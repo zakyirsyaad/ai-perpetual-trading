@@ -460,9 +460,12 @@ def _covers(cols: Cols, start: int, limit: int) -> bool:
     """Whether the cache holds every minute from the entry bar to the time-exit bar, ``limit`` bars on.
 
     The whole window is required, not just the bars up to the exit this walk happens to take: keeping the trades whose
-    walk ends inside a cache that stops short would keep the early exits and drop the long holds."""
+    walk ends inside a cache that stops short would keep the early exits and drop the long holds. Every step must be
+    exactly one minute, as the walk itself requires: two ends a full window apart do not show a duplicate bar plus a hole."""
     end = start + limit
-    return end < len(cols.open_ms) and cols.open_ms[end] - cols.open_ms[start] == limit * INTERVAL_1M
+    return end < len(cols.open_ms) and all(
+        cols.open_ms[i + 1] - cols.open_ms[i] == INTERVAL_1M for i in range(start, end)
+    )
 
 
 def _must_walk(label: str, cols: Cols, start: int, args: tuple, rule: ExitRule) -> Outcome:

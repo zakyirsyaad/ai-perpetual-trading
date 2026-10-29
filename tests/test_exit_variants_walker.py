@@ -128,6 +128,8 @@ class PriceNetTests(_SideCase):
             price_for_net(E, self.side, N, FEE_PCT, math.nan)
         with self.assertRaises(ValueError):  # a loss so large that the exit price would be zero or below
             price_for_net(E, self.side, N, FEE_PCT, -self.side * 1e9)
+        with self.assertRaises(ValueError):  # not a number at all: ValueError like the other refusals, not TypeError
+            price_for_net(E, self.side, N, FEE_PCT, None)  # type: ignore[arg-type]
 
     def test_the_target_price_is_the_backtests_take_profit_level(self) -> None:
         rules: Any = SimpleNamespace(fee_perkiraan_persen=FEE_PCT, tp_net_usdt=LIVE_FLOOR)  # all the function reads
@@ -329,6 +331,17 @@ class InputCheckTests(unittest.TestCase):
             dict(entry_idx=12),
             dict(rule=ExitRule("x", limit_min=0)),
             dict(rule=ExitRule("x", tp_net=0.0)),
+            # a bool is never a number or a side, a side is a whole number, and none of these may escape as another type
+            # of error (the report catches ValueError only): the same rules as bot.strategy.modes.checks
+            dict(side=1.0),
+            dict(side=True),
+            dict(entry_fill=True),
+            dict(entry_fill=None),
+            dict(sl_pct="0.3"),
+            dict(notional=10**400),
+            dict(entry_idx=True),
+            dict(entry_idx=1.0),
+            dict(rule=ExitRule("x", limit_min=True)),
         )
         for overrides in bad:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
@@ -503,6 +516,9 @@ class SettleTests(_SideCase):
             ("fee", (E, self.side, outcome, 0, N, -0.1, COSTS)),
             ("slippage", (E, self.side, outcome, 0, N, FEE_PCT, Costs(-1.0, 0.0, 0.0))),
             ("raw price", (E, self.side, Outcome(TP, 1, math.nan, False, 0.0), 0, N, FEE_PCT, COSTS)),
+            ("side as a float", (E, 1.0, outcome, 0, N, FEE_PCT, COSTS)),
+            ("entry as text", ("100", self.side, outcome, 0, N, FEE_PCT, COSTS)),
+            ("raw price missing", (E, self.side, Outcome(TP, 1, None, False, 0.0), 0, N, FEE_PCT, COSTS)),
         ):
             with self.subTest(label), self.assertRaises(ValueError):
                 settle(*args)

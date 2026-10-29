@@ -512,6 +512,14 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(sims, [])
         self.assertEqual([s.code for s in skipped], [study.SKIP_CANDLES])
 
+    def test_a_duplicate_bar_plus_a_hole_inside_the_window_skips_the_trade_instead_of_failing_the_run(self) -> None:
+        # the two ends of the window are still a full window apart, but minute 30 is missing and minute 29 is there twice
+        cols = cols_for(SHORT, [FLAT] + [(2.0, 3.0, 1.0)] * 63)
+        open_ms = list(cols.open_ms)
+        open_ms[30] = open_ms[29]
+        sims, skipped = study.simulate([position()], Cols(open_ms, cols.open, cols.high, cols.low), RULES)
+        self.assertEqual((sims, [s.code for s in skipped]), ([], [study.SKIP_CANDLES]))
+
     def test_a_variant_that_runs_out_of_bars_where_the_live_walk_did_not_is_a_bug_not_a_skip(self) -> None:
         # a variant only adds exits, so it can never need more bars than the live walk; if it does, say so loudly
         calls = []

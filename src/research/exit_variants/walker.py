@@ -33,7 +33,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Mapping, NamedTuple, Optional, Sequence
 
-from bot.strategy.modes.checks import LONG, SHORT
+from bot.strategy.modes.checks import (
+    LONG,
+    SHORT,
+    check_side,
+    is_finite,
+    is_whole,
+    require_not_negative,
+    require_positive,
+)
 from research.mode_backtest.simulate import reaches_sl, reaches_tp
 from research.pine_gate.features import INTERVAL_1M
 
@@ -125,32 +133,17 @@ class Money(NamedTuple):
     hold_min: int
 
 
-def _require_positive(name: str, value: float) -> None:
-    if not (math.isfinite(value) and value > 0):
-        raise ValueError(f"{name} must be a finite number above 0, got {value!r}")
-
-
-def _require_not_negative(name: str, value: float) -> None:
-    if not (math.isfinite(value) and value >= 0):
-        raise ValueError(f"{name} must be a finite number of at least 0, got {value!r}")
-
-
-def _require_side(side: int) -> None:
-    if side not in (LONG, SHORT):
-        raise ValueError(f"side must be LONG ({LONG}) or SHORT ({SHORT}), got {side!r}")
-
-
 def price_for_net(entry: float, side: int, notional: float, fee_pct: float, net: float) -> float:
     """The price at which the bot's net estimate (gross minus ``fee_pct`` percent of both notionals) equals ``net``.
 
     With ``r = fee_pct / 100`` and ``q = notional / entry``: a LONG is ``(entry (1 + r) + net / q) / (1 - r)`` and a
     SHORT ``(entry (1 - r) - net / q) / (1 + r)``; the inverse of ``net_for_price``. Raises ``ValueError`` for a
     price that is not above 0 (a SHORT target too large for the notional)."""
-    _require_side(side)
-    _require_positive("entry", entry)
-    _require_positive("notional", notional)
-    _require_not_negative("fee_pct", fee_pct)
-    if not math.isfinite(net):
+    check_side(side)
+    require_positive("entry", entry)
+    require_positive("notional", notional)
+    require_not_negative("fee_pct", fee_pct)
+    if not is_finite(net):
         raise ValueError(f"net must be a finite number, got {net!r}")
     rate, qty = fee_pct / _PERCENT, notional / entry
     if side == LONG:
@@ -201,16 +194,16 @@ def _check_walk(
     fee_pct: float,
     rule: ExitRule,
 ) -> None:
-    _require_side(side)
-    _require_positive("entry_fill", entry_fill)
-    _require_positive("sl_pct", sl_pct)
-    _require_positive("notional", notional)
-    _require_not_negative("fee_pct", fee_pct)
-    _require_positive("tp_net", rule.tp_net)
-    _require_not_negative("trail_dist", rule.trail_dist)
-    if not isinstance(entry_idx, int) or not 0 <= entry_idx < len(cols.open_ms):
+    check_side(side)
+    require_positive("entry_fill", entry_fill)
+    require_positive("sl_pct", sl_pct)
+    require_positive("notional", notional)
+    require_not_negative("fee_pct", fee_pct)
+    require_positive("tp_net", rule.tp_net)
+    require_not_negative("trail_dist", rule.trail_dist)
+    if not is_whole(entry_idx) or not 0 <= entry_idx < len(cols.open_ms):
         raise ValueError(f"entry_idx must be a bar index from 0 to {len(cols.open_ms) - 1}, got {entry_idx!r}")
-    if not isinstance(rule.limit_min, int) or rule.limit_min < 1:
+    if not is_whole(rule.limit_min) or rule.limit_min < 1:
         raise ValueError(f"limit_min must be a whole number of minutes of at least 1, got {rule.limit_min!r}")
 
 
@@ -286,13 +279,13 @@ def settle(
     ``costs.exit_market_bps`` for every other exit, plus ``costs.lock_extra_bps`` for a lock exit; ``qty`` is
     ``notional / entry_fill``, the fee ``fee_pct`` percent of both legs and the net the gross minus that fee.
     Raises ``ValueError`` for numbers that cannot give an answer."""
-    _require_side(side)
-    _require_positive("entry_fill", entry_fill)
-    _require_positive("raw exit price", outcome.raw_price)
-    _require_positive("notional", notional)
-    _require_not_negative("fee_pct", fee_pct)
+    check_side(side)
+    require_positive("entry_fill", entry_fill)
+    require_positive("raw exit price", outcome.raw_price)
+    require_positive("notional", notional)
+    require_not_negative("fee_pct", fee_pct)
     for name, slippage in costs._asdict().items():
-        _require_not_negative(name, slippage)
+        require_not_negative(name, slippage)
     bps = costs.tp_bps if outcome.reason == TP else costs.exit_market_bps
     if outcome.reason == LOCK:
         bps += costs.lock_extra_bps

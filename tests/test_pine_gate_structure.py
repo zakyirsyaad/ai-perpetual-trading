@@ -218,6 +218,17 @@ def _research_offenders(trees):
     return offenders
 
 
+def _importers_of_a_research_script(trees):
+    """``path: name`` for each live source, other than the exempt scripts themselves, that imports one of them.
+
+    The exemption is for running the script, not for reaching research through it: a bot module that imported the
+    script would load ``research`` in the live process while every check of direct imports still passed."""
+    scripts = {path.stem for path in RESEARCH_IMPORTERS}
+    return [f"{path.relative_to(SRC).as_posix()}: {name}"
+            for path, tree in trees.items() if path not in RESEARCH_IMPORTERS
+            for name in _imports(tree) if name.split(".")[0] in scripts]
+
+
 class IsolationTests(unittest.TestCase):
     """The bot never imports research; research never touches private venue code (E8)."""
 
@@ -251,6 +262,21 @@ class IsolationTests(unittest.TestCase):
                 self.assertNotEqual(_research_offenders({script: ast.parse(source)}), [])
         self.assertEqual(_research_offenders({script: ast.parse(
             "from research.exit_variants import study\nfrom research.exit_variants.walker import Cols\n")}), [])
+
+    def test_no_live_source_imports_a_script_that_is_allowed_to_import_research(self):
+        # the exemption must not become a back door into the live process
+        self.assertEqual(_importers_of_a_research_script({p: _tree(p) for p in _live_sources()}), [])
+
+    def test_the_back_door_guard_sees_an_import_of_the_exempt_script(self):
+        (script,) = RESEARCH_IMPORTERS
+        engine = BOT / "core" / "trade_engine.py"
+        for source in ("import report_exit_variants\n",
+                       "from report_exit_variants import load_klines\n",
+                       "import importlib\nimportlib.import_module('report_exit_variants')\n"):
+            with self.subTest(source=source):
+                offenders = _importers_of_a_research_script({script: ast.parse(source), engine: ast.parse(source)})
+                self.assertEqual({offender.split(":")[0] for offender in offenders}, {"bot/core/trade_engine.py"})
+        self.assertEqual(_importers_of_a_research_script({engine: ast.parse("import json\n")}), [])
 
     def test_the_guard_sees_dynamic_imports(self):
         source = ("import importlib\n"
