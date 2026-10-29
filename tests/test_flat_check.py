@@ -232,6 +232,20 @@ class CheckFlatTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(report.flat)
                 self.assertEqual(report.lines, ("UNREADABLE InvalidOperation (venue position of BTC/USDT)",))
 
+    async def test_an_empty_list_of_rows_is_flat(self) -> None:
+        # the answer tests/test_bingx_client.py reads as "no position": the gate must not turn it into UNREADABLE
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": []}})
+        self.assertEqual((report.flat, report.lines), (True, ("FLAT",)))
+
+    async def test_an_unreadable_row_does_not_hide_the_open_position_beside_it(self) -> None:
+        data = [venue_row("BTC/USDT", "0.0100", "LONG"), venue_row("BTC/USDT", "n/a", "SHORT")]
+        report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": data}})
+        self.assertFalse(report.flat)
+        self.assertEqual(
+            report.lines,
+            ("OPEN venue BTC-USDT side=LONG size=0.01", "UNREADABLE InvalidOperation (venue position of BTC/USDT)"),
+        )
+
     async def test_a_nonzero_amount_counts_whatever_symbol_the_row_names(self) -> None:
         row = {"symbol": "BTCUSDT", "positionAmt": "0.01", "positionSide": "LONG"}
         report, _, _ = await self.check(answers={"BTC/USDT": {"code": 0, "data": [row]}})
@@ -452,6 +466,10 @@ class RealClientEndToEndTests(unittest.TestCase):
             ["GET open-api-vst.bingx.com/openApi/swap/v2/user/positions",
              "GET x-test-project-4.example.test/rest/v1/open_position_state"],
         )
+
+    def test_an_empty_list_of_rows_is_flat_through_the_real_client_too(self) -> None:
+        code, out, _, _ = self.run_check({"code": 0, "data": []})
+        self.assertEqual((code, out), (0, "FLAT\n"))
 
     def test_an_open_position_is_open(self) -> None:
         row = {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.0100"}

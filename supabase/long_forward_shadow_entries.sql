@@ -1,5 +1,5 @@
 -- Generated from supabase/schema.sql by src/forward_schema.py (--only shadow_entries); do not edit by hand.
--- Adds the shadow_entries table to the existing 'long_forward' schema. The generator checked that every create and add column in it is `if not exists`.
+-- Adds the shadow_entries table to the existing 'long_forward' schema. The generator refused any table or index creation, or first add column, without `if not exists`; other statements are copied as written, so check them before running the file twice.
 
 -- Hypothetical entries the live AI did not take, scored later against 1m candles.
 -- `source` is shadow_side (a side the regime map does not allow) or ledger_block

@@ -163,6 +163,24 @@ src/bot/ unchanged: 11 files differ from origin/main, plus this document
 
 The first full run, before the review fixes, was `Ran 3096 tests ... OK`, coverage 92%.
 
+## Post-review fixes (code review of 29 Oct 2026)
+
+A second review of this pull request (ten angles, one verifier vote per finding, a sweep) found the items below. Each is fixed in the working tree, with a test where code is involved; the new tests were also run against the source of `be853e3` (6 failures and 14 errors there, mostly the whitespace cases of the idempotency guard, the header wording, the comment and multi-line secret cases of the builder, and the unreadable row of `flat_check`; the empty-list case and the refusal cases are characterization tests that already held).
+
+| Finding | Fix |
+|---|---|
+| `_render` copied comment lines verbatim, so a commented-out old key (`# BINGX_API_KEY=old`) or the tail of a multi-line secret survived in the "blanked" `.env`; `_verify_readback` checks only the forced keys | comment lines that assign a blanked key are left out and counted (the CLI says how many, never what they held); a blanked key whose value spans several lines is refused by key name. Both modes |
+| The rollback put the interactive `crontab -e` in the middle of a block, ran `mv .env ...` on a line of its own after the `cd` (from account 1's directory it renames the live bot's `.env`), and a literal `<STAMP>` half-executed (`.env` moved aside, the restore failed) | the `mv` is chained to the `cd`; the restore is moved first so a literal `<STAMP>` stops the chain before `.env` is touched; `crontab -e` is last |
+| In `flat_check`, an unreadable `positionAmt` on one row raised out of the loop and hid the OPEN line of the row beside it (the verdict was still not flat) | one UNREADABLE line per bad row while the readable rows still print; a test pins it, and another pins `{"code": 0, "data": []}` as FLAT (no committed test fed `check_flat` that answer before) |
+| `_NOT_RERUNNABLE` refused `if not exists` after two spaces or a newline plus indent (10 of 29 spellings tested); the generated header said every create and add column had been checked, which it had not (create policy/trigger, `alter table only` and a comma list of add column pass unchecked) | the lookahead refuses a space too; the header says what is refused (table or index creation, or the first add column, without `if not exists`) and that other statements are copied as written; `supabase/long_forward_shadow_entries.sql` is regenerated (line 2 only) |
+| Section 7 had no memory or swap preflight | a Preconditions bullet: `free -m`, the live bot's resident size, `available` at least twice that, swap not growing; the `pip install` runs under `nice` |
+| Step 4's parity checks compare files, not the running process, and the rollback said "Nothing else changed" after a `pip install` | step 4 also compares the last move of the live checkout's HEAD with the last "trade engine started" line and saves a `pip freeze` before the install; the rollback restores from it |
+| The CLAUDE.md `flat_check` line left out `--expect-schema`, so a run from the wrong directory prints FLAT for another account | the line shows the flag and says why |
+
+Verification of the working tree, Python 3.10.20, the same commands as above: `compileall` passed; `Ran 3143 tests in 169.3s OK`; line coverage 92 % (17,719 statements, 1,377 missed; `flat_check.py` and `forward_schema.py` 100 %, `build_forward_env.py` 96 %); `git diff --check` clean; `src/bot` unchanged.
+
+Confirmed by the review and left as they are (design choices, or past the review's 15-finding cap): `--only` and its SQL splitter could be replaced by running the whole idempotent `long_forward_schema.sql` again; `flat_check` reads the store through private attributes; the renderer is line based with a python-dotenv read-back, so a forced key repeated inside another key's multi-line quoted value is still dropped silently; the refusal message for reserved schema names lists only `public`, `information_schema` and `pg_`, and the denylist misses `_realtime`, `_analytics`, `_supavisor` and `pgtle`; the runbook's ground rule "prints key names, never values" predates section 7's non-secret prints; "SL+" is defined only in the pull request that adds the exit-variants report; the BingX key comparison is a proxy for "same account".
+
 ## Commit trail
 
 - `5fb14a4` — `feat: build_forward_env --mirror-live, account 1's settings with LONG for account 2`
@@ -174,6 +192,7 @@ The first full run, before the review fixes, was `Ran 3096 tests ... OK`, covera
 - `e13cde9` — `fix: forward_schema --only fails closed on what it cannot place and says what it checked`
 - `e0ceb57` — `docs: runbook section 7 after review, and a test that runs its commands`
 - the commit that adds this document
+- the commit that carries the fixes of the 29 Oct 2026 code review (the section above)
 
 ## Deployment gate
 
@@ -182,7 +201,7 @@ Before account 2 runs anything from this change, in this order (runbook section 
 1. The manager's new decision to start account 2 again (section 6). Until then nothing past the `shadow_entries` table is done on the VPS.
 2. This pull request merged by the user, and the tag `long-forward-v2` created and pushed by the operator on the merge commit. The code-parity `git diff` and the `status --porcelain` check against the live checkout print nothing.
 3. `supabase/long_forward_shadow_entries.sql` run in the Supabase SQL editor, and the REST check printing `schema long_forward | shadow_entries answers 200`.
-4. Account 2 flat: `src/flat_check.py --expect-schema long_forward` run from `/home/ubuntu/ai-perp-long` prints `FLAT`, once after the checkout and once more with the new `.env` and the keys typed in; no resting order in the BingX VST app.
+4. Account 2 flat: `src/flat_check.py --expect-schema long_forward` run from `/home/ubuntu/ai-perp-long` prints `FLAT`, once after the checkout and once more with the new `.env` and the keys typed in; no resting order in the BingX VST app; memory checked as the runbook's Preconditions say (`free -m` before the pip install and before the foreground start, `available` at least twice the live bot's resident size, swap not growing).
 5. The env: the environment-override check prints `[]`; the BingX key check prints `different keys`; the names-only review is done; the key policy for `XAI_API_KEY` and the sizing check are decided and recorded; the effective-values check shows `long_forward`, `long`, `map`, `lean`, `volume`, ledger `shadow`, exits `0`, `('BTC/USDT',)`, port `3919`, `entry_weekly_window = mon 07:00-sat 00:00` and equal start stamps.
 6. First start in the foreground between Saturday 00:00 and Monday 07:00 WIB with no `shadow_entries` warning in the log; then `pm2 start`, the after-start environment check printing `[]`, and `pm2 save`.
 7. The supervisor cron line uncommented after a `--dry-run`, with a crontab backup taken first.

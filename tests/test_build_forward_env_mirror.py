@@ -469,6 +469,61 @@ class ReadbackAndCleanupTests(MirrorCase):
                 self.assertFalse(self.target.exists())
 
 
+class CommentedAndMultiLineSecretTests(MirrorCase):
+    """Blanking covers the active assignments. A commented-out copy of a secret, or the tail of a multi-line one, would
+    carry an old value into the other account's file, where its owner opens it to type the keys. Both modes."""
+
+    OLD = ("x-test-old-commented-1", "x-test-old-commented-2", "x-test-old-commented-3")
+
+    def commented_source(self) -> str:
+        return "\n".join(
+            [
+                *LIVE_LIKE_SOURCE,
+                f"# BINGX_API_KEY={self.OLD[0]}",
+                f"#XAI_API_KEY={self.OLD[1]}",
+                f"   ## export bingx_secret_key = {self.OLD[2]}",
+                "# SUPABASE_SCHEMA=commented-out-stays",
+                "# the BINGX_API_KEY above is account 1's",  # prose that names a key, not an assignment
+            ]
+        ) + "\n"
+
+    def test_commented_out_assignments_of_a_blanked_key_are_left_out_and_counted(self) -> None:
+        for mirror in (True, False):
+            with self.subTest(mirror_live=mirror):
+                self.write_source(self.commented_source())
+                report = build(self.source, self.target, CYCLE, mirror_live=mirror)
+                text = self.target.read_text(encoding="utf-8")
+                for old in self.OLD:
+                    self.assertNotIn(old, text)
+                self.assertEqual(report.dropped_comment_lines, 3)
+                self.assertIn("# SUPABASE_SCHEMA=commented-out-stays", text)  # any other comment stays
+                self.assertIn("# the BINGX_API_KEY above is account 1's", text)
+                self.target.unlink()
+
+    def test_the_cli_says_how_many_it_left_out_and_never_what_they_held(self) -> None:
+        self.write_source(self.commented_source())
+        code, out, err = self.run_main("--mirror-live")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[-1], "left out 3 commented-out line(s) that assigned a blanked key")
+        for old in self.OLD:
+            self.assertNotIn(old, out)
+
+    def test_a_source_without_such_comments_reports_none(self) -> None:
+        self.assertEqual(build(self.source, self.target, CYCLE, mirror_live=True).dropped_comment_lines, 0)
+
+    def test_a_secret_whose_value_spans_several_lines_is_refused_by_key_name_only(self) -> None:
+        for mirror in (True, False):
+            with self.subTest(mirror_live=mirror):
+                self.write_source(
+                    "\n".join(LIVE_LIKE_SOURCE) + '\nBINGX_SECRET_KEY="x-test-line-one\nx-test-line-two"\n'
+                )
+                with self.assertRaises(ForwardEnvError) as caught:
+                    build(self.source, self.target, CYCLE, mirror_live=mirror)
+                self.assertIn("BINGX_SECRET_KEY", str(caught.exception))
+                self.assertNotIn("x-test-line", str(caught.exception))
+                self.assertFalse(self.target.exists())
+
+
 class LegacyOutputUnchangedTests(MirrorCase):
     """Characterization: these pass on the builder as it was before mirror mode existed."""
 

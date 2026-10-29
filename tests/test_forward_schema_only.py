@@ -58,6 +58,8 @@ class ShadowEntriesOnlyTests(unittest.TestCase):
         self.assertTrue(second.startswith("--"))
         self.assertIn("if not exists", second)
         self.assertNotIn("every statement", second)
+        self.assertNotIn("every create", second)  # only create table, create index and the first add column are checked
+        self.assertIn("other statements are copied as written", second)
 
     def test_holds_the_table_its_index_and_row_level_security_in_that_order(self) -> None:
         positions = [
@@ -238,6 +240,32 @@ class FailClosedTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     forward_schema.table_sql("lf", "t", base)
                 self.assertIn("if not exists", str(caught.exception))
+
+    def test_any_whitespace_before_if_not_exists_is_accepted(self) -> None:
+        # the guard's `\s+` must not give a space back and then read the rest of the run as "not if not exists"
+        head = "create table if not exists public.t (id int);\n"
+        for gap in (" ", "\t", "  ", "\n    ", " \t\n"):
+            for statement in (
+                f"create index{gap}if not exists i on public.t (a);",
+                f"create unique index{gap}if not exists u on public.t (a);",
+                f"alter table public.t add column{gap}if not exists b int;",
+            ):
+                with self.subTest(gap=repr(gap), statement=statement):
+                    self.assertIn("if not exists", forward_schema.table_sql("lf", "t", head + statement + "\n"))
+            with self.subTest(gap=repr(gap), statement="create table"):
+                forward_schema.table_sql("lf", "t", f"create table{gap}if not exists public.t (id int);\n")
+
+    def test_a_create_without_if_not_exists_is_refused_whatever_the_whitespace(self) -> None:
+        head = "create table if not exists public.t (id int);\n"
+        for statement in (
+            "create index  t_idx on public.t (id);",
+            "create index\n    t_idx on public.t (id);",
+            "alter table public.t add column  b int;",
+            "alter table public.t add column\n  b int;",
+            "create unique index  if_not_exists_x on public.t (id);",  # a name that spells the phrase is not the phrase
+        ):
+            with self.subTest(statement=statement), self.assertRaises(ValueError):
+                forward_schema.table_sql("lf", "t", head + statement + "\n")
 
     def test_syntax_the_splitter_does_not_understand_is_refused(self) -> None:
         bases = {

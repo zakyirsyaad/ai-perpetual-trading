@@ -7,6 +7,8 @@ secrets that belong to the second account: the account owner types those by hand
 `--mirror-live` builds the other kind of target: account 1's file as it is, so account 2
 runs account 1's settings (regime gate, payload, ledger, exits) with LONG where account 1
 trades SHORT. Only MIRROR_OVERRIDES, the two start timestamps and the three secrets change.
+Comment lines that assign one of the three secrets (`# BINGX_API_KEY=old`) are left out of the copy and counted, and
+a secret whose value spans several lines is refused, because a line-based copy cannot blank the rest of it.
 
 No value read from the source is ever printed, logged or put in an error or in the
 report: only key names travel. The target is created exclusively with mode 0600.
@@ -78,6 +80,8 @@ FUTURE_TOLERANCE = timedelta(minutes=5)  # the same bound Settings applies to th
 
 _LINE_PATTERN = re.compile(r"[^\n]*\n|[^\n]+")
 _EXPORT_PATTERN = re.compile(r"^export\s+")
+# `# BINGX_API_KEY=old-value`: a commented-out assignment, which python-dotenv ignores but a person reads
+_COMMENTED_ASSIGNMENT = re.compile(r"^\s*#+\s*(?:export\s+)?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*=")
 
 
 class ForwardEnvError(Exception):
@@ -88,6 +92,7 @@ class ForwardEnvError(Exception):
 class BuildReport:
     set_keys: tuple[str, ...]
     blanked_keys: tuple[str, ...]
+    dropped_comment_lines: int = 0  # commented-out assignments of a blanked key that were left out of the copy
 
 
 def _key_of(line: str) -> str | None:
@@ -108,6 +113,26 @@ def _key_of(line: str) -> str | None:
 def _has_value(line: str) -> bool:
     body = _EXPORT_PATTERN.sub("", line.strip(), count=1)
     return bool(body.split("=", 1)[1].strip().strip("'\""))
+
+
+def _is_commented_secret(line: str) -> bool:
+    """Whether ``line`` is a commented-out assignment of one of the blanked keys.
+
+    The renderer blanks the active assignments, but a comment such as `# BINGX_API_KEY=old` would carry an old
+    value into the new file, where the account owner opens it to type the keys."""
+    match = _COMMENTED_ASSIGNMENT.match(line)
+    return match is not None and match.group(2).upper() in BLANKED_KEYS
+
+
+def _check_single_line_secrets(source_text: str) -> None:
+    """Refuse a blanked key whose value spans several lines.
+
+    A line-based copy would blank the first line and keep the rest, so the tail of the secret would survive.
+    Key names only in the error."""
+    values = {key.upper(): value for key, value in dotenv_values(stream=io.StringIO(source_text)).items() if key}
+    spanning = [key for key in BLANKED_KEYS if "\n" in (values.get(key) or "")]
+    if spanning:
+        raise ForwardEnvError("the value of a key to blank spans several lines: " + ", ".join(spanning))
 
 
 def _validate_cycle_start(cycle_start: str) -> None:
@@ -142,6 +167,8 @@ def _render(source_text: str, forced: dict[str, str]) -> str:
     seen: set[str] = set()
     out: list[str] = []
     for line in _LINE_PATTERN.findall(source_text):
+        if _is_commented_secret(line):  # a commented-out old key must not travel to the other account
+            continue
         key = _key_of(line)
         if key is None or key not in forced:
             out.append(line)
@@ -208,11 +235,13 @@ def build_forward_env(source: Path, target: Path, cycle_start: str, *, mirror_li
     source_text = _read_source(source)
     if not any(_key_of(line) == REQUIRED_SOURCE_KEY and _has_value(line) for line in _LINE_PATTERN.findall(source_text)):
         raise ForwardEnvError(f"source has no {REQUIRED_SOURCE_KEY}; is it the live bot's env file?")
+    _check_single_line_secrets(source_text)
     forced, set_keys = _forced_settings(cycle_start, mirror_live)
     rendered = _render(source_text, forced)
     _verify_readback(rendered, forced)
     _write_exclusive(target, rendered)
-    return BuildReport(set_keys=set_keys, blanked_keys=BLANKED_KEYS)
+    dropped = sum(1 for line in _LINE_PATTERN.findall(source_text) if _is_commented_secret(line))
+    return BuildReport(set_keys=set_keys, blanked_keys=BLANKED_KEYS, dropped_comment_lines=dropped)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -236,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"built {args.target} (mode 600)")
     print("set: " + ", ".join(report.set_keys))
     print("blanked, type these by hand: " + ", ".join(report.blanked_keys))
+    if report.dropped_comment_lines:
+        print(f"left out {report.dropped_comment_lines} commented-out line(s) that assigned a blanked key")
     return 0
 
 

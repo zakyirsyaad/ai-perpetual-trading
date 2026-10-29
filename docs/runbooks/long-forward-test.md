@@ -272,7 +272,7 @@ Account 2 runs account 1's code and `.env` as they are, with one difference of b
 
 This section only prepares the start. Nothing in it runs by itself, and the start needs the manager's new decision (section 6). Order: merge, tag, add the `shadow_entries` table, update the clone, flat check, build the `.env`, type the keys, review, flat check again, first start in the foreground, pm2, cron.
 
-**What `--mirror-live` changes** in the copy of account 1's `.env` (every other line, comments included, is copied as it is):
+**What `--mirror-live` changes** in the copy of account 1's `.env` (every other line, comments included, is copied as it is, except the comment lines that assign one of the three blanked keys, such as `# BINGX_API_KEY=old`: those are left out and the builder says how many, and a secret whose value spans several lines is refused):
 
 | Key | Account 2 |
 |---|---|
@@ -291,6 +291,7 @@ Two things follow from copying the rest. The forward guard of section 4 stays of
 - **Account 1's settings are the ones to mirror.** The builder copies `/home/ubuntu/ai-perpetual-trading/.env` as it is when it runs, so make any pending change to account 1 first.
 - **The key policy.** `XAI_API_KEY` comes out blank. Decide whose key the account owner types: account 2's own (spec 9.3: its own token spend and rate limit) or the one account 1 uses (the choice taken on 2026-10-19). With one key both bots draw on one provider limit, and a `mimo-v2.6-pro` call can take about a minute, so their calls can overlap. Write the decision down. The copied `COINMARKETCAP_API_KEY` and `DUNE_API_KEY` are decided in step 8.
 - **Sizing.** `POSITION_USDT`, `VOLUME_MARGIN_PER_ENTRY_USDT` and `LEVERAGE` are copied too. Check that account 2's VST balance can margin what account 1's can; the venue rejects an order its balance cannot cover.
+- **Memory.** The VPS is small and shared (28 Oct: 1.9 GB, 126 MB available, 4.4 of 8 GB of swap in use, `ai-perp-volume` about 36 MB resident), and account 2 adds a `pip install` (step 4), a foreground run (step 10) and a second resident bot with its feed server (step 11). Before step 4 and again before step 10 run `free -m` and read the live bot's size with `ps -o rss= -p "$(pm2 pid ai-perp-volume)"` (KB). Start only if `available` is at least twice that size and the swap figure is not growing between two readings a minute apart; otherwise stop and tell the manager. A live bot that is swapped out or killed while it holds a position is the restart hazard of section 4.
 - **Timing.** Account 1's `ENTRY_WEEKLY_WINDOW` is copied. Do steps 4 to 12 between Saturday 00:00 and Monday 07:00 WIB (section 2 step 7 says why).
 
 Steps:
@@ -311,17 +312,24 @@ Steps:
    pm2 jlist | python3 -c 'import json,sys; print([p["name"] for p in json.load(sys.stdin)])'    # must not list ai-perp-long
    cd /home/ubuntu/ai-perp-long && git status --short    # no tracked change; .env and logs/ are ignored
    git fetch --tags origin && git checkout long-forward-v2    # detached HEAD on purpose, as in section 2 step 1
-   .venv/bin/pip install -r requirements.txt
+   .venv/bin/pip freeze > ~/pip-freeze-ai-perp-long.before-v2.txt    # what the venv held; the rollback restores from it
+   nice -n 19 .venv/bin/pip install -r requirements.txt
    ```
    Account 2 must run the code account 1 runs. Both of these print nothing when the trading code of the tag equals what the live checkout has; the second one catches an uncommitted edit there:
    ```bash
    git diff --stat "$(git -C /home/ubuntu/ai-perpetual-trading rev-parse HEAD)" long-forward-v2 -- src/bot src/main.py config requirements.txt
    git -C /home/ubuntu/ai-perpetual-trading status --porcelain -- src/bot src/main.py config requirements.txt
    ```
-   Any output means `main` has moved past what account 1 runs, or the live checkout is edited. Settle that first (deploy to account 1 as its own staged decision, or move the tag); do not start a mirror of different code. `requirements.txt` has ranges, not pins, so also compare what the two venvs resolved, and look at httpx, pydantic, pydantic-settings, python-dotenv, tenacity and PyYAML:
+   Any output means `main` has moved past what account 1 runs, or the live checkout is edited. Settle that first (deploy to account 1 as its own staged decision, or move the tag); do not start a mirror of different code. Those two commands compare files, not the running process: a `git pull` in the live checkout without a restart passes both while `ai-perp-volume` still runs older code. So also check that the live bot started after its checkout last moved (both lines carry the VPS's own clock, CST):
+   ```bash
+   git -C /home/ubuntu/ai-perpetual-trading reflog -1 --date=iso    # when the live checkout's HEAD last moved
+   grep "trade engine started" ~/.pm2/logs/ai-perp-volume-error.log | tail -1    # when the live bot last started
+   ```
+   The start must be the later of the two. If the checkout moved after the bot started, the bot runs older code than the checkout shows: settle that first as well. `requirements.txt` has ranges, not pins, so also compare what the two venvs resolved, and look at httpx, pydantic, pydantic-settings, python-dotenv, tenacity and PyYAML:
    ```bash
    diff <(/home/ubuntu/ai-perpetual-trading/.venv/bin/pip freeze) <(/home/ubuntu/ai-perp-long/.venv/bin/pip freeze)
    ```
+   If they differ on one of those packages, stop and tell the manager before going on; aligning a venv is a decision, not a step here.
 5. **Flat check, first look.** `src/flat_check.py` ships in the tag, so this is the first moment the clone has it. Run the clean-shell check of section 2 step 6 ("Before the first start"; it must print nothing), then, with the old `.env` still in place:
    ```bash
    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/flat_check.py --expect-schema long_forward
@@ -379,14 +387,13 @@ Steps:
 
 **Rollback.** Do it with the entry window closed (Saturday 00:00 to Monday 07:00 WIB), like the start: with the window open an entry can appear between the flat check and the stop, and the stop, floor and time exits live in the bot process. Pick the phase you are in:
 
-- Steps 4 and 5 (the clone is on the tag, the old `.env` is untouched): `cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1`. Nothing else changed on the VPS.
-- Steps 6 to 9 (the new `.env` exists, no bot has run): that, then `mv .env .env.mirror-unused && mv .env.bak-mirror-<STAMP> .env`. The `shadow_entries` table stays; it does no harm.
+- Steps 4 and 5 (the clone is on the tag, the old `.env` is untouched): `cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1`. Nothing else changed on the VPS except the account 2 venv, which step 4's `pip install` may have moved because `requirements.txt` holds ranges, not pins: if `git diff long-forward-v1 long-forward-v2 -- requirements.txt` prints anything, or the freeze of the venv differs from `~/pip-freeze-ai-perp-long.before-v2.txt`, put it back with `.venv/bin/pip install -r ~/pip-freeze-ai-perp-long.before-v2.txt` before anything starts `long-forward-v1` again.
+- Steps 6 to 9 (the new `.env` exists, no bot has run): that, then `cd /home/ubuntu/ai-perp-long && mv .env.bak-mirror-<STAMP> .env.restore && mv .env .env.mirror-unused && mv .env.restore .env`, with the real stamp from `ls .env.bak-mirror-*` in place of `<STAMP>` (a literal `<STAMP>` makes the first `mv` fail before `.env` is touched). The `cd` is part of the line on purpose: run from any other directory, a bare `mv .env ...` renames that directory's `.env`. The `shadow_entries` table stays; it does no harm.
 - Step 10 (the foreground run): Ctrl-C, check that the account is flat, then the previous bullet.
 - After step 11 (pm2): the position first. `pm2 stop` alone would leave an open position unwatched. The rules' exits end any trade within 60 minutes (the stop, the net +56 floor or take-profit, and the time stop), so wait for it or close it on the venue (section 4), and confirm `FLAT` with `src/flat_check.py --expect-schema long_forward`. Then, flat and with the window closed:
   ```bash
   pm2 delete ai-perp-long && pm2 save     # back to the retired state of section 6; never `all`
-  crontab -e                              # comment the ai-perp-long supervisor line again
-  cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1
-  mv .env .env.mirror-stopped-<STAMP> && mv .env.bak-mirror-<STAMP> .env
+  cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1 && mv .env.bak-mirror-<STAMP> .env.restore && mv .env .env.mirror-stopped && mv .env.restore .env
+  crontab -e                              # last, because it is interactive: comment the ai-perp-long supervisor line again
   ```
-  Nothing in `long_forward` is deleted.
+  Replace `<STAMP>` with the real stamp from `ls .env.bak-mirror-*` before pasting (a literal `<STAMP>` is a syntax error, so nothing of the second line runs). The `mv` is chained to the `cd` on purpose: from any other directory it would rename that directory's `.env`. If step 4's `pip install` moved the venv, restore it as in the first bullet. Nothing in `long_forward` is deleted.

@@ -47,7 +47,7 @@ PYTHONPATH=src python src/realtime_backtest.py --source auto --no-trades   # dry
 
 # entry-block latch watchdog (cron on the VPS; --dry-run decides but never restarts)
 PYTHONPATH=src python src/supervisor.py --dry-run
-PYTHONPATH=src python src/flat_check.py   # run from a bot directory (reads its .env, read-only): prints FLAT and exits 0, else OPEN/UNREADABLE lines and exit 1
+PYTHONPATH=src python src/flat_check.py --expect-schema <public|long_forward>   # run from a bot directory (reads its .env, read-only): prints FLAT and exits 0, else OPEN/UNREADABLE lines and exit 1. Always pass --expect-schema: without it a run from the wrong directory prints FLAT for whatever account that .env names
 
 # offline Pine-gate research (see "Offline research"); `--help` lists every stage
 PYTHONPATH=src python -m research.pine_gate.cli --help

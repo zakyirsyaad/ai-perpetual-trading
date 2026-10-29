@@ -41,9 +41,11 @@ _CREATE_TABLE = re.compile(
     r"\s*create\s+table\s+(?:if\s+not\s+exists\s+)?public\.([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE
 )
 # A statement that cannot be run twice: a create or an add column whose keywords are not directly followed by
-# `if not exists`. Anchored at the keywords, so the phrase inside a default or a comment proves nothing.
+# `if not exists`. Anchored at the keywords, so the phrase inside a default or a comment proves nothing. The lookahead
+# also refuses a space, so `\s+` cannot give one back and then see `if not exists` after it (two spaces, or a newline
+# and an indent, before the phrase would otherwise read as a missing `if not exists`).
 _NOT_RERUNNABLE = re.compile(
-    r"\s*(?:create\s+(?:unique\s+)?(?:table|index)|alter\s+table\s+\S+\s+add\s+column)\s+(?!if\s+not\s+exists\b)",
+    r"\s*(?:create\s+(?:unique\s+)?(?:table|index)|alter\s+table\s+\S+\s+add\s+column)\s+(?!\s|if\s+not\s+exists\b)",
     re.IGNORECASE,
 )
 
@@ -200,8 +202,9 @@ def table_sql(schema: str, table: str, base_sql: str) -> str:
         raise ValueError("base SQL still mentions public after the rewrite")
     return (
         f"-- Generated from supabase/schema.sql by src/forward_schema.py (--only {table}); do not edit by hand.\n"
-        f"-- Adds the {table} table to the existing '{schema}' schema. The generator checked that every create "
-        "and add column in it is `if not exists`.\n"
+        f"-- Adds the {table} table to the existing '{schema}' schema. The generator refused any table or index "
+        "creation, or first add column, without `if not exists`; other statements are copied as written, so check "
+        "them before running the file twice.\n"
         "\n"
         f"{body}\n"
         "\n"

@@ -85,11 +85,23 @@ def _unreadable(exc: Exception, what: str) -> str:
     return f"UNREADABLE {type(exc).__name__} ({what})"
 
 
+def _row_findings(row: Any, symbol: str) -> list[str]:
+    """The OPEN line of one position row, none for a zero amount; raises for a row it cannot read."""
+    if not isinstance(row, dict):
+        raise VenueAnswerError("a position row is not an object")
+    amount = Decimal(str(row.get("positionAmt")))  # a missing or garbled amount raises InvalidOperation
+    if amount == 0:  # NaN is not equal to zero either
+        return []
+    size = format(abs(amount).normalize(), "f")
+    return [f"OPEN venue {row.get('symbol') or symbol} side={row.get('positionSide') or '?'} size={size}"]
+
+
 async def _venue_findings(client: Any, symbol: str) -> list[str]:
     """The OPEN lines for one symbol, read strictly from the raw positions answer.
 
     `client.get_symbol_position_details` is not used: it maps an answer without a list of rows, a row it
     cannot parse and a row naming another symbol to "no position", and a flat check must never do that.
+    A row it cannot read is reported on its own line and does not hide the open position of the row beside it.
     """
     answer = await client.get_position_info(symbol)
     rows = answer.get("data") if isinstance(answer, dict) else None
@@ -97,12 +109,10 @@ async def _venue_findings(client: Any, symbol: str) -> list[str]:
         raise VenueAnswerError("no list of position rows")
     findings: list[str] = []
     for row in rows:
-        if not isinstance(row, dict):
-            raise VenueAnswerError("a position row is not an object")
-        amount = Decimal(str(row.get("positionAmt")))  # a missing or garbled amount raises InvalidOperation
-        if amount != 0:  # NaN is not equal to zero either
-            size = format(abs(amount).normalize(), "f")
-            findings.append(f"OPEN venue {row.get('symbol') or symbol} side={row.get('positionSide') or '?'} size={size}")
+        try:
+            findings.extend(_row_findings(row, symbol))
+        except Exception as exc:  # unreadable exposure must never look flat, nor hide the rows that are readable
+            findings.append(_unreadable(exc, f"venue position of {symbol}"))
     return findings
 
 
