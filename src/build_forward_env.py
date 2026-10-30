@@ -4,18 +4,27 @@ The operator runs this on the VPS. It copies the source file line by line, force
 forward bot's settings (its own Supabase schema first of all), and blanks the three
 secrets that belong to the second account: the account owner types those by hand.
 
+`--mirror-live` builds the other kind of target: account 1's file as it is, so account 2
+runs account 1's settings (regime gate, payload, ledger, exits) with LONG where account 1
+trades SHORT. Only MIRROR_OVERRIDES, the two start timestamps and the three secrets change.
+Comment lines that assign one of the three secrets (`# BINGX_API_KEY=old`) are left out of the copy and counted, and
+a secret whose value spans several lines is refused, because a line-based copy cannot blank the rest of it.
+
 No value read from the source is ever printed, logged or put in an error or in the
 report: only key names travel. The target is created exclusively with mode 0600.
 """
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from dotenv import dotenv_values
 
 from clean_env import _key_from_line
 
@@ -49,7 +58,20 @@ FORWARD_OVERRIDES: dict[str, str] = {
     "MAX_DAILY_DRAWDOWN_USDT": "1000000000",
     "MAX_CONSECUTIVE_LOSSES": "1000",
 }
+# --mirror-live: these keys are forced on top of a copy of account 1's file, and nothing else is.
+# Under ENTRY_REGIME_GATE=map the hourly regime picks the side (NAIK long, TURUN short) and
+# ENTRY_GATE_DIRECTION says which of the two may trade, so `long` makes LONG live in NAIK hours and
+# turns the SHORT of TURUN hours into shadow rows.
+MIRROR_OVERRIDES: dict[str, str] = {
+    "SUPABASE_SCHEMA": "long_forward",
+    "ENTRY_GATE_DIRECTION": "long",
+    # main.py refuses the regime gate with more than one symbol, and the live .env may list several.
+    "SYMBOLS": "BTC/USDT",
+    # Account 1's dashboard feed owns 3917; ai-perp-long-dashboard proxies this port.
+    "TELEMETRY_PORT": "3919",
+}
 CYCLE_KEY = "VOLUME_CYCLE_STARTED_AT"
+LEDGER_SINCE_KEY = "SETUP_LEDGER_SINCE"  # mirror mode only: account 2's ledger counts from its own start
 BLANKED_KEYS: tuple[str, ...] = ("BINGX_API_KEY", "BINGX_SECRET_KEY", "XAI_API_KEY")
 REQUIRED_SOURCE_KEY = "SUPABASE_URL"
 
@@ -58,6 +80,8 @@ FUTURE_TOLERANCE = timedelta(minutes=5)  # the same bound Settings applies to th
 
 _LINE_PATTERN = re.compile(r"[^\n]*\n|[^\n]+")
 _EXPORT_PATTERN = re.compile(r"^export\s+")
+# `# BINGX_API_KEY=old-value`: a commented-out assignment, which python-dotenv ignores but a person reads
+_COMMENTED_ASSIGNMENT = re.compile(r"^\s*#+\s*(?:export\s+)?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*=")
 
 
 class ForwardEnvError(Exception):
@@ -68,6 +92,7 @@ class ForwardEnvError(Exception):
 class BuildReport:
     set_keys: tuple[str, ...]
     blanked_keys: tuple[str, ...]
+    dropped_comment_lines: int = 0  # commented-out assignments of a blanked key that were left out of the copy
 
 
 def _key_of(line: str) -> str | None:
@@ -88,6 +113,26 @@ def _key_of(line: str) -> str | None:
 def _has_value(line: str) -> bool:
     body = _EXPORT_PATTERN.sub("", line.strip(), count=1)
     return bool(body.split("=", 1)[1].strip().strip("'\""))
+
+
+def _is_commented_secret(line: str) -> bool:
+    """Whether ``line`` is a commented-out assignment of one of the blanked keys.
+
+    The renderer blanks the active assignments, but a comment such as `# BINGX_API_KEY=old` would carry an old
+    value into the new file, where the account owner opens it to type the keys."""
+    match = _COMMENTED_ASSIGNMENT.match(line)
+    return match is not None and match.group(2).upper() in BLANKED_KEYS
+
+
+def _check_single_line_secrets(source_text: str) -> None:
+    """Refuse a blanked key whose value spans several lines.
+
+    A line-based copy would blank the first line and keep the rest, so the tail of the secret would survive.
+    Key names only in the error."""
+    values = {key.upper(): value for key, value in dotenv_values(stream=io.StringIO(source_text)).items() if key}
+    spanning = [key for key in BLANKED_KEYS if "\n" in (values.get(key) or "")]
+    if spanning:
+        raise ForwardEnvError("the value of a key to blank spans several lines: " + ", ".join(spanning))
 
 
 def _validate_cycle_start(cycle_start: str) -> None:
@@ -122,6 +167,8 @@ def _render(source_text: str, forced: dict[str, str]) -> str:
     seen: set[str] = set()
     out: list[str] = []
     for line in _LINE_PATTERN.findall(source_text):
+        if _is_commented_secret(line):  # a commented-out old key must not travel to the other account
+            continue
         key = _key_of(line)
         if key is None or key not in forced:
             out.append(line)
@@ -141,6 +188,20 @@ def _render(source_text: str, forced: dict[str, str]) -> str:
     return "".join(out)
 
 
+def _verify_readback(rendered: str, forced: dict[str, str]) -> None:
+    """Read the rendered file back the way the bot does (python-dotenv, keys case-folded, last one wins) and
+    refuse it unless every forced key holds its forced value.
+
+    The renderer works line by line, so a forced key inside a multi-line quoted value, or one spelled so that
+    only the bot's parser folds it onto a forced key, would otherwise slip through and leave a setting at its
+    default or a copied secret in place. Key names only in the error.
+    """
+    read = {key.lower(): value for key, value in dotenv_values(stream=io.StringIO(rendered)).items()}
+    wrong = [key for key, value in forced.items() if (read.get(key.lower()) or "") != value]
+    if wrong:
+        raise ForwardEnvError("the rendered file does not read back as intended for: " + ", ".join(wrong))
+
+
 def _write_exclusive(target: Path, text: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -155,18 +216,32 @@ def _write_exclusive(target: Path, text: str) -> None:
     except OSError as exc:
         target.unlink(missing_ok=True)
         raise ForwardEnvError(f"cannot write target: {exc.strerror or 'I/O error'}") from None
+    except BaseException:  # an interrupt must not leave a half-written file holding copied secrets
+        target.unlink(missing_ok=True)
+        raise
 
 
-def build_forward_env(source: Path, target: Path, cycle_start: str) -> BuildReport:
+def _forced_settings(cycle_start: str, mirror_live: bool) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Every key the target forces with its value, and the names of those that are set rather than blanked."""
+    overrides = MIRROR_OVERRIDES if mirror_live else FORWARD_OVERRIDES
+    starts = {CYCLE_KEY: cycle_start, **({LEDGER_SINCE_KEY: cycle_start} if mirror_live else {})}
+    return {**overrides, **starts, **{key: "" for key in BLANKED_KEYS}}, (*overrides, *starts)
+
+
+def build_forward_env(source: Path, target: Path, cycle_start: str, *, mirror_live: bool = False) -> BuildReport:
     source, target = Path(source), Path(target)
     _validate_cycle_start(cycle_start)
     _check_paths(source, target)
     source_text = _read_source(source)
     if not any(_key_of(line) == REQUIRED_SOURCE_KEY and _has_value(line) for line in _LINE_PATTERN.findall(source_text)):
         raise ForwardEnvError(f"source has no {REQUIRED_SOURCE_KEY}; is it the live bot's env file?")
-    forced = {**FORWARD_OVERRIDES, CYCLE_KEY: cycle_start, **{key: "" for key in BLANKED_KEYS}}
-    _write_exclusive(target, _render(source_text, forced))
-    return BuildReport(set_keys=(*FORWARD_OVERRIDES, CYCLE_KEY), blanked_keys=BLANKED_KEYS)
+    _check_single_line_secrets(source_text)
+    forced, set_keys = _forced_settings(cycle_start, mirror_live)
+    rendered = _render(source_text, forced)
+    _verify_readback(rendered, forced)
+    _write_exclusive(target, rendered)
+    dropped = sum(1 for line in _LINE_PATTERN.findall(source_text) if _is_commented_secret(line))
+    return BuildReport(set_keys=set_keys, blanked_keys=BLANKED_KEYS, dropped_comment_lines=dropped)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,15 +251,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", required=True, type=Path, help="The live bot's .env (read only).")
     parser.add_argument("--target", required=True, type=Path, help="The new file to create (must not exist).")
     parser.add_argument("--cycle-start", required=True, help="Timezone-aware ISO-8601 start of the forward test.")
+    parser.add_argument(
+        "--mirror-live",
+        action="store_true",
+        help="Copy the source as it is and change only the mirror's keys: account 2 runs account 1's settings with LONG.",
+    )
     args = parser.parse_args(argv)
     try:
-        report = build_forward_env(args.source, args.target, args.cycle_start)
+        report = build_forward_env(args.source, args.target, args.cycle_start, mirror_live=args.mirror_live)
     except ForwardEnvError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"built {args.target} (mode 600)")
     print("set: " + ", ".join(report.set_keys))
     print("blanked, type these by hand: " + ", ".join(report.blanked_keys))
+    if report.dropped_comment_lines:
+        print(f"left out {report.dropped_comment_lines} commented-out line(s) that assigned a blanked key")
     return 0
 
 

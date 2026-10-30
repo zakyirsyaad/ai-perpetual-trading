@@ -5,7 +5,7 @@ LONG entries while the hourly regime reads NAIK, on its own BingX VST account, i
 directory. Spec: `docs/superpowers/specs/2026-10-18-long-ai-forward-test-design.md`. Plan:
 `docs/superpowers/plans/2026-10-19-long-ai-forward-test.md`. Evidence: `.github/tdd/long-ai-forward-test.tdd.md`.
 
-**Status (2026-10-25): retired.** The operator stopped the bot on 2026-10-25 at 11:31 WIB (`pm2 stop ai-perp-long`, flat before and after). At 15:43 WIB, on the manager's answer to stop account 2 completely, it was removed from pm2 and its saved list. Section 6 says why, what was kept and how to start it again; sections 2 to 4 describe the bot while it runs.
+**Status (2026-10-25): retired.** The operator stopped the bot on 2026-10-25 at 11:31 WIB (`pm2 stop ai-perp-long`, flat before and after). At 15:43 WIB, on the manager's answer to stop account 2 completely, it was removed from pm2 and its saved list. Section 6 says why, what was kept and how to start it again; sections 2 to 4 describe the bot while it runs. Section 7 is the procedure for a second start on account 1's latest code and settings with LONG (prepared 2026-10-28, not started).
 
 Ground rules:
 
@@ -258,9 +258,142 @@ The operator stopped the bot on 2026-10-25 at 11:31:27 WIB (option B of the 25 O
 - **Kept.** The forward `.env`, `logs/`, the `long_forward` schema, and the week-1 export `~/replay/out/fwd_week1/forward_trades_2026-10-19_2026-10-26.csv`. Nothing was deleted.
 - **Still running.** `ai-perp-long-dashboard` and `ai-perp-tunnel` (the dashboard shows frozen data).
 - **Retired (15:43 WIB).** `flat_check` on account 2 printed FLAT (it has to be pointed at `/home/ubuntu/ai-perp-long` and the `long_forward` schema, because `~/replay/flat_check.py` is hard-wired to account 1), then `pm2 delete ai-perp-long` and `pm2 save`. The saved dump had still listed the bot as online and `pm2-ubuntu` is enabled, so a VPS reboot could have started it; now it is in neither pm2 nor the dump. Only the two account 2 entries changed in the saved list, and the live bot kept its pid and restart count. The dump as it was: `~/.pm2/dump.pm2.bak-acct2-retire-20261025T164322`. The 5-minute supervisor cron line is commented out (crontab backup `~/crontab.bak-acct2-retire-20261025T164342`).
+- **Account 1's latest code on account 2.** Section 7 is the procedure for starting account 2 on the code and the `.env` settings account 1 runs, with LONG (`build_forward_env.py --mirror-live`, tag `long-forward-v2`). The list below restarts the first version unchanged (tag `long-forward-v1`, its own settings).
 - **To start it again,** only on a new decision from the manager and while flat on the venue:
     1. Decide whether it keeps the AI exits (`AI_EXIT_MAX_CALLS_PER_TRADE=25`) or uses the rules' exits (`0`, as account 1 has since 2026-10-21).
     2. Set a new `VOLUME_CYCLE_STARTED_AT` in `/home/ubuntu/ai-perp-long/.env`. The guard and the weekly report count from it, so without a new value the old 6 trades stay in the result and two versions mix.
     3. Back up `.env`, rerun the clean-shell check of section 2 step 6, then start it with the `pm2 start` command of section 2 (the pm2 entry is gone, so `pm2 restart` has nothing to restart), read the startup log and run `pm2 save`.
     4. Uncomment the supervisor cron line (section 2, step 9).
     5. The code stays pinned at `long-forward-v1`; a change of code is a new tag, as in section 2.
+
+## 7. Second start: account 1's latest code on account 2 (LONG)
+
+Account 2 runs account 1's code and `.env` as they are, with one difference of behaviour: `ENTRY_GATE_DIRECTION=long`. Under `ENTRY_REGIME_GATE=map` the hourly regime picks the side (NAIK long, TURUN short) and `ENTRY_GATE_DIRECTION` says which side may trade, so on account 2 LONG is live in NAIK hours and the SHORT of TURUN hours is recorded as a `shadow_entries` row (`source=shadow_side`). Between them the two accounts then trade both regimes with real fills. Everything else is account 1's: `AI_ENTRY_PAYLOAD=lean`, `AI_LEAN_OBJECTIVE=volume`, `SETUP_LEDGER_MODE=shadow`, the rules' exits (`AI_EXIT_MAX_CALLS_PER_TRADE=0`), the daily guards and the entry window. There is no exit change and no SL+ here: that is a separate, later stage.
+
+This section only prepares the start. Nothing in it runs by itself, and the start needs the manager's new decision (section 6). Order: merge, tag, add the `shadow_entries` table, update the clone, flat check, build the `.env`, type the keys, review, flat check again, first start in the foreground, pm2, cron.
+
+**What `--mirror-live` changes** in the copy of account 1's `.env` (every other line, comments included, is copied as it is, except the comment lines that assign one of the three blanked keys, such as `# BINGX_API_KEY=old`: those are left out and the builder says how many, and a secret whose value spans several lines is refused):
+
+| Key | Account 2 |
+|---|---|
+| `SUPABASE_SCHEMA` | `long_forward` |
+| `ENTRY_GATE_DIRECTION` | `long` |
+| `SYMBOLS` | `BTC/USDT` |
+| `TELEMETRY_PORT` | `3919` (account 1's feed owns 3917; `ai-perp-long-dashboard` proxies 3919) |
+| `VOLUME_CYCLE_STARTED_AT`, `SETUP_LEDGER_SINCE` | the `--cycle-start` instant, both |
+| `BINGX_API_KEY`, `BINGX_SECRET_KEY`, `XAI_API_KEY` | blank, typed by the account owner |
+
+Two things follow from copying the rest. The forward guard of section 4 stays off, because its keys are not in account 1's file: add `FORWARD_KILL_AFTER_POSITIONS`, `FORWARD_KILL_BELOW_PER_1M` and `FORWARD_REVIEW_AT_POSITIONS` to the new `.env` before the first start if the manager wants an automatic stop (they count from the cycle start, in `long_forward`). And `TELEMETRY_ENABLED` is copied, so the feed listens on 3919 again and the account 2 dashboard shows live data instead of the frozen one.
+
+**Preconditions** (all before step 4):
+
+- **The manager's new decision** to start account 2 again (section 6). Until it exists, do nothing past step 3: steps 1 to 3 touch nothing on the VPS but one table.
+- **Account 1's settings are the ones to mirror.** The builder copies `/home/ubuntu/ai-perpetual-trading/.env` as it is when it runs, so make any pending change to account 1 first.
+- **The key policy.** `XAI_API_KEY` comes out blank. Decide whose key the account owner types: account 2's own (spec 9.3: its own token spend and rate limit) or the one account 1 uses (the choice taken on 2026-10-19). With one key both bots draw on one provider limit, and a `mimo-v2.6-pro` call can take about a minute, so their calls can overlap. Write the decision down. The copied `COINMARKETCAP_API_KEY` and `DUNE_API_KEY` are decided in step 8.
+- **Sizing.** `POSITION_USDT`, `VOLUME_MARGIN_PER_ENTRY_USDT` and `LEVERAGE` are copied too. Check that account 2's VST balance can margin what account 1's can; the venue rejects an order its balance cannot cover.
+- **Memory.** The VPS is small and shared (28 Oct: 1.9 GB, 126 MB available, 4.4 of 8 GB of swap in use, `ai-perp-volume` about 36 MB resident), and account 2 adds a `pip install` (step 4), a foreground run (step 10) and a second resident bot with its feed server (step 11). Before step 4 and again before step 10 run `free -m` and read the live bot's size with `ps -o rss= -p "$(pm2 pid ai-perp-volume)"` (KB). Start only if `available` is at least twice that size and the swap figure is not growing between two readings a minute apart; otherwise stop and tell the manager. A live bot that is swapped out or killed while it holds a position is the restart hazard of section 4.
+- **Timing.** Account 1's `ENTRY_WEEKLY_WINDOW` is copied. Do steps 4 to 12 between Saturday 00:00 and Monday 07:00 WIB (section 2 step 7 says why).
+
+Steps:
+
+1. **Merge** the pull request that adds the mirror tooling. The user merges it; nobody merges automatically.
+2. **Tag** the merge commit from a machine with push rights, as in section 2 step 1:
+   ```bash
+   git fetch origin && git tag -a long-forward-v2 -m "Account 2 mirrors account 1's code with LONG" origin/main
+   git push origin long-forward-v2
+   ```
+3. **Add `shadow_entries` to `long_forward`.** The schema was created on 2026-10-19, before that table joined `supabase/schema.sql`, so the REST API answers 404 for it, while `ENTRY_REGIME_GATE=map` and the ledger read and write it on every tick. In the SQL editor of the project the live bot uses, run the contents of `supabase/long_forward_shadow_entries.sql`. It is generated from `supabase/schema.sql` by `src/forward_schema.py --schema long_forward --only shadow_entries` (a test pins the drift). Its creates are `if not exists` and the rest is row level security and the schema's `service_role` grants, which can be repeated, so running it twice is safe. Then check that the API serves the table. This prints the schema name and a status code, nothing else (a failure prints only `failed:` and the exception's class name, never a value), and uses the old `.env`:
+   ```bash
+   cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python -c "import sys; sys.excepthook = lambda t, v, tb: print('failed:', t.__name__, file=sys.stderr); import httpx; from bot.config import Settings; s = Settings(); k = s.supabase_service_role_key; r = httpx.get(s.supabase_url.rstrip('/') + '/rest/v1/shadow_entries', params={'select': 'id', 'limit': '1'}, headers={'apikey': k, 'Authorization': 'Bearer ' + k, 'Accept-Profile': s.supabase_schema}, timeout=20); print('schema', s.supabase_schema, '| shadow_entries answers', r.status_code)"
+   ```
+   Expect `schema long_forward | shadow_entries answers 200`. A `404` means PostgREST's schema cache has not seen the table yet: run `notify pgrst, 'reload schema';` in the SQL editor and check again. The schema stays in the exposed schemas from section 1.
+4. **Update the clone to the tag.** No trading process runs from it (the pm2 entry was deleted on 2026-10-25). The account 2 dashboard `ai-perp-long-dashboard` has its directory under the clone, but it serves a prebuilt, untracked `.next` that a checkout does not touch. Check that no `ai-perp-long` app is listed, then update:
+   ```bash
+   pm2 jlist | python3 -c 'import json,sys; print([p["name"] for p in json.load(sys.stdin)])'    # must not list ai-perp-long
+   cd /home/ubuntu/ai-perp-long && git status --short    # no tracked change; .env and logs/ are ignored
+   git fetch --tags origin && git checkout long-forward-v2    # detached HEAD on purpose, as in section 2 step 1
+   .venv/bin/pip freeze > ~/pip-freeze-ai-perp-long.before-v2.txt    # what the venv held; the rollback restores from it
+   nice -n 19 .venv/bin/pip install -r requirements.txt
+   ```
+   Account 2 must run the code account 1 runs. Both of these print nothing when the trading code of the tag equals what the live checkout has; the second one catches an uncommitted edit there:
+   ```bash
+   git diff --stat "$(git -C /home/ubuntu/ai-perpetual-trading rev-parse HEAD)" long-forward-v2 -- src/bot src/main.py config requirements.txt
+   git -C /home/ubuntu/ai-perpetual-trading status --porcelain -- src/bot src/main.py config requirements.txt
+   ```
+   Any output means `main` has moved past what account 1 runs, or the live checkout is edited. Settle that first (deploy to account 1 as its own staged decision, or move the tag); do not start a mirror of different code. Those two commands compare files, not the running process: a `git pull` in the live checkout without a restart passes both while `ai-perp-volume` still runs older code. So also check that the live bot started after its checkout last moved (both lines carry the VPS's own clock, CST):
+   ```bash
+   git -C /home/ubuntu/ai-perpetual-trading reflog -1 --date=iso    # when the live checkout's HEAD last moved
+   grep "trade engine started" ~/.pm2/logs/ai-perp-volume-error.log | tail -1    # when the live bot last started
+   ```
+   The start must be the later of the two. If the checkout moved after the bot started, the bot runs older code than the checkout shows: settle that first as well. `requirements.txt` has ranges, not pins, so also compare what the two venvs resolved, and look at httpx, pydantic, pydantic-settings, python-dotenv, tenacity and PyYAML:
+   ```bash
+   diff <(/home/ubuntu/ai-perpetual-trading/.venv/bin/pip freeze) <(/home/ubuntu/ai-perp-long/.venv/bin/pip freeze)
+   ```
+   If they differ on one of those packages, stop and tell the manager before going on; aligning a venv is a decision, not a step here.
+5. **Flat check, first look.** `src/flat_check.py` ships in the tag, so this is the first moment the clone has it. Run the clean-shell check of section 2 step 6 ("Before the first start"; it must print nothing), then, with the old `.env` still in place:
+   ```bash
+   cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python src/flat_check.py --expect-schema long_forward
+   ```
+   It must print exactly `FLAT`, and its stderr line must say `store schema long_forward`. `--expect-schema` makes a run from a directory whose `.env` names another schema fail with `UNREADABLE SchemaMismatch` instead of reporting that account as flat. `OPEN ...` or `UNREADABLE ...` means stop: account 2 is not flat or cannot be read; close a position on the venue before anything else (section 4). `UNREADABLE ValidationError (settings)` only says the old `.env` does not load under this code: carry on and make the check in step 9 the one that counts. The script reads only; it places, cancels and closes nothing.
+6. **Back up the old `.env` and build the new one.** The builder refuses to overwrite, so the old file is moved aside first (`mv` keeps its mode 600; `ls .env.bak-mirror-*` finds the backup later):
+   ```bash
+   cd /home/ubuntu/ai-perp-long && STAMP=$(date -u +%Y%m%dT%H%M%SZ) && mv .env ".env.bak-mirror-$STAMP"
+   PYTHONPATH=src .venv/bin/python src/build_forward_env.py --mirror-live \
+     --source /home/ubuntu/ai-perpetual-trading/.env \
+     --target /home/ubuntu/ai-perp-long/.env \
+     --cycle-start "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+   ```
+   It prints the key names it set and the three it blanked, never a value; show that output to the user. If it fails nothing was written: `mv ".env.bak-mirror-$STAMP" .env` restores the old file. `VOLUME_CYCLE_STARTED_AT` and `SETUP_LEDGER_SINCE` are now both this instant, and they are never edited afterwards (section 2 step 3): the volume accounting, the setup ledger and the report all count from here.
+7. **The account owner types** `BINGX_API_KEY`, `BINGX_SECRET_KEY` and `XAI_API_KEY` (the key policy above) into `/home/ubuntu/ai-perp-long/.env` with an editor. `chmod 600 .env` stays.
+8. **Review,** in the shell you will start the bot from:
+   - the process environment overrides `.env`, and the prefix list of section 2 step 6 does not know the `AI_*` and `SETUP_*` names that account 1's file brings. Use this instead; it prints the names of any environment variable that the new `.env` also defines, and it must print `[]`:
+     ```bash
+     cd /home/ubuntu/ai-perp-long && .venv/bin/python -I -c "import os, sys; from dotenv import dotenv_values as d; k = {x.upper() for x in d(sys.argv[1])}; print(sorted(n for n in os.environ if n.upper() in k))" /home/ubuntu/ai-perp-long/.env
+     ```
+   - the two accounts must not share a BingX key. The file was built from account 1's and the keys are typed by hand: if account 1's key went in, the second bot would trade on account 1's account, and step 9 could still print `FLAT` while the live bot is flat. This prints a verdict only and must print `different keys`:
+     ```bash
+     cd /home/ubuntu/ai-perp-long && .venv/bin/python -I -c "import sys; from dotenv import dotenv_values as d; a, b = (d(p).get('BINGX_API_KEY') or '' for p in sys.argv[1:3]); print('SAME KEY' if a == b else 'EMPTY KEY' if not (a and b) else 'different keys')" /home/ubuntu/ai-perpetual-trading/.env /home/ubuntu/ai-perp-long/.env
+     ```
+   - the names-only review of section 2 step 4. Decide the copied `COINMARKETCAP_API_KEY` and `DUNE_API_KEY` there: both bots then call those providers on one quota, so keep them, give account 2 its own, or blank them in the new `.env`. `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are copied as well: it is one project, so only `SUPABASE_SCHEMA=long_forward` keeps account 2 away from account 1's tables, which the next bullet shows;
+   - the effective values of the mirror. This prints an allowlist of non-secret settings, and `Settings()` also refuses to boot on a bad combination, so it proves the file loads:
+     ```bash
+     cd /home/ubuntu/ai-perp-long && PYTHONPATH=src .venv/bin/python -c "import sys; sys.excepthook = lambda t, v, tb: print('failed:', t.__name__, file=sys.stderr); from bot.config import Settings; s = Settings(); print(*(f'{n} = {getattr(s, n)}' for n in ('supabase_schema', 'entry_gate_direction', 'entry_regime_gate', 'ai_entry_payload', 'ai_lean_objective', 'setup_ledger_mode', 'setup_ledger_since', 'volume_cycle_started_at', 'ai_exit_max_calls_per_trade', 'symbols', 'telemetry_enabled', 'telemetry_port', 'entry_weekly_window')), sep='\n')"
+     ```
+     Expect `supabase_schema = long_forward`, `entry_gate_direction = long`, `entry_regime_gate = map`, `ai_entry_payload = lean`, `ai_lean_objective = volume`, `setup_ledger_mode = shadow`, `ai_exit_max_calls_per_trade = 0`, `symbols = ('BTC/USDT',)`, `telemetry_port = 3919`, `entry_weekly_window = mon 07:00-sat 00:00`, and `setup_ledger_since` equal to `volume_cycle_started_at` (the instant of step 6). If the window reads empty or differs, stop: the foreground start of step 10 is safe only because the entry window is closed then.
+9. **Flat check, the gate.** The command of step 5 (with `--expect-schema long_forward`) in the same clean shell, now with the new `.env` and the keys typed in: exactly `FLAT`. Anything else: do not start. It looks at positions only, so also look at the BingX VST app for resting orders: BingX rejects `set_margin_mode` (`104103`) while a position or a pending order exists, and the startup check then turns a restart into a crash loop (section 4).
+10. **First start in the foreground, outside the entry window:** exactly section 2 step 7 (same command, same reasons). You will see the same startup lines. One difference: with `map` and the ledger on, the engine evaluates pending shadow rows right after the entries latch and before the window gate, so `shadow_entries` is read on the first tick even though the window is closed. These lines mean the table is missing or not served (go back to step 3): `Shadow evaluation failed`, `could not be read from the store`, `its shadow row could not be saved`. Stop it with Ctrl-C after reading the lines, flat as before.
+11. **pm2, still outside the window and flat:** the command of section 2 step 8, then the after-start check below (the same idea as step 8's first check, applied to the app's environment; it must print `[]`), then `pm2 save`. The entry was removed from the saved list on 2026-10-25 and `pm2-ubuntu` is enabled, so without the save a VPS reboot would start only the live bot.
+    ```bash
+    cd /home/ubuntu/ai-perp-long && PYTHONPATH=src pm2 start src/main.py --name ai-perp-long \
+      --interpreter /home/ubuntu/ai-perp-long/.venv/bin/python --cwd /home/ubuntu/ai-perp-long --restart-delay 10000
+    pm2 status    # ai-perp-volume must still be online and unrestarted
+    pm2 jlist | .venv/bin/python -I -c "import json, sys; from dotenv import dotenv_values as d; k = {x.upper() for x in d(sys.argv[1])}; app = [p for p in json.load(sys.stdin) if p['name'] == 'ai-perp-long'][0]['pm2_env']; print(sorted(n for n in app if n.upper() in k))" /home/ubuntu/ai-perp-long/.env    # must print []
+    pm2 save
+    ```
+12. **Supervisor cron.** First once by hand with `--dry-run`, as in section 2 step 9. Then uncomment the line that was commented out on 2026-10-25, after a backup, and leave the live bot's line alone:
+    ```bash
+    crontab -l > ~/crontab.bak-acct2-mirror-$(date -u +%Y%m%dT%H%M%SZ)
+    crontab -l | grep ai-perp-long    # the commented line; if it is gone, add the one of section 2 step 9
+    crontab -e                        # remove the leading # of that line only
+    ```
+13. **Record** the cycle start, the tag `long-forward-v2` and the first Monday in `CLAUDE.md` and in memory, as in section 2 step 10.
+
+**What to read afterwards.** On the first Monday after 07:00 WIB, in `~/.pm2/logs/ai-perp-long-error.log`:
+
+- `grep "Regime gate" ~/.pm2/logs/ai-perp-long-error.log | tail -5`. The first line reads `Regime gate BTC/USDT: <reason> | allowed=... kondisi=...`, logged once per change. Under `map` the reason is `naik` (a LONG hour) or `turun` (a SHORT hour); `not_mapped:...`, `volatility` and `history_short` map no side, and then no AI call is made.
+- NAIK hours: LONG is live. A trade carries its bucket at `factor_metadata.setup` (`LONG|NAIK|atr_...`).
+- TURUN hours: the lean request offers SHORT only, and `ENTRY_GATE_DIRECTION=long` makes it a shadow side. The engine logs `Strategy returned HOLD`, `ai_decisions.payload_json.gate.shadow_side` is `true`, and a `shadow_entries` row with `source=shadow_side` is written, at most one per hold-plus-cooldown spacing. No SHORT order is ever sent: a SHORT in the `trades` of `long_forward` means the side filter failed, so stop and look.
+- The stage report from the clone, read-only, reading this directory's `.env` and so `long_forward`: `PYTHONPATH=src .venv/bin/python src/report_live_stages.py --stage-start <the instant of step 6>`. Judge the LONG trades the way account 1's step 2 is judged (gross bps per trade with its standard error, at the 30, 60 and 100 closed-trade reads) unless the manager says otherwise.
+
+**Rollback.** Do it with the entry window closed (Saturday 00:00 to Monday 07:00 WIB), like the start: with the window open an entry can appear between the flat check and the stop, and the stop, floor and time exits live in the bot process. Pick the phase you are in:
+
+- Steps 4 and 5 (the clone is on the tag, the old `.env` is untouched): `cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1`. Nothing else changed on the VPS except the account 2 venv, which step 4's `pip install` may have moved because `requirements.txt` holds ranges, not pins: if `git diff long-forward-v1 long-forward-v2 -- requirements.txt` prints anything, or the freeze of the venv differs from `~/pip-freeze-ai-perp-long.before-v2.txt`, put it back with `.venv/bin/pip install -r ~/pip-freeze-ai-perp-long.before-v2.txt` before anything starts `long-forward-v1` again.
+- Steps 6 to 9 (the new `.env` exists, no bot has run): that, then `cd /home/ubuntu/ai-perp-long && mv .env.bak-mirror-<STAMP> .env.restore && mv .env .env.mirror-unused && mv .env.restore .env`, with the real stamp from `ls .env.bak-mirror-*` in place of `<STAMP>` (a literal `<STAMP>` makes the first `mv` fail before `.env` is touched). The `cd` is part of the line on purpose: run from any other directory, a bare `mv .env ...` renames that directory's `.env`. The `shadow_entries` table stays; it does no harm.
+- Step 10 (the foreground run): Ctrl-C, check that the account is flat, then the previous bullet.
+- After step 11 (pm2): the position first. `pm2 stop` alone would leave an open position unwatched. The rules' exits end any trade within 60 minutes (the stop, the net +56 floor or take-profit, and the time stop), so wait for it or close it on the venue (section 4), and confirm `FLAT` with `src/flat_check.py --expect-schema long_forward`. Then, flat and with the window closed:
+  ```bash
+  pm2 delete ai-perp-long && pm2 save     # back to the retired state of section 6; never `all`
+  cd /home/ubuntu/ai-perp-long && git checkout long-forward-v1 && mv .env.bak-mirror-<STAMP> .env.restore && mv .env .env.mirror-stopped && mv .env.restore .env
+  crontab -e                              # last, because it is interactive: comment the ai-perp-long supervisor line again
+  ```
+  Replace `<STAMP>` with the real stamp from `ls .env.bak-mirror-*` before pasting (a literal `<STAMP>` is a syntax error, so nothing of the second line runs). The `mv` is chained to the `cd` on purpose: from any other directory it would rename that directory's `.env`. If step 4's `pip install` moved the venv, restore it as in the first bullet. Nothing in `long_forward` is deleted.
