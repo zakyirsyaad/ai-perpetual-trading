@@ -197,8 +197,65 @@ Verification of the working tree, Python 3.10.20, the same commands as above: `c
 
 Confirmed by the review and left as they are (design choices or beyond a fix here, or past the review's 15-finding cap): the report copies a few helpers of `report_live_stages.py`; the test fixtures `store_settings` and `_FakeHTTP` repeat those of two other test modules; `ReportStore` is a subclass in the script, not a method of the store, so it inherits the store's write methods (the tests drive `execute` with a fake that has only the two reads); the stop and take-profit are derived from today's settings instead of being stored at entry (calibration is the guard); `load_klines` peaks near 77 MB with the current cache; `day_bootstrap` redraws identical resamples for each table; `settle` is not pinned against `live_sim.settle_live` by a test.
 
+## Production-candle sensitivity (31 Oct 2026)
+
+### Why
+
+The first run of the report on the VPS (30 Oct 2026, 27 positions) calibrated 25/27. Both misses were trades of the evening of 29 Oct that ended on the real 60-minute time stop while the simulated live walk exited early on a 1m wick of the VST cache. Read-only checks the same afternoon (the bot's own minute log, the public candles of both venues, a replay on production candles) showed what such a wick is:
+
+| Position (SHORT) | VST bar | Production bar | Level | What the bot saw |
+|---|---|---|---|---|
+| opened 29 Oct 18:14 WIB | 19:05: low 79,725.6 on 4,909 BTC | low 80,040.4 on 7.4 BTC | target 79,889.1 | minute lines: net -0.35, +2.90, +2.90 against the +56 exit; time stop at +3.65 |
+| opened 29 Oct 19:34 WIB | 20:30: high 80,286.8 on 275 BTC | high 80,254.8 on 6.8 BTC | stop 80,280.1 | price about 80,240 at 20:30:18; time stop at -53.02 instead of about -101 |
+
+- **Replay on production candles** (the same code, the candles fetched in memory): calibration 27/27 against 25/27, and the paired means over the same 27 positions move by less than 0.6 USDT (`lock 45->20` +5.30 against +5.18, `floor +45` +6.47 against +5.94, `lock 40->15` +4.74 against +4.41, `trail 40/20` +6.62 against +6.43). The numbers the report gave stand.
+- **How heavy the tail is** (5,952 minutes of the cache, 26 Oct 00:00 to 30 Oct 03:15 WIB, against production): the amount by which the VST high or low lies beyond production's is 0.4 bps at the median, 1.9 at the 90th percentile, 21.5 at the 99th, 47 at the 99.9th and 83.4 at most; 72 minutes (1.2 %) exceed 20 bps. The worst event came after the cache ended: on 30 Oct 04:34-04:37 WIB VST printed a low of 71,545.4 (production 79,450.8) and a high of 80,000 (production 79,647.8) on 22-24k BTC a minute (production 6-10), and the SHORT opened at 04:35:37 was stopped at 79,905.4 after 49 s for -165.85 USDT, while the highest production high on its path was 79,648.9.
+- **On the 14 positions opened since 29 Oct** (production candles also cover the 9 of 30 Oct that the VST cache lacks until its next refresh) every variant is below the live rules: `lock 45->20` -2.84 +- 2.84, `lock 40->15` -3.20, `trail 40/20` -2.24, `floor +45` -3.89 +- 1.47. Four changed exits in 36 positions drive that sign, so it says nothing yet, and it is not the registered read.
+
+### Design
+
+- `--production-candles` on `src/report_exit_variants.py`, mutually exclusive with `--klines` (argparse exits 2), off by default. The registered output is untouched: every renderer gets a `production=False` keyword, and a test pins that the default text holds none of "PRODUKSI", "sensitivitas" or "produksi".
+- `src/research/exit_variants/candles.py` (`window_for`, `production_cols`) downloads BTC-USDT 1m bars for `[first open minute, last open minute + hold + 2 minutes)` from the public production endpoint, cut at the last closed minute. It reuses the public `fetch_window`, `httpx_get` and exceptions of `research.pine_gate.fetch` (no key, no signature) and keeps the fetcher's rules: windows of at most 1,440 bars (a request per day of candles), at least a second between requests, the in-body 100410 retried after 5, 15 and 45 s, 5xx and dropped connections up to 3 attempts, 4xx and HTTP 403, 418 and 429 raised at once, every row validated. A minute the venue does not return stays a hole, so the study lists the trades that need it as skipped, as it does for the cache. A range over 100 days is refused before any request.
+- The backoff loop is copied in small, not imported: `_call_with_retries` of the fetcher is private, and `research/pine_gate` and `research/mode_backtest` are bound by one-shot locks, so neither is edited.
+- The text says what it is: a header line, the rule heading ("dibaca pada candle PRODUKSI: sensitivitas, bukan vonis terdaftar"), a pass line that reads "memenuhi angka aturan pada candle produksi (sensitivitas, bukan vonis)" and never "layak jadi lengan live", and a closing line that names the public candle read. The registered verdict stays the one read from the VST cache; making production the primary read is a decision for the manager and a new evidence document, not an edit here.
+- Unchanged: the variants, conventions, costs, thresholds, `FORWARD_FROM`, the default cache path and every number of the registered read.
+
+### RED evidence
+
+Before any implementation (`PYTHONPATH=src python -m unittest ...` on the two new test files):
+
+```text
+ImportError: cannot import name 'candles' from 'research.exit_variants' (src/research/exit_variants/__init__.py)
+Ran 15 tests ... FAILED (failures=1, errors=18)        # tests/test_report_exit_variants_production.py
+AttributeError: module 'report_exit_variants' has no attribute 'candles'      (13 times)
+python -m unittest: error: unrecognized arguments: --production-candles
+```
+
+### GREEN and verification
+
+Python 3.10.20 (the VPS runs 3.10, CI 3.11), from the worktree with `PYTHONPATH=src`, the same commands as above:
+
+- `python -m compileall -q src tests` passed.
+- `python -m coverage run -m unittest discover -s tests`: `Ran 3431 tests in 159.2s OK` (3,395 on `main` before: 21 new tests for `candles`, 15 for the report option).
+- `python -m coverage report`: line coverage 93 % (18,536 statements, 1,378 missed); `src/research/exit_variants/candles.py` 60 statements at 100 % and `src/report_exit_variants.py` 287 at 100 %.
+- The real transport, which no unit test exercises: `production_cols` against the public endpoint for five minutes of 29 Oct returned the bars seen in the investigation (12:05 UTC: open 80,068.8, high 80,068.8, low 80,040.4).
+- An independent review of the diff found no defects. Its one low note (the window arithmetic was pinned only by restating the formula) is closed by `WindowAgreesWithTheStudyTests`, which runs the downloaded window through `study.simulate`; lowering the margin from 2 minutes to 1 turns three tests red.
+
+### Limitations
+
+1. Production candles are not what the VST bot traded. A VST print can be real for its account (the stop-out of 30 Oct 04:36 is a loss in the VST account), so on production candles the replay can disagree with it: the one miss left among the 36 positions is that trade (real stop_loss -165.85, simulated TP).
+2. Production candles are current to the last closed minute, while the VST cache is refreshed once a day, so the newest trades are readable sooner. A trade whose time-exit bar has not closed is skipped in both.
+3. The download adds about a second per day of candles and needs the public host to be reachable from where the report runs; the VST path stays offline.
+4. The tail figures come from a cache that ended before the worst event, so they understate it.
+5. The 14-position forward figures are a diagnostic: four changed exits, and no correction for the variants tried.
+
+### Commit trail
+
+- the commit that adds `--production-candles` and this evidence (this change; subject `feat: read production candles in the exit-variants report`)
+
 ## Deployment gate
 
 1. Merging changes nothing for trading: no setting, no trade path, nothing under `src/bot` imports the new code, and `src/bot` is not edited. Pulling `main` on the VPS needs no restart.
 2. Run it by hand from the bot's directory: `cd /home/ubuntu/ai-perpetual-trading && PYTHONPATH=src python src/report_exit_variants.py --since <ISO with timezone>`. The first run also settles the PostgREST select (limitation 7).
 3. Its verdict is data for a decision point. Enabling any exit variant is a separate change with its own spec, hypothesis, offline test and a restart while flat; the report says so itself.
+4. The production reading (31 Oct 2026) adds no dependency (httpx is already required) and no setting, and it is read-only like the rest. After pulling `main` on the VPS: `cd /home/ubuntu/ai-perpetual-trading && PYTHONPATH=src python src/report_exit_variants.py --since 2026-10-26T00:00:00+07:00 --production-candles`. Five days of candles are five requests, about ten seconds with the pauses; the registered read stays the run without the flag.

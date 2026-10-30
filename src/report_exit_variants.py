@@ -14,10 +14,15 @@ bot's (account 1 ``public``, account 2 ``long_forward``):
 BTC-USDT pair (default ``~/replay/edge_klines.json``). Trades whose candles are not all in the cache, or whose stop cannot
 be derived, are listed and skipped.
 
+``--production-candles`` replaces the cache with the same minutes downloaded from the public production endpoint
+(``research.exit_variants.candles``: no keys, a request per day of candles, a second apart). It is a sensitivity, not the
+registered read: VST is a demo venue whose 1m extremes now and then stray from the real market, and the text says that the
+registered verdict is read from the cache. The two options exclude each other.
+
 The report ends with the pre-registered decision rule as text. It is never an instruction: nothing here enables anything.
 
-Exit codes: 0 ok, 1 expected failure (one ``error:`` line: unusable cache, unmodelled live exits, a failed read), 2 usage
-error (a naive time, ``--until`` not after ``--since``).
+Exit codes: 0 ok, 1 expected failure (one ``error:`` line: unusable cache, a failed candle download, unmodelled live
+exits, a failed read), 2 usage error (a naive time, ``--until`` not after ``--since``).
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ from pydantic import ValidationError
 from bot.config import Settings
 from bot.core.forward_summary import MISSING, WIB, format_number, format_percent
 from bot.storage.supabase_trade_store import SupabaseTradeStore, parse_timestamp
-from research.exit_variants import study
+from research.exit_variants import candles, study
 from research.exit_variants.walker import Cols
 
 __all__ = [
@@ -89,6 +94,21 @@ _SUBSETS = (("Semua posisi", None), ("Posisi tenang", study.calm_subset))
 _CLOSING = (
     "Laporan ini tidak mengubah satu pun trade: hanya membaca (Supabase GET dan berkas candle), "
     "tidak menulis apa pun selain layar."
+)
+_CLOSING_PRODUCTION = (
+    "Laporan ini tidak mengubah satu pun trade: hanya membaca (Supabase GET dan GET publik candle produksi), "
+    "tidak menulis apa pun selain layar."
+)
+# A read on production candles is a sensitivity beside the registered one (the VST cache): the text must not let a
+# reader take its rule section for the registered verdict.
+_SOURCE_NOTE = (
+    "Sumber candle: PRODUKSI (open-api.bingx.com, publik), bukan cache VST: bacaan sensitivitas. "
+    "Vonis terdaftar dibaca dari run tanpa --production-candles."
+)
+_RULE_HEADING = "=== Aturan keputusan yang didaftarkan sebelumnya ==="
+_RULE_HEADING_PRODUCTION = (
+    "=== Aturan keputusan yang didaftarkan sebelumnya "
+    "(dibaca pada candle PRODUKSI: sensitivitas, bukan vonis terdaftar) ==="
 )
 
 
@@ -191,12 +211,14 @@ def _within(
     return kept, unreadable
 
 
-def render_header(settings: Any, since: datetime, until: datetime, unreadable: int) -> str:
+def render_header(settings: Any, since: datetime, until: datetime, unreadable: int, production: bool = False) -> str:
     lines = [
         "Varian keluar bayangan: selisih berpasangan terhadap aturan live. Hanya analisis; tidak mengubah satu pun trade.",
         f"Skema Supabase: {settings.supabase_schema} | bursa: {settings.exchange_name}",
         f"Dibaca: posisi tertutup sejak {_wib(since)} sampai {_wib(until)} (WIB, akhir tidak termasuk)",
     ]
+    if production:
+        lines.append(_SOURCE_NOTE)
     if unreadable:
         lines.append(f"PERINGATAN: {unreadable} posisi tanpa waktu tutup yang terbaca dilewati.")
     return "\n".join(lines)
@@ -322,8 +344,10 @@ def _criterion_text(criterion: study.Criterion) -> str:
     return f"kalibrasi: {format_percent(None if value is None else 100.0 * value, 1)} (perlu >= {format_percent(100.0 * needed, 1)})"
 
 
-def render_candidate(candidate: study.Candidate, verdict: study.Verdict) -> str:
-    """One candidate of the decision rule: its criteria, ticked or open, and the conclusion."""
+def render_candidate(candidate: study.Candidate, verdict: study.Verdict, production: bool = False) -> str:
+    """One candidate of the decision rule: its criteria, ticked or open, and the conclusion.
+
+    On production candles a pass is only said to meet the numbers: the registered verdict is read from the VST cache."""
     claim = f"n >= {candidate.min_trades}, rata-rata >= {signed(candidate.min_mean, 2)} USDT/posisi"
     if candidate.name == study.CALM_POSITIONS.name:
         heading = f"kandidat posisi tenang (setup.atr_pct < {format_number(study.CALM_ATR_PCT, 3)}%; {claim}):"
@@ -331,7 +355,13 @@ def render_candidate(candidate: study.Candidate, verdict: study.Verdict) -> str:
         heading = f"kandidat semua posisi ({claim}):"
     lines = [heading]
     lines += [f"  [{'x' if criterion.met else ' '}] {_criterion_text(criterion)}" for criterion in verdict.criteria]
-    if verdict.passed:
+    if verdict.passed and production:
+        lines.append("  -> memenuhi angka aturan pada candle produksi (sensitivitas, bukan vonis)")
+        lines.append(
+            "     (vonis terdaftar dibaca dari cache VST; hasil aturan, bukan perintah untuk mengaktifkan apa pun: "
+            "keputusan tetap di tangan manajer)"
+        )
+    elif verdict.passed:
         lines.append("  -> layak jadi lengan live")
         lines.append("     (hasil aturan, bukan perintah untuk mengaktifkan apa pun: keputusan tetap di tangan manajer)")
     else:
@@ -339,11 +369,11 @@ def render_candidate(candidate: study.Candidate, verdict: study.Verdict) -> str:
     return "\n".join(lines)
 
 
-def render_rule(result: study.Study, since: Optional[datetime] = None) -> str:
+def render_rule(result: study.Study, since: Optional[datetime] = None, production: bool = False) -> str:
     forward = study.forward_subset(result.simulated)
     ratio = study.calibration(forward).ratio
     lines = [
-        "=== Aturan keputusan yang didaftarkan sebelumnya ===",
+        _RULE_HEADING_PRODUCTION if production else _RULE_HEADING,
         f"varian utama: {study.PRIMARY_VARIANT}, dibaca pada konvensi {study.DECISION_CONVENTION}; varian lain hanya "
         "deskriptif (tanpa vonis, karena tidak ada koreksi untuk banyaknya varian yang dicoba)",
         f"posisi yang dihitung untuk vonis: {len(forward)} dari {len(result.simulated)} (hanya yang dibuka sejak "
@@ -359,7 +389,7 @@ def render_rule(result: study.Study, since: Optional[datetime] = None) -> str:
     for candidate in (study.ALL_POSITIONS, study.CALM_POSITIONS):
         pool = forward if candidate is study.ALL_POSITIONS else study.calm_subset(forward)
         summary = study.summarize(pool, study.PRIMARY_VARIANT, study.DECISION_CONVENTION)
-        lines.append(render_candidate(candidate, study.evaluate_rule(candidate, summary, ratio)))
+        lines.append(render_candidate(candidate, study.evaluate_rule(candidate, summary, ratio), production))
     return "\n".join(lines)
 
 
@@ -370,9 +400,10 @@ def render_report(
     since: datetime,
     until: datetime,
     unreadable: int = 0,
+    production: bool = False,
 ) -> str:
     parts = [
-        render_header(settings, since, until, unreadable),
+        render_header(settings, since, until, unreadable, production),
         render_sample(result),
         render_calibration(result),
         render_parameters(rules),
@@ -380,7 +411,7 @@ def render_report(
     for title, pick in _SUBSETS:
         pool = list(result.simulated) if pick is None else pick(result.simulated)
         parts += [render_block(title, pool, convention) for convention in study.CONVENTIONS]
-    parts += [render_rule(result, since), _CLOSING]
+    parts += [render_rule(result, since, production), _CLOSING_PRODUCTION if production else _CLOSING]
     return "\n\n".join(parts)
 
 
@@ -424,9 +455,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--until", type=_parse_moment, default=None, metavar="ISO",
         help="End of the window, timezone-aware ISO-8601, exclusive (default: now).",
     )
-    parser.add_argument(
+    candles_from = parser.add_mutually_exclusive_group()
+    candles_from.add_argument(
         "--klines", type=Path, default=DEFAULT_KLINES, metavar="FILE",
         help=f"1m kline cache, JSON {{\"k1\": {{\"<bar open ms>\": [open, high, low, close]}}}} (default: {DEFAULT_KLINES}).",
+    )
+    candles_from.add_argument(
+        "--production-candles", action="store_true",
+        help="Download the 1m candles of the window from the public production endpoint instead of reading the VST "
+             "cache: a sensitivity read, not the registered one. Excludes --klines.",
     )
     return parser
 
@@ -452,6 +489,15 @@ async def _read(
         min(opened) - study.DECISION_WINDOW, max(opened) + _DECISION_END_SLACK
     )
     return trades, unreadable, decisions
+
+
+async def _production_cols(trades: Sequence[Mapping[str, Any]], rules: study.LiveRules) -> Cols:
+    """The production candles the walks of ``trades`` can read. The download blocks, so it runs off the event loop."""
+    opened = [moment for moment in (parse_timestamp(row.get("opened_at")) for row in trades) if moment is not None]
+    window = candles.window_for(opened, rules.hold_minutes, datetime.now(timezone.utc))
+    if window is None:
+        return Cols([], [], [], [])
+    return await asyncio.to_thread(candles.production_cols, *window)
 
 
 async def execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
@@ -480,10 +526,12 @@ async def _execute(args: argparse.Namespace, store: Any, settings: Any) -> int:
         return 2
     try:
         rules = study.live_rules_from_settings(settings)
-        cols = load_klines(args.klines.expanduser())
+        cols = None if args.production_candles else load_klines(args.klines.expanduser())
         trades, unreadable, decisions = await _read(store, since, until)
+        if cols is None:  # the window of the download is known only once the trades are
+            cols = await _production_cols(trades, rules)
         result = study.run_study(trades, decisions, cols, rules)
-        text = render_report(result, rules, settings, since, until, unreadable)
+        text = render_report(result, rules, settings, since, until, unreadable, args.production_candles)
     except (ValueError, RuntimeError, OSError, httpx.HTTPError) as exc:
         _error(_describe(exc))
         return 1
